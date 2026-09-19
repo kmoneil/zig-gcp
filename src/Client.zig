@@ -54,7 +54,7 @@ pub const Options = struct {
     token_provider: ?TokenProvider = null,
     retry: RetryPolicy = .{},
     /// Printable ASCII.
-    user_agent: []const u8 = "zig-pubsub/0.1",
+    user_agent: []const u8 = "zig-pubsub/0.2",
     /// Filled with details of every failed call; cleared by each new call.
     diagnostics: ?*Diagnostics = null,
     /// Sends requests through this instead of `std.http.Client`. Useful for
