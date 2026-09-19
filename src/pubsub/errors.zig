@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const test_util = @import("test_util.zig");
-const TransportError = @import("transport.zig").Error;
+const TransportError = @import("core").transport.Error;
 const TokenError = @import("auth.zig").TokenProvider.Error;
 
 /// Every error a client call can return.

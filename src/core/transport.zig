@@ -482,7 +482,7 @@ fn socketOk(connection: *const http.Client.Connection) Error {
 
 const testing = std.testing;
 const net = std.Io.net;
-const test_util = @import("test_util.zig");
+const test_util = @import("testing.zig");
 
 /// Accepts connections on 127.0.0.1 and answers each request with the next
 /// scripted raw HTTP response. Records the raw requests it saw.

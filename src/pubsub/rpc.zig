@@ -13,8 +13,8 @@ const errors = @import("errors.zig");
 const logging = @import("logging.zig");
 const validate = @import("validate.zig");
 const isRetryable = @import("retry.zig").isRetryable;
-const Method = @import("transport.zig").Method;
-const Response = @import("transport.zig").Response;
+const Method = @import("core").transport.Method;
+const Response = @import("core").transport.Response;
 const Error = errors.Error;
 
 pub const Call = struct {

@@ -44,7 +44,7 @@ pub const limits = @import("validate.zig");
 
 /// The HTTP seam: implement `transport.Transport` to send requests another
 /// way, or to fake the server in your own tests.
-pub const transport = @import("transport.zig");
+pub const transport = @import("core").transport;
 
 test "usage: the spec's example, against a fake server" {
     const std = @import("std");
