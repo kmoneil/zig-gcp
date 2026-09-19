@@ -201,8 +201,11 @@ pub const HttpTransport = struct {
         const decompress_buffer: []u8 = switch (encoding) {
             .identity => &.{},
             .gzip, .deflate => try arena.alloc(u8, std.compress.flate.max_window_len),
-            .zstd => try arena.alloc(u8, std.compress.zstd.default_window_len),
-            .compress => {
+            // std refuses an encoding the request did not accept, and it
+            // accepts only gzip and deflate, so these arrive only if std
+            // changes. Refuse them here too: zstd would need a larger buffer
+            // than std's own table gives, and a smaller one fails an assertion.
+            .zstd, .compress => {
                 connection.closing = true;
                 return error.HttpProtocolError;
             },
@@ -889,6 +892,111 @@ test "HttpTransport: a gzip body cut short is a dropped connection; a corrupt on
     try testing.expectError(
         error.HttpProtocolError,
         ht.transport().send(.{ .method = .GET, .url = server.url(&buf, "/b") }, arena.allocator()),
+    );
+}
+
+test "HttpTransport: an informational response is returned as it is" {
+    const io = testing.io;
+    // A 1xx precedes the real response. This client does not wait for it,
+    // and does not reuse the connection; the next request still works.
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    const early = try ht.transport().send(.{ .method = .GET, .url = server.url(&buf, "/a") }, arena.allocator());
+    try testing.expectEqual(103, early.status);
+    try testing.expectEqualStrings("", early.body);
+    const next = try ht.transport().send(.{ .method = .GET, .url = server.url(&buf, "/b") }, arena.allocator());
+    try testing.expectEqual(200, next.status);
+    try testing.expectEqualStrings("{}", next.body);
+    try serving.await(io);
+}
+
+test "HttpTransport decodes deflate, and refuses encodings it did not ask for" {
+    const io = testing.io;
+    // std sends `accept-encoding: gzip, deflate`, but a proxy may send
+    // anything. HTTP's deflate is zlib-wrapped.
+    const deflate = "\x78\xda\xab\x56\xca\xcf\x56\xb2\x2a\x29\x2a\x4d\xad\x05\x00\x16\xe3\x04\x11";
+    const zstd = "\x28\xb5\x2f\xfd\x20\x0b\x59\x00\x00\x7b\x22\x6f\x6b\x22\x3a\x74\x72\x75\x65\x7d";
+    var server: ScriptedServer = try .start(io, &.{
+        std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Encoding: deflate\r\nContent-Length: {d}\r\n\r\n", .{deflate.len}) ++ deflate,
+        std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Encoding: zstd\r\nContent-Length: {d}\r\n\r\n", .{zstd.len}) ++ zstd,
+        "HTTP/1.1 200 OK\r\nContent-Encoding: compress\r\nContent-Length: 4\r\n\r\nabcd",
+    });
+    // deflate and zstd share the first connection, which the client keeps
+    // after a whole body. A refused encoding leaves its body unread, so the
+    // client closes that connection and compress needs a new one.
+    server.per_connection = 2;
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    const res = try ht.transport().send(.{ .method = .GET, .url = server.url(&buf, "/deflate") }, arena.allocator());
+    try testing.expectEqualStrings("{\"ok\":true}", res.body);
+    for ([_][]const u8{ "/zstd", "/compress" }) |path| {
+        try testing.expectError(
+            error.HttpProtocolError,
+            ht.transport().send(.{ .method = .GET, .url = server.url(&buf, path) }, arena.allocator()),
+        );
+    }
+    try serving.await(io);
+}
+
+test "HttpTransport: chunked framing cut after a whole gzip stream is a dropped connection" {
+    const io = testing.io;
+    // The gzip stream decodes completely, but the terminating chunk never
+    // arrives: the body cannot be known to be whole.
+    const gzip = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\xab\x56\xca\xcf\x56\xb2\x2a\x29\x2a\x4d\xad\x05\x00\x90\x5f\xd4\xa7\x0b\x00\x00\x00";
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n1f\r\n" ++ gzip ++ "\r\n",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    try testing.expectError(
+        error.ConnectionResetByPeer,
+        ht.transport().send(.{ .method = .GET, .url = server.url(&buf, "/") }, arena.allocator()),
+    );
+    try serving.await(io);
+}
+
+test "HttpTransport: a chunk-size line longer than the read buffer is a protocol error" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;" ++ ("x" ** 16384) ++ "\r\nhello\r\n0\r\n\r\n",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    try testing.expectError(
+        error.HttpProtocolError,
+        ht.transport().send(.{ .method = .GET, .url = server.url(&buf, "/") }, arena.allocator()),
     );
 }
 
