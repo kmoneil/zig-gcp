@@ -172,13 +172,14 @@ precise than the documentation.
 
 ### Logging
 
-The library logs through `std.log.scoped(.pubsub)`: each request at `debug`
-(method, path, status, attempt, time) and each retry at `warn`. It never logs
-tokens, message data or attribute values. Filter it in your root file:
+The library logs through `std.log.scoped(.gcp_pubsub)`: each request at
+`debug` (method, path, status, attempt, time) and each retry at `warn`. It
+never logs tokens, message data or attribute values. Filter it in your root
+file:
 
 ```zig
 pub const std_options: std.Options = .{
-    .log_scope_levels = &.{.{ .scope = .pubsub, .level = .warn }},
+    .log_scope_levels = &.{.{ .scope = .gcp_pubsub, .level = .warn }},
 };
 ```
 

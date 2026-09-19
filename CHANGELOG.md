@@ -9,6 +9,9 @@ including the ones that did not change.
 - pubsub: breaking: `retry_publish` moved from `RetryPolicy` to
   `Client.Options`. Write `.retry_publish = false` instead of
   `.retry = .{ .retry_publish = false }`.
+- pubsub: breaking: logs under the scope `.gcp_pubsub`, not `.pubsub`, so
+  it cannot collide with another library's scope. Rename it in
+  `std_options.log_scope_levels`.
 
 ## 0.3.0 (2026-09-19)
 

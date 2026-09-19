@@ -16,7 +16,7 @@ const pubsub = @import("pubsub");
 /// The library logs under the `.pubsub` scope; show only its warnings (each
 /// retry) and hide the per-request debug lines.
 pub const std_options: std.Options = .{
-    .log_scope_levels = &.{.{ .scope = .pubsub, .level = .warn }},
+    .log_scope_levels = &.{.{ .scope = .gcp_pubsub, .level = .warn }},
 };
 
 pub fn main(init: std.process.Init) !void {
