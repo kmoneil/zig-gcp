@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Alignment = std.mem.Alignment;
 
 const Transport = @import("transport.zig").Transport;
 const TransportError = @import("transport.zig").Error;
@@ -253,6 +254,48 @@ pub const ScriptedServer = struct {
         @memcpy(s.seen[slot][len..][0..body.len], body);
         s.seen_len[slot] = len + body.len;
         s.seen_count += 1;
+    }
+};
+
+/// An allocator that counts the blocks that were not all zeros when freed,
+/// to test code that must wipe secrets. Such code should free with `rawFree`
+/// after wiping: `Allocator.free` overwrites memory with a debug pattern in
+/// safe builds, which would hide a missing wipe.
+pub const WipeChecker = struct {
+    child: Allocator,
+    frees: usize = 0,
+    unwiped: usize = 0,
+
+    pub fn allocator(self: *WipeChecker) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn fromPtr(ptr: *anyopaque) *WipeChecker {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
+        return fromPtr(ptr).child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+        return fromPtr(ptr).child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        return fromPtr(ptr).child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
+        const self = fromPtr(ptr);
+        self.frees += 1;
+        if (!std.mem.allEqual(u8, memory, 0)) self.unwiped += 1;
+        self.child.rawFree(memory, alignment, ret_addr);
     }
 };
 
