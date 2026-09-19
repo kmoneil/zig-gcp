@@ -2,7 +2,7 @@
 //! mapping and `Diagnostics` live in core.
 
 const core = @import("core");
-const TokenError = @import("auth.zig").TokenProvider.Error;
+const TokenError = core.TokenProvider.Error;
 
 /// Every error a client call can return.
 pub const Error = core.ApiError || core.transport.Error || TokenError || error{

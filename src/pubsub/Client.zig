@@ -25,7 +25,7 @@ const Diagnostics = @import("core").Diagnostics;
 const Error = errors.Error;
 const HttpTransport = @import("core").transport.HttpTransport;
 const RetryPolicy = @import("core").RetryPolicy;
-const TokenProvider = @import("auth.zig").TokenProvider;
+const TokenProvider = @import("core").TokenProvider;
 const Transport = @import("core").transport.Transport;
 
 gpa: Allocator,
@@ -189,7 +189,7 @@ fn isValidUserAgent(user_agent: []const u8) bool {
 
 const testing = std.testing;
 const test_util = @import("test_util.zig");
-const StaticToken = @import("auth.zig").StaticToken;
+const StaticToken = @import("core").StaticToken;
 
 const local_emulator: Endpoint = .{ .url = "localhost:8085", .emulator = true };
 

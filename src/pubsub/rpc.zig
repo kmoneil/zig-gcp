@@ -8,15 +8,17 @@ const Allocator = std.mem.Allocator;
 const core = @import("core");
 
 const Client = @import("Client.zig");
-const auth = @import("auth.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
 const validate = @import("validate.zig");
-const isRetryable = @import("core").isRetryable;
-const Method = @import("core").transport.Method;
-const Response = @import("core").transport.Response;
+const isRetryable = core.isRetryable;
+const Method = core.transport.Method;
+const Response = core.transport.Response;
 const Error = errors.Error;
+
+/// The OAuth scope the client asks its token provider for.
+pub const scope = "https://www.googleapis.com/auth/pubsub";
 
 pub const Call = struct {
     method: Method,
@@ -104,11 +106,11 @@ fn bearerToken(client: *Client) Error!?[]const u8 {
     // Never send credentials to the emulator: it speaks plain HTTP.
     if (client.emulator) return null;
     const provider = client.token_provider orelse return null;
-    const token = provider.getToken(client.io, &.{auth.scope}) catch |err| {
+    const token = provider.getToken(client.io, &.{scope}) catch |err| {
         if (client.diagnostics) |d| d.print("the token provider failed: {t}", .{err});
         return err;
     };
-    if (!auth.isValidToken(token)) {
+    if (!core.TokenProvider.isValidToken(token)) {
         if (client.diagnostics) |d| d.print("the token provider returned an empty token, or one with spaces, newlines or non-ASCII bytes", .{});
         return error.TokenUnavailable;
     }
@@ -361,16 +363,16 @@ test "credentials: an unusable token fails before sending" {
 test "credentials: a failing provider's error is returned, not retried" {
     const Failing = struct {
         calls: usize = 0,
-        fn provider(self: *@This()) auth.TokenProvider {
+        fn provider(self: *@This()) core.TokenProvider {
             return .{ .ptr = self, .vtable = &.{ .getToken = getToken } };
         }
-        fn getToken(ptr: *anyopaque, io: std.Io, scopes: []const []const u8) auth.TokenProvider.Error![]const u8 {
+        fn getToken(ptr: *anyopaque, io: std.Io, scopes: []const []const u8) core.TokenProvider.Error![]const u8 {
             _ = io;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             // The client asks for exactly the Pub/Sub scope.
             testing.expectEqual(1, scopes.len) catch return error.TokenUnavailable;
-            testing.expectEqualStrings(auth.scope, scopes[0]) catch return error.TokenUnavailable;
+            testing.expectEqualStrings(scope, scopes[0]) catch return error.TokenUnavailable;
             return error.TokenUnavailable;
         }
     };
@@ -388,10 +390,10 @@ test "credentials: a failing provider's error is returned, not retried" {
 test "credentials: the provider is asked again on every attempt" {
     const Counting = struct {
         calls: usize = 0,
-        fn provider(self: *@This()) auth.TokenProvider {
+        fn provider(self: *@This()) core.TokenProvider {
             return .{ .ptr = self, .vtable = &.{ .getToken = getToken } };
         }
-        fn getToken(ptr: *anyopaque, io: std.Io, scopes: []const []const u8) auth.TokenProvider.Error![]const u8 {
+        fn getToken(ptr: *anyopaque, io: std.Io, scopes: []const []const u8) core.TokenProvider.Error![]const u8 {
             _ = io;
             _ = scopes;
             const self: *@This() = @ptrCast(@alignCast(ptr));
