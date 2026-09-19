@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const core = @import("core");
 
 const Client = @import("Client.zig");
 const auth = @import("auth.zig");
@@ -90,13 +91,13 @@ pub fn executeDiscard(client: *Client, call: Call) Error!void {
 
 /// Maps a non-2xx response and records its details.
 fn failure(client: *Client, scratch: Allocator, res: Response) Error {
-    const body = codec.decodeError(scratch, res.body);
+    const body = core.errors.decodeErrorBody(scratch, res.body);
     const status = if (body) |b| b.status else "";
     // A body that is not the standard error shape, such as a proxy's page,
     // is the best message there is.
     const message = if (body) |b| b.message else res.body;
     if (client.diagnostics) |d| d.set(res.status, status, message);
-    return errors.fromResponse(res.status, status);
+    return core.errors.fromResponse(res.status, status);
 }
 
 fn bearerToken(client: *Client) Error!?[]const u8 {

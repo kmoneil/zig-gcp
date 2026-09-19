@@ -276,13 +276,6 @@ const WirePullResponse = struct {
     receivedMessages: ?[]const WireReceivedMessage = null,
 };
 
-const WireErrorBody = struct {
-    @"error": ?struct {
-        status: ?[]const u8 = null,
-        message: ?[]const u8 = null,
-    } = null,
-};
-
 /// Parses `body` into `T`. A blank body counts as `{}`: a pull with no
 /// messages may return nothing at all.
 fn parseWire(comptime T: type, arena: Allocator, body: []const u8) DecodeError!T {
@@ -371,20 +364,6 @@ fn attributesFromWire(
     const out = try arena.alloc(types.Attribute, map.count());
     for (map.keys(), map.values(), out) |k, v, *a| a.* = .{ .key = k, .value = v orelse "" };
     return out;
-}
-
-pub const ErrorBody = struct {
-    /// Such as "NOT_FOUND"; "" when absent.
-    status: []const u8,
-    message: []const u8,
-};
-
-/// The standard Google error body, or null when `body` is not one (a proxy's
-/// HTML page, say). Never fails: the caller falls back to the HTTP status.
-pub fn decodeError(arena: Allocator, body: []const u8) ?ErrorBody {
-    const wire = std.json.parseFromSliceLeaky(WireErrorBody, arena, body, parse_options) catch return null;
-    const e = wire.@"error" orelse return null;
-    return .{ .status = e.status orelse "", .message = e.message orelse "" };
 }
 
 pub const Base64Error = error{ InvalidBase64, OutOfMemory };
@@ -638,28 +617,6 @@ test "decode publish: ids must match the message count" {
     try testing.expectError(error.InvalidResponse, decodePublish(a, "{\"messageIds\":[null]}", 1));
 }
 
-test "decode error bodies" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const e = decodeError(a, "{\"error\":{\"code\":404,\"message\":\"Topic not found\",\"status\":\"NOT_FOUND\"}}").?;
-    try testing.expectEqualStrings("NOT_FOUND", e.status);
-    try testing.expectEqualStrings("Topic not found", e.message);
-
-    const detailed = decodeError(a,
-        \\{"error":{"code":400,"message":"bad","status":"INVALID_ARGUMENT",
-        \\"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"X"}]}}
-    ).?;
-    try testing.expectEqualStrings("INVALID_ARGUMENT", detailed.status);
-
-    try testing.expectEqual(null, decodeError(a, "Not Found"));
-    try testing.expectEqual(null, decodeError(a, ""));
-    try testing.expectEqual(null, decodeError(a, "{}"));
-    try testing.expectEqual(null, decodeError(a, "{\"error\":\"string\"}"));
-    const partial = decodeError(a, "{\"error\":{\"code\":\"weird\"}}");
-    try testing.expectEqualStrings("", partial.?.status);
-}
-
 test "base64: padding, alphabets and rejects" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -759,7 +716,6 @@ fn decodeArbitrary(_: void, input: []const u8) !void {
         error.InvalidResponse => {},
         else => return err,
     };
-    _ = decodeError(a, input);
 }
 
 test "fuzz decoders: arbitrary bodies never crash" {
