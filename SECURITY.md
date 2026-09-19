@@ -46,15 +46,19 @@ code in `src/`.
   refuses a non-emulator endpoint that is not `https`. `credentials never go
   to a plain-http endpoint`.
 - **A token that could break the Authorization header is refused before
-  anything is sent.** `credentials: an unusable token fails before sending`,
-  `isValidToken rejects what would break the header`.
+  anything is sent,** whatever bytes a token provider returns.
+  `credentials: an unusable token fails before sending`, `isValidToken
+  rejects what would break the header`, `fuzz isValidToken: accepts exactly
+  non-empty visible ASCII`, `fuzz: a provider's token reaches the request
+  intact or not at all`.
 - **Redirects are never followed,** so a server cannot send the request, and
   its Authorization header, to another host. `HttpTransport does not follow
   redirects`.
 - **Nothing sensitive reaches the log:** no tokens, message data, attribute
-  keys or values, ordering keys or page tokens. `log hygiene: no token,
-  payload or attribute value ever reaches the log`, `log hygiene: page tokens
-  stay out of the log`.
+  keys or values, ordering keys or page tokens. Tokens stay out of
+  `Diagnostics` too. `log hygiene: no token, payload or attribute value ever
+  reaches the log`, `log hygiene: page tokens stay out of the log`, `fuzz: a
+  provider's token reaches the request intact or not at all`.
 
 ## Talking to a server
 
@@ -72,6 +76,12 @@ code in `src/`.
   not a panic`, `fuzz Dechunker: arbitrary input never crashes`.
 - **A response body is capped at 32 MiB.** `HttpTransport enforces the
   response size limit`.
+- **Running out of memory is reported, never swallowed, and leaks
+  nothing,** on every call path and at every allocation. `every public
+  call: every allocation failure is OutOfMemory without leaks`,
+  `credentials: every allocation failure on the token path is OutOfMemory
+  without leaks`, `decodeErrorBody reports running out of memory, not an
+  unreadable body`.
 - **Certificates are checked against a clock read within the hour,** so a
   long-running client neither rejects rotated certificates nor keeps
   accepting expired ones. `HttpTransport: a TLS clock older than an hour is

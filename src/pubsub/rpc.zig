@@ -502,6 +502,114 @@ test "fuzz: any server response yields a value or an error, never a crash or lea
     } });
 }
 
+fn tokenGateProperty(_: void, input: []const u8) !void {
+    // Whatever a provider returns is sent verbatim or refused before
+    // anything is sent. The marker shows up if the secret leaks anywhere.
+    const marker = "zzSECRETzz";
+    var buffer: [marker.len + 128]u8 = undefined;
+    const tail = input[0..@min(input.len, 128)];
+    @memcpy(buffer[0..marker.len], marker);
+    @memcpy(buffer[marker.len..][0..tail.len], tail);
+    const token = buffer[0 .. marker.len + tail.len];
+
+    logging.capture.reset();
+    var provider: FakeTokenProvider = .{ .token = token };
+    var h: Harness = undefined;
+    try h.init(&.{ unavailable, topic_ok }, .{ .token = "unused" });
+    defer h.deinit();
+    h.client.token_provider = provider.provider();
+    if (h.client.topic("orders").get()) |result| {
+        var owned = result;
+        owned.deinit();
+        try testing.expect(core.TokenProvider.isValidToken(token));
+        try h.expectRequestCount(2);
+        for (0..2) |i| try testing.expectEqualStrings(token, (try h.fake.request(i)).bearer.?);
+    } else |err| {
+        try testing.expectEqual(error.TokenUnavailable, err);
+        try testing.expect(!core.TokenProvider.isValidToken(token));
+        try h.expectRequestCount(0);
+    }
+    try testing.expect(std.mem.indexOf(u8, logging.capture.text(), marker) == null);
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), marker) == null);
+}
+
+test "fuzz: a provider's token reaches the request intact or not at all" {
+    try test_util.fuzzBytes({}, tokenGateProperty, .{ .corpus = &.{
+        "",
+        ".a0AfB_byC-9x",
+        " x",
+        "\r\nX-Injected: 1",
+        "\xc3\xa9",
+        "\x7f",
+    } });
+}
+
+/// Replies a server or network can give, retryable and not.
+const retry_replies = [_]Reply{
+    .{ .fail = error.ConnectionResetByPeer },
+    .{ .fail = error.ConnectionRefused },
+    .{ .fail = error.TlsFailure },
+    .{ .fail = error.UnknownHostName },
+    unavailable,
+    .{ .respond = .{ .status = 429, .body = "{}" } },
+    .{ .respond = .{ .status = 500, .body = "not json" } },
+    .{ .respond = .{ .status = 404, .body = "{\"error\":{\"status\":\"NOT_FOUND\"}}" } },
+    .{ .respond = .{ .status = 400, .body = "{\"error\":{\"status\":\"FAILED_PRECONDITION\"}}" } },
+    topic_ok,
+};
+
+fn retrySequenceProperty(_: void, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    const max_attempts = g.intRange(u8, 1, 6);
+    var script: [6]Reply = undefined;
+    for (&script) |*reply| reply.* = g.pick(Reply, &retry_replies);
+
+    // The model: walk the script as the policy says, one reply per attempt.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var expected_requests: usize = 0;
+    const expected: Error!void = for (script[0..max_attempts], 1..) |reply, attempt| {
+        expected_requests = attempt;
+        const err: Error = switch (reply) {
+            .fail => |e| e,
+            .respond => |c| if (c.status >= 200 and c.status < 300) break {} else e: {
+                const body = try core.errors.decodeErrorBody(arena.allocator(), c.body);
+                break :e core.errors.fromResponse(c.status, if (body) |b| b.status else "");
+            },
+        };
+        if (attempt == max_attempts or !isRetryable(err)) break err;
+    } else unreachable;
+
+    var h: Harness = undefined;
+    try h.init(&script, .{ .token = "ya29.retry", .retry = .{ .max_attempts = max_attempts } });
+    defer h.deinit();
+    const got = h.client.topic("orders").get();
+    if (expected) |_| {
+        var owned = try got;
+        owned.deinit();
+    } else |expected_err| {
+        try testing.expectError(expected_err, got);
+    }
+    try h.expectRequestCount(expected_requests);
+    // Every attempt carried the token, and each retry waited within the
+    // policy's cap for that retry.
+    for (0..expected_requests) |i| try testing.expectEqualStrings("ya29.retry", (try h.fake.request(i)).bearer.?);
+    try testing.expectEqual(expected_requests - 1, h.clock.sleep_count);
+    for (0..h.clock.sleep_count) |i| try testing.expect(h.clock.sleepMs(i) <= h.client.retry.backoffCapMs(@intCast(i + 1)));
+}
+
+test "fuzz retry: attempts, waits and outcome follow the policy for any failure sequence" {
+    try test_util.fuzzBytes({}, retrySequenceProperty, .{ .corpus = &.{
+        "\x03\x04\x04\x09",
+        "\x06\x00\x01\x02",
+        "\x01\x04",
+        "\x06\x05\x06\x04\x00\x02\x09",
+        "\x02\x07",
+        "\x05\x08",
+        "",
+    } });
+}
+
 test "credentials: every allocation failure on the token path is OutOfMemory without leaks" {
     const Run = struct {
         fn get(gpa: Allocator) !void {
