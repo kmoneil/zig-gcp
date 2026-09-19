@@ -2,7 +2,7 @@
 
 Until 1.0, minor versions may break the API; each entry says how.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-09-19)
 
 First version, for Zig 0.16.0.
 
