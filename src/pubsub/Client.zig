@@ -273,6 +273,73 @@ test "init: every allocation failure is OutOfMemory without leaks" {
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
 }
 
+test "every public call: every allocation failure is OutOfMemory without leaks" {
+    const Reply = test_util.FakeTransport.Reply;
+    const topic_body = "{\"name\":\"projects/p/topics/orders\"}";
+    const sub_body = "{\"name\":\"projects/p/subscriptions/orders-worker\",\"topic\":\"projects/p/topics/orders\",\"ackDeadlineSeconds\":10}";
+    const ok: Reply = .{ .respond = .{ .body = "{}" } };
+    // One reply per request, in the order the calls below make them.
+    const script = [_]Reply{
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .respond = .{ .body = topic_body } },
+        .{ .respond = .{ .body = topic_body } },
+        .{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } },
+        .{ .respond = .{ .body = "{\"topics\":[" ++ topic_body ++ "],\"nextPageToken\":\"n\"}" } },
+        .{ .respond = .{ .body = sub_body } },
+        .{ .respond = .{ .body = sub_body } },
+        .{ .respond = .{ .body = "{\"subscriptions\":[" ++ sub_body ++ "]}" } },
+        .{ .respond = .{ .body = "{\"receivedMessages\":[{\"ackId\":\"a1\",\"message\":{\"data\":\"aGk=\",\"attributes\":{\"k\":\"v\"},\"messageId\":\"1\",\"publishTime\":\"2026-09-19T00:00:00Z\",\"orderingKey\":\"o\"},\"deliveryAttempt\":1}]}" } },
+        ok, ok, // ack takes two requests
+        ok, ok, // modifyAckDeadline, nack
+        ok, ok, // the two deletes
+    };
+    const Run = struct {
+        /// One more id than a request may carry.
+        const many_ids: [validate.max_ack_ids_per_request + 1][]const u8 = @splat("a1");
+
+        fn all(gpa: Allocator, replies: []const Reply) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, replies);
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: StaticToken = .{ .token = "ya29.token" };
+            var client: Client = try .init(gpa, clock.io(), .{
+                .project_id = "p",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+
+            const t = client.topic("orders");
+            var created = try t.create(.{}); // after one retry
+            created.deinit();
+            var got = try t.get();
+            got.deinit();
+            var sent = try t.publish(&.{.{ .data = "hi", .attributes = &.{.{ .key = "k", .value = "v" }} }}, .{ .ordering_key = "o" });
+            sent.deinit();
+            var topics = try client.listTopics(.{ .page_size = 1 });
+            topics.deinit();
+
+            const s = client.subscription("orders-worker");
+            var sub = try s.create(.{ .topic_id = "orders" });
+            sub.deinit();
+            var sub_got = try s.get();
+            sub_got.deinit();
+            var subs = try client.listSubscriptions(.{ .page_token = "n" });
+            subs.deinit();
+            var batch = try s.pull(.{ .max_messages = 10 });
+            batch.deinit();
+            try s.ack(&many_ids);
+            try s.modifyAckDeadline(&.{"a1"}, 30);
+            try s.nack(&.{"a1"});
+            try s.delete();
+            try t.delete();
+            // The calls above used the whole script, so none was skipped.
+            try testing.expectEqual(replies.len, fake.requests.items.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.all, .{@as([]const Reply, &script)});
+}
+
 test "golden: listTopics and listSubscriptions pass page options" {
     var h: test_util.Harness = undefined;
     try h.init(&.{

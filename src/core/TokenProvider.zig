@@ -8,6 +8,7 @@ const TokenProvider = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const transport = @import("transport.zig");
+const test_util = @import("testing.zig");
 
 ptr: *anyopaque,
 vtable: *const VTable,
@@ -78,6 +79,29 @@ test "isValidToken rejects what would break the header" {
     try std.testing.expect(!isValidToken("a b"));
     try std.testing.expect(!isValidToken("abc\r\nX-Injected: 1"));
     try std.testing.expect(!isValidToken("t\xc3\xa9"));
+}
+
+fn isValidTokenProperty(_: void, input: []const u8) !void {
+    // The rule, stated independently: non-empty, every byte visible ASCII.
+    var visible = input.len > 0;
+    for (input) |c| visible = visible and c >= '!' and c <= '~';
+    try std.testing.expectEqual(visible, isValidToken(input));
+    // So an accepted token can never end the header line or start another.
+    if (isValidToken(input)) try std.testing.expect(std.mem.indexOfAny(u8, input, "\r\n\x00 \t") == null);
+}
+
+test "fuzz isValidToken: accepts exactly non-empty visible ASCII" {
+    try test_util.fuzzBytes({}, isValidTokenProperty, .{ .corpus = &.{
+        "ya29.a0AfB_byC-9x",
+        "",
+        " ",
+        "!",
+        "~",
+        "\x7f",
+        "abc\r\nX-Injected: 1",
+        "t\xc3\xa9",
+        "tok\x00en",
+    } });
 }
 
 test "the wrappers pass their arguments through" {
