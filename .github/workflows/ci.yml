@@ -63,6 +63,77 @@ jobs:
           zig build example-publish -- orders 3
           zig build example-worker
 
+  # The unit tests with the optimizer on. Bugs that depend on it, such as a
+  # read of undefined memory, can pass in Debug and fail here.
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        optimize: [ReleaseSafe, ReleaseFast]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Unit, property and fuzz-corpus tests
+        env:
+          OPTIMIZE: ${{ matrix.optimize }}
+        run: zig build test "-Doptimize=$OPTIMIZE" --summary all
+
+  # The unit tests on macOS and Windows. The integration tests need the
+  # emulator's container, which only the Linux runners have.
+  platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Unit, property and fuzz-corpus tests
+        run: zig build test --summary all
+
+  # Line coverage of the unit tests. Debian packages kcov and the Ubuntu 24.04
+  # runners do not, so this job runs in a Debian container.
+  coverage:
+    runs-on: ubuntu-latest
+    container:
+      # debian:trixie-slim; `docker buildx imagetools inspect` gives a newer digest.
+      image: debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+      # kcov turns off address-space randomization for the process it traces,
+      # which Docker's default seccomp profile forbids.
+      options: --security-opt seccomp=unconfined
+    steps:
+      - name: Install kcov
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends kcov python3 ca-certificates git xz-utils
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Measure coverage
+        run: zig build coverage
+
+      - name: Summarize
+        run: python3 tools/coverage_summary.py zig-out/coverage >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: zig-out/coverage
+
   fuzz:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.fuzz_iterations != '')
     runs-on: ubuntu-latest
@@ -74,7 +145,38 @@ jobs:
         with:
           version: 0.16.0
 
+      # Each run starts from the corpus the earlier runs built up.
+      - name: Restore the fuzz corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/f
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
       - name: Coverage-guided fuzzing
         env:
           ITERATIONS: ${{ inputs.fuzz_iterations || '2M' }}
-        run: zig build test -Dfuzz-runner -Dtest-filter=fuzz "--fuzz=$ITERATIONS"
+        run: |
+          # A failing input saved by an earlier run is not this run's.
+          rm -f .zig-cache/f/crash
+          zig build test -Dfuzz-runner -Dtest-filter=fuzz "--fuzz=$ITERATIONS"
+
+      - name: Save the fuzz corpus
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache/f
+          key: fuzz-corpus-${{ github.run_id }}
+
+      # `crash` is the failing input: a 4-byte little-endian length, then the
+      # bytes. CONTRIBUTING.md says how to turn it into a regression test.
+      - name: Keep the failing input
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-failure
+          path: |
+            .zig-cache/f/crash
+            .zig-cache/tmp/libfuzzer.log
+          include-hidden-files: true
+          if-no-files-found: ignore
