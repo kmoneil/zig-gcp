@@ -128,6 +128,8 @@ fn sendAckIds(self: Subscription, ack_ids: []const []const u8, deadline_seconds:
     var chunk_arena: std.heap.ArenaAllocator = .init(c.gpa);
     defer chunk_arena.deinit();
     while (true) {
+        // The check above rejects every id that would fail here. This stays
+        // so that if the two ever disagree, the call fails, not the process.
         const chunk = chunks.next() catch |err| {
             if (c.diagnostics) |d| d.print("ack id {d} is too long to fit in a request", .{chunks.pos});
             return err;
