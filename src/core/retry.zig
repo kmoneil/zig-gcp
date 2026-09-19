@@ -1,7 +1,7 @@
 //! Retry policy: which failures are retried and how long to wait in between.
 
 const std = @import("std");
-const test_util = @import("test_util.zig");
+const test_util = @import("testing.zig");
 
 pub const RetryPolicy = struct {
     /// Attempts in total, including the first. 1 disables retries.

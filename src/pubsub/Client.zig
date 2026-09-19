@@ -24,7 +24,7 @@ const validate = @import("validate.zig");
 const Diagnostics = errors.Diagnostics;
 const Error = errors.Error;
 const HttpTransport = @import("core").transport.HttpTransport;
-const RetryPolicy = @import("retry.zig").RetryPolicy;
+const RetryPolicy = @import("core").RetryPolicy;
 const TokenProvider = @import("auth.zig").TokenProvider;
 const Transport = @import("core").transport.Transport;
 

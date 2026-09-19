@@ -15,7 +15,7 @@ pub const StaticToken = @import("auth.zig").StaticToken;
 /// The OAuth scope the client requests from its `TokenProvider`.
 pub const auth_scope = @import("auth.zig").scope;
 
-pub const RetryPolicy = @import("retry.zig").RetryPolicy;
+pub const RetryPolicy = @import("core").RetryPolicy;
 pub const Diagnostics = @import("errors.zig").Diagnostics;
 pub const Error = @import("errors.zig").Error;
 pub const ApiError = @import("errors.zig").ApiError;
@@ -97,7 +97,6 @@ test {
     _ = @import("codec.zig");
     _ = @import("errors.zig");
     _ = @import("logging.zig");
-    _ = @import("retry.zig");
     _ = @import("rpc.zig");
     _ = @import("test_util.zig");
     _ = @import("timestamp.zig");
