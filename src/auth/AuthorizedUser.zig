@@ -274,9 +274,13 @@ fn exchange(self: *AuthorizedUser, arena: Allocator, body: []const u8) Result {
     if (self.diagnostics) |d| {
         if (oauth) |e| {
             if (std.mem.eql(u8, e.code, "invalid_grant")) {
+                const fix = "Run `gcloud auth application-default login` again.";
+                const generic = "The refresh token no longer works. " ++ fix;
                 var buf: [400]u8 = undefined;
-                const message = std.fmt.bufPrint(&buf, "{s} Run `gcloud auth application-default login` again.", .{e.description}) catch
-                    "The refresh token no longer works. Run `gcloud auth application-default login` again.";
+                const message = if (e.description.len == 0)
+                    generic
+                else
+                    std.fmt.bufPrint(&buf, "{s} " ++ fix, .{e.description}) catch generic;
                 d.set(res.status, e.code, message);
             } else {
                 d.set(res.status, e.code, e.description);
@@ -410,6 +414,21 @@ test "AuthorizedUser: invalid_grant is RefreshTokenInvalid, not retried, and say
     try testing.expectEqual(400, h.diag.http_status);
     try testing.expectEqualStrings("invalid_grant", h.diag.status());
     try testing.expectEqualStrings("Token has been expired or revoked. Run `gcloud auth application-default login` again.", h.diag.message());
+}
+
+test "AuthorizedUser: invalid_grant without a usable description still says how to fix it" {
+    for ([_][]const u8{
+        "{\"error\":\"invalid_grant\"}",
+        "{\"error\":\"invalid_grant\",\"error_description\":\"\"}",
+        // Too long to fit in front of the fix.
+        "{\"error\":\"invalid_grant\",\"error_description\":\"" ++ "x" ** 400 ++ "\"}",
+    }) |body| {
+        var h: Harness = undefined;
+        try h.init(&.{.{ .respond = .{ .status = 400, .body = body } }});
+        defer h.deinit();
+        try testing.expectError(error.RefreshTokenInvalid, h.get());
+        try testing.expectEqualStrings("The refresh token no longer works. Run `gcloud auth application-default login` again.", h.diag.message());
+    }
 }
 
 test "AuthorizedUser: another refusal is TokenEndpointRejected, not retried" {

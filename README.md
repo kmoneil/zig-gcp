@@ -11,7 +11,7 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 214 unit, property and fuzz tests; 20 Pub/Sub integration
+- Tested with 215 unit, property and fuzz tests; 20 Pub/Sub integration
   tests that pass against both the emulator and production; and 2 auth tests
   against Google's token endpoint.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
