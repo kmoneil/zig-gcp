@@ -1,0 +1,22 @@
+# Plans, scratch, reviews. Never committed.
+_plan/
+_plans/
+_tmp/
+_reviews/
+_reports/
+# The benchmark's staging directory (scripts/bench.sh).
+_bench/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# AI Files (CLAUDE.md is tracked — it is project law, not scratch)
+GEMINI.md
+.claude/
+
+# Zig build output
+.zig-cache/
+zig-out/

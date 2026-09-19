@@ -1,0 +1,65 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Nightly: a longer coverage-guided fuzzing run.
+    - cron: "17 3 * * *"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Format
+        run: zig build fmt
+
+      - name: Unit, property and fuzz-corpus tests
+        run: zig build test --summary all
+
+      - name: Start the Pub/Sub emulator
+        run: |
+          docker run -d --name pubsub -p 8085:8085 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud beta emulators pubsub start --project=test --host-port=0.0.0.0:8085
+          for _ in $(seq 1 90); do
+            curl -sf http://127.0.0.1:8085/ >/dev/null && exit 0
+            sleep 2
+          done
+          docker logs pubsub
+          exit 1
+
+      - name: Integration tests
+        env:
+          PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
+        run: zig build test-integration --summary all
+
+      - name: Examples
+        env:
+          PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
+        run: |
+          zig build example-worker
+          zig build example-publish -- orders 3
+          zig build example-worker
+
+  fuzz:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Coverage-guided fuzzing
+        run: zig build test -Dfuzz-runner -Dtest-filter=fuzz --fuzz=2M
