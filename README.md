@@ -1,27 +1,35 @@
-# pubsub
+# zig-gcp
 
-A small, synchronous Zig client for the Google Cloud Pub/Sub v1 REST API:
-publish, pull, acknowledge, and topic and subscription management.
+Google Cloud clients for Zig, written against the REST APIs. The package is
+`gcp`, with one module per service, and an application compiles only the
+modules it imports.
+
+| Module | Covers | Stability |
+| --- | --- | --- |
+| `pubsub` | Pub/Sub v1: publish, pull, acknowledge, and topic and subscription management | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Works against the local emulator with no credentials, and against
-  production through a token-provider seam.
 - Tested with 140 unit, property and fuzz tests, and 20 integration tests
   that pass against both the emulator and production.
+- Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
 
 ## Install
 
 ```
-zig fetch --save git+https://github.com/kmoneil/zig-gcp-pubsub#v0.2.0
+zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.3.0
 ```
 
 ```zig
 // build.zig
-const pubsub = b.dependency("pubsub", .{ .target = target, .optimize = optimize });
-exe.root_module.addImport("pubsub", pubsub.module("pubsub"));
+const gcp = b.dependency("gcp", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("pubsub", gcp.module("pubsub"));
 ```
 
-## Use
+## Pub/Sub
+
+A small, synchronous client for the Pub/Sub v1 REST API. It works against
+the local emulator with no credentials, and against production through a
+token-provider seam.
 
 ```zig
 const std = @import("std");
@@ -64,9 +72,9 @@ See `examples/publish.zig` and `examples/worker.zig` for complete programs.
 
 ### Production credentials
 
-Production needs a `TokenProvider`. Loading credentials from a metadata
-server or key file is the job of a separate auth package; until then, a
-static token works for about an hour:
+Production needs a `TokenProvider`. Loading credentials from the metadata
+server or from gcloud's login is planned for an `auth` module in this
+package. Until then, a static token works for about an hour:
 
 ```zig
 var token: pubsub.StaticToken = .{ .token = access_token }; // gcloud auth print-access-token
@@ -180,7 +188,7 @@ Implement `pubsub.transport.Transport` (one `send` function) and pass it as
 `Client.Options.transport` to answer requests from your tests instead of a
 server.
 
-## The emulator is not production
+### The emulator is not production
 
 These differences were measured with emulator 0.8.35. The client's own checks
 catch the ones marked *checked*, so code tested against the emulator does not
@@ -199,7 +207,7 @@ fail later in production.
 ## Zig 0.16 standard library issues handled here
 
 The HTTP transport works around these, each covered by a regression test in
-`src/transport.zig`:
+`src/pubsub/transport.zig`:
 
 - A chunk size near 2^64 panics `std.http`'s chunked decoder (integer
   overflow), so the transport decodes chunked bodies itself.
