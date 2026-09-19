@@ -22,6 +22,9 @@ gcloud beta emulators pubsub start --project=test --host-port=127.0.0.1:8085
 PUBSUB_EMULATOR_HOST=127.0.0.1:8085 zig build test-integration
 ```
 
+The auth integration tests run against Google when `AUTH_TEST_CREDENTIALS`
+names a credentials file of type `authorized_user`; the README shows how.
+
 To fuzz, run `zig build test -Dfuzz-runner -Dtest-filter=fuzz --fuzz=100K`.
 For line coverage, install [kcov](https://github.com/SimonKagstrom/kcov) and
 run `zig build coverage`; the report is `zig-out/coverage/index.html`.

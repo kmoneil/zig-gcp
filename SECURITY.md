@@ -1,9 +1,10 @@
 # Security
 
-`pubsub` holds a bearer token for somebody's Google Cloud project and carries
-their messages. Two things follow from that, and this document is about both:
-the token must not leak, and nothing a server or network peer sends may crash
-the client or pass a partial response off as a whole one.
+This package holds credentials for somebody's Google Cloud account: bearer
+tokens, and in `auth`, the refresh token that mints them. `pubsub` also
+carries their messages. Two things follow from that, and this document is
+about both: no credential may leak, and nothing a server or network peer
+sends may crash the client or pass a partial response off as a whole one.
 
 ## Reporting a vulnerability
 
@@ -31,8 +32,9 @@ say anything. A response is parsed, never trusted.
 own instructions. A mistake in them is still an error, never a crash or a
 malformed request.
 
-**Out of scope:** an attacker who already has the token, a compromised
-machine, and the behavior of the emulator itself.
+**Out of scope:** an attacker who already has a token or can read the
+credentials file, a compromised machine, and the behavior of the emulator
+itself.
 
 Every claim below names the test that holds it. The tests live next to the
 code in `src/`.
@@ -51,11 +53,22 @@ code in `src/`.
   rejects what would break the header`, `fuzz isValidToken: accepts exactly
   non-empty visible ASCII`, `fuzz: a provider's token reaches the request
   intact or not at all`.
-- **A cached token is wiped before its memory is freed,** and so is
+- **Secrets are wiped before their memory is freed:** cached tokens, the
+  refresh token and client secret, the credentials file as read, and
   everything a token fetch allocated. `Cache: every block the cache frees is
-  wiped first`, `WipingAllocator: freed memory is zeroed before the child
-  gets it back`, `WipingAllocator: an arena on top wipes every chunk when it
-  is freed`, `fuzz WipingAllocator: nothing written survives a free`.
+  wiped first`, `AuthorizedUser: every block it frees is wiped first`,
+  `WipingAllocator: freed memory is zeroed before the child gets it back`,
+  `WipingAllocator: an arena on top wipes every chunk when it is freed`,
+  `fuzz WipingAllocator: nothing written survives a free`. Not covered:
+  std.http's own connection buffers, which hold the latest request and
+  response until the connection closes.
+- **The refresh token goes only to the token endpoint,** over https, or
+  plain http only to this machine, for tests. A redirect is refused, not
+  followed. `AuthorizedUser: the token URL must use https, or http to this
+  machine`, `AuthorizedUser: against a token endpoint on loopback`.
+- **Credential files are only read,** never written, and one over 64 KiB
+  is refused. `AuthorizedUser: initFromFile reads the file, and reports a
+  missing or oversized one`.
 - **Redirects are never followed,** so a server cannot send the request, and
   its Authorization header, to another host. `HttpTransport does not follow
   redirects`.
@@ -65,7 +78,7 @@ code in `src/`.
   reaches the log`, `log hygiene: page tokens stay out of the log`, `fuzz: a
   provider's token reaches the request intact or not at all`, `Cache: a
   failed early refresh returns the cached token, warns, and retries 10 s
-  later`.
+  later`, `AuthorizedUser: secrets reach neither the log nor Diagnostics`.
 
 ## Talking to a server
 
@@ -124,14 +137,17 @@ topics out. It can withhold messages, redeliver them, or answer slowly; a
 slow answer is bounded only by the caller's own cancellation, because
 std.http has no request timeout. It can send a body just under the 32 MiB
 cap. And on the plain-HTTP path to the emulator, anyone in between can read
-and change everything, which is why no token ever goes there.
+and change everything, which is why no token ever goes there. A token
+endpoint can hand out a token that does not work; the cache keeps it for at
+most 12 hours (`max_lifetime_s`), or until the provider's `invalidate` is
+called.
 
-What it cannot do is get the token sent anywhere else, crash the client, or
-get a truncated body accepted as complete.
+What it cannot do is get a credential sent anywhere else, crash the client,
+or get a truncated body accepted as complete.
 
 ## Keeping this current
 
-Update this file in the same change that alters how a token is handled, what
-reaches the log, how responses are read, or the disclosure process. Every
-claim above names the test that holds it, so if you move or rename one, this
-document is part of the change.
+Update this file in the same change that alters how a credential is
+handled, what reaches the log, how responses are read, or the disclosure
+process. Every claim above names the test that holds it, so if you move or
+rename one, this document is part of the change.
