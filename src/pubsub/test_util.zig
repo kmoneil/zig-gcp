@@ -10,7 +10,7 @@ const Client = @import("Client.zig");
 const Endpoint = @import("Endpoint.zig");
 const Diagnostics = @import("errors.zig").Diagnostics;
 const StaticToken = @import("auth.zig").StaticToken;
-const RetryPolicy = @import("retry.zig").RetryPolicy;
+const RetryPolicy = @import("core").RetryPolicy;
 
 pub const FakeTransport = core.testing.FakeTransport;
 pub const FakeClock = core.testing.FakeClock;
