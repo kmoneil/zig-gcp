@@ -16,6 +16,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Credentials for the service modules. It imports core, never a service.
+    const auth = b.addModule("auth", .{
+        .root_source_file = b.path("src/auth/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+
     const mod = b.addModule("pubsub", .{
         .root_source_file = b.path("src/pubsub/root.zig"),
         .target = target,
@@ -36,7 +44,7 @@ pub fn build(b: *std.Build) void {
     // Unit, property and fuzz-corpus tests, one run per module. No network: a
     // fake transport and a fake clock drive everything.
     // `zig build test -Dfuzz-runner --fuzz` fuzzes the same tests.
-    const unit_modules = [_]struct { []const u8, *std.Build.Module }{ .{ "core", core }, .{ "pubsub", mod } };
+    const unit_modules = [_]struct { []const u8, *std.Build.Module }{ .{ "core", core }, .{ "auth", auth }, .{ "pubsub", mod } };
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     for (unit_modules) |entry| {
         const unit_tests = b.addTest(.{

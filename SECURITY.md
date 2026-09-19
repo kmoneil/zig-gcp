@@ -51,6 +51,11 @@ code in `src/`.
   rejects what would break the header`, `fuzz isValidToken: accepts exactly
   non-empty visible ASCII`, `fuzz: a provider's token reaches the request
   intact or not at all`.
+- **A cached token is wiped before its memory is freed,** and so is
+  everything a token fetch allocated. `Cache: every block the cache frees is
+  wiped first`, `WipingAllocator: freed memory is zeroed before the child
+  gets it back`, `WipingAllocator: an arena on top wipes every chunk when it
+  is freed`, `fuzz WipingAllocator: nothing written survives a free`.
 - **Redirects are never followed,** so a server cannot send the request, and
   its Authorization header, to another host. `HttpTransport does not follow
   redirects`.
@@ -58,7 +63,9 @@ code in `src/`.
   keys or values, ordering keys or page tokens. Tokens stay out of
   `Diagnostics` too. `log hygiene: no token, payload or attribute value ever
   reaches the log`, `log hygiene: page tokens stay out of the log`, `fuzz: a
-  provider's token reaches the request intact or not at all`.
+  provider's token reaches the request intact or not at all`, `Cache: a
+  failed early refresh returns the cached token, warns, and retries 10 s
+  later`.
 
 ## Talking to a server
 

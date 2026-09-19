@@ -7,10 +7,11 @@ modules it imports.
 | Module | Covers | Stability |
 | --- | --- | --- |
 | `pubsub` | Pub/Sub v1: publish, pull, acknowledge, and topic and subscription management | beta |
+| `auth` | Credentials for the service modules. So far: `StaticToken`, and the token cache that providers for the metadata server and gcloud's login will build on. | experimental |
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 158 unit, property and fuzz tests, and 20 integration tests
+- Tested with 180 unit, property and fuzz tests, and 20 integration tests
   that pass against both the emulator and production.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
 
@@ -74,8 +75,9 @@ See `examples/publish.zig` and `examples/worker.zig` for complete programs.
 ### Production credentials
 
 Production needs a `TokenProvider`. Loading credentials from the metadata
-server or from gcloud's login is planned for an `auth` module in this
-package. Until then, a static token works for about an hour:
+server or from gcloud's login is planned for the `auth` module, which so far
+holds the token cache those providers will share. Until then, a static token
+works for about an hour:
 
 ```zig
 var token: pubsub.StaticToken = .{ .token = access_token }; // gcloud auth print-access-token
