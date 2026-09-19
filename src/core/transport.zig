@@ -3,6 +3,7 @@
 //! `HttpTransport` is the `std.http.Client` implementation.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const http = std.http;
 
@@ -454,6 +455,13 @@ fn mapError(err: anyerror, connection: ?*http.Client.Connection) Error {
         => error.TlsFailure,
 
         error.UnsupportedUriScheme, error.UriMissingHost => error.InvalidEndpoint,
+
+        // std 0.16 on Windows returns Unexpected for socket statuses it does
+        // not map, among them a refused connection (STATUS_CONNECTION_REFUSED)
+        // and a peer that hangs up (STATUS_LOCAL_DISCONNECT). Which one it
+        // was is lost by now; both are worth retrying, so call it a dropped
+        // connection. Elsewhere std maps every socket error it expects.
+        error.Unexpected => if (builtin.os.tag == .windows) error.ConnectionResetByPeer else error.NetworkFailure,
 
         error.HttpHeadersOversize,
         error.HttpHeadersInvalid,
@@ -1017,7 +1025,13 @@ test "HttpTransport: a failed TLS handshake forgets the TLS clock" {
     ht.client.now = std.Io.Clock.real.now(io);
     var buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&buf, "https://127.0.0.1:{d}/v1/x", .{server.port});
-    // The server hangs up mid-handshake: a failure worth retrying.
+    // The server hangs up mid-handshake: a failure worth retrying. std 0.16
+    // on Windows reports that as a socket error rather than a TLS failure
+    // (see mapError), and only a TLS failure forgets the clock.
+    if (builtin.os.tag == .windows) {
+        try testing.expectError(error.ConnectionResetByPeer, ht.transport().send(.{ .method = .GET, .url = url }, arena.allocator()));
+        return;
+    }
     try testing.expectError(error.TlsFailure, ht.transport().send(.{ .method = .GET, .url = url }, arena.allocator()));
     try testing.expectEqual(null, ht.client.now);
 }
@@ -1226,10 +1240,18 @@ test "HttpTransport maps a refused connection" {
     defer arena.deinit();
     var buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}/v1/x", .{port});
-    try testing.expectError(
-        error.ConnectionRefused,
-        ht.transport().send(.{ .method = .GET, .url = url }, arena.allocator()),
-    );
+    // std 0.16 on Windows cannot tell a refused connection from a dropped
+    // one (see mapError). Either way the call is retried.
+    const expected: Error = if (builtin.os.tag == .windows) error.ConnectionResetByPeer else error.ConnectionRefused;
+    try testing.expectError(expected, ht.transport().send(.{ .method = .GET, .url = url }, arena.allocator()));
+}
+
+test "mapError: an unmapped socket status on Windows is a dropped connection" {
+    // Regression: CI on Windows showed a refused connection and a hang-up
+    // arriving as error.Unexpected, which was a permanent NetworkFailure, so
+    // neither was retried.
+    const expected: Error = if (builtin.os.tag == .windows) error.ConnectionResetByPeer else error.NetworkFailure;
+    try testing.expectEqual(expected, mapError(error.Unexpected, null));
 }
 
 test "HttpTransport rejects unusable URLs without panicking" {

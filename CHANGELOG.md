@@ -22,6 +22,9 @@ including the ones that did not change.
   implements `invalidate` and `quotaProject`. `TokenProvider.Error` names
   the token failures a caller can act on, such as `RefreshTokenInvalid`,
   and `pubsub.Error` gains them. `StaticToken` works as before.
+- pubsub: fixed: on Windows, a refused or dropped connection is retried.
+  Zig 0.16 reports both as an unexpected error there, which the client took
+  for a permanent `NetworkFailure`.
 - pubsub: fixed: running out of memory while reading an error response is
   reported as `error.OutOfMemory`. Before, the error was mapped from the
   HTTP status alone, which could name the wrong error, and the call went
