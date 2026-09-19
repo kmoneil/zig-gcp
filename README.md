@@ -7,9 +7,10 @@ modules it imports.
 | Module | Covers | Stability |
 | --- | --- | --- |
 | `pubsub` | Pub/Sub v1: publish, pull, acknowledge, and topic and subscription management | beta |
+| `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 140 unit, property and fuzz tests, and 20 integration tests
+- Tested with 146 unit, property and fuzz tests, and 20 integration tests
   that pass against both the emulator and production.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
 
@@ -188,7 +189,10 @@ pub const std_options: std.Options = .{
 
 Implement `pubsub.transport.Transport` (one `send` function) and pass it as
 `Client.Options.transport` to answer requests from your tests instead of a
-server.
+server. The `core` module has ready-made fakes: `core.testing.FakeTransport`
+answers from a script and records every request, and
+`core.testing.FakeTokenProvider` stands in for credentials. Add
+`gcp.module("core")` to your test build to use them.
 
 ### The emulator is not production
 
