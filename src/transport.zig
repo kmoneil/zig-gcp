@@ -1053,6 +1053,32 @@ test "fuzz Dechunker: arbitrary input never crashes" {
     } });
 }
 
+test "HttpTransport does not follow redirects" {
+    const io = testing.io;
+    // A redirect could carry the request, Authorization header and all, to
+    // another host. The response comes back as it is and nothing follows it.
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 302 Found\r\nLocation: http://attacker.invalid/steal\r\nContent-Length: 0\r\n\r\n",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    const res = try ht.transport().send(.{
+        .method = .GET,
+        .url = server.url(&buf, "/v1/projects/p/topics/t"),
+        .bearer = "secret-token",
+    }, arena.allocator());
+    try testing.expectEqual(302, res.status);
+    try serving.await(io);
+    try testing.expectEqual(1, server.connections);
+}
+
 test "HttpTransport enforces the response size limit" {
     const io = testing.io;
     var server: ScriptedServer = try .start(io, &.{

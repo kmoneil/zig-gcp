@@ -6,7 +6,7 @@ publish, pull, acknowledge, and topic and subscription management.
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
 - Works against the local emulator with no credentials, and against
   production through a token-provider seam.
-- Tested with 139 unit, property and fuzz tests, and 20 integration tests
+- Tested with 140 unit, property and fuzz tests, and 20 integration tests
   that pass against both the emulator and production.
 
 ## Install
