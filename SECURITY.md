@@ -60,7 +60,8 @@ code in `src/`.
 
 - **Any response yields a value or an error, never a crash or a leak.**
   `fuzz: any server response yields a value or an error, never a crash or
-  leak`, `fuzz decoders: arbitrary bodies never crash`.
+  leak`, `fuzz decoders: arbitrary bodies never crash`, `fuzz
+  decodeErrorBody: arbitrary bodies never crash`.
 - **A body cut short is a dropped connection, never a short success,** whether
   it was framed by length or by chunks, compressed or not. `HttpTransport
   reports a truncated body as a dropped connection`, `HttpTransport reports a

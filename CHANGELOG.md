@@ -6,6 +6,11 @@ including the ones that did not change.
 
 ## 0.4.0 (unreleased)
 
+- core: new module, holding what the service modules share: the HTTP
+  transport, `RetryPolicy`, Google API errors and `Diagnostics`, `Owned`,
+  the `TokenProvider` seam with `StaticToken`, and test fakes in
+  `core.testing`. pubsub re-exports what its callers use, so most code
+  never imports core.
 - pubsub: breaking: `retry_publish` moved from `RetryPolicy` to
   `Client.Options`. Write `.retry_publish = false` instead of
   `.retry = .{ .retry_publish = false }`.
