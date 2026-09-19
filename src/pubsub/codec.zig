@@ -883,6 +883,22 @@ test "fuzz pull decoding: server-shaped responses decode exactly" {
     } });
 }
 
+test "decodePull: every allocation failure is OutOfMemory without leaks" {
+    // 12 KiB of data, so decoding it needs an allocation of its own rather
+    // than space left over in the arena.
+    const body = "{\"receivedMessages\":[{\"ackId\":\"a1\",\"message\":{\"data\":\"" ++ ("QUFB" ** 4096) ++
+        "\",\"attributes\":{\"k\":\"v\"},\"messageId\":\"1\",\"publishTime\":\"2026-09-19T00:00:00Z\"},\"deliveryAttempt\":1}]}";
+    const Run = struct {
+        fn decode(gpa: Allocator, text: []const u8) !void {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const result = try decodePull(arena.allocator(), text);
+            try testing.expectEqual(3 * 4096, result.messages[0].data.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.decode, .{@as([]const u8, body)});
+}
+
 fn stringLenProperty(_: void, input: []const u8) !void {
     var buf: [6 * test_util.max_fuzz_input + 2]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
