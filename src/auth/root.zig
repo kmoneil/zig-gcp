@@ -11,5 +11,6 @@ pub const Cache = @import("Cache.zig");
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("Cache.zig");
+    _ = @import("form.zig");
     _ = @import("logging.zig");
 }
