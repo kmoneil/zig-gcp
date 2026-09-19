@@ -22,6 +22,9 @@ pub const Owned = @import("owned.zig").Owned;
 pub const TokenProvider = @import("TokenProvider.zig");
 pub const StaticToken = @import("StaticToken.zig");
 
+/// An allocator that wipes memory before freeing it, for secrets.
+pub const WipingAllocator = @import("WipingAllocator.zig");
+
 /// Logging under each module's own scope, captured in test builds.
 pub const logging = @import("logging.zig");
 
@@ -32,6 +35,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("StaticToken.zig");
     _ = @import("TokenProvider.zig");
+    _ = @import("WipingAllocator.zig");
     _ = @import("errors.zig");
     _ = @import("logging.zig");
     _ = @import("owned.zig");
