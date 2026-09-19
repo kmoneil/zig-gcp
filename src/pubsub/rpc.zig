@@ -93,7 +93,7 @@ pub fn executeDiscard(client: *Client, call: Call) Error!void {
 
 /// Maps a non-2xx response and records its details.
 fn failure(client: *Client, scratch: Allocator, res: Response) Error {
-    const body = core.errors.decodeErrorBody(scratch, res.body);
+    const body = core.errors.decodeErrorBody(scratch, res.body) catch |err| return err;
     const status = if (body) |b| b.status else "";
     // A body that is not the standard error shape, such as a proxy's page,
     // is the best message there is.
@@ -500,4 +500,24 @@ test "fuzz: any server response yields a value or an error, never a crash or lea
         "\x04<html>",
         "\x00",
     } });
+}
+
+test "credentials: every allocation failure on the token path is OutOfMemory without leaks" {
+    const Run = struct {
+        fn get(gpa: Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{ unavailable, topic_ok });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: core.StaticToken = .{ .token = "ya29.token" };
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "p",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+            var info = try client.topic("orders").get();
+            info.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{});
 }
