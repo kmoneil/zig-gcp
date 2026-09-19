@@ -100,16 +100,21 @@ const WireErrorBody = struct {
 };
 
 /// The standard Google error body, `{"error": {"status": ..., "message":
-/// ...}}`, or null when `body` is not one (a proxy's HTML page, say). Never
-/// fails: the caller falls back to the HTTP status. The strings may point
-/// into `body`.
-pub fn decodeErrorBody(arena: Allocator, body: []const u8) ?ErrorBody {
+/// ...}}`, or null when `body` is not one (a proxy's HTML page, say), in
+/// which case the caller falls back to the HTTP status. Running out of
+/// memory is an error, not a body that failed to decode: the fallback could
+/// report the wrong error, since statuses share HTTP codes. The strings may
+/// point into `body`.
+pub fn decodeErrorBody(arena: Allocator, body: []const u8) Allocator.Error!?ErrorBody {
     const wire = std.json.parseFromSliceLeaky(WireErrorBody, arena, body, .{
         .ignore_unknown_fields = true,
         // Proto3 JSON parsers keep the last duplicate rather than failing.
         .duplicate_field_behavior = .use_last,
         .allocate = .alloc_if_needed,
-    }) catch return null;
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     const e = wire.@"error" orelse return null;
     return .{ .status = e.status orelse "", .message = e.message orelse "" };
 }
@@ -310,29 +315,39 @@ test "decode error bodies" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const e = decodeErrorBody(a, "{\"error\":{\"code\":404,\"message\":\"Topic not found\",\"status\":\"NOT_FOUND\"}}").?;
+    const e = (try decodeErrorBody(a, "{\"error\":{\"code\":404,\"message\":\"Topic not found\",\"status\":\"NOT_FOUND\"}}")).?;
     try testing.expectEqualStrings("NOT_FOUND", e.status);
     try testing.expectEqualStrings("Topic not found", e.message);
 
-    const detailed = decodeErrorBody(a,
+    const detailed = (try decodeErrorBody(a,
         \\{"error":{"code":400,"message":"bad","status":"INVALID_ARGUMENT",
         \\"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"X"}]}}
-    ).?;
+    )).?;
     try testing.expectEqualStrings("INVALID_ARGUMENT", detailed.status);
 
-    try testing.expectEqual(null, decodeErrorBody(a, "Not Found"));
-    try testing.expectEqual(null, decodeErrorBody(a, ""));
-    try testing.expectEqual(null, decodeErrorBody(a, "{}"));
-    try testing.expectEqual(null, decodeErrorBody(a, "{\"error\":\"string\"}"));
-    const partial = decodeErrorBody(a, "{\"error\":{\"code\":\"weird\"}}");
+    try testing.expectEqual(null, try decodeErrorBody(a, "Not Found"));
+    try testing.expectEqual(null, try decodeErrorBody(a, ""));
+    try testing.expectEqual(null, try decodeErrorBody(a, "{}"));
+    try testing.expectEqual(null, try decodeErrorBody(a, "{\"error\":\"string\"}"));
+    const partial = try decodeErrorBody(a, "{\"error\":{\"code\":\"weird\"}}");
     try testing.expectEqualStrings("", partial.?.status);
+}
+
+test "decodeErrorBody reports running out of memory, not an unreadable body" {
+    // Regression: it returned null, so the caller fell back to the HTTP
+    // status, which can name the wrong error, and the out-of-memory error
+    // never surfaced. An allocation-failure sweep of the token path found it.
+    try testing.expectError(
+        error.OutOfMemory,
+        decodeErrorBody(testing.failing_allocator, "{\"error\":{\"status\":\"FAILED_PRECONDITION\"}}"),
+    );
 }
 
 fn decodeErrorBodyArbitrary(_: void, input: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     // Total: any body decodes to an error body or to null, never a crash.
-    const body = decodeErrorBody(arena.allocator(), input) orelse return;
+    const body = (try decodeErrorBody(arena.allocator(), input)) orelse return;
     // A status the mapping knows always decides the error.
     if (by_status.get(body.status)) |expected| try testing.expectEqual(expected, fromResponse(500, body.status));
 }
