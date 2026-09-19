@@ -116,7 +116,7 @@ test "retryable errors are exactly the transient ones" {
     for ([_]anyerror{
         error.InvalidArgument,  error.FailedPrecondition, error.Unauthenticated,
         error.PermissionDenied, error.NotFound,           error.AlreadyExists,
-        error.Cancelled,        error.Canceled,           error.Aborted,
+        error.ServerCancelled,  error.Canceled,           error.Aborted,
         error.Unknown,          error.InvalidResponse,    error.InvalidEndpoint,
         error.UnknownHostName,  error.ResponseTooLarge,   error.OutOfMemory,
         error.InvalidMessage,   error.TokenUnavailable,   error.HttpProtocolError,

@@ -288,7 +288,7 @@ test "error table end to end: every status through a real call" {
         .{ 404, "NOT_FOUND", error.NotFound },
         .{ 409, "ALREADY_EXISTS", error.AlreadyExists },
         .{ 429, "RESOURCE_EXHAUSTED", error.ResourceExhausted },
-        .{ 499, "CANCELLED", error.Cancelled },
+        .{ 499, "CANCELLED", error.ServerCancelled },
         .{ 500, "INTERNAL", error.Internal },
         .{ 502, "BAD_GATEWAY", error.Unavailable },
         .{ 503, "UNAVAILABLE", error.Unavailable },
