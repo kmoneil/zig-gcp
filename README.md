@@ -7,12 +7,13 @@ modules it imports.
 | Module | Covers | Stability |
 | --- | --- | --- |
 | `pubsub` | Pub/Sub v1: publish, pull, acknowledge, and topic and subscription management | beta |
-| `auth` | Credentials for the service modules. So far: `StaticToken`, and the token cache that providers for the metadata server and gcloud's login will build on. | experimental |
+| `auth` | Credentials for the service modules: `AuthorizedUser`, which uses the login `gcloud auth application-default login` saves, and `StaticToken`. | experimental |
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 180 unit, property and fuzz tests, and 20 integration tests
-  that pass against both the emulator and production.
+- Tested with 214 unit, property and fuzz tests; 20 Pub/Sub integration
+  tests that pass against both the emulator and production; and 2 auth tests
+  against Google's token endpoint.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
 
 ## Install
@@ -25,6 +26,7 @@ zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.3.0
 // build.zig
 const gcp = b.dependency("gcp", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("pubsub", gcp.module("pubsub"));
+exe.root_module.addImport("auth", gcp.module("auth")); // for credentials
 ```
 
 ## Pub/Sub
@@ -74,17 +76,28 @@ See `examples/publish.zig` and `examples/worker.zig` for complete programs.
 
 ### Production credentials
 
-Production needs a `TokenProvider`. Loading credentials from the metadata
-server or from gcloud's login is planned for the `auth` module, which so far
-holds the token cache those providers will share. Until then, a static token
-works for about an hour:
+Production needs a `TokenProvider`. On a developer machine, run
+`gcloud auth application-default login` once, and let `auth.AuthorizedUser`
+read the file it writes. It trades the saved refresh token for access tokens
+at Google's token endpoint, and refreshes them before they expire:
+
+```zig
+// ~/.config/gcloud/application_default_credentials.json on Linux and macOS,
+// %APPDATA%\gcloud\application_default_credentials.json on Windows.
+var user = try auth.AuthorizedUser.initFromFile(gpa, io, path, .{});
+defer user.deinit();
+var client = try pubsub.Client.init(gpa, io, .{
+    .project_id = "my-project",
+    .token_provider = user.provider(),
+});
+```
+
+`user` must not move while the client uses its provider. Finding the file
+on its own, and credentials from the metadata server on Google Cloud, are
+planned. A static token also works, for about an hour:
 
 ```zig
 var token: pubsub.StaticToken = .{ .token = access_token }; // gcloud auth print-access-token
-var client = try pubsub.Client.init(gpa, io, .{
-    .project_id = "my-project",
-    .token_provider = token.provider(),
-});
 ```
 
 Emulator endpoints never receive a token, even when a provider is set, and
@@ -279,6 +292,11 @@ PUBSUB_EMULATOR_HOST=127.0.0.1:8085 zig build test-integration
 # Or a real project. Every test creates zigps-* resources and deletes them.
 PUBSUB_TEST_PROJECT=my-project PUBSUB_TEST_TOKEN=$(gcloud auth print-access-token) \
     zig build test-integration
+
+# auth against Google's token endpoint, with the file gcloud's login wrote,
+# and a read-only Pub/Sub call with the token it gets.
+AUTH_TEST_CREDENTIALS=$HOME/.config/gcloud/application_default_credentials.json \
+    PUBSUB_TEST_PROJECT=my-project zig build test-integration
 ```
 
 The emulator binds to IPv6 localhost unless given `--host-port`.

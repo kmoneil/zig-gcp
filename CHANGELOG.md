@@ -7,13 +7,17 @@ including the ones that did not change.
 ## 0.4.0 (unreleased)
 
 - core: new module, holding what the service modules share: the HTTP
-  transport, `RetryPolicy`, Google API errors and `Diagnostics`, `Owned`,
-  the `TokenProvider` seam with `StaticToken`, `WipingAllocator` for memory
-  that held a secret, the logging helper the modules share, and test fakes
-  in `core.testing`. pubsub re-exports what its callers use, so most code
-  never imports core.
-- auth: new module, experimental. `Cache` is the token cache providers will
-  build on: it refreshes a token before it expires, runs one fetch at a
+  transport, which can send JSON or form bodies, `RetryPolicy`, Google API
+  errors and `Diagnostics`, `Owned`, the `TokenProvider` seam with
+  `StaticToken`, `WipingAllocator` for memory that held a secret, the
+  logging helper the modules share, and test helpers in `core.testing`: a
+  fake transport, token provider and clock, a scripted HTTP server, and an
+  allocator that checks memory was wiped. pubsub re-exports what its callers
+  use, so most code never imports core.
+- auth: new module, experimental. `AuthorizedUser` reads the credentials
+  file that `gcloud auth application-default login` writes, and trades its
+  refresh token for access tokens at Google's token endpoint. `Cache`, which
+  it builds on, refreshes a token before it expires, runs one fetch at a
   time, keeps using a still-valid token when an early refresh fails, and
   wipes every copy it frees. `StaticToken` is also available here.
 - pubsub: breaking: `retry_publish` moved from `RetryPolicy` to
