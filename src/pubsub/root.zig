@@ -5,20 +5,22 @@
 //! returns an `Owned(T)`, freed with one `deinit`. Errors carry no payload:
 //! pass a `Diagnostics` in `Client.Options` for the server's message.
 
+const core = @import("core");
+
 pub const Client = @import("Client.zig");
 pub const Topic = @import("Topic.zig");
 pub const Subscription = @import("Subscription.zig");
 pub const Endpoint = @import("Endpoint.zig");
 
-pub const TokenProvider = @import("auth.zig").TokenProvider;
-pub const StaticToken = @import("auth.zig").StaticToken;
+pub const TokenProvider = core.TokenProvider;
+pub const StaticToken = core.StaticToken;
 /// The OAuth scope the client requests from its `TokenProvider`.
-pub const auth_scope = @import("auth.zig").scope;
+pub const auth_scope = @import("rpc.zig").scope;
 
-pub const RetryPolicy = @import("core").RetryPolicy;
-pub const Diagnostics = @import("core").Diagnostics;
+pub const RetryPolicy = core.RetryPolicy;
+pub const Diagnostics = core.Diagnostics;
 pub const Error = @import("errors.zig").Error;
-pub const ApiError = @import("core").ApiError;
+pub const ApiError = core.ApiError;
 
 pub const Owned = @import("types.zig").Owned;
 pub const Attribute = @import("types.zig").Attribute;
@@ -44,7 +46,7 @@ pub const limits = @import("validate.zig");
 
 /// The HTTP seam: implement `transport.Transport` to send requests another
 /// way, or to fake the server in your own tests.
-pub const transport = @import("core").transport;
+pub const transport = core.transport;
 
 test "usage: the spec's example, against a fake server" {
     const std = @import("std");
@@ -93,7 +95,6 @@ test "usage: the spec's example, against a fake server" {
 
 test {
     @import("std").testing.refAllDecls(@This());
-    _ = @import("auth.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
     _ = @import("logging.zig");

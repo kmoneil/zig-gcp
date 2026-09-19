@@ -9,7 +9,7 @@ const Method = core.transport.Method;
 const Client = @import("Client.zig");
 const Endpoint = @import("Endpoint.zig");
 const Diagnostics = core.Diagnostics;
-const StaticToken = @import("auth.zig").StaticToken;
+const StaticToken = core.StaticToken;
 const RetryPolicy = core.RetryPolicy;
 
 pub const FakeTransport = core.testing.FakeTransport;
