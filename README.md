@@ -100,8 +100,8 @@ orders.create(.{}) catch |err| {
 };
 ```
 
-`error.Cancelled` is the server's CANCELLED status. `error.Canceled` means
-this task's `std.Io` operation was canceled.
+`error.ServerCancelled` is the server's CANCELLED status. `error.Canceled`
+means this task's `std.Io` operation was canceled.
 
 ### Retries, time limits and cancellation
 

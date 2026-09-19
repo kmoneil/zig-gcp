@@ -35,9 +35,10 @@ pub const ApiError = error{
     Aborted,
     /// Quota or rate limit exceeded. Retried.
     ResourceExhausted,
-    /// The server reports the request as canceled (HTTP 499). Not the same as
-    /// `error.Canceled`, which means this task's `std.Io` operation was canceled.
-    Cancelled,
+    /// The server reports the request as cancelled: status CANCELLED, HTTP
+    /// 499. Not to be confused with `error.Canceled`, which means this task's
+    /// `std.Io` operation was canceled.
+    ServerCancelled,
     /// Retried.
     Internal,
     DataLoss,
@@ -59,7 +60,7 @@ const by_status = std.StaticStringMap(ApiError).initComptime(.{
     .{ "ALREADY_EXISTS", error.AlreadyExists },
     .{ "ABORTED", error.Aborted },
     .{ "RESOURCE_EXHAUSTED", error.ResourceExhausted },
-    .{ "CANCELLED", error.Cancelled },
+    .{ "CANCELLED", error.ServerCancelled },
     .{ "INTERNAL", error.Internal },
     .{ "DATA_LOSS", error.DataLoss },
     .{ "UNKNOWN", error.Unknown },
@@ -88,7 +89,7 @@ pub fn fromHttpStatus(http_status: u16) ApiError {
         408, 504 => error.DeadlineExceeded,
         409 => error.AlreadyExists,
         429 => error.ResourceExhausted,
-        499 => error.Cancelled,
+        499 => error.ServerCancelled,
         500 => error.Internal,
         501 => error.Unimplemented,
         502, 503 => error.Unavailable,
@@ -170,7 +171,7 @@ test "error table: each API status maps to its error" {
         .{ "NOT_FOUND", 404, error.NotFound },
         .{ "ALREADY_EXISTS", 409, error.AlreadyExists },
         .{ "RESOURCE_EXHAUSTED", 429, error.ResourceExhausted },
-        .{ "CANCELLED", 499, error.Cancelled },
+        .{ "CANCELLED", 499, error.ServerCancelled },
         .{ "INTERNAL", 500, error.Internal },
         .{ "BAD_GATEWAY", 502, error.Unavailable },
         .{ "UNAVAILABLE", 503, error.Unavailable },
