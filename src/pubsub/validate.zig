@@ -12,7 +12,7 @@
 const std = @import("std");
 const codec = @import("codec.zig");
 const types = @import("types.zig");
-const Diagnostics = @import("errors.zig").Diagnostics;
+const Diagnostics = @import("core").Diagnostics;
 const test_util = @import("test_util.zig");
 
 pub const max_messages_per_publish = 1000;

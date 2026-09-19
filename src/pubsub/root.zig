@@ -16,9 +16,9 @@ pub const StaticToken = @import("auth.zig").StaticToken;
 pub const auth_scope = @import("auth.zig").scope;
 
 pub const RetryPolicy = @import("core").RetryPolicy;
-pub const Diagnostics = @import("errors.zig").Diagnostics;
+pub const Diagnostics = @import("core").Diagnostics;
 pub const Error = @import("errors.zig").Error;
-pub const ApiError = @import("errors.zig").ApiError;
+pub const ApiError = @import("core").ApiError;
 
 pub const Owned = @import("types.zig").Owned;
 pub const Attribute = @import("types.zig").Attribute;
