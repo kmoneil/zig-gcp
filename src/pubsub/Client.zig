@@ -37,6 +37,7 @@ base_url: []const u8,
 emulator: bool,
 token_provider: ?TokenProvider,
 retry: RetryPolicy,
+retry_publish: bool,
 diagnostics: ?*Diagnostics,
 transport: Transport,
 /// The built-in transport, when `Options.transport` was null.
@@ -53,6 +54,10 @@ pub const Options = struct {
     /// Required, except for the emulator, which never receives credentials.
     token_provider: ?TokenProvider = null,
     retry: RetryPolicy = .{},
+    /// A retried publish can store messages twice: after a 504, say, the
+    /// server may already have them. Subscribers must tolerate duplicates
+    /// anyway; set false to never retry a publish.
+    retry_publish: bool = true,
     /// Printable ASCII.
     user_agent: []const u8 = "zig-gcp-pubsub/0.3",
     /// Filled with details of every failed call; cleared by each new call.
@@ -117,6 +122,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
         .emulator = endpoint.emulator,
         .token_provider = options.token_provider,
         .retry = options.retry,
+        .retry_publish = options.retry_publish,
         .diagnostics = diag,
         .transport = transport,
         .http = http,

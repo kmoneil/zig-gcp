@@ -118,9 +118,9 @@ Transient failures are retried with full-jitter exponential backoff
 RESOURCE_EXHAUSTED, INTERNAL, UNAVAILABLE (and HTTP 502), DEADLINE_EXCEEDED,
 connections that were refused, reset or timed out, and failed TLS handshakes
 (std reports a connection dropped mid-handshake as a TLS failure). A retried
-publish can store messages twice; set `retry_publish = false` to opt out, and
-note that such a publish also fails, rather than retries, when the server has
-closed an idle connection. Retried creates and deletes can report
+publish can store messages twice; set `Client.Options.retry_publish = false`
+to opt out, and note that such a publish also fails, rather than retries, when
+the server has closed an idle connection. Retried creates and deletes can report
 `AlreadyExists` or `NotFound` for an attempt that succeeded but whose
 response was lost.
 

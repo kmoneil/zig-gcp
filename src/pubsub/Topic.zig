@@ -57,7 +57,7 @@ pub fn delete(self: Topic) Error!void {
 
 /// Publishes `messages` in one HTTP request. The returned ids match the order
 /// of `messages`. Limits are checked first (`error.InvalidMessage`).
-/// A retried publish can store messages twice; see `RetryPolicy.retry_publish`.
+/// A retried publish can store messages twice; see `Client.Options.retry_publish`.
 pub fn publish(
     self: Topic,
     messages: []const types.Message,
@@ -79,7 +79,7 @@ pub fn publish(
         .method = .POST,
         .path = path,
         .body = body,
-        .retry = c.retry.retry_publish,
+        .retry = c.retry_publish,
     });
     result.value = codec.decodePublish(result.arena.allocator(), response, messages.len) catch |err|
         return rpc.decodeFailed(c, err, "publish");
@@ -174,7 +174,7 @@ test "publish: retry_publish = false makes exactly one attempt" {
     try h.init(&.{
         .{ .respond = .{ .status = 504, .body = "{\"error\":{\"status\":\"DEADLINE_EXCEEDED\"}}" } },
         .{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } },
-    }, .{ .retry = .{ .retry_publish = false } });
+    }, .{ .retry_publish = false });
     defer h.deinit();
     try testing.expectError(error.DeadlineExceeded, h.client.topic("orders").publish(&.{.{ .data = "x" }}, .{}));
     try h.expectRequestCount(1);

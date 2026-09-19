@@ -30,6 +30,7 @@ pub const Harness = struct {
         /// targets production.
         token: ?[]const u8 = null,
         retry: RetryPolicy = .{},
+        retry_publish: bool = true,
         project_id: []const u8 = "p",
     };
 
@@ -48,6 +49,7 @@ pub const Harness = struct {
             .endpoint = if (options.token == null) emulator else null,
             .token_provider = if (options.token == null) null else h.token.provider(),
             .retry = options.retry,
+            .retry_publish = options.retry_publish,
             .diagnostics = &h.diag,
             .transport = h.fake.transport(),
         });
