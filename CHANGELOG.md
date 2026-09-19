@@ -8,9 +8,14 @@ including the ones that did not change.
 
 - core: new module, holding what the service modules share: the HTTP
   transport, `RetryPolicy`, Google API errors and `Diagnostics`, `Owned`,
-  the `TokenProvider` seam with `StaticToken`, and test fakes in
-  `core.testing`. pubsub re-exports what its callers use, so most code
+  the `TokenProvider` seam with `StaticToken`, `WipingAllocator` for memory
+  that held a secret, the logging helper the modules share, and test fakes
+  in `core.testing`. pubsub re-exports what its callers use, so most code
   never imports core.
+- auth: new module, experimental. `Cache` is the token cache providers will
+  build on: it refreshes a token before it expires, runs one fetch at a
+  time, keeps using a still-valid token when an early refresh fails, and
+  wipes every copy it frees. `StaticToken` is also available here.
 - pubsub: breaking: `retry_publish` moved from `RetryPolicy` to
   `Client.Options`. Write `.retry_publish = false` instead of
   `.retry = .{ .retry_publish = false }`.
