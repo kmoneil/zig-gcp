@@ -578,8 +578,8 @@ test "AuthorizedUser: every block it frees is wiped first" {
 
 test "AuthorizedUser: every allocation failure is OutOfMemory without leaks" {
     const Run = struct {
-        fn run(gpa: Allocator) !void {
-            var fake: test_util.FakeTransport = .init(testing.allocator, &.{token_ok});
+        fn get(gpa: Allocator, reply: Reply) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{reply});
             defer fake.deinit();
             var clock: test_util.FakeClock = .{};
             var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -588,8 +588,37 @@ test "AuthorizedUser: every allocation failure is OutOfMemory without leaks" {
             defer user.deinit();
             _ = try user.provider().getToken(clock.io(), arena.allocator(), test_scopes);
         }
+
+        fn refused(gpa: Allocator, reply: Reply) !void {
+            get(gpa, reply) catch |err| switch (err) {
+                error.RefreshTokenInvalid => return,
+                else => return err,
+            };
+            return error.TestExpectedRefusal;
+        }
+
+        fn fromFile(gpa: Allocator, path: []const u8) !void {
+            // With the built-in transport, which init allocates too.
+            var user: AuthorizedUser = try .initFromFile(gpa, testing.io, path, .{});
+            user.deinit();
+        }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{token_ok});
+    // Escapes make std.json allocate; without them it points into the body.
+    try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{Reply{ .respond = .{
+        .body = "{\"access_token\":\"ya29.\\u0053ECRET-at\",\"expires_in\":3599}",
+    } }});
+    try testing.checkAllAllocationFailures(testing.allocator, Run.refused, .{Reply{ .respond = .{
+        .status = 400,
+        .body = "{\"error\":\"invalid_grant\",\"error_description\":\"Token has been \\\"revoked\\\".\"}",
+    } }});
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "adc.json", .data = file_json });
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/adc.json", .{&tmp.sub_path});
+    try testing.checkAllAllocationFailures(testing.allocator, Run.fromFile, .{path});
 }
 
 test "AuthorizedUser: initFromFile reads the file, and reports a missing or oversized one" {
