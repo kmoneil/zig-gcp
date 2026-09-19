@@ -157,6 +157,105 @@ pub const FakeTransport = struct {
     }
 };
 
+/// Accepts connections on 127.0.0.1 and answers each request with the next
+/// scripted raw HTTP response. Records the raw requests it saw.
+pub const ScriptedServer = struct {
+    server: std.Io.net.Server,
+    port: u16,
+    /// Raw bytes to write per request; a connection closes after its last reply.
+    replies: []const []const u8,
+    /// Replies per connection before the server closes it.
+    per_connection: usize = 1,
+    /// When set, the server reads the request and never answers.
+    hang: bool = false,
+    /// When set, the server closes its first connection without reading.
+    close_on_accept: bool = false,
+    /// How long to hold a connection open after its last reply.
+    linger_ms: i64 = 0,
+    seen: [8][2048]u8 = undefined,
+    seen_len: [8]usize = @splat(0),
+    seen_count: usize = 0,
+    connections: usize = 0,
+
+    pub fn start(io: std.Io, replies: []const []const u8) !ScriptedServer {
+        return startOn(io, .{ .ip4 = .loopback(0) }, replies);
+    }
+
+    pub fn startOn(io: std.Io, address: std.Io.net.IpAddress, replies: []const []const u8) !ScriptedServer {
+        const server = try address.listen(io, .{ .reuse_address = true });
+        return .{
+            .server = server,
+            .port = server.socket.address.getPort(),
+            .replies = replies,
+        };
+    }
+
+    pub fn deinit(s: *ScriptedServer, io: std.Io) void {
+        s.server.deinit(io);
+    }
+
+    pub fn url(s: *const ScriptedServer, buf: []u8, path: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}{s}", .{ s.port, path }) catch unreachable;
+    }
+
+    pub fn request(s: *const ScriptedServer, index: usize) []const u8 {
+        return s.seen[index][0..s.seen_len[index]];
+    }
+
+    /// Serves every scripted reply, then returns.
+    pub fn run(s: *ScriptedServer, io: std.Io) !void {
+        if (s.close_on_accept) {
+            const stream = try s.server.accept(io);
+            s.connections += 1;
+            stream.close(io);
+            return;
+        }
+        var next: usize = 0;
+        while (next < s.replies.len or s.hang) {
+            const stream = try s.server.accept(io);
+            defer stream.close(io);
+            defer if (s.linger_ms > 0) io.sleep(.fromMilliseconds(s.linger_ms), .awake) catch {};
+            s.connections += 1;
+            var read_buf: [4096]u8 = undefined;
+            var reader = stream.reader(io, &read_buf);
+            var write_buf: [256]u8 = undefined;
+            var writer = stream.writer(io, &write_buf);
+            var served: usize = 0;
+            while (served < s.per_connection and (next < s.replies.len or s.hang)) : (served += 1) {
+                try s.readRequest(&reader.interface);
+                if (s.hang) {
+                    // Wait until the client gives up; the read fails or ends then.
+                    _ = reader.interface.discardRemaining() catch {};
+                    return;
+                }
+                try writer.interface.writeAll(s.replies[next]);
+                try writer.interface.flush();
+                next += 1;
+            }
+        }
+    }
+
+    fn readRequest(s: *ScriptedServer, r: *std.Io.Reader) !void {
+        const slot = s.seen_count % s.seen.len;
+        var len: usize = 0;
+        var content_length: usize = 0;
+        while (true) {
+            const line = try r.takeDelimiterInclusive('\n');
+            @memcpy(s.seen[slot][len..][0..line.len], line);
+            len += line.len;
+            if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+                const value = std.mem.trim(u8, line["content-length:".len..], " \r\n");
+                content_length = try std.fmt.parseInt(usize, value, 10);
+            }
+            if (std.mem.eql(u8, line, "\r\n")) break;
+        }
+        const body = try r.take(content_length);
+        @memcpy(s.seen[slot][len..][0..body.len], body);
+        s.seen_len[slot] = len + body.len;
+        s.seen_count += 1;
+    }
+};
+
 /// An `Io` whose clock, sleep and randomness are simulated. Every other
 /// operation fails, as in `std.Io.failing`, so a test cannot touch the network.
 pub const FakeClock = struct {
