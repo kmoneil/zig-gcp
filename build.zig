@@ -9,10 +9,18 @@ pub fn build(b: *std.Build) void {
         "Skip tests whose names do not match any filter",
     ) orelse &.{};
 
+    // What the service modules share. It imports nothing but std.
+    const core = b.addModule("core", .{
+        .root_source_file = b.path("src/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("pubsub", .{
         .root_source_file = b.path("src/pubsub/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
     });
 
     // Fuzzing on Zig 0.16.0 needs two things the defaults lack: a test runner
@@ -25,17 +33,20 @@ pub fn build(b: *std.Build) void {
         "Build the unit tests for `zig build test --fuzz`: patched runner, LLVM backend",
     ) orelse false;
 
-    // Unit, property and fuzz-corpus tests. No network: a fake transport and a
-    // fake clock drive everything. `zig build test -Dfuzz-runner --fuzz`
-    // fuzzes the same tests.
-    const unit_tests = b.addTest(.{
-        .root_module = mod,
-        .filters = test_filters,
-        .test_runner = if (fuzz_runner) .{ .path = b.path("tools/test_runner.zig"), .mode = .server } else null,
-        .use_llvm = if (fuzz_runner) true else null,
-    });
+    // Unit, property and fuzz-corpus tests, one run per module. No network: a
+    // fake transport and a fake clock drive everything.
+    // `zig build test -Dfuzz-runner --fuzz` fuzzes the same tests.
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
-    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    for ([_]struct { []const u8, *std.Build.Module }{ .{ "core", core }, .{ "pubsub", mod } }) |entry| {
+        const unit_tests = b.addTest(.{
+            .name = entry[0],
+            .root_module = entry[1],
+            .filters = test_filters,
+            .test_runner = if (fuzz_runner) .{ .path = b.path("tools/test_runner.zig"), .mode = .server } else null,
+            .use_llvm = if (fuzz_runner) true else null,
+        });
+        test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+    }
 
     // Integration tests against the emulator (PUBSUB_EMULATOR_HOST) or, when
     // configured, a real project. They skip cleanly when neither is set.

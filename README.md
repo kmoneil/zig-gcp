@@ -208,7 +208,7 @@ fail later in production.
 ## Zig 0.16 standard library issues handled here
 
 The HTTP transport works around these, each covered by a regression test in
-`src/pubsub/transport.zig`:
+`src/core/transport.zig`:
 
 - A chunk size near 2^64 panics `std.http`'s chunked decoder (integer
   overflow), so the transport decodes chunked bodies itself.

@@ -23,10 +23,10 @@ const url = @import("url.zig");
 const validate = @import("validate.zig");
 const Diagnostics = errors.Diagnostics;
 const Error = errors.Error;
-const HttpTransport = @import("transport.zig").HttpTransport;
+const HttpTransport = @import("core").transport.HttpTransport;
 const RetryPolicy = @import("retry.zig").RetryPolicy;
 const TokenProvider = @import("auth.zig").TokenProvider;
-const Transport = @import("transport.zig").Transport;
+const Transport = @import("core").transport.Transport;
 
 gpa: Allocator,
 io: std.Io,
