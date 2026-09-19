@@ -10,7 +10,7 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 152 unit, property and fuzz tests, and 20 integration tests
+- Tested with 157 unit, property and fuzz tests, and 20 integration tests
   that pass against both the emulator and production.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
 
@@ -232,22 +232,37 @@ The HTTP transport works around these, each covered by a regression test in
 ```
 zig build test                         # unit, property and fuzz-corpus tests
 zig build test --seed 0x1234           # same, with different pseudo-random inputs
+zig build test -Doptimize=ReleaseFast  # same, optimized; also ReleaseSafe
 zig build test -Dfuzz-runner --fuzz    # coverage-guided fuzzing (see below)
 zig build test-integration             # needs a server, see below
+zig build coverage                     # line coverage; needs kcov (see below)
 zig build example-publish -- orders 5
 zig build example-worker -- orders orders-worker
 zig build fmt                          # zig fmt --check
 ```
 
 Every fuzz property also runs in `zig build test`: on its seed corpus and on a
-few hundred pseudo-random inputs. When the fuzzer finds a failing input, add
-it to that property's corpus so it stays covered. Zig 0.16.0's own test
-runner does not compile in fuzz mode, and its default x86_64 backend emits
-no coverage instrumentation. `-Dfuzz-runner` fixes both: it swaps in
+few hundred pseudo-random inputs. Zig 0.16.0's own test runner does not
+compile in fuzz mode, and its default x86_64 backend emits no coverage
+instrumentation. `-Dfuzz-runner` fixes both: it swaps in
 `tools/test_runner.zig`, a copy with a one-line fix, and builds the tests
-with LLVM. The fuzzer keeps its
-corpus in `.zig-cache/f`, so only one fuzzing run per checkout at a time;
-`-Dtest-filter=fuzz` skips the unit tests that are not fuzz targets.
+with LLVM. The fuzzer keeps its corpus in `.zig-cache/f`, so only one
+fuzzing run per checkout at a time; `-Dtest-filter=fuzz` skips the unit
+tests that are not fuzz targets. When it finds a failing input, it saves it
+to `.zig-cache/f/crash`: a 4-byte little-endian length, then the input. Add
+the input to that property's corpus, so the fix stays covered.
+
+`zig build coverage` runs the unit tests under
+[kcov](https://github.com/SimonKagstrom/kcov) and writes the report to
+`zig-out/coverage/index.html`. `tools/coverage_summary.py` prints it as
+Markdown, including every line no test reached. kcov counts lines, not
+branches, and sees only code the compiler kept.
+
+CI runs the unit tests on Linux, macOS and Windows, and on Linux also in
+ReleaseSafe and ReleaseFast; the integration tests and examples against the
+emulator; and coverage, whose summary and report are attached to each run. Every night it
+also fuzzes, starting from the corpus that earlier nights built up. A failing
+input is attached to the run as `fuzz-failure`.
 
 Integration tests skip unless a server is configured:
 

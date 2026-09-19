@@ -105,7 +105,8 @@ code in `src/`.
 
 - **No dependencies** beyond the Zig standard library.
 - **CI runs with a read-only token** and pins its actions to full commit
-  SHAs, which Dependabot keeps current. CodeQL scans the workflows.
+  SHAs, which Dependabot keeps current. The coverage job's container image
+  is pinned by digest. CodeQL scans the workflows.
 
 ## What a hostile server can still do
 

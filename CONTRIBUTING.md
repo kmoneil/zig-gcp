@@ -23,13 +23,18 @@ PUBSUB_EMULATOR_HOST=127.0.0.1:8085 zig build test-integration
 ```
 
 To fuzz, run `zig build test -Dfuzz-runner -Dtest-filter=fuzz --fuzz=100K`.
+For line coverage, install [kcov](https://github.com/SimonKagstrom/kcov) and
+run `zig build coverage`; the report is `zig-out/coverage/index.html`.
 
 ## Changes
 
 - `main` is protected: open a pull request, and CI must pass before it
   merges.
 - A bug fix comes with a test that fails without it. When the fuzzer finds
-  a failing input, add that input to the property's corpus.
+  a failing input, add that input to the property's corpus. The fuzzer
+  saves it as `.zig-cache/f/crash`, and the nightly CI run attaches it as
+  the `fuzz-failure` artifact: a 4-byte little-endian length, then the
+  input.
 - User-visible changes go in `CHANGELOG.md`. Until 1.0, minor versions may
   break the API; say how in the changelog entry.
 - Follow the existing code: `zig fmt`, doc comments on public declarations,
