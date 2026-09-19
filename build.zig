@@ -36,8 +36,9 @@ pub fn build(b: *std.Build) void {
     // Unit, property and fuzz-corpus tests, one run per module. No network: a
     // fake transport and a fake clock drive everything.
     // `zig build test -Dfuzz-runner --fuzz` fuzzes the same tests.
+    const unit_modules = [_]struct { []const u8, *std.Build.Module }{ .{ "core", core }, .{ "pubsub", mod } };
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
-    for ([_]struct { []const u8, *std.Build.Module }{ .{ "core", core }, .{ "pubsub", mod } }) |entry| {
+    for (unit_modules) |entry| {
         const unit_tests = b.addTest(.{
             .name = entry[0],
             .root_module = entry[1],
@@ -47,6 +48,34 @@ pub fn build(b: *std.Build) void {
         });
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
+
+    // Line coverage of the unit tests, measured by kcov, which must be on
+    // PATH. Each module's tests run under kcov, and the merged report is
+    // installed to zig-out/coverage: index.html, plus coverage.json and
+    // cobertura.xml in kcov-merged/.
+    const coverage_step = b.step("coverage", "Measure the unit tests' line coverage with kcov");
+    const merge = b.addSystemCommand(&.{ "kcov", "--merge" });
+    const merged = merge.addOutputDirectoryArg("coverage");
+    for (unit_modules) |entry| {
+        const coverage_tests = b.addTest(.{
+            .name = entry[0],
+            .root_module = entry[1],
+            .filters = test_filters,
+            // kcov maps addresses to lines through DWARF, which LLVM emits in full.
+            .use_llvm = true,
+        });
+        const kcov = b.addSystemCommand(&.{ "kcov", b.fmt("--include-path={s}", .{b.pathFromRoot("src")}) });
+        merge.addDirectoryArg(kcov.addOutputDirectoryArg(entry[0]));
+        kcov.addArtifactArg(coverage_tests);
+        // The tests' progress output is captured: the build shows it only
+        // when they fail, which kcov reports by exiting as they did.
+        _ = kcov.captureStdErr(.{});
+    }
+    coverage_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = merged,
+        .install_dir = .prefix,
+        .install_subdir = "coverage",
+    }).step);
 
     // Integration tests against the emulator (PUBSUB_EMULATOR_HOST) or, when
     // configured, a real project. They skip cleanly when neither is set.
