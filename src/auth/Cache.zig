@@ -140,6 +140,7 @@ fn drop(self: *Cache) void {
 const testing = std.testing;
 const FakeClock = core.testing.FakeClock;
 const ByteGen = core.testing.ByteGen;
+const WipeChecker = core.testing.WipeChecker;
 
 /// A `Source` that answers each fetch with the next scripted reply.
 const FakeSource = struct {
@@ -345,45 +346,6 @@ test "Cache: each caller gets its own copy" {
     // Replacing the token did not change the copy handed out before.
     try testing.expectEqualStrings("ya29.one", first);
 }
-
-/// Records whether each block was all zeros when it was freed.
-const WipeChecker = struct {
-    child: Allocator,
-    frees: usize = 0,
-    unwiped: usize = 0,
-
-    fn allocator(self: *WipeChecker) Allocator {
-        return .{ .ptr = self, .vtable = &.{
-            .alloc = alloc,
-            .resize = resize,
-            .remap = remap,
-            .free = free,
-        } };
-    }
-
-    fn fromPtr(ptr: *anyopaque) *WipeChecker {
-        return @ptrCast(@alignCast(ptr));
-    }
-
-    fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        return fromPtr(ptr).child.rawAlloc(len, alignment, ret_addr);
-    }
-
-    fn resize(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        return fromPtr(ptr).child.rawResize(memory, alignment, new_len, ret_addr);
-    }
-
-    fn remap(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        return fromPtr(ptr).child.rawRemap(memory, alignment, new_len, ret_addr);
-    }
-
-    fn free(ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self = fromPtr(ptr);
-        self.frees += 1;
-        if (!std.mem.allEqual(u8, memory, 0)) self.unwiped += 1;
-        self.child.rawFree(memory, alignment, ret_addr);
-    }
-};
 
 test "Cache: every block the cache frees is wiped first" {
     var checker: WipeChecker = .{ .child = testing.allocator };
