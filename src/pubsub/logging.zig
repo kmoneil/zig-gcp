@@ -1,4 +1,4 @@
-//! Library logging. Everything goes through `std.log.scoped(.pubsub)`, so
+//! Library logging. Everything goes through `std.log.scoped(.gcp_pubsub)`, so
 //! applications can filter or silence it with `std_options.log_scope_levels`.
 //! Callers pass only methods, paths, statuses, counts and timings: never
 //! tokens, message data or attribute values.
@@ -9,7 +9,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const log = std.log.scoped(.pubsub);
+const log = std.log.scoped(.gcp_pubsub);
 
 pub fn debug(comptime format: []const u8, args: anytype) void {
     if (builtin.is_test) return capture.record("debug", format, args);
