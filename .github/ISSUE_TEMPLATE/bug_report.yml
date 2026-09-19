@@ -1,0 +1,43 @@
+name: Bug report
+description: The client does something other than what its documentation says.
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Library version
+      placeholder: v0.2.0
+    validations:
+      required: true
+  - type: input
+    id: zig
+    attributes:
+      label: Zig version
+      placeholder: 0.16.0
+    validations:
+      required: true
+  - type: dropdown
+    id: server
+    attributes:
+      label: Server
+      options:
+        - Production
+        - Emulator
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: >-
+        What you called, what you expected, and what happened instead. Include
+        the error and, if there is one, the Diagnostics status and message.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The smallest code that shows the problem.
+      render: zig
