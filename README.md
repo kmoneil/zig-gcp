@@ -10,7 +10,7 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 157 unit, property and fuzz tests, and 20 integration tests
+- Tested with 158 unit, property and fuzz tests, and 20 integration tests
   that pass against both the emulator and production.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
 
@@ -225,6 +225,10 @@ The HTTP transport works around these, each covered by a regression test in
   failed.
 - The TLS certificate clock is read once per client; the transport reloads it
   hourly and after a TLS failure.
+- On Windows, a refused connection and a peer that hangs up both come back
+  as `error.Unexpected`, because std does not map their NTSTATUS codes. The
+  transport reports a dropped connection, so the call is retried; it cannot
+  tell the two apart.
 - `zig build test --fuzz` does not compile; see `-Dfuzz-runner` below.
 
 ## Development
