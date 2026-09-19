@@ -106,6 +106,30 @@ test "token_response: OAuth errors" {
     try testing.expectEqual(null, try parseError(a, "<html></html>"));
 }
 
+test "token_response: running out of memory is OutOfMemory, never a verdict on the body" {
+    // Escapes make std.json allocate; without them it points into the body.
+    // Each parser gets its own sweep: an arena that one call has grown would
+    // serve the next without asking the failing allocator.
+    const Run = struct {
+        fn token(gpa: Allocator) !void {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const got = try parse(arena.allocator(), "{\"access_token\":\"ya29.\\u0061b\",\"expires_in\":3599}");
+            try testing.expectEqualStrings("ya29.ab", got.token);
+        }
+
+        fn oauthError(gpa: Allocator) !void {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const e = try parseError(arena.allocator(), "{\"error\":\"invalid_grant\",\"error_description\":\"it\\u0027s gone\"}") orelse
+                return error.TestExpectedOAuthError;
+            try testing.expectEqualStrings("it's gone", e.description);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.token, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, Run.oauthError, .{});
+}
+
 fn arbitraryProperty(_: void, input: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
