@@ -2,7 +2,7 @@
 
 Until 1.0, minor versions may break the API; each entry says how.
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-09-19)
 
 - Breaking: `error.Cancelled` is now `error.ServerCancelled`, so the
   server's CANCELLED status no longer sits one letter away from

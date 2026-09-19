@@ -12,7 +12,7 @@ publish, pull, acknowledge, and topic and subscription management.
 ## Install
 
 ```
-zig fetch --save git+https://github.com/kmoneil/zig-gcp-pubsub#v0.1.0
+zig fetch --save git+https://github.com/kmoneil/zig-gcp-pubsub#v0.2.0
 ```
 
 ```zig
