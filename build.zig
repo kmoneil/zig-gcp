@@ -15,11 +15,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Zig 0.16.0's own test runner cannot build in fuzz mode; see the file.
+    // Fuzzing on Zig 0.16.0 needs two things the defaults lack: a test runner
+    // that compiles in fuzz mode (see tools/test_runner.zig), and the LLVM
+    // backend. The self-hosted x86_64 backend, the Debug default there,
+    // emits no coverage instrumentation, so the fuzzer would run blind.
     const fuzz_runner = b.option(
         bool,
         "fuzz-runner",
-        "Use tools/test_runner.zig, needed for `zig build test --fuzz` on Zig 0.16.0",
+        "Build the unit tests for `zig build test --fuzz`: patched runner, LLVM backend",
     ) orelse false;
 
     // Unit, property and fuzz-corpus tests. No network: a fake transport and a
@@ -29,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
         .filters = test_filters,
         .test_runner = if (fuzz_runner) .{ .path = b.path("tools/test_runner.zig"), .mode = .server } else null,
+        .use_llvm = if (fuzz_runner) true else null,
     });
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
