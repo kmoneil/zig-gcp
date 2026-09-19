@@ -102,9 +102,28 @@ pub fn build(b: *std.Build) void {
     run_integration.has_side_effects = true;
     const integration_step = b.step(
         "test-integration",
-        "Run integration tests against PUBSUB_EMULATOR_HOST",
+        "Run integration tests against PUBSUB_EMULATOR_HOST, or Google when configured",
     );
     integration_step.dependOn(&run_integration.step);
+
+    // auth against Google's token endpoint, when AUTH_TEST_CREDENTIALS names
+    // a credentials file. They skip otherwise.
+    const auth_integration_tests = b.addTest(.{
+        .name = "auth-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/auth_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "auth", .module = auth },
+                .{ .name = "pubsub", .module = mod },
+            },
+        }),
+        .filters = test_filters,
+    });
+    const run_auth_integration = b.addRunArtifact(auth_integration_tests);
+    run_auth_integration.has_side_effects = true;
+    integration_step.dependOn(&run_auth_integration.step);
 
     inline for (.{ "publish", "worker" }) |name| {
         const exe = b.addExecutable(.{

@@ -6,6 +6,8 @@ const core = @import("core");
 
 pub const TokenProvider = core.TokenProvider;
 pub const StaticToken = core.StaticToken;
+pub const Diagnostics = core.Diagnostics;
+pub const RetryPolicy = core.RetryPolicy;
 pub const Cache = @import("Cache.zig");
 pub const AuthorizedUser = @import("AuthorizedUser.zig");
 
