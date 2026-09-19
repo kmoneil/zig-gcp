@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     ) orelse &.{};
 
     const mod = b.addModule("pubsub", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/pubsub/root.zig"),
         .target = target,
         .optimize = optimize,
     });
