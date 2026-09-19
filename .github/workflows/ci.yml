@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      fuzz_iterations:
+        description: "Also run the fuzz job for this many iterations, such as 20K or 2M"
+        default: ""
   schedule:
     # Nightly: a longer coverage-guided fuzzing run.
     - cron: "17 3 * * *"
@@ -13,7 +17,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: mlugg/setup-zig@v2
         with:
@@ -51,15 +55,17 @@ jobs:
           zig build example-worker
 
   fuzz:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.fuzz_iterations != '')
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
 
       - name: Coverage-guided fuzzing
-        run: zig build test -Dfuzz-runner -Dtest-filter=fuzz --fuzz=2M
+        env:
+          ITERATIONS: ${{ inputs.fuzz_iterations || '2M' }}
+        run: zig build test -Dfuzz-runner -Dtest-filter=fuzz "--fuzz=$ITERATIONS"

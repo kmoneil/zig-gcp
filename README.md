@@ -228,8 +228,10 @@ zig build fmt                          # zig fmt --check
 Every fuzz property also runs in `zig build test`: on its seed corpus and on a
 few hundred pseudo-random inputs. When the fuzzer finds a failing input, add
 it to that property's corpus so it stays covered. Zig 0.16.0's own test
-runner does not compile in fuzz mode; `-Dfuzz-runner` swaps in
-`tools/test_runner.zig`, a copy with the one-line fix. The fuzzer keeps its
+runner does not compile in fuzz mode, and its default x86_64 backend emits
+no coverage instrumentation. `-Dfuzz-runner` fixes both: it swaps in
+`tools/test_runner.zig`, a copy with a one-line fix, and builds the tests
+with LLVM. The fuzzer keeps its
 corpus in `.zig-cache/f`, so only one fuzzing run per checkout at a time;
 `-Dtest-filter=fuzz` skips the unit tests that are not fuzz targets.
 
