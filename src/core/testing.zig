@@ -11,6 +11,7 @@ const TransportError = @import("transport.zig").Error;
 const Method = @import("transport.zig").Method;
 const Request = @import("transport.zig").Request;
 const Response = @import("transport.zig").Response;
+const ContentType = @import("transport.zig").ContentType;
 const TokenProvider = @import("TokenProvider.zig");
 
 /// A `TokenProvider` that returns one token, or fails with one error, and
@@ -91,6 +92,7 @@ pub const FakeTransport = struct {
         url: []u8,
         bearer: ?[]u8,
         body: ?[]u8,
+        content_type: ContentType,
     };
 
     pub fn init(gpa: Allocator, script: []const Reply) FakeTransport {
@@ -150,6 +152,7 @@ pub const FakeTransport = struct {
             .url = url,
             .bearer = bearer,
             .body = body,
+            .content_type = req.content_type,
         });
     }
 };
