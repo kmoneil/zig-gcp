@@ -22,6 +22,9 @@ pub const Owned = @import("owned.zig").Owned;
 pub const TokenProvider = @import("TokenProvider.zig");
 pub const StaticToken = @import("StaticToken.zig");
 
+/// Logging under each module's own scope, captured in test builds.
+pub const logging = @import("logging.zig");
+
 /// Fakes and property-test helpers, for tests only.
 pub const testing = @import("testing.zig");
 
@@ -30,6 +33,7 @@ test {
     _ = @import("StaticToken.zig");
     _ = @import("TokenProvider.zig");
     _ = @import("errors.zig");
+    _ = @import("logging.zig");
     _ = @import("owned.zig");
     _ = @import("retry.zig");
     _ = @import("testing.zig");
