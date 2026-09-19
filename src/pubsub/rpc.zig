@@ -47,7 +47,7 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
 
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
-        const bearer = try bearerToken(client);
+        const bearer = try bearerToken(client, scratch.allocator());
         const started = std.Io.Clock.awake.now(client.io);
         const outcome = client.transport.send(.{
             .method = call.method,
@@ -102,11 +102,13 @@ fn failure(client: *Client, scratch: Allocator, res: Response) Error {
     return core.errors.fromResponse(res.status, status);
 }
 
-fn bearerToken(client: *Client) Error!?[]const u8 {
+/// The token for one attempt, copied into `scratch`, which outlives the
+/// request and is freed when the call returns.
+fn bearerToken(client: *Client, scratch: Allocator) Error!?[]const u8 {
     // Never send credentials to the emulator: it speaks plain HTTP.
     if (client.emulator) return null;
     const provider = client.token_provider orelse return null;
-    const token = provider.getToken(client.io, &.{scope}) catch |err| {
+    const token = provider.getToken(client.io, scratch, &.{scope}) catch |err| {
         if (client.diagnostics) |d| d.print("the token provider failed: {t}", .{err});
         return err;
     };
@@ -148,6 +150,7 @@ const testing = std.testing;
 const test_util = @import("test_util.zig");
 const Harness = test_util.Harness;
 const Reply = test_util.FakeTransport.Reply;
+const FakeTokenProvider = test_util.FakeTokenProvider;
 
 const unavailable: Reply = .{ .respond = .{
     .status = 503,
@@ -361,47 +364,39 @@ test "credentials: an unusable token fails before sending" {
 }
 
 test "credentials: a failing provider's error is returned, not retried" {
-    const Failing = struct {
-        calls: usize = 0,
-        fn provider(self: *@This()) core.TokenProvider {
-            return .{ .ptr = self, .vtable = &.{ .getToken = getToken } };
-        }
-        fn getToken(ptr: *anyopaque, io: std.Io, scopes: []const []const u8) core.TokenProvider.Error![]const u8 {
-            _ = io;
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            // The client asks for exactly the Pub/Sub scope.
-            testing.expectEqual(1, scopes.len) catch return error.TokenUnavailable;
-            testing.expectEqualStrings(scope, scopes[0]) catch return error.TokenUnavailable;
-            return error.TokenUnavailable;
-        }
-    };
-    var failing: Failing = .{};
+    var failing: FakeTokenProvider = .{ .fail = error.TokenUnavailable };
     var h: Harness = undefined;
     try h.init(&.{topic_ok}, .{ .token = "unused" });
     defer h.deinit();
     h.client.token_provider = failing.provider();
     try testing.expectError(error.TokenUnavailable, h.client.topic("orders").get());
     try testing.expectEqual(1, failing.calls);
+    // The client asks for exactly the Pub/Sub scope.
+    try testing.expectEqual(1, failing.scope_count);
+    try testing.expectEqualStrings(scope, failing.firstScope());
     try h.expectRequestCount(0);
     try testing.expectEqualStrings("the token provider failed: TokenUnavailable", h.diag.message());
 }
 
+test "credentials: token errors reach the caller by name" {
+    // A caller can tell a dead login from a missing service account or a
+    // network failure. None is retried here: providers retry their own
+    // requests, and a failed token fetch would only fail again.
+    inline for (.{ error.RefreshTokenInvalid, error.MetadataUnavailable, error.ConnectionRefused }) |e| {
+        var failing: FakeTokenProvider = .{ .fail = e };
+        var h: Harness = undefined;
+        try h.init(&.{topic_ok}, .{ .token = "unused" });
+        defer h.deinit();
+        h.client.token_provider = failing.provider();
+        try testing.expectError(e, h.client.topic("orders").get());
+        try testing.expectEqual(1, failing.calls);
+        try h.expectRequestCount(0);
+        try testing.expectEqualStrings("the token provider failed: " ++ @errorName(e), h.diag.message());
+    }
+}
+
 test "credentials: the provider is asked again on every attempt" {
-    const Counting = struct {
-        calls: usize = 0,
-        fn provider(self: *@This()) core.TokenProvider {
-            return .{ .ptr = self, .vtable = &.{ .getToken = getToken } };
-        }
-        fn getToken(ptr: *anyopaque, io: std.Io, scopes: []const []const u8) core.TokenProvider.Error![]const u8 {
-            _ = io;
-            _ = scopes;
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
-            return "tok";
-        }
-    };
-    var counting: Counting = .{};
+    var counting: FakeTokenProvider = .{};
     var h: Harness = undefined;
     try h.init(&.{ unavailable, topic_ok }, .{ .token = "unused" });
     defer h.deinit();
@@ -409,6 +404,10 @@ test "credentials: the provider is asked again on every attempt" {
     var info = try h.client.topic("orders").get();
     info.deinit();
     try testing.expectEqual(2, counting.calls);
+    // The provider's copy, in the call's scratch arena, reached the request.
+    try testing.expectEqualStrings("ya29.fake-token", (try h.fake.request(1)).bearer.?);
+    // A 503 is not a credentials problem: the cached token stays.
+    try testing.expectEqual(0, counting.invalidations);
 }
 
 test "log hygiene: no token, payload or attribute value ever reaches the log" {

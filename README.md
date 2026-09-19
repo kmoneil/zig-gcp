@@ -98,9 +98,10 @@ of a call. Handles borrow their client and id, so they must not outlive them.
 
 Every call returns `pubsub.Error`, a closed error set: one error per API
 status (`error.NotFound`, `error.AlreadyExists`, ...), the transport's errors
-(`error.ConnectionRefused`, `error.TlsFailure`, ...), and client-side checks
-(`error.InvalidMessage`, `error.InvalidResourceId`). Errors carry no payload;
-the details of the last failed call go to `Diagnostics`:
+(`error.ConnectionRefused`, `error.TlsFailure`, ...), the token provider's
+(`error.RefreshTokenInvalid`, `error.TokenUnavailable`, ...), and client-side
+checks (`error.InvalidMessage`, `error.InvalidResourceId`). Errors carry no
+payload; the details of the last failed call go to `Diagnostics`:
 
 ```zig
 orders.create(.{}) catch |err| {

@@ -13,6 +13,7 @@ const StaticToken = core.StaticToken;
 const RetryPolicy = core.RetryPolicy;
 
 pub const FakeTransport = core.testing.FakeTransport;
+pub const FakeTokenProvider = core.testing.FakeTokenProvider;
 pub const FakeClock = core.testing.FakeClock;
 pub const ByteGen = core.testing.ByteGen;
 pub const FuzzOptions = core.testing.FuzzOptions;

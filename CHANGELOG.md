@@ -12,6 +12,11 @@ including the ones that did not change.
 - pubsub: breaking: logs under the scope `.gcp_pubsub`, not `.pubsub`, so
   it cannot collide with another library's scope. Rename it in
   `std_options.log_scope_levels`.
+- pubsub: breaking, for custom token providers: `TokenProvider.getToken`
+  takes an arena and returns the token copied into it, and a provider also
+  implements `invalidate` and `quotaProject`. `TokenProvider.Error` names
+  the token failures a caller can act on, such as `RefreshTokenInvalid`,
+  and `pubsub.Error` gains them. `StaticToken` works as before.
 
 ## 0.3.0 (2026-09-19)
 
