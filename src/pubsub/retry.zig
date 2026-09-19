@@ -10,10 +10,6 @@ pub const RetryPolicy = struct {
     max_backoff_ms: u32 = 10_000,
     /// At least 1.
     multiplier: f32 = 2.0,
-    /// A retried publish can store messages twice: after a 504, say, the
-    /// server may already have them. Subscribers must tolerate duplicates
-    /// anyway; set false to never retry a publish.
-    retry_publish: bool = true,
 
     pub fn isValid(p: RetryPolicy) bool {
         return p.max_attempts >= 1 and std.math.isFinite(p.multiplier) and p.multiplier >= 1.0;

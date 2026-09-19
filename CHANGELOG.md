@@ -4,6 +4,12 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.4.0 (unreleased)
+
+- pubsub: breaking: `retry_publish` moved from `RetryPolicy` to
+  `Client.Options`. Write `.retry_publish = false` instead of
+  `.retry = .{ .retry_publish = false }`.
+
 ## 0.3.0 (2026-09-19)
 
 - Breaking: the repository is now `zig-gcp` and the package is `gcp`, with
