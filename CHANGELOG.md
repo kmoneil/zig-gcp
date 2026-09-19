@@ -4,12 +4,13 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-09-19)
 
 - Breaking: the repository is now `zig-gcp` and the package is `gcp`, with
   one module per Google Cloud service. Depend on `gcp` instead of `pubsub`;
   the module keeps its name, so imports do not change.
-- pubsub: no changes.
+- pubsub: no API changes. The default `User-Agent` is now
+  `zig-gcp-pubsub/0.3`, after the repository.
 
 ## 0.2.0 (2026-09-19)
 
