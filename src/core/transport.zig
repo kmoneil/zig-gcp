@@ -15,9 +15,24 @@ pub const Request = struct {
     url: []const u8,
     /// Token for `Authorization: Bearer <token>`; null sends no Authorization header.
     bearer: ?[]const u8 = null,
-    /// JSON body, sent with `Content-Type: application/json`. GET and DELETE
-    /// never carry a body.
+    /// Sent with the `Content-Type` that `content_type` names. GET and
+    /// DELETE never carry a body.
     body: ?[]const u8 = null,
+    content_type: ContentType = .json,
+};
+
+/// How a request body is encoded.
+pub const ContentType = enum {
+    json,
+    /// `application/x-www-form-urlencoded`, as OAuth token endpoints take.
+    form,
+
+    pub fn mediaType(ct: ContentType) []const u8 {
+        return switch (ct) {
+            .json => "application/json",
+            .form => "application/x-www-form-urlencoded",
+        };
+    }
 };
 
 pub const Response = struct {
@@ -165,7 +180,7 @@ pub const HttpTransport = struct {
             .redirect_behavior = .unhandled,
             .headers = .{
                 .user_agent = .{ .override = self.user_agent },
-                .content_type = if (has_body) .{ .override = "application/json" } else .omit,
+                .content_type = if (has_body) .{ .override = req.content_type.mediaType() } else .omit,
                 .authorization = if (authorization) |v| .{ .override = v } else .omit,
             },
         }) catch |err| return mapError(err, null);
@@ -650,6 +665,33 @@ test "HttpTransport sends headers and body and reads the response" {
     try testing.expect(std.mem.startsWith(u8, get, "GET /v1/projects/p/topics/t HTTP/1.1\r\n"));
     try testing.expect(std.mem.indexOf(u8, get, "authorization") == null);
     try testing.expect(std.mem.indexOf(u8, get, "content-type") == null);
+}
+
+test "HttpTransport sends a form body with its content type" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try ht.transport().send(.{
+        .method = .POST,
+        .url = server.url(&buf, "/token"),
+        .body = "grant_type=refresh_token&refresh_token=1%2F%2Fabc",
+        .content_type = .form,
+    }, arena.allocator());
+    try serving.await(io);
+
+    const post = server.request(0);
+    try expectHeader(post, "content-type: application/x-www-form-urlencoded\r\n");
+    try testing.expect(std.mem.endsWith(u8, post, "\r\n\r\ngrant_type=refresh_token&refresh_token=1%2F%2Fabc"));
 }
 
 test "HttpTransport reaches IPv6 literal hosts, as PUBSUB_EMULATOR_HOST=[::1]:8085" {
