@@ -13,6 +13,7 @@ const Method = @import("transport.zig").Method;
 const Request = @import("transport.zig").Request;
 const Response = @import("transport.zig").Response;
 const ContentType = @import("transport.zig").ContentType;
+const Header = @import("transport.zig").Header;
 const TokenProvider = @import("TokenProvider.zig");
 
 /// A `TokenProvider` that returns one token, or fails with one error, and
@@ -94,6 +95,13 @@ pub const FakeTransport = struct {
         bearer: ?[]u8,
         body: ?[]u8,
         content_type: ContentType,
+        headers: []Header,
+
+        /// The value sent for `name`, matched as HTTP matches names, or null.
+        pub fn header(self: Recorded, name: []const u8) ?[]const u8 {
+            for (self.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+            return null;
+        }
     };
 
     pub fn init(gpa: Allocator, script: []const Reply) FakeTransport {
@@ -105,6 +113,11 @@ pub const FakeTransport = struct {
             self.gpa.free(r.url);
             if (r.bearer) |b| self.gpa.free(b);
             if (r.body) |b| self.gpa.free(b);
+            for (r.headers) |h| {
+                self.gpa.free(h.name);
+                self.gpa.free(h.value);
+            }
+            self.gpa.free(r.headers);
         }
         self.requests.deinit(self.gpa);
         self.* = undefined;
@@ -148,12 +161,28 @@ pub const FakeTransport = struct {
         errdefer if (bearer) |b| self.gpa.free(b);
         const body = if (req.body) |b| try self.gpa.dupe(u8, b) else null;
         errdefer if (body) |b| self.gpa.free(b);
+        const headers = try self.gpa.alloc(Header, req.headers.len);
+        var copied: usize = 0;
+        errdefer {
+            for (headers[0..copied]) |h| {
+                self.gpa.free(h.name);
+                self.gpa.free(h.value);
+            }
+            self.gpa.free(headers);
+        }
+        for (req.headers, headers) |from, *to| {
+            const name = try self.gpa.dupe(u8, from.name);
+            errdefer self.gpa.free(name);
+            to.* = .{ .name = name, .value = try self.gpa.dupe(u8, from.value) };
+            copied += 1;
+        }
         try self.requests.append(self.gpa, .{
             .method = req.method,
             .url = url,
             .bearer = bearer,
             .body = body,
             .content_type = req.content_type,
+            .headers = headers,
         });
     }
 };
@@ -606,4 +635,25 @@ test "FakeTransport records requests and replays the script" {
     );
     try std.testing.expectEqual(3, fake.requests.items.len);
     try std.testing.expectEqualStrings("{}", (try fake.request(1)).body.?);
+}
+
+test "FakeTransport records the headers a request carried" {
+    var fake: FakeTransport = .init(std.testing.allocator, &.{.{ .respond = .{} }});
+    defer fake.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    // The caller's headers may be gone by the time the test looks.
+    var name: [15]u8 = "Metadata-Flavor".*;
+    var value: [6]u8 = "Google".*;
+    _ = try fake.transport().send(.{
+        .method = .GET,
+        .url = "http://x/computeMetadata/v1/",
+        .headers = &.{.{ .name = &name, .value = &value }},
+    }, arena.allocator());
+    @memset(&name, 'x');
+    @memset(&value, 'x');
+
+    const sent = try fake.request(0);
+    try std.testing.expectEqualStrings("Google", sent.header("metadata-flavor").?);
+    try std.testing.expectEqual(null, sent.header("x-goog-user-project"));
 }
