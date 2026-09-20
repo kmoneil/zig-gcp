@@ -56,6 +56,9 @@ pub fn isRetryable(err: anyerror) bool {
         error.NetworkUnreachable,
         error.NameServerFailure,
         error.TlsFailure,
+        // A request that outlived its own deadline: the next attempt may
+        // find the server healthy again.
+        error.TimedOut,
         => true,
         else => false,
     };
@@ -104,10 +107,10 @@ test "odd policies stay total" {
 
 test "retryable errors are exactly the transient ones" {
     for ([_]anyerror{
-        error.ResourceExhausted,  error.Internal,           error.Unavailable,
-        error.DeadlineExceeded,   error.ConnectionRefused,  error.ConnectionResetByPeer,
-        error.ConnectionTimedOut, error.NetworkUnreachable, error.NameServerFailure,
-        error.TlsFailure,
+        error.ResourceExhausted, error.Internal,           error.Unavailable,
+        error.DeadlineExceeded,  error.ConnectionRefused,  error.ConnectionResetByPeer,
+        error.TimedOut,          error.ConnectionTimedOut, error.NetworkUnreachable,
+        error.NameServerFailure, error.TlsFailure,
     }) |err| try testing.expect(isRetryable(err));
     for ([_]anyerror{
         error.InvalidArgument,      error.FailedPrecondition, error.Unauthenticated,

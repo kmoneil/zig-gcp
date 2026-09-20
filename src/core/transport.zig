@@ -23,6 +23,11 @@ pub const Request = struct {
     /// end the header line is `error.InvalidRequestHeader`, never a second
     /// request smuggled into this one.
     headers: []const Header = &.{},
+    /// How long this request may take before it is `error.TimedOut`, or 0
+    /// for no limit. std.http has no timeout of its own, so without one a
+    /// server that accepts the connection and then says nothing stalls the
+    /// caller until its `std.Io` task is canceled.
+    timeout_ms: u32 = 0,
 };
 
 /// One header, as `std.http` writes it.
@@ -106,6 +111,8 @@ pub const Error = error{
     InvalidEndpoint,
     /// A header on the request has a name or value that HTTP cannot carry.
     InvalidRequestHeader,
+    /// The request did not finish within `Request.timeout_ms`.
+    TimedOut,
     /// Any other operating-system network failure.
     NetworkFailure,
     /// The surrounding `std.Io` task was canceled.
@@ -159,6 +166,32 @@ pub const HttpTransport = struct {
 
     fn send(ptr: *anyopaque, req: Request, arena: Allocator) Error!Response {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
+        if (req.timeout_ms == 0) return self.sendNow(req, arena);
+
+        // The request runs elsewhere, so a server that accepts the
+        // connection and then says nothing costs `timeout_ms` rather than
+        // the rest of the program's life. Canceling it interrupts the
+        // blocked read, and the connection it was using is not reused.
+        const Winner = union(enum) { sent: Error!Response, expired: void };
+        var slots: [2]Winner = undefined;
+        var race: std.Io.Select(Winner) = .init(self.client.io, &slots);
+        // Without a second thread there is no timeout to be had, and the
+        // request runs here instead.
+        race.concurrent(.sent, sendNow, .{ self, req, arena }) catch return self.sendNow(req, arena);
+        defer race.cancelDiscard();
+        // A failed timer leaves the request to finish on its own.
+        race.concurrent(.expired, expire, .{ self.client.io, req.timeout_ms }) catch {};
+        return switch (race.await() catch |err| return err) {
+            .sent => |result| result,
+            .expired => error.TimedOut,
+        };
+    }
+
+    fn expire(io: std.Io, ms: u32) void {
+        io.sleep(.fromMilliseconds(ms), .awake) catch {};
+    }
+
+    fn sendNow(self: *HttpTransport, req: Request, arena: Allocator) Error!Response {
         const uri = std.Uri.parse(req.url) catch return error.InvalidEndpoint;
         const protocol = http.Client.Protocol.fromUri(uri) orelse return error.InvalidEndpoint;
         if (protocol == .tls) self.expireTlsClock(.when_stale);
@@ -657,6 +690,66 @@ test "HttpTransport sends a form body with its content type" {
     const post = server.request(0);
     try expectHeader(post, "content-type: application/x-www-form-urlencoded\r\n");
     try testing.expect(std.mem.endsWith(u8, post, "\r\n\r\ngrant_type=refresh_token&refresh_token=1%2F%2Fabc"));
+}
+
+test "HttpTransport: a server that accepts and then says nothing is TimedOut" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"});
+    defer server.deinit(io);
+    server.hang = true;
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    const started = std.Io.Clock.awake.now(io);
+    try testing.expectError(error.TimedOut, ht.transport().send(.{
+        .method = .GET,
+        .url = server.url(&buf, "/v1/slow"),
+        .timeout_ms = 150,
+    }, arena.allocator()));
+    const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    // It waited for the timeout, and not much longer.
+    try testing.expect(elapsed_ms >= 150);
+    try testing.expect(elapsed_ms < 5_000);
+}
+
+test "HttpTransport: a timed-out request leaves the transport usable" {
+    const io = testing.io;
+    var slow: ScriptedServer = try .start(io, &.{"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"});
+    defer slow.deinit(io);
+    slow.hang = true;
+    var serving_slow = try io.concurrent(ScriptedServer.run, .{ &slow, io });
+    defer _ = serving_slow.cancel(io) catch {};
+    var quick: ScriptedServer = try .start(io, &.{"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"});
+    defer quick.deinit(io);
+    var serving_quick = try io.concurrent(ScriptedServer.run, .{ &quick, io });
+    defer _ = serving_quick.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.TimedOut, ht.transport().send(.{
+        .method = .GET,
+        .url = slow.url(&buf, "/v1/slow"),
+        .timeout_ms = 150,
+    }, arena.allocator()));
+
+    // The canceled request took its connection with it; the next one works.
+    var next_buf: [128]u8 = undefined;
+    const res = try ht.transport().send(.{
+        .method = .GET,
+        .url = quick.url(&next_buf, "/v1/quick"),
+        .timeout_ms = 30_000,
+    }, arena.allocator());
+    try testing.expectEqual(200, res.status);
+    try testing.expectEqualStrings("hi", res.body);
+    try serving_quick.await(io);
 }
 
 test "HttpTransport hands back the response headers, still readable after the body" {
