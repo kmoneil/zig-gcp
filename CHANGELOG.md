@@ -7,19 +7,23 @@ including the ones that did not change.
 ## 0.4.0 (unreleased)
 
 - core: new module, holding what the service modules share: the HTTP
-  transport, which can send JSON or form bodies, `RetryPolicy`, Google API
+  transport, which can send JSON or form bodies and carry extra request
+  headers, and hands back the response's, `RetryPolicy`, Google API
   errors and `Diagnostics`, `Owned`, the `TokenProvider` seam with
   `StaticToken`, `WipingAllocator` for memory that held a secret, the
   logging helper the modules share, and test helpers in `core.testing`: a
   fake transport, token provider and clock, a scripted HTTP server, and an
   allocator that checks memory was wiped. pubsub re-exports what its callers
   use, so most code never imports core.
-- auth: new module, experimental. `AuthorizedUser` reads the credentials
-  file that `gcloud auth application-default login` writes, and trades its
-  refresh token for access tokens at Google's token endpoint. `Cache`, which
-  it builds on, refreshes a token before it expires, runs one fetch at a
-  time, keeps using a still-valid token when an early refresh fails, and
-  wipes every copy it frees. `StaticToken` is also available here.
+- auth: new module, experimental. `MetadataServer` fetches tokens for the
+  service account attached to a workload on Google Cloud, reads its project
+  id, and tells you whether there is a metadata server at all.
+  `AuthorizedUser` reads the credentials file that
+  `gcloud auth application-default login` writes, and trades its refresh
+  token for access tokens at Google's token endpoint. `Cache`, which both
+  build on, refreshes a token before it expires, runs one fetch at a time,
+  keeps using a still-valid token when an early refresh fails, and wipes
+  every copy it frees. `StaticToken` is also available here.
 - pubsub: breaking: `retry_publish` moved from `RetryPolicy` to
   `Client.Options`. Write `.retry_publish = false` instead of
   `.retry = .{ .retry_publish = false }`.
