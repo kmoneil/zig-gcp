@@ -673,3 +673,147 @@ test "timeout: race a held pull against a sleep with Io.Select" {
     try testing.expect(first == .timed_out);
     try testing.expect(nowMs() - started < 5_000);
 }
+
+/// A handler for the subscriber tests: counts distinct message bodies,
+/// optionally failing each body's first delivery, and stops the
+/// subscriber once `want` distinct bodies succeeded.
+const Worker = struct {
+    gpa: Allocator = undefined,
+    subscriber: *pubsub.Subscriber = undefined,
+    want: usize = 0,
+    fail_first: bool = false,
+    sleep_ms: i64 = 0,
+    mutex: std.Io.Mutex = .init,
+    /// Body -> deliveries seen (successes and failures).
+    deliveries: std.StringHashMapUnmanaged(usize) = .empty,
+    distinct_done: usize = 0,
+
+    fn deinit(w: *Worker) void {
+        var it = w.deliveries.keyIterator();
+        while (it.next()) |key| w.gpa.free(key.*);
+        w.deliveries.deinit(w.gpa);
+    }
+
+    fn handler(w: *Worker) pubsub.Subscriber.Handler {
+        return .{ .ptr = w, .vtable = &.{ .handle = handle } };
+    }
+
+    fn handle(ptr: *anyopaque, io: std.Io, message: pubsub.ReceivedMessage) anyerror!void {
+        const w: *Worker = @ptrCast(@alignCast(ptr));
+        if (w.sleep_ms > 0) try io.sleep(.fromMilliseconds(w.sleep_ms), .awake);
+        w.mutex.lockUncancelable(io);
+        defer w.mutex.unlock(io);
+        const entry = try w.deliveries.getOrPut(w.gpa, message.data);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = try w.gpa.dupe(u8, message.data);
+            entry.value_ptr.* = 0;
+        }
+        entry.value_ptr.* += 1;
+        if (w.fail_first and entry.value_ptr.* == 1) return error.FirstDeliveryRefused;
+        if (entry.value_ptr.* == @as(usize, if (w.fail_first) 2 else 1)) {
+            w.distinct_done += 1;
+            if (w.distinct_done >= w.want) w.subscriber.stop();
+        }
+    }
+
+    fn done(w: *Worker) bool {
+        w.mutex.lockUncancelable(testing.io);
+        defer w.mutex.unlock(testing.io);
+        return w.distinct_done >= w.want;
+    }
+};
+
+/// Builds a subscriber against the fixture's server and runs it under
+/// `worker`'s control, failing rather than hanging if it never finishes.
+fn runSubscriber(f: *Fixture, sub: pubsub.Subscription, worker: *Worker, concurrency: u16, timeout_s: i64) !pubsub.Subscriber.Stats {
+    const io = testing.io;
+    var subscriber: pubsub.Subscriber = try .init(testing.allocator, io, .{
+        .subscription_id = sub.id,
+        .client = .{
+            .project_id = f.client.project_id,
+            .endpoint = .{ .url = f.client.base_url, .emulator = f.client.emulator },
+            .token_provider = if (f.production) f.token.provider() else null,
+        },
+        .concurrency = concurrency,
+    });
+    defer subscriber.deinit();
+    worker.subscriber = &subscriber;
+
+    var running = try io.concurrent(pubsub.Subscriber.run, .{ &subscriber, worker.handler() });
+    const deadline = nowMs() + timeout_s * 1000;
+    while (!worker.done()) {
+        if (nowMs() > deadline) {
+            _ = running.cancel(io) catch {};
+            std.debug.print("subscriber timed out with {d} of {d} done\n", .{ worker.distinct_done, worker.want });
+            return error.TestTimedOut;
+        }
+        try io.sleep(.fromMilliseconds(100), .awake);
+    }
+    running.await(io) catch |err| return f.fail(err);
+    return subscriber.stats();
+}
+
+test "subscriber: concurrent handlers process every message, then ack it away" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("subw");
+    const sub = try f.createSubscription("subw-sub", .{ .topic_id = topic.id });
+
+    var bodies: [40][8]u8 = undefined;
+    var messages: [40]pubsub.Message = undefined;
+    for (&bodies, &messages, 0..) |*b, *m, i| {
+        _ = std.fmt.bufPrint(b, "{d:0>8}", .{i}) catch unreachable;
+        m.* = .{ .data = b };
+    }
+    var sent = topic.publish(&messages, .{}) catch |err| return f.fail(err);
+    sent.deinit();
+
+    var worker: Worker = .{ .gpa = testing.allocator, .want = 40 };
+    defer worker.deinit();
+    const counts = try runSubscriber(&f, sub, &worker, 4, f.patience());
+    try testing.expectEqual(40, worker.deliveries.count());
+    try testing.expect(counts.acked >= 40);
+    try testing.expectEqual(counts.received, counts.acked + counts.nacked);
+    try expectNoMessages(&f, sub);
+}
+
+test "subscriber: a failing handler sees the message again, and nothing is lost" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("subr");
+    const sub = try f.createSubscription("subr-sub", .{ .topic_id = topic.id });
+    for (0..10) |i| {
+        var buf: [8]u8 = undefined;
+        _ = try publishOne(&f, topic, .{ .data = try std.fmt.bufPrint(&buf, "retry-{d}", .{i}) }, .{});
+    }
+
+    var worker: Worker = .{ .gpa = testing.allocator, .want = 10, .fail_first = true };
+    defer worker.deinit();
+    const counts = try runSubscriber(&f, sub, &worker, 2, 2 * f.patience());
+    try testing.expectEqual(10, worker.deliveries.count());
+    try testing.expect(counts.handler_failures >= 10);
+    try testing.expect(counts.acked >= 10);
+    try expectNoMessages(&f, sub);
+}
+
+test "subscriber: lease extension carries a handler past the ack deadline" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("sublease");
+    const sub = try f.createSubscription("sublease-sub", .{ .topic_id = topic.id, .ack_deadline_seconds = 10 });
+    _ = try publishOne(&f, topic, .{ .data = "hold me past the deadline" }, .{});
+
+    // The handler outlives the 10 s deadline; the subscriber's extensions
+    // must keep the message leased, so it is handled exactly once.
+    var worker: Worker = .{ .gpa = testing.allocator, .want = 1, .sleep_ms = 15_000 };
+    defer worker.deinit();
+    const counts = try runSubscriber(&f, sub, &worker, 1, 30 + f.patience());
+    try testing.expectEqual(1, worker.deliveries.count());
+    try testing.expectEqual(1, worker.deliveries.get("hold me past the deadline").?);
+    try testing.expect(counts.extended >= 1);
+    try testing.expectEqual(1, counts.acked);
+    try expectNoMessages(&f, sub);
+}

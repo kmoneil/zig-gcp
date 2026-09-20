@@ -1,22 +1,45 @@
-//! Pulls messages from a subscription, prints them, and acknowledges them.
-//! Creates the topic and the subscription first if needed. A subscription only
-//! receives messages published after it exists, so run this once before the
-//! publish example.
+//! Consumes a subscription with `pubsub.Subscriber`: messages are pulled,
+//! printed and acknowledged, with leases extended for as long as a handler
+//! runs. Creates the topic and the subscription first if needed. A
+//! subscription only receives messages published after it exists, so run
+//! this once before the publish example.
 //!
 //!     PUBSUB_EMULATOR_HOST=localhost:8085 zig build example-worker -- orders orders-worker
 //!
 //! Arguments: topic id (default "orders"), subscription id (default
-//! "orders-worker"), and `--follow` to keep waiting for messages instead of
-//! stopping at the first empty pull. Configuration is as for the publish
-//! example.
+//! "orders-worker"), and `--follow` to keep waiting for messages instead
+//! of stopping once the backlog is drained. Configuration is as for the
+//! publish example.
 
 const std = @import("std");
 const pubsub = @import("pubsub");
 
-/// The library logs under the `.pubsub` scope; show only its warnings (each
-/// retry) and hide the per-request debug lines.
+/// The library logs under the `.gcp_pubsub` scope; show only its warnings
+/// (each retry) and hide the per-request debug lines.
 pub const std_options: std.Options = .{
     .log_scope_levels = &.{.{ .scope = .gcp_pubsub, .level = .warn }},
+};
+
+/// Prints each message. Called from `concurrency` tasks at once, so the
+/// printing is locked.
+const Printer = struct {
+    mutex: std.Io.Mutex = .init,
+    out: *std.Io.Writer,
+
+    fn handler(self: *Printer) pubsub.Subscriber.Handler {
+        return .{ .ptr = self, .vtable = &.{ .handle = handle } };
+    }
+
+    fn handle(ptr: *anyopaque, io: std.Io, message: pubsub.ReceivedMessage) anyerror!void {
+        const self: *Printer = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        try self.out.print("{s} {s} ({d} bytes): {s}\n", .{
+            message.message_id, message.publish_time, message.data.len, message.data,
+        });
+        for (message.attributes) |a| try self.out.print("    {s} = {s}\n", .{ a.key, a.value });
+        try self.out.flush();
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -42,16 +65,19 @@ pub fn main(init: std.process.Init) !void {
     var token: pubsub.StaticToken = .{
         .token = std.mem.trim(u8, init.environ_map.get("PUBSUB_ACCESS_TOKEN") orelse "", &std.ascii.whitespace),
     };
-    var diag: pubsub.Diagnostics = .{};
-    var client = pubsub.Client.init(init.gpa, init.io, .{
+    const client_options: pubsub.Client.Options = .{
         .project_id = init.environ_map.get("PUBSUB_PROJECT_ID") orelse "test",
         .endpoint = pubsub.Endpoint.fromEnv(init.environ_map),
         .token_provider = if (token.token.len > 0) token.provider() else null,
-        .diagnostics = &diag,
-    }) catch |err| return fail(err, &diag);
+    };
+    var diag: pubsub.Diagnostics = .{};
+    var setup_options = client_options;
+    setup_options.diagnostics = &diag;
+    var client = pubsub.Client.init(init.gpa, init.io, setup_options) catch |err| return fail(err, &diag);
     defer client.deinit();
 
-    // Make sure the topic exists, so the examples run in any order.
+    // Make sure the topic and the subscription exist, so the examples run
+    // in any order.
     if (client.topic(topic_id).create(.{})) |created| {
         var info = created;
         info.deinit();
@@ -59,9 +85,7 @@ pub fn main(init: std.process.Init) !void {
         error.AlreadyExists => {},
         else => return fail(err, &diag),
     }
-
-    const worker = client.subscription(subscription_id);
-    if (worker.create(.{ .topic_id = topic_id })) |created| {
+    if (client.subscription(subscription_id).create(.{ .topic_id = topic_id })) |created| {
         var info = created;
         defer info.deinit();
         try out.print("created {s} on {s}\n", .{ info.value.name, info.value.topic });
@@ -71,27 +95,35 @@ pub fn main(init: std.process.Init) !void {
         else => return fail(err, &diag),
     }
 
-    var handled: usize = 0;
-    while (true) {
-        // Without `return_immediately` the server holds an empty pull open,
-        // which is what a long-running worker wants.
-        var batch = worker.pull(.{ .max_messages = 100, .return_immediately = !follow }) catch |err|
-            return fail(err, &diag);
-        defer batch.deinit();
-        if (batch.value.messages.len == 0 and !follow) break;
+    var printer: Printer = .{ .out = out };
+    var subscriber = pubsub.Subscriber.init(init.gpa, init.io, .{
+        .subscription_id = subscription_id,
+        .client = setup_options,
+        .concurrency = 4,
+    }) catch |err| return fail(err, &diag);
+    defer subscriber.deinit();
 
-        const ack_ids = try init.gpa.alloc([]const u8, batch.value.messages.len);
-        defer init.gpa.free(ack_ids);
-        for (batch.value.messages, ack_ids) |m, *ack_id| {
-            try out.print("{s} {s} ({d} bytes): {s}\n", .{ m.message_id, m.publish_time, m.data.len, m.data });
-            for (m.attributes) |a| try out.print("    {s} = {s}\n", .{ a.key, a.value });
-            ack_id.* = m.ack_id;
+    var running = try init.io.concurrent(pubsub.Subscriber.run, .{ &subscriber, printer.handler() });
+    if (!follow) {
+        // Stop once the backlog is drained: everything received resolved,
+        // and five quiet seconds passed. The window is generous because
+        // delivery can lag a fresh pull by a second or two.
+        var idle_ms: i64 = 0;
+        var last = subscriber.stats();
+        while (idle_ms < 5_000) {
+            try init.io.sleep(.fromMilliseconds(250), .awake);
+            const now = subscriber.stats();
+            const drained = now.received == now.acked + now.nacked;
+            idle_ms = if (drained and now.received == last.received) idle_ms + 250 else 0;
+            last = now;
         }
-        try out.flush();
-        worker.ack(ack_ids) catch |err| return fail(err, &diag);
-        handled += ack_ids.len;
+        subscriber.stop();
     }
-    try out.print("handled {d} messages\n", .{handled});
+    running.await(init.io) catch |err| return fail(err, &diag);
+    const counts = subscriber.stats();
+    try out.print("handled {d} messages ({d} acknowledged, {d} released)\n", .{
+        counts.received, counts.acked, counts.nacked,
+    });
     try out.flush();
 }
 

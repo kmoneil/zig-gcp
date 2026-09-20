@@ -4,6 +4,22 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.7.0 (unreleased)
+
+- pubsub: `Subscriber`, the worker loop consuming a subscription used to
+  mean writing by hand: it pulls, hands each message to a handler on one
+  of `concurrency` tasks, extends leases for as long as a handler runs
+  (up to `max_extension_s`), acknowledges successes, releases failures
+  for redelivery, and bounds unresolved messages with `max_outstanding`.
+  Transient failures are retried forever with backoff; a fatal one, such
+  as the subscription being deleted, stops the loop and comes back from
+  `run` with diagnostics. `stop` drains cleanly from any task, `stats`
+  snapshots the counters, and `examples/worker.zig` is now four lines of
+  handler around it. Proven by unit tests against an in-memory server,
+  integration tests against the emulator (a 15-second handler outliving
+  a 10-second ack deadline included), and a fault-injection run.
+- core, auth: unchanged.
+
 ## 0.6.0 (2026-09-20)
 
 - auth: service account keys. `ServiceAccount` reads a `service_account`
