@@ -4,6 +4,24 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.5.0 (unreleased)
+
+- core: every request now carries a deadline. `Request.timeout_ms` bounds
+  one request, and one that outlives it is the new `error.TimedOut`, which
+  the retry policy treats as transient. std.http has no timeout of its own,
+  so before this a server that accepted a connection and then said nothing
+  stalled the caller until its `std.Io` task was canceled. A timed-out
+  request takes its connection with it, and the transport stays usable.
+  Where the runtime offers no second thread there is no timer to race, and
+  the request runs unbounded as before.
+- core: breaking, for exhaustive switches: `transport.Error` gains
+  `TimedOut`, so `pubsub.Error` does too.
+- pubsub: `Client.Options.request_timeout_ms`, 3 minutes by default,
+  because an empty pull is held open by the server. 0 removes the limit.
+- auth: `request_timeout_ms` on `AuthorizedUser`, `MetadataServer` and
+  `findDefault`: 30 seconds for a token endpoint on the internet, 10 for
+  the metadata server on this machine's own network.
+
 ## 0.4.0 (2026-09-20)
 
 - core: new module, holding what the service modules share: the HTTP
