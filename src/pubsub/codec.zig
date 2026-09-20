@@ -13,6 +13,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Stringify = std.json.Stringify;
+const base64 = @import("core").base64;
 const types = @import("types.zig");
 const test_util = @import("test_util.zig");
 
@@ -41,7 +42,7 @@ const PublishBody = struct {
             try jw.beginObject();
             if (m.data.len > 0) {
                 try jw.objectField("data");
-                try writeBase64(jw, m.data);
+                try base64.writeJsonString(jw, m.data);
             }
             if (m.attributes.len > 0) {
                 try jw.objectField("attributes");
@@ -63,14 +64,6 @@ const PublishBody = struct {
     }
 };
 
-/// Streams `data` as a base64 JSON string without an intermediate copy.
-fn writeBase64(jw: *Stringify, data: []const u8) Stringify.Error!void {
-    try jw.beginWriteRaw();
-    try jw.writer.writeByte('"');
-    try std.base64.standard.Encoder.encodeWriter(jw.writer, data);
-    try jw.writer.writeByte('"');
-    jw.endWriteRaw();
-}
 
 /// The `subscriptions.pull` body. `max_messages` must already be clamped.
 pub fn encodePull(arena: Allocator, max_messages: u32, return_immediately: bool) Allocator.Error![]u8 {
@@ -165,7 +158,7 @@ pub fn publishBodyLen(messages: []const types.Message, ordering_key: ?[]const u8
         var fields: usize = 0;
         n += "{}".len;
         if (m.data.len > 0) {
-            n += "\"data\":\"\"".len + std.base64.standard.Encoder.calcSize(m.data.len);
+            n += "\"data\":\"\"".len + base64.encodedLen(m.data.len);
             fields += 1;
         }
         if (m.attributes.len > 0) {
@@ -366,21 +359,9 @@ fn attributesFromWire(
     return out;
 }
 
-pub const Base64Error = error{ InvalidBase64, OutOfMemory };
-
-/// Decodes base64 with or without padding. Accepts the URL-safe alphabet too,
-/// as proto3 JSON parsers must, but not a mix of the two alphabets.
-pub fn decodeBase64(arena: Allocator, text: []const u8) Base64Error![]u8 {
-    const url_safe = std.mem.indexOfAny(u8, text, "-_") != null;
-    const padded = text.len % 4 == 0 and std.mem.endsWith(u8, text, "=");
-    const codecs = if (url_safe)
-        if (padded) std.base64.url_safe else std.base64.url_safe_no_pad
-    else if (padded) std.base64.standard else std.base64.standard_no_pad;
-    const size = codecs.Decoder.calcSizeForSlice(text) catch return error.InvalidBase64;
-    const out = try arena.alloc(u8, size);
-    codecs.Decoder.decode(out, text) catch return error.InvalidBase64;
-    return out;
-}
+/// Base64: the same rules for every Google JSON API, so core owns them.
+pub const Base64Error = base64.Error;
+pub const decodeBase64 = base64.decode;
 
 // Tests
 
@@ -617,19 +598,6 @@ test "decode publish: ids must match the message count" {
     try testing.expectError(error.InvalidResponse, decodePublish(a, "{\"messageIds\":[null]}", 1));
 }
 
-test "base64: padding, alphabets and rejects" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    try testing.expectEqualStrings("", try decodeBase64(a, ""));
-    try testing.expectEqualStrings("hi", try decodeBase64(a, "aGk="));
-    try testing.expectEqualStrings("hi", try decodeBase64(a, "aGk"));
-    try testing.expectEqualStrings("h", try decodeBase64(a, "aA=="));
-    try testing.expectEqualStrings("h", try decodeBase64(a, "aA"));
-    for ([_][]const u8{ "a", "aGk==", "a=Gk", "+-", "aGk=\n", " aGk", "====", "aGk*" }) |bad| {
-        try testing.expectError(error.InvalidBase64, decodeBase64(a, bad));
-    }
-}
 
 test "jsonStringLen matches Stringify" {
     var buf: [64]u8 = undefined;
@@ -662,44 +630,6 @@ test "AckChunks splits by size and count, in order" {
 
 // Fuzz properties
 
-const base64_variants = [_]std.base64.Codecs{
-    std.base64.standard,
-    std.base64.standard_no_pad,
-    std.base64.url_safe,
-    std.base64.url_safe_no_pad,
-};
-
-fn base64RoundTrip(_: void, input: []const u8) !void {
-    var g: ByteGen = .init(input);
-    const codecs = base64_variants[g.intRange(usize, 0, 3)];
-    const data = g.rest();
-    var encoded_buf: [std.base64.standard.Encoder.calcSize(test_util.max_fuzz_input)]u8 = undefined;
-    const encoded = codecs.Encoder.encode(&encoded_buf, data);
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    try testing.expectEqualSlices(u8, data, try decodeBase64(arena.allocator(), encoded));
-}
-
-test "fuzz base64: every encoding variant decodes back" {
-    try test_util.fuzzBytes({}, base64RoundTrip, .{ .corpus = &.{ "\x00", "\x01\xfb\xff", "\x02hello", "\x03\x00\x00" } });
-}
-
-fn base64Arbitrary(_: void, input: []const u8) !void {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const decoded = decodeBase64(a, input) catch |err| switch (err) {
-        error.InvalidBase64 => return,
-        else => return err,
-    };
-    // Whatever it accepts is consistent: re-encode and decode again.
-    const again = try a.alloc(u8, std.base64.standard.Encoder.calcSize(decoded.len));
-    try testing.expectEqualSlices(u8, decoded, try decodeBase64(a, std.base64.standard.Encoder.encode(again, decoded)));
-}
-
-test "fuzz base64: arbitrary input never crashes" {
-    try test_util.fuzzBytes({}, base64Arbitrary, .{ .corpus = &.{ "aGk=", "aGk", "-_", "a===", "=", "aGk*", "AAAA" } });
-}
 
 fn decodeArbitrary(_: void, input: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -805,7 +735,7 @@ fn writePullResponse(arena: Allocator, messages: []const types.ReceivedMessage) 
                 try jw.beginObject();
                 if (m.data.len > 0) {
                     try jw.objectField("data");
-                    try writeBase64(jw, m.data);
+                    try base64.writeJsonString(jw, m.data);
                 }
                 if (m.attributes.len > 0) {
                     try jw.objectField("attributes");

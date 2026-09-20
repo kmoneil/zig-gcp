@@ -15,6 +15,12 @@ pub const rpc = @import("rpc.zig");
 /// Resource-name rules more than one service needs.
 pub const names = @import("names.zig");
 
+/// Turning a configured endpoint into the base URL of every request.
+pub const endpoint = @import("endpoint.zig");
+
+/// Base64, as Google's JSON APIs carry `bytes` fields.
+pub const base64 = @import("base64.zig");
+
 pub const RetryPolicy = @import("retry.zig").RetryPolicy;
 pub const isRetryable = @import("retry.zig").isRetryable;
 
@@ -52,7 +58,9 @@ test {
     _ = @import("StaticToken.zig");
     _ = @import("TokenProvider.zig");
     _ = @import("WipingAllocator.zig");
+    _ = @import("base64.zig");
     _ = @import("crc32c.zig");
+    _ = @import("endpoint.zig");
     _ = @import("errors.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");

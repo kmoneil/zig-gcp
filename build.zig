@@ -31,6 +31,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
+    // Secrets. It imports core, never a service.
+    const secret_manager = b.addModule("secret_manager", .{
+        .root_source_file = b.path("src/secret_manager/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+
     // Fuzzing on Zig 0.16.0 needs two things the defaults lack: a test runner
     // that compiles in fuzz mode (see tools/test_runner.zig), and the LLVM
     // backend. The self-hosted x86_64 backend, the Debug default there,
@@ -44,7 +52,12 @@ pub fn build(b: *std.Build) void {
     // Unit, property and fuzz-corpus tests, one run per module. No network: a
     // fake transport and a fake clock drive everything.
     // `zig build test -Dfuzz-runner --fuzz` fuzzes the same tests.
-    const unit_modules = [_]struct { []const u8, *std.Build.Module }{ .{ "core", core }, .{ "auth", auth }, .{ "pubsub", mod } };
+    const unit_modules = [_]struct { []const u8, *std.Build.Module }{
+        .{ "core", core },
+        .{ "auth", auth },
+        .{ "pubsub", mod },
+        .{ "secret_manager", secret_manager },
+    };
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     for (unit_modules) |entry| {
         const unit_tests = b.addTest(.{
@@ -145,10 +158,12 @@ pub fn build(b: *std.Build) void {
     run_fault.has_side_effects = true;
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "worker", "whoami" }) |name| {
-        // whoami is the one example that picks its own credentials.
+    inline for (.{ "publish", "worker", "whoami", "secret" }) |name| {
+        // whoami and secret pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "secret"))
+            &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
         else
             &.{.{ .name = "pubsub", .module = mod }};
         const exe = b.addExecutable(.{
