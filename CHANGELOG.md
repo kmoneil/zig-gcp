@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.6.0 (unreleased)
+## 0.6.0 (2026-09-20)
 
 - auth: service account keys. `ServiceAccount` reads a `service_account`
   key file, signs a short-lived RS256 JWT with its RSA key, and trades it
