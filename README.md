@@ -172,10 +172,20 @@ the server has closed an idle connection. Retried creates and deletes can report
 `AlreadyExists` or `NotFound` for an attempt that succeeded but whose
 response was lost.
 
-`std.http.Client` has no per-request timeout in 0.16, and the library adds
-none: bounding a call is up to the caller's `std.Io`. A canceled call returns
-`error.Canceled` promptly and the client stays usable. To race a call against
-a timer (this exact code runs in the integration tests):
+`std.http.Client` has no per-request timeout in 0.16, so the library adds
+one: every request is raced against a timer, and one that outlives
+`Client.Options.request_timeout_ms` (3 minutes by default) is
+`error.TimedOut` and is retried like any other transient failure. The
+default is generous because an empty pull is held open by the server; lower
+it for calls that should fail fast, or set 0 to remove the limit. A request
+that times out takes its connection with it, and the client stays usable.
+Where the runtime offers no second thread, there is no timer to race, and
+the request runs unbounded as before.
+
+That bounds one request, not a whole call: five attempts with backoff can
+still take longer. A canceled call returns `error.Canceled` promptly, so to
+bound everything, race the call itself against a timer (this exact code runs
+in the integration tests):
 
 ```zig
 const Race = union(enum) {

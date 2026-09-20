@@ -83,6 +83,11 @@ code in `src/`.
   checked against RFC 9110 before the transport connects.
   `HttpTransport refuses a header that would end the line, before it
   connects`, `fuzz headers: nothing accepted can break the request`.
+- **A request cannot hang forever.** Every one is raced against a timer,
+  and one that outlives its deadline is `error.TimedOut`, whatever the
+  server is doing. `HttpTransport: a server that accepts and then says
+  nothing is TimedOut`, `HttpTransport: a timed-out request leaves the
+  transport usable`.
 - **Credential files are only read,** never written, and one over 64 KiB
   is refused. `AuthorizedUser: initFromFile reads the file, and reports a
   missing or oversized one`.
@@ -160,17 +165,17 @@ code in `src/`.
 Stated plainly, because a threat model that only lists wins is not one.
 
 It can lie about the data: wrong messages, wrong ids, a list that leaves
-topics out. It can withhold messages, redeliver them, or answer slowly; a
-slow answer is bounded only by the caller's own cancellation, because
-std.http has no request timeout. It can send a body just under the 32 MiB
-cap. And on the plain-HTTP path to the emulator, anyone in between can read
-and change everything, which is why no token ever goes there. A service
-answering on the metadata address is in the same position: it receives no
-credential, because that request carries none, and the most it can do is
-hand out a token that does not work, or nothing at all. A token
-endpoint can hand out a token that does not work; the cache keeps it for at
-most 12 hours (`max_lifetime_s`), or until the provider's `invalidate` is
-called.
+topics out. It can withhold messages, redeliver them, or answer slowly,
+though a request that outlives `request_timeout_ms` is dropped and its
+connection with it. It can still spend that whole budget on every attempt,
+and it can send a body just under the 32 MiB cap. And on the plain-HTTP path
+to the emulator, anyone in between can read and change everything, which is
+why no token ever goes there. A service answering on the metadata address is
+in the same position: it receives no credential, because that request
+carries none, and the most it can do is hand out a token that does not work,
+or nothing at all. A token endpoint can hand out a token that does not work;
+the cache keeps it for at most 12 hours (`max_lifetime_s`), or until the
+provider's `invalidate` is called.
 
 What it cannot do is get a credential sent anywhere else, crash the client,
 or get a truncated body accepted as complete.
