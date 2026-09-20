@@ -15,9 +15,14 @@ including the ones that did not change.
   fake transport, token provider and clock, a scripted HTTP server, and an
   allocator that checks memory was wiped. pubsub re-exports what its callers
   use, so most code never imports core.
-- auth: new module, experimental. `MetadataServer` fetches tokens for the
-  service account attached to a workload on Google Cloud, reads its project
-  id, and tells you whether there is a metadata server at all.
+- auth: new module, experimental. `findDefault` picks credentials the way
+  Google's own libraries do: the file `GOOGLE_APPLICATION_CREDENTIALS`
+  names, then the one gcloud's login writes, then the metadata server, with
+  `Lookup.fromEnv` reading the variables and per-OS paths. A credential that
+  is there but unusable stops the search rather than falling through.
+  `MetadataServer` fetches tokens for the service account attached to a
+  workload on Google Cloud, reads its project id, and tells you whether
+  there is a metadata server at all.
   `AuthorizedUser` reads the credentials file that
   `gcloud auth application-default login` writes, and trades its refresh
   token for access tokens at Google's token endpoint. `Cache`, which both
