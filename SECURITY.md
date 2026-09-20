@@ -57,6 +57,7 @@ code in `src/`.
   refresh token and client secret, the credentials file as read, and
   everything a token fetch allocated. `Cache: every block the cache frees is
   wiped first`, `AuthorizedUser: every block it frees is wiped first`,
+  `MetadataServer: every block it frees is wiped first`,
   `WipingAllocator: freed memory is zeroed before the child gets it back`,
   `WipingAllocator: an arena on top wipes every chunk when it is freed`,
   `fuzz WipingAllocator: nothing written survives a free`. Not covered:
@@ -66,6 +67,22 @@ code in `src/`.
   plain http only to this machine, for tests. A redirect is refused, not
   followed. `AuthorizedUser: the token URL must use https, or http to this
   machine`, `AuthorizedUser: against a token endpoint on loopback`.
+- **The metadata server has to prove itself.** It speaks plain HTTP by
+  design, on an address that never leaves the host, so a header stands in
+  for TLS: every request carries `Metadata-Flavor: Google`, which nothing
+  can be tricked into sending by accident, and an answer without it is
+  refused, whatever it contains. A redirect is refused too, and its
+  answers are read to at most 64 KiB.
+  `MetadataServer: the token request carries Metadata-Flavor and no token
+  of its own`, `MetadataServer: an answer without Metadata-Flavor is not
+  the metadata server's`, `MetadataServer: a wrong Metadata-Flavor value is
+  refused, any case is accepted`, `MetadataServer: a redirect is refused,
+  not followed`, `MetadataServer: its own transport reads at most 64 KiB
+  from the answer`.
+- **A header cannot smuggle a second request:** every name and value is
+  checked against RFC 9110 before the transport connects.
+  `HttpTransport refuses a header that would end the line, before it
+  connects`, `fuzz headers: nothing accepted can break the request`.
 - **Credential files are only read,** never written, and one over 64 KiB
   is refused. `AuthorizedUser: initFromFile reads the file, and reports a
   missing or oversized one`.
@@ -78,7 +95,8 @@ code in `src/`.
   reaches the log`, `log hygiene: page tokens stay out of the log`, `fuzz: a
   provider's token reaches the request intact or not at all`, `Cache: a
   failed early refresh returns the cached token, warns, and retries 10 s
-  later`, `AuthorizedUser: secrets reach neither the log nor Diagnostics`.
+  later`, `AuthorizedUser: secrets reach neither the log nor Diagnostics`,
+  `MetadataServer: the token reaches neither the log nor Diagnostics`.
 
 ## Talking to a server
 
@@ -137,7 +155,10 @@ topics out. It can withhold messages, redeliver them, or answer slowly; a
 slow answer is bounded only by the caller's own cancellation, because
 std.http has no request timeout. It can send a body just under the 32 MiB
 cap. And on the plain-HTTP path to the emulator, anyone in between can read
-and change everything, which is why no token ever goes there. A token
+and change everything, which is why no token ever goes there. A service
+answering on the metadata address is in the same position: it receives no
+credential, because that request carries none, and the most it can do is
+hand out a token that does not work, or nothing at all. A token
 endpoint can hand out a token that does not work; the cache keeps it for at
 most 12 hours (`max_lifetime_s`), or until the provider's `invalidate` is
 called.

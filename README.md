@@ -7,11 +7,11 @@ modules it imports.
 | Module | Covers | Stability |
 | --- | --- | --- |
 | `pubsub` | Pub/Sub v1: publish, pull, acknowledge, and topic and subscription management | beta |
-| `auth` | Credentials for the service modules: `AuthorizedUser`, which uses the login `gcloud auth application-default login` saves, and `StaticToken`. | experimental |
+| `auth` | Credentials for the service modules: `MetadataServer` on Google Cloud, `AuthorizedUser` for the login `gcloud auth application-default login` saves, and `StaticToken`. | experimental |
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 216 unit, property and fuzz tests; 20 Pub/Sub integration
+- Tested with 245 unit, property and fuzz tests; 20 Pub/Sub integration
   tests that pass against both the emulator and production; and 2 auth tests
   against Google's token endpoint.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
@@ -92,9 +92,26 @@ var client = try pubsub.Client.init(gpa, io, .{
 });
 ```
 
-`user` must not move while the client uses its provider. Finding the file
-on its own, and credentials from the metadata server on Google Cloud, are
-planned. A static token also works, for about an hour:
+`user` must not move while the client uses its provider.
+
+On Google Cloud (Cloud Run, GKE, GCE, Cloud Functions), nothing has to be
+stored: the workload's service account has a token waiting on the metadata
+server, and `auth.MetadataServer` fetches and refreshes it. `probe` answers
+whether there is a metadata server to ask, in half a second on a machine
+that has none:
+
+```zig
+var metadata = try auth.MetadataServer.init(gpa, io, .{});
+defer metadata.deinit();
+if (!metadata.probe(io)) return error.NotOnGoogleCloud;
+var client = try pubsub.Client.init(gpa, io, .{
+    .project_id = try metadata.projectId(io, arena), // or your own
+    .token_provider = metadata.provider(),
+});
+```
+
+Choosing between the two by where the program runs is coming next. A static
+token also works, for about an hour:
 
 ```zig
 var token: pubsub.StaticToken = .{ .token = access_token }; // gcloud auth print-access-token
