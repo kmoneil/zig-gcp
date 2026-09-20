@@ -13,6 +13,7 @@ pub const RetryPolicy = core.RetryPolicy;
 pub const Cache = @import("Cache.zig");
 pub const AuthorizedUser = @import("AuthorizedUser.zig");
 pub const ServiceAccount = @import("ServiceAccount.zig");
+pub const ExternalAccount = @import("ExternalAccount.zig");
 pub const MetadataServer = @import("MetadataServer.zig");
 pub const Lookup = @import("Lookup.zig");
 pub const Credentials = @import("Credentials.zig");
@@ -25,6 +26,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("AuthorizedUser.zig");
     _ = @import("ServiceAccount.zig");
+    _ = @import("ExternalAccount.zig");
     _ = @import("MetadataServer.zig");
     _ = @import("rsa.zig");
     _ = @import("Lookup.zig");

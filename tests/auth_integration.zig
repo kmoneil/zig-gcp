@@ -134,6 +134,66 @@ test "a real assertion, then a Pub/Sub call the token authenticates" {
     page.deinit();
 }
 
+test "a real exchange: the STS trades a real subject token for an access token" {
+    var env = try testing.environ.createMap(testing.allocator);
+    defer env.deinit();
+    var type_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer type_arena.deinit();
+    const kind = try credentialsType(&env, type_arena.allocator()) orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, kind, "external_account")) return error.SkipZigTest;
+    const path = env.get("AUTH_TEST_CREDENTIALS").?;
+    var diag: auth.Diagnostics = .{};
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+
+    var account: auth.ExternalAccount = try .initFromFile(testing.allocator, testing.io, path, .{ .diagnostics = &diag });
+    defer account.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const p = account.provider();
+
+    const first = try p.getToken(testing.io, arena.allocator(), scopes);
+    try testing.expect(auth.TokenProvider.isValidToken(first));
+    // The second call is served from the cache.
+    try testing.expectEqualStrings(first, try p.getToken(testing.io, arena.allocator(), scopes));
+    // After invalidate, the whole exchange runs again.
+    p.invalidate();
+    try testing.expect(auth.TokenProvider.isValidToken(try p.getToken(testing.io, arena.allocator(), scopes)));
+}
+
+test "a real STS refusal: Google's token exchange rejects a fabricated subject token in form" {
+    // Needs no credentials, only permission to touch the network, which
+    // AUTH_TEST_CREDENTIALS being set signals.
+    var env = try testing.environ.createMap(testing.allocator);
+    defer env.deinit();
+    if (env.get("AUTH_TEST_CREDENTIALS") == null) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "subject", .data = "not-a-real-oidc-token" });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const json = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"type": "external_account",
+        \\ "audience": "//iam.googleapis.com/projects/000000/locations/global/workloadIdentityPools/no-such-pool/providers/none",
+        \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        \\ "token_url": "https://sts.googleapis.com/v1/token",
+        \\ "credential_source": {{"file": ".zig-cache/tmp/{s}/subject"}}}}
+    , .{&tmp.sub_path});
+
+    var diag: auth.Diagnostics = .{};
+    var account: auth.ExternalAccount = try .initFromJson(testing.allocator, testing.io, json, .{ .diagnostics = &diag });
+    defer account.deinit();
+    // The real endpoint answers with a real OAuth error, which proves the
+    // exchange's wire format and our reading of the answer.
+    try testing.expectError(error.TokenEndpointRejected, account.provider().getToken(
+        testing.io,
+        arena.allocator(),
+        &.{"https://www.googleapis.com/auth/cloud-platform"},
+    ));
+    try testing.expectEqual(400, diag.http_status);
+    try testing.expect(diag.status().len > 0);
+    try testing.expect(diag.message().len > 0);
+}
+
 test "on Google Cloud: the metadata server hands out a token for the attached account" {
     const io = testing.io;
     var diag: auth.Diagnostics = .{};

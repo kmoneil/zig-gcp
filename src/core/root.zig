@@ -28,6 +28,9 @@ pub const WipingAllocator = @import("WipingAllocator.zig");
 /// Logging under each module's own scope, captured in test builds.
 pub const logging = @import("logging.zig");
 
+/// RFC 3339 timestamps, as Google's APIs send them.
+pub const timestamp = @import("timestamp.zig");
+
 /// Fakes and property-test helpers, for tests only.
 pub const testing = @import("testing.zig");
 
@@ -41,5 +44,6 @@ test {
     _ = @import("owned.zig");
     _ = @import("retry.zig");
     _ = @import("testing.zig");
+    _ = @import("timestamp.zig");
     _ = @import("transport.zig");
 }

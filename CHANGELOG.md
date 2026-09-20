@@ -4,6 +4,24 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.8.0 (unreleased)
+
+- auth: workload identity federation. `ExternalAccount` reads an
+  `external_account` file, fetches the third-party subject token from its
+  credential source (a file or a URL, text or a JSON field), trades it at
+  Google's STS with an RFC 8693 token exchange, and impersonates a
+  service account through the IAM Credentials API when the file asks.
+  `findDefault` and the gcloud file path accept such files wherever the
+  other types worked. Subject tokens rotate, so each fetch reads anew;
+  everything is cached, retried and wiped like the other providers. AWS
+  credential sources (which need request signing), executable sources
+  (which run a subprocess) and workforce pools are refused by name.
+- auth: the scope-fixing that `ServiceAccount` introduced is shared as
+  `Cache.ScopeSet`, and `ExternalAccount` uses it too.
+- core: gains `timestamp` (RFC 3339), moved from pubsub, which auth needs
+  for impersonated tokens' expiry. `pubsub.parseTimestamp` is unchanged.
+- pubsub: unchanged.
+
 ## 0.7.0 (2026-09-20)
 
 - pubsub: `Subscriber`, the worker loop consuming a subscription used to

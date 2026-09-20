@@ -151,7 +151,8 @@ Cloud that means a program needs no configuration at all.
 It looks in three places, in this order:
 
 1. The credentials file `GOOGLE_APPLICATION_CREDENTIALS` names: a user
-   login (`authorized_user`) or a service account key (`service_account`).
+   login (`authorized_user`), a service account key (`service_account`),
+   or workload identity federation (`external_account`).
 2. The file `gcloud auth application-default login` writes, under
    `$HOME/.config/gcloud` or `%APPDATA%\gcloud`.
 3. The metadata server, on Cloud Run, GKE, GCE or Cloud Functions, which
@@ -164,7 +165,8 @@ somebody else, quietly, would be worse. With nothing anywhere, the error is
 `NoCredentialsFound` and `Diagnostics` lists what was tried.
 
 To choose a source yourself, use `auth.AuthorizedUser.initFromFile` for a
-user login, `auth.ServiceAccount.initFromFile` for a key file, or
+user login, `auth.ServiceAccount.initFromFile` for a key file,
+`auth.ExternalAccount.initFromFile` for federation, or
 `auth.MetadataServer` on Google Cloud, whose `probe` answers whether there
 is a metadata server to ask (in half a second on a machine that has none)
 and whose `projectId` says which project it runs in. None of them may move
@@ -176,6 +178,16 @@ A `ServiceAccount` signs a short-lived JWT with the key file's RSA key
 anything is sent) and trades it at the token endpoint. Its tokens are
 minted for particular scopes, so the first `getToken` fixes them; use a
 second provider for a second scope set.
+
+An `ExternalAccount` is workload identity federation: no stored Google key
+at all. Each fetch reads the third-party subject token from the file's
+credential source (a file, as GitHub Actions and Kubernetes write, or a
+URL, as Azure's metadata service answers), trades it at Google's STS, and,
+when the file names a service account to impersonate, trades once more at
+the IAM Credentials API. Subject tokens rotate, so each fetch reads anew.
+AWS credential sources (which need request signing) and executable sources
+(which run a subprocess) are refused by name. Scopes fix on first use, as
+for a service account.
 
 A static token also works, for about an hour:
 

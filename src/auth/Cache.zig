@@ -33,6 +33,68 @@ expires_at: std.Io.Timestamp = .zero,
 /// How long to wait after a failed early refresh before trying again.
 pub const retry_delay_s = 10;
 
+/// The scopes a provider's tokens are minted for, fixed by the first
+/// `getToken`: a cached token handed out for other scopes would give a
+/// caller more or less than it asked for. Embed one per provider.
+pub const ScopeSet = struct {
+    mutex: std.Io.Mutex = .init,
+    /// Space-joined and owned; read freely once set.
+    joined: ?[]u8 = null,
+
+    /// Binds `scopes` on the first call and refuses different ones later.
+    /// `what` names the provider for the diagnostics.
+    pub fn bind(
+        self: *ScopeSet,
+        io: std.Io,
+        gpa: Allocator,
+        scopes: []const []const u8,
+        diag: ?*core.Diagnostics,
+        what: []const u8,
+    ) TokenProvider.Error!void {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        if (self.joined) |bound| {
+            if (matches(bound, scopes)) return;
+            if (diag) |d| d.print("this provider's tokens are scoped to what its first call asked for; use a second {s} for a second scope set", .{what});
+            return error.TokenUnavailable;
+        }
+        if (scopes.len == 0) {
+            if (diag) |d| d.print("no scopes requested; a {s} token is minted for particular scopes", .{what});
+            return error.TokenUnavailable;
+        }
+        // Each scope travels inside a space-joined field.
+        for (scopes) |scope| if (!TokenProvider.isValidToken(scope)) {
+            if (diag) |d| d.print("invalid scope: scopes are visible ASCII without spaces", .{});
+            return error.TokenUnavailable;
+        };
+        self.joined = try std.mem.join(gpa, " ", scopes);
+    }
+
+    /// Wipes and frees the bound scopes.
+    pub fn deinit(self: *ScopeSet, gpa: Allocator) void {
+        if (self.joined) |joined| {
+            std.crypto.secureZero(u8, joined);
+            gpa.rawFree(joined, .of(u8), @returnAddress());
+        }
+        self.* = undefined;
+    }
+
+    /// Whether `scopes` joined with spaces is exactly `joined`, without
+    /// allocating.
+    fn matches(joined: []const u8, scopes: []const []const u8) bool {
+        var rest = joined;
+        for (scopes, 0..) |scope, i| {
+            if (i > 0) {
+                if (!std.mem.startsWith(u8, rest, " ")) return false;
+                rest = rest[1..];
+            }
+            if (!std.mem.startsWith(u8, rest, scope)) return false;
+            rest = rest[scope.len..];
+        }
+        return rest.len == 0;
+    }
+};
+
 pub const Options = struct {
     /// Fetch a new token when less than this much of its life remains. Must
     /// be below 300: the metadata server hands out the same token until
