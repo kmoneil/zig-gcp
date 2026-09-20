@@ -21,6 +21,11 @@ including the ones that did not change.
 - auth: `request_timeout_ms` on `AuthorizedUser`, `MetadataServer` and
   `findDefault`: 30 seconds for a token endpoint on the internet, 10 for
   the metadata server on this machine's own network.
+- tests: a fault-injection suite (`zig build test-integration`) drives the
+  whole stack against the emulator through a proxy that drops connections
+  mid-response, truncates and trickles bytes, stalls past the deadline and
+  rewrites frames. It pins down what each misdelivery costs: a retry, an
+  exact error, or a duplicated publish. No API change.
 
 ## 0.4.0 (2026-09-20)
 
