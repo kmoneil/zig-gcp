@@ -9,6 +9,7 @@
 const Credentials = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const core = @import("core");
 const TokenProvider = core.TokenProvider;
@@ -403,14 +404,17 @@ test "findDefault: a gcloud path that is there but unreadable is an error" {
 }
 
 test "findDefault: a gcloud path that cannot even be checked is an error" {
-    // A path no filesystem can hold: looking for the file fails with
-    // something other than "it is not there", which must not be read as
-    // "it is not there".
+    // Looking for the file fails with something other than "it is not
+    // there", and that must not be read as "it is not there". Each
+    // platform refuses a different path: Windows reports one that is
+    // merely too long as absent, which it is, but refuses one it cannot
+    // encode, and posix is the other way round.
+    const unusable_dir = if (builtin.os.tag == .windows) "bad\xffname" else "x" ** 5000;
     var fake: test_util.FakeTransport = .init(testing.allocator, &.{ metadata_listing, metadata_token });
     defer fake.deinit();
     var diag: Diagnostics = .{};
     try testing.expectError(error.CredentialsFileNotFound, find(testing.allocator, testing.io, .{
-        .gcloud_config_dir = "x" ** 5000,
+        .gcloud_config_dir = unusable_dir,
         .diagnostics = &diag,
     }, .{ .transport = fake.transport() }));
     try testing.expect(std.mem.startsWith(u8, diag.message(), "cannot read"));
