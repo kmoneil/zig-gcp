@@ -39,6 +39,7 @@ token_provider: ?TokenProvider,
 retry: RetryPolicy,
 retry_publish: bool,
 send_quota_project: bool,
+request_timeout_ms: u32,
 diagnostics: ?*Diagnostics,
 transport: Transport,
 /// The built-in transport, when `Options.transport` was null.
@@ -59,6 +60,12 @@ pub const Options = struct {
     /// server may already have them. Subscribers must tolerate duplicates
     /// anyway; set false to never retry a publish.
     retry_publish: bool = true,
+    /// How long one request may take before it is `error.TimedOut`, which
+    /// is retried like any other transient failure. Generous by default,
+    /// because a pull with nothing to return is held open: about 20
+    /// seconds in production and 90 by the emulator. 0 removes the limit,
+    /// and nothing bounds a call then but the caller's own `std.Io`.
+    request_timeout_ms: u32 = 180_000,
     /// Sends `x-goog-user-project` when the credentials name a project to
     /// charge for quota, as a user's own credentials do. Set false where
     /// the project owning the resources should pay instead.
@@ -129,6 +136,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
         .retry = options.retry,
         .retry_publish = options.retry_publish,
         .send_quota_project = options.send_quota_project,
+        .request_timeout_ms = options.request_timeout_ms,
         .diagnostics = diag,
         .transport = transport,
         .http = http,

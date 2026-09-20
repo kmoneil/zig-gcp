@@ -31,6 +31,7 @@ refresh_token: []u8,
 quota_project_id: ?[]u8,
 token_url: []u8,
 user_agent: []u8,
+request_timeout_ms: u32,
 retry: core.RetryPolicy,
 diagnostics: ?*Diagnostics,
 cache: Cache,
@@ -46,6 +47,10 @@ pub const Options = struct {
     /// than an API call would.
     retry: core.RetryPolicy = .{ .max_attempts = 3 },
     cache: Cache.Options = .{},
+    /// How long one request to the token endpoint may take before it is
+    /// `error.TimedOut`, which the retry policy treats as transient. 0
+    /// removes the limit.
+    request_timeout_ms: u32 = 30_000,
     /// Printable ASCII.
     user_agent: []const u8 = "zig-gcp-auth/0.4",
     /// Filled with the details of the last failure, while reading the file
@@ -147,6 +152,7 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
         .quota_project_id = quota_project_id,
         .token_url = token_url,
         .user_agent = user_agent,
+        .request_timeout_ms = options.request_timeout_ms,
         .retry = options.retry,
         .diagnostics = diag,
         .cache = cache,
@@ -257,6 +263,7 @@ fn exchange(self: *AuthorizedUser, arena: Allocator, body: []const u8) Result {
         .url = self.token_url,
         .body = body,
         .content_type = .form,
+        .timeout_ms = self.request_timeout_ms,
     }, arena) catch |err| {
         if (self.diagnostics) |d| d.print("the token endpoint could not be reached: {t}", .{err});
         return if (core.isRetryable(err)) .{ .retry = err } else .{ .fail = err };
@@ -388,6 +395,16 @@ test "AuthorizedUser: the refresh is a form POST with every value encoded" {
     try testing.expectEqual(.form, req.content_type);
     try testing.expectEqual(null, req.bearer);
     try testing.expectEqualStrings(expected_body, req.body.?);
+}
+
+test "AuthorizedUser: the refresh carries a deadline of its own" {
+    var h: Harness = undefined;
+    try h.init(&.{token_ok});
+    defer h.deinit();
+    _ = try h.get();
+    // The token endpoint is on the internet, and a fetch sits in front of
+    // every API call, so it gives up well before one would.
+    try testing.expectEqual(30_000, (try h.fake.request(0)).timeout_ms);
 }
 
 test "AuthorizedUser: the token is kept until it goes stale" {

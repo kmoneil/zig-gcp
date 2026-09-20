@@ -48,6 +48,9 @@ pub const Source = enum {
 pub const Options = struct {
     cache: Cache.Options = .{},
     retry: core.RetryPolicy = .{ .max_attempts = 3 },
+    /// How long one request for a token may take before it is
+    /// `error.TimedOut`. 0 removes the limit.
+    request_timeout_ms: u32 = 30_000,
     /// Printable ASCII.
     user_agent: []const u8 = "zig-gcp-auth/0.4",
     /// How long to wait for a metadata server before deciding there is
@@ -235,6 +238,7 @@ fn userOptions(lookup: Lookup, options: Options) AuthorizedUser.Options {
         .retry = options.retry,
         .cache = options.cache,
         .user_agent = options.user_agent,
+        .request_timeout_ms = options.request_timeout_ms,
         .diagnostics = lookup.diagnostics,
         .transport = options.transport,
     };
@@ -243,6 +247,7 @@ fn userOptions(lookup: Lookup, options: Options) AuthorizedUser.Options {
 fn metadataOptions(lookup: Lookup, options: Options) MetadataServer.Options {
     var opts: MetadataServer.Options = .{
         .probe_timeout_ms = options.probe_timeout_ms,
+        .request_timeout_ms = options.request_timeout_ms,
         .retry = options.retry,
         .cache = options.cache,
         .user_agent = options.user_agent,

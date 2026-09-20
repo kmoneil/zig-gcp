@@ -63,6 +63,7 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
             .bearer = bearer,
             .body = call.body,
             .headers = headers,
+            .timeout_ms = client.request_timeout_ms,
         }, response.allocator());
         const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(client.io)).toMilliseconds();
 
@@ -813,4 +814,38 @@ test "401: a call that fails twice over still reports the later failure" {
     try h.expectRequestCount(3);
     try testing.expectEqual(1, provider.invalidations);
     try testing.expectEqual(1, h.clock.sleep_count);
+}
+
+test "timeouts: every request carries the client's deadline" {
+    var h: Harness = undefined;
+    try h.init(&.{ topic_ok, topic_ok }, .{});
+    defer h.deinit();
+    var info = try h.client.topic("orders").get();
+    info.deinit();
+    // Generous by default: an empty pull is held open, up to about 90
+    // seconds by the emulator.
+    try testing.expectEqual(180_000, (try h.fake.request(0)).timeout_ms);
+    try testing.expect(h.client.request_timeout_ms > 90_000);
+
+    h.client.request_timeout_ms = 2_500;
+    var again = try h.client.topic("orders").get();
+    again.deinit();
+    try testing.expectEqual(2_500, (try h.fake.request(1)).timeout_ms);
+}
+
+test "timeouts: a request that outlived its deadline is retried" {
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .fail = error.TimedOut }, topic_ok }, .{});
+    defer h.deinit();
+    var info = try h.client.topic("orders").get();
+    defer info.deinit();
+    try h.expectRequestCount(2);
+    try testing.expectEqual(1, h.clock.sleep_count);
+
+    // Unless the caller turned retries off for this call.
+    var publish: Harness = undefined;
+    try publish.init(&.{.{ .fail = error.TimedOut }}, .{ .retry_publish = false });
+    defer publish.deinit();
+    try testing.expectError(error.TimedOut, publish.client.topic("orders").publish(&.{.{ .data = "x" }}, .{}));
+    try publish.expectRequestCount(1);
 }
