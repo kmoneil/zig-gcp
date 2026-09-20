@@ -101,12 +101,14 @@ user credentials name: the client sends it as `x-goog-user-project`, and
 `send_quota_project` turns that off. When a call comes back 401, the client
 drops the cached token, fetches another and tries once more.
 `creds.projectId(io, arena)` says which project the program runs in, when
-the credentials know: the metadata server does, a credentials file does
-not. On Google Cloud that means a program needs no configuration at all.
+the credentials know: the metadata server does, and a service account key
+file names the project it belongs to; a user login does not. On Google
+Cloud that means a program needs no configuration at all.
 
 It looks in three places, in this order:
 
-1. The credentials file `GOOGLE_APPLICATION_CREDENTIALS` names.
+1. The credentials file `GOOGLE_APPLICATION_CREDENTIALS` names: a user
+   login (`authorized_user`) or a service account key (`service_account`).
 2. The file `gcloud auth application-default login` writes, under
    `$HOME/.config/gcloud` or `%APPDATA%\gcloud`.
 3. The metadata server, on Cloud Run, GKE, GCE or Cloud Functions, which
@@ -119,11 +121,18 @@ somebody else, quietly, would be worse. With nothing anywhere, the error is
 `NoCredentialsFound` and `Diagnostics` lists what was tried.
 
 To choose a source yourself, use `auth.AuthorizedUser.initFromFile` for a
-credentials file, or `auth.MetadataServer` on Google Cloud, whose `probe`
-answers whether there is a metadata server to ask (in half a second on a
-machine that has none) and whose `projectId` says which project it runs in.
-Neither may move while a client uses its provider; the `Credentials` that
-`findDefault` returns may, because it keeps the provider on the heap.
+user login, `auth.ServiceAccount.initFromFile` for a key file, or
+`auth.MetadataServer` on Google Cloud, whose `probe` answers whether there
+is a metadata server to ask (in half a second on a machine that has none)
+and whose `projectId` says which project it runs in. None of them may move
+while a client uses its provider; the `Credentials` that `findDefault`
+returns may, because it keeps the provider on the heap.
+
+A `ServiceAccount` signs a short-lived JWT with the key file's RSA key
+(RS256, via `std.crypto`, checked against the key's own public half before
+anything is sent) and trades it at the token endpoint. Its tokens are
+minted for particular scopes, so the first `getToken` fixes them; use a
+second provider for a second scope set.
 
 A static token also works, for about an hour:
 

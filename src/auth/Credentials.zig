@@ -19,6 +19,8 @@ const AuthorizedUser = @import("AuthorizedUser.zig");
 const Cache = @import("Cache.zig");
 const Lookup = @import("Lookup.zig");
 const MetadataServer = @import("MetadataServer.zig");
+const ServiceAccount = @import("ServiceAccount.zig");
+const adc_file = @import("adc_file.zig");
 const logging = @import("logging.zig");
 
 gpa: Allocator,
@@ -89,9 +91,9 @@ pub fn find(gpa: Allocator, io: std.Io, lookup: Lookup, options: Options) Error!
     // 1. The file the environment names, if it names one.
     if (lookup.credentials_path) |path| {
         logging.debug("credentials: GOOGLE_APPLICATION_CREDENTIALS names {s}", .{path});
-        var user: AuthorizedUser = try .initFromFile(gpa, io, path, userOptions(lookup, options));
-        errdefer user.deinit();
-        return hold(gpa, .env_file, .{ .user = user }, lookup);
+        var impl = try fromFile(gpa, io, path, lookup, options);
+        errdefer implDeinit(&impl);
+        return hold(gpa, .env_file, impl, lookup);
     }
 
     // 2. The file gcloud's login writes, if it is there.
@@ -101,9 +103,9 @@ pub fn find(gpa: Allocator, io: std.Io, lookup: Lookup, options: Options) Error!
     if (gcloud_path) |path| {
         if (std.Io.Dir.cwd().access(io, path, .{})) {
             logging.debug("credentials: reading {s}", .{path});
-            var user: AuthorizedUser = try .initFromFile(gpa, io, path, userOptions(lookup, options));
-            errdefer user.deinit();
-            return hold(gpa, .gcloud_file, .{ .user = user }, lookup);
+            var impl = try fromFile(gpa, io, path, lookup, options);
+            errdefer implDeinit(&impl);
+            return hold(gpa, .gcloud_file, impl, lookup);
         } else |err| switch (err) {
             error.FileNotFound => no_gcloud_file = "no file from gcloud's login",
             error.Canceled => return error.Canceled,
@@ -151,12 +153,13 @@ pub fn quotaProjectId(self: Credentials) ?[]const u8 {
 }
 
 /// The project this workload runs in, when the credentials can say: the
-/// metadata server knows, a credentials file does not. Copied into
-/// `arena`. On Google Cloud this saves a program from being told where it
-/// is running.
+/// metadata server knows, and a service account key file names the project
+/// it belongs to; a user login does not. Copied into `arena`. This saves a
+/// program from being told where it is running.
 pub fn projectId(self: Credentials, io: std.Io, arena: Allocator) MetadataServer.ProjectIdError!?[]const u8 {
     return switch (self.held.impl) {
         .user => null,
+        .service_account => |*account| if (account.projectId()) |p| try arena.dupe(u8, p) else null,
         .metadata => |*metadata| try metadata.projectId(io, arena),
     };
 }
@@ -176,6 +179,7 @@ const Held = struct {
 
     const Impl = union(enum) {
         user: AuthorizedUser,
+        service_account: ServiceAccount,
         metadata: MetadataServer,
     };
 
@@ -190,6 +194,7 @@ const Held = struct {
     fn inner(self: *Held) TokenProvider {
         return switch (self.impl) {
             .user => |*u| u.provider(),
+            .service_account => |*s| s.provider(),
             .metadata => |*m| m.provider(),
         };
     }
@@ -197,6 +202,7 @@ const Held = struct {
     fn deinit(self: *Held, gpa: Allocator) void {
         switch (self.impl) {
             .user => |*u| u.deinit(),
+            .service_account => |*s| s.deinit(),
             .metadata => |*m| m.deinit(),
         }
         if (self.quota_project) |q| gpa.free(q);
@@ -233,7 +239,42 @@ fn hold(gpa: Allocator, source: Source, impl: Held.Impl, lookup: Lookup) Allocat
     return .{ .gpa = gpa, .source = source, .held = held };
 }
 
+/// Reads the credentials file at `path` and builds the provider its
+/// declared type calls for.
+fn fromFile(gpa: Allocator, io: std.Io, path: []const u8, lookup: Lookup, options: Options) Error!Held.Impl {
+    const diag = lookup.diagnostics;
+    // The file holds a secret whichever type it is; the parse here only
+    // decides the type, and the provider's own init reads `json` again.
+    var wiping: core.WipingAllocator = .init(gpa);
+    var scratch: std.heap.ArenaAllocator = .init(wiping.allocator());
+    defer scratch.deinit();
+    const json = try adc_file.readFile(io, scratch.allocator(), path, diag);
+    return switch (try adc_file.parse(scratch.allocator(), json, diag)) {
+        .authorized_user => .{ .user = try AuthorizedUser.initFromJson(gpa, io, json, userOptions(lookup, options)) },
+        .service_account => .{ .service_account = try ServiceAccount.initFromJson(gpa, io, json, serviceOptions(lookup, options)) },
+    };
+}
+
+fn implDeinit(impl: *Held.Impl) void {
+    switch (impl.*) {
+        .user => |*u| u.deinit(),
+        .service_account => |*s| s.deinit(),
+        .metadata => |*m| m.deinit(),
+    }
+}
+
 fn userOptions(lookup: Lookup, options: Options) AuthorizedUser.Options {
+    return .{
+        .retry = options.retry,
+        .cache = options.cache,
+        .user_agent = options.user_agent,
+        .request_timeout_ms = options.request_timeout_ms,
+        .diagnostics = lookup.diagnostics,
+        .transport = options.transport,
+    };
+}
+
+fn serviceOptions(lookup: Lookup, options: Options) ServiceAccount.Options {
     return .{
         .retry = options.retry,
         .cache = options.cache,
@@ -335,8 +376,10 @@ test "findDefault: a file the environment names must work, or nothing does" {
     var path_buf: [160]u8 = undefined;
     // The other two sources are available, and must not be reached.
     _ = try config.write(&path_buf, Lookup.adc_file_name, gcloud_json);
-    var service_buf: [160]u8 = undefined;
-    const service_path = try config.write(&service_buf, "service.json", "{\"type\":\"service_account\"}");
+    var external_buf: [160]u8 = undefined;
+    const external_path = try config.write(&external_buf, "external.json", "{\"type\":\"external_account\"}");
+    var partial_buf: [160]u8 = undefined;
+    const partial_path = try config.write(&partial_buf, "partial.json", "{\"type\":\"service_account\",\"client_email\":\"e@p\"}");
     var junk_buf: [160]u8 = undefined;
     const junk_path = try config.write(&junk_buf, "junk.json", "not json at all");
     var missing_buf: [160]u8 = undefined;
@@ -344,7 +387,8 @@ test "findDefault: a file the environment names must work, or nothing does" {
 
     const cases: []const struct { path: []const u8, want: anyerror } = &.{
         .{ .path = missing_path, .want = error.CredentialsFileNotFound },
-        .{ .path = service_path, .want = error.UnsupportedCredentialType },
+        .{ .path = external_path, .want = error.UnsupportedCredentialType },
+        .{ .path = partial_path, .want = error.InvalidCredentialsFile },
         .{ .path = junk_path, .want = error.InvalidCredentialsFile },
     };
     for (cases) |case| {
@@ -359,6 +403,66 @@ test "findDefault: a file the environment names must work, or nothing does" {
         try testing.expect(diag.message().len > 0);
         try testing.expectEqual(0, fake.requests.items.len);
     }
+}
+
+/// A service account key file around one of rsa.zig's test keys, with the
+/// PEM's newlines as JSON escapes, the way Google writes one.
+fn serviceAccountJson(arena: Allocator) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+    try json.beginObject();
+    inline for (.{
+        .{ "type", "service_account" },
+        .{ "project_id", "sa-project" },
+        .{ "private_key_id", "kid-1" },
+        .{ "private_key", @import("rsa.zig").test_key_1024 },
+        .{ "client_email", "robot@sa-project.iam.gserviceaccount.com" },
+        .{ "token_uri", "https://oauth2.googleapis.com/token" },
+    }) |field| {
+        try json.objectField(field[0]);
+        try json.write(field[1]);
+    }
+    try json.endObject();
+    return out.written();
+}
+
+test "findDefault: a service account key file works from either file source" {
+    var config: TmpConfig = undefined;
+    try config.init();
+    defer config.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const sa_json = try serviceAccountJson(arena.allocator());
+
+    // Named by the environment.
+    var env_buf: [160]u8 = undefined;
+    const env_path = try config.write(&env_buf, "sa.json", sa_json);
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{user_token});
+    defer fake.deinit();
+    var creds = try find(testing.allocator, testing.io, .{ .credentials_path = env_path }, .{
+        .transport = fake.transport(),
+    });
+    defer creds.deinit();
+    try testing.expectEqual(.env_file, creds.source);
+    // The key file says which project it belongs to, with no request.
+    try testing.expectEqualStrings("sa-project", (try creds.projectId(testing.io, arena.allocator())).?);
+    try testing.expectEqual(null, creds.quotaProjectId());
+    // Its token comes from a signed JWT at the token endpoint.
+    try testing.expectEqualStrings("ya29.from-file", try creds.provider().getToken(testing.io, arena.allocator(), test_scopes));
+    const sent = try fake.request(0);
+    try testing.expectEqualStrings("https://oauth2.googleapis.com/token", sent.url);
+    try testing.expect(std.mem.startsWith(u8, sent.body.?, "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion="));
+
+    // As gcloud's file, the same key is found second.
+    var gcloud_buf: [160]u8 = undefined;
+    _ = try config.write(&gcloud_buf, Lookup.adc_file_name, sa_json);
+    var second_fake: test_util.FakeTransport = .init(testing.allocator, &.{});
+    defer second_fake.deinit();
+    var second = try find(testing.allocator, testing.io, .{ .gcloud_config_dir = config.dir }, .{
+        .transport = second_fake.transport(),
+    });
+    defer second.deinit();
+    try testing.expectEqual(.gcloud_file, second.source);
 }
 
 test "findDefault: gcloud's login file is next, and its token comes from it" {

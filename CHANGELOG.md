@@ -4,6 +4,23 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.6.0 (unreleased)
+
+- auth: service account keys. `ServiceAccount` reads a `service_account`
+  key file, signs a short-lived RS256 JWT with its RSA key, and trades it
+  at the token endpoint for an access token, cached and wiped like every
+  other secret. `findDefault` and the gcloud file path accept such files
+  wherever an `authorized_user` one worked. The RSA is `std.crypto`'s
+  constant-time modular exponentiation; the key is parsed from PKCS#8 or
+  PKCS#1 PEM without allocating, and every signature is verified against
+  the key's own public half before it leaves the process. A service
+  account token is minted for particular scopes, so a provider's first
+  `getToken` fixes its scopes, and a call asking for different ones fails
+  with a diagnostic instead of silently changing what the token can do.
+- auth: `Credentials.projectId` also answers from a service account key
+  file, which names the project it belongs to.
+- core, pubsub: unchanged.
+
 ## 0.5.0 (2026-09-20)
 
 - core: every request now carries a deadline. `Request.timeout_ms` bounds

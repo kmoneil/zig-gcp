@@ -81,18 +81,7 @@ pub fn initFromFile(gpa: Allocator, io: std.Io, path: []const u8, options: Optio
     var wiping: core.WipingAllocator = .init(gpa);
     var scratch: std.heap.ArenaAllocator = .init(wiping.allocator());
     defer scratch.deinit();
-    const json = std.Io.Dir.cwd().readFileAlloc(io, path, scratch.allocator(), .limited(adc_file.max_file_bytes)) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Canceled => return error.Canceled,
-        error.StreamTooLong => {
-            if (options.diagnostics) |d| d.print("the credentials file is larger than 64 KiB", .{});
-            return error.InvalidCredentialsFile;
-        },
-        else => {
-            if (options.diagnostics) |d| d.print("cannot read the credentials file {s}: {t}", .{ path, err });
-            return error.CredentialsFileNotFound;
-        },
-    };
+    const json = try adc_file.readFile(io, scratch.allocator(), path, options.diagnostics);
     return initFromJson(gpa, io, json, options);
 }
 
@@ -122,7 +111,13 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
     var wiping: core.WipingAllocator = .init(gpa);
     var scratch: std.heap.ArenaAllocator = .init(wiping.allocator());
     defer scratch.deinit();
-    const file = try adc_file.parse(scratch.allocator(), json, diag);
+    const file = switch (try adc_file.parse(scratch.allocator(), json, diag)) {
+        .authorized_user => |user| user,
+        .service_account => {
+            if (diag) |d| d.print("the credentials file is a service account key; use ServiceAccount, or findDefault", .{});
+            return error.UnsupportedCredentialType;
+        },
+    };
 
     const client_id = try gpa.dupe(u8, file.client_id);
     errdefer wipeFree(gpa, client_id);
@@ -315,18 +310,7 @@ fn wipeFree(gpa: Allocator, buf: []u8) void {
     gpa.rawFree(buf, .of(u8), @returnAddress());
 }
 
-/// https anywhere, or plain http to this machine. The refresh token goes to
-/// this URL, so it must not cross a network in the clear.
-fn isAcceptableTokenUrl(url: []const u8) bool {
-    const uri = std.Uri.parse(url) catch return false;
-    const component = uri.host orelse return false;
-    var buf: [256]u8 = undefined;
-    const host = component.toRaw(&buf) catch return false;
-    if (host.len == 0) return false;
-    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return true;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
-    return std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "[::1]") or std.ascii.eqlIgnoreCase(host, "localhost");
-}
+const isAcceptableTokenUrl = token_response.isAcceptableTokenUrl;
 
 fn isPrintable(text: []const u8) bool {
     if (text.len == 0) return false;
@@ -550,7 +534,12 @@ test "AuthorizedUser: init refuses a bad retry policy, cache setting or user age
     try testing.expectError(error.InvalidOptions, AuthorizedUser.initFromJson(testing.allocator, io, file_json, .{ .cache = .{ .refresh_margin_s = 300 } }));
     try testing.expectError(error.InvalidOptions, AuthorizedUser.initFromJson(testing.allocator, io, file_json, .{ .user_agent = "a\r\nX: y" }));
     // A bad file is reported as such, even with good options.
-    try testing.expectError(error.UnsupportedCredentialType, AuthorizedUser.initFromJson(testing.allocator, io, "{\"type\":\"service_account\"}", .{}));
+    try testing.expectError(error.UnsupportedCredentialType, AuthorizedUser.initFromJson(
+        testing.allocator,
+        io,
+        "{\"type\":\"service_account\",\"client_email\":\"e@p\",\"private_key\":\"SECRET\"}",
+        .{},
+    ));
 }
 
 test "AuthorizedUser: secrets reach neither the log nor Diagnostics" {

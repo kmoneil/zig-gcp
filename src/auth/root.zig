@@ -1,7 +1,8 @@
 //! Credentials for the other modules: turns "where am I running?" into a
 //! bearer token. `MetadataServer` for a workload on Google Cloud,
-//! `AuthorizedUser` for the login `gcloud` saves, `StaticToken` for a token
-//! from somewhere else, and `Cache`, which the first two share.
+//! `AuthorizedUser` for the login `gcloud` saves, `ServiceAccount` for a
+//! service account key file, `StaticToken` for a token from somewhere
+//! else, and `Cache`, which the providers share.
 
 const core = @import("core");
 
@@ -11,6 +12,7 @@ pub const Diagnostics = core.Diagnostics;
 pub const RetryPolicy = core.RetryPolicy;
 pub const Cache = @import("Cache.zig");
 pub const AuthorizedUser = @import("AuthorizedUser.zig");
+pub const ServiceAccount = @import("ServiceAccount.zig");
 pub const MetadataServer = @import("MetadataServer.zig");
 pub const Lookup = @import("Lookup.zig");
 pub const Credentials = @import("Credentials.zig");
@@ -22,7 +24,9 @@ pub const findDefault = Credentials.find;
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("AuthorizedUser.zig");
+    _ = @import("ServiceAccount.zig");
     _ = @import("MetadataServer.zig");
+    _ = @import("rsa.zig");
     _ = @import("Lookup.zig");
     _ = @import("Credentials.zig");
     _ = @import("Cache.zig");
