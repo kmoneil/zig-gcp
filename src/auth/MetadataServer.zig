@@ -53,7 +53,7 @@ pub const Options = struct {
     retry: core.RetryPolicy = .{ .max_attempts = 3 },
     cache: Cache.Options = .{},
     /// Printable ASCII.
-    user_agent: []const u8 = "zig-gcp-auth/0.3",
+    user_agent: []const u8 = "zig-gcp-auth/0.4",
     /// Filled with the details of the last failure. Never holds a token.
     diagnostics: ?*Diagnostics = null,
     /// Sends requests through this instead of `std.http.Client`.

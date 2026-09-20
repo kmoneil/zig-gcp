@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-09-20)
 
 - core: new module, holding what the service modules share: the HTTP
   transport, which can send JSON or form bodies and carry extra request
@@ -48,6 +48,9 @@ including the ones that did not change.
   implements `invalidate` and `quotaProject`. `TokenProvider.Error` names
   the token failures a caller can act on, such as `RefreshTokenInvalid`,
   and `pubsub.Error` gains them. `StaticToken` works as before.
+- pubsub: breaking, for exhaustive switches: `pubsub.Error` gains the token
+  errors above and `InvalidRequestHeader`, which a request carrying a header
+  HTTP cannot express returns before it connects.
 - pubsub: fixed: on Windows, a refused or dropped connection is retried.
   Zig 0.16 reports both as an unexpected error there, which the client took
   for a permanent `NetworkFailure`.
