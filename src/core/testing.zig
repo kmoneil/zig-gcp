@@ -86,6 +86,7 @@ pub const FakeTransport = struct {
     pub const Canned = struct {
         status: u16 = 200,
         body: []const u8 = "{}",
+        headers: []const Header = &.{},
     };
 
     /// A deep copy of one request, owned by the fake.
@@ -150,8 +151,18 @@ pub const FakeTransport = struct {
             .respond => |canned| .{
                 .status = canned.status,
                 .body = try arena.dupe(u8, canned.body),
+                .headers = try copyHeaders(arena, canned.headers),
             },
         };
+    }
+
+    fn copyHeaders(arena: Allocator, headers: []const Header) Allocator.Error![]const Header {
+        const out = try arena.alloc(Header, headers.len);
+        for (headers, out) |from, *to| to.* = .{
+            .name = try arena.dupe(u8, from.name),
+            .value = try arena.dupe(u8, from.value),
+        };
+        return out;
     }
 
     fn record(self: *FakeTransport, req: Request) Allocator.Error!void {

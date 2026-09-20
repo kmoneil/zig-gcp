@@ -71,6 +71,16 @@ pub const Response = struct {
     status: u16,
     /// The complete body, allocated in the arena passed to `send`.
     body: []const u8,
+    /// Every header the response carried, in order, allocated in the same
+    /// arena. A server that sends the same name twice appears twice.
+    headers: []const Header = &.{},
+
+    /// The value sent for `name`, matched as HTTP matches names, or null.
+    /// The first wins, as `std.http` does for the headers it reads itself.
+    pub fn header(self: Response, name: []const u8) ?[]const u8 {
+        for (self.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+        return null;
+    }
 };
 
 /// Failures below HTTP: no response arrived, or none that can be used.
@@ -238,16 +248,19 @@ pub const HttpTransport = struct {
         };
         const head = response.head;
         const status: u16 = @intFromEnum(head.status);
+        // The head lives in the connection's read buffer, which reading the
+        // body overwrites, so copy the headers out first.
+        const headers = try collectHeaders(head, arena);
         if (status == 204 or status == 304) {
             // These end at the head; the connection is ready for the next request.
             request.reader.state = .ready;
-            return .{ .status = status, .body = "" };
+            return .{ .status = status, .body = "", .headers = headers };
         }
         if (status < 200) {
             // An informational response precedes the real one, which this
             // client does not wait for. The connection cannot be reused.
             connection.closing = true;
-            return .{ .status = status, .body = "" };
+            return .{ .status = status, .body = "", .headers = headers };
         }
 
         const encoding = head.content_encoding;
@@ -308,7 +321,19 @@ pub const HttpTransport = struct {
             connection.closing = true;
             return error.ConnectionResetByPeer;
         }
-        return .{ .status = status, .body = body };
+        return .{ .status = status, .body = body, .headers = headers };
+    }
+
+    /// Every header of `head`, copied into `arena`. std.http bounds the head
+    /// by the connection's read buffer, so this copy is bounded too.
+    fn collectHeaders(head: http.Client.Response.Head, arena: Allocator) Allocator.Error![]const Header {
+        var headers: std.ArrayList(Header) = .empty;
+        var it = head.iterateHeaders();
+        while (it.next()) |h| try headers.append(arena, .{
+            .name = try arena.dupe(u8, h.name),
+            .value = try arena.dupe(u8, h.value),
+        });
+        return headers.items;
     }
 };
 
@@ -632,6 +657,43 @@ test "HttpTransport sends a form body with its content type" {
     const post = server.request(0);
     try expectHeader(post, "content-type: application/x-www-form-urlencoded\r\n");
     try testing.expect(std.mem.endsWith(u8, post, "\r\n\r\ngrant_type=refresh_token&refresh_token=1%2F%2Fabc"));
+}
+
+test "HttpTransport hands back the response headers, still readable after the body" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nMetadata-Flavor: Google\r\nContent-Length: 12\r\n" ++
+            "X-Twice: first\r\nX-Twice: second\r\n\r\nhello world!",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    const res = try ht.transport().send(.{
+        .method = .GET,
+        .url = server.url(&buf, "/computeMetadata/v1/"),
+    }, arena.allocator());
+    try serving.await(io);
+
+    // The head lives in the read buffer that the body overwrites, so these
+    // are copies, not views of whatever is there now.
+    try testing.expectEqualStrings("hello world!", res.body);
+    try testing.expectEqualStrings("Google", res.header("metadata-flavor").?);
+    try testing.expectEqualStrings("12", res.header("Content-Length").?);
+    try testing.expectEqual(null, res.header("X-Absent"));
+    // A name sent twice keeps its first value, as std.http does.
+    try testing.expectEqualStrings("first", res.header("x-twice").?);
+    try testing.expectEqual(4, res.headers.len);
+}
+
+test "a response without headers answers every lookup with null" {
+    const empty: Response = .{ .status = 200, .body = "" };
+    try testing.expectEqual(null, empty.header("Metadata-Flavor"));
 }
 
 test "HttpTransport sends extra headers, in order, after its own" {
