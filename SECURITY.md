@@ -86,6 +86,15 @@ code in `src/`.
 - **Credential files are only read,** never written, and one over 64 KiB
   is refused. `AuthorizedUser: initFromFile reads the file, and reports a
   missing or oversized one`.
+- **The search for credentials never falls through a failure.** Whatever
+  the environment names is used or the program stops: a file that is
+  missing, unreadable, of an unsupported type or not JSON is an error, not
+  a reason to try the next source and run as somebody else. Only a file
+  that is genuinely absent lets the search go on.
+  `findDefault: a file the environment names must work, or nothing does`,
+  `findDefault: a gcloud file that is there but broken stops the search`,
+  `findDefault: a gcloud path that is there but unreadable is an error`,
+  `findDefault: a gcloud path that cannot even be checked is an error`.
 - **Redirects are never followed,** so a server cannot send the request, and
   its Authorization header, to another host. `HttpTransport does not follow
   redirects`.

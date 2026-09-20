@@ -7,11 +7,11 @@ modules it imports.
 | Module | Covers | Stability |
 | --- | --- | --- |
 | `pubsub` | Pub/Sub v1: publish, pull, acknowledge, and topic and subscription management | beta |
-| `auth` | Credentials for the service modules: `MetadataServer` on Google Cloud, `AuthorizedUser` for the login `gcloud auth application-default login` saves, and `StaticToken`. | experimental |
+| `auth` | Credentials for the service modules: `findDefault` picks between the metadata server on Google Cloud, the login `gcloud auth application-default login` saves, and a file the environment names. | experimental |
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 246 unit, property and fuzz tests; 20 Pub/Sub integration
+- Tested with 270 unit, property and fuzz tests; 20 Pub/Sub integration
   tests that pass against both the emulator and production; and 2 auth tests
   against Google's token endpoint.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
@@ -76,42 +76,46 @@ See `examples/publish.zig` and `examples/worker.zig` for complete programs.
 
 ### Production credentials
 
-Production needs a `TokenProvider`. On a developer machine, run
-`gcloud auth application-default login` once, and let `auth.AuthorizedUser`
-read the file it writes. It trades the saved refresh token for access tokens
-at Google's token endpoint, and refreshes them before they expire:
+Production needs a `TokenProvider`. `auth.findDefault` picks one the way
+Google's own libraries do, so the same binary runs on a laptop and on Cloud
+Run without a flag:
 
 ```zig
-// ~/.config/gcloud/application_default_credentials.json on Linux and macOS,
-// %APPDATA%\gcloud\application_default_credentials.json on Windows.
-var user = try auth.AuthorizedUser.initFromFile(gpa, io, path, .{});
-defer user.deinit();
+var arena: std.heap.ArenaAllocator = .init(gpa);
+defer arena.deinit();
+const lookup = try auth.Lookup.fromEnv(init.environ, arena.allocator());
+var creds = try auth.findDefault(gpa, io, lookup, .{});
+defer creds.deinit();
+std.log.info("credentials from {t}", .{creds.source});
+
 var client = try pubsub.Client.init(gpa, io, .{
     .project_id = "my-project",
-    .token_provider = user.provider(),
+    .token_provider = creds.provider(),
 });
 ```
 
-`user` must not move while the client uses its provider.
+It looks in three places, in this order:
 
-On Google Cloud (Cloud Run, GKE, GCE, Cloud Functions), nothing has to be
-stored: the workload's service account has a token waiting on the metadata
-server, and `auth.MetadataServer` fetches and refreshes it. `probe` answers
-whether there is a metadata server to ask, in half a second on a machine
-that has none:
+1. The credentials file `GOOGLE_APPLICATION_CREDENTIALS` names.
+2. The file `gcloud auth application-default login` writes, under
+   `$HOME/.config/gcloud` or `%APPDATA%\gcloud`.
+3. The metadata server, on Cloud Run, GKE, GCE or Cloud Functions, which
+   hands out tokens for the workload's service account with nothing stored
+   on disk.
 
-```zig
-var metadata = try auth.MetadataServer.init(gpa, io, .{});
-defer metadata.deinit();
-if (!metadata.probe(io)) return error.NotOnGoogleCloud;
-var client = try pubsub.Client.init(gpa, io, .{
-    .project_id = try metadata.projectId(io, arena), // or your own
-    .token_provider = metadata.provider(),
-});
-```
+The first place that has something decides it. A credential that is there
+but unusable is an error, never a reason to try the next place: running as
+somebody else, quietly, would be worse. With nothing anywhere, the error is
+`NoCredentialsFound` and `Diagnostics` lists what was tried.
 
-Choosing between the two by where the program runs is coming next. A static
-token also works, for about an hour:
+To choose a source yourself, use `auth.AuthorizedUser.initFromFile` for a
+credentials file, or `auth.MetadataServer` on Google Cloud, whose `probe`
+answers whether there is a metadata server to ask (in half a second on a
+machine that has none) and whose `projectId` says which project it runs in.
+Neither may move while a client uses its provider; the `Credentials` that
+`findDefault` returns may, because it keeps the provider on the heap.
+
+A static token also works, for about an hour:
 
 ```zig
 var token: pubsub.StaticToken = .{ .token = access_token }; // gcloud auth print-access-token
