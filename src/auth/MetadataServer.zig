@@ -385,8 +385,14 @@ fn isValidHost(host: []const u8) bool {
         'A'...'Z', 'a'...'z', '0'...'9', '-', '.', ':' => {},
         else => return false,
     };
-    // A leading or trailing separator would build a URL with an empty host.
-    return host[0] != ':' and host[0] != '.' and host[host.len - 1] != ':';
+    // A leading separator would build a URL with an empty host.
+    if (host[0] == ':' or host[0] == '.') return false;
+    // Whatever follows a colon must be a port, or the URL will not parse.
+    // (The fuzzer found "P:y" accepted here and refused by std.Uri.)
+    if (std.mem.indexOfScalar(u8, host, ':')) |colon| {
+        _ = std.fmt.parseInt(u16, host[colon + 1 ..], 10) catch return false;
+    }
+    return true;
 }
 
 /// `default`, or a service account email address.
@@ -919,6 +925,12 @@ test "MetadataServer: hosts, service accounts and project ids" {
     try testing.expect(!isValidHost("host/path"));
     try testing.expect(!isValidHost("host:"));
     try testing.expect(!isValidHost("[::1]:80"));
+    // After a colon there must be a port number, and just one colon.
+    try testing.expect(!isValidHost("P:y"));
+    try testing.expect(!isValidHost("host:8080x"));
+    try testing.expect(!isValidHost("host:65536"));
+    try testing.expect(!isValidHost("a:1:2"));
+    try testing.expect(isValidHost("host:65535"));
     try testing.expect(isValidServiceAccount("default"));
     try testing.expect(isValidServiceAccount("worker@p.iam.gserviceaccount.com"));
     try testing.expect(!isValidServiceAccount("../../instance"));
@@ -941,12 +953,18 @@ fn hostProperty(_: void, input: []const u8) !void {
 }
 
 test "fuzz MetadataServer: an accepted host cannot reshape the URL" {
-    try test_util.fuzzBytes({}, hostProperty, .{ .corpus = &.{
-        "metadata.google.internal",
-        "127.0.0.1:8085",
-        "evil/../..",
-        "a@b",
-        "a?b",
-        "a#b",
-    } });
+    try test_util.fuzzBytes({}, hostProperty, .{
+        .corpus = &.{
+            "metadata.google.internal",
+            "127.0.0.1:8085",
+            "evil/../..",
+            "a@b",
+            "a?b",
+            "a#b",
+            // CI's fuzzer found this accepted and then refused by std.Uri.
+            "P:y",
+            "a:1:2",
+            "host:65536",
+        },
+    });
 }
