@@ -34,6 +34,20 @@ pub fn parse(arena: Allocator, body: []const u8) ParseError!Cache.Fetched {
     return .{ .token = token, .expires_in = expires_in };
 }
 
+/// https anywhere, or plain http to this machine (127.0.0.1, [::1] or
+/// localhost), as tests use. Credentials travel to the token endpoint, so
+/// it must not cross a network in the clear.
+pub fn isAcceptableTokenUrl(url: []const u8) bool {
+    const uri = std.Uri.parse(url) catch return false;
+    const component = uri.host orelse return false;
+    var buf: [256]u8 = undefined;
+    const host = component.toRaw(&buf) catch return false;
+    if (host.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) return true;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
+    return std.mem.eql(u8, host, "127.0.0.1") or std.mem.eql(u8, host, "[::1]") or std.ascii.eqlIgnoreCase(host, "localhost");
+}
+
 /// An OAuth error, such as `invalid_grant`.
 pub const OAuthError = struct {
     code: []const u8,

@@ -27,7 +27,8 @@ emulator, through a proxy that drops, cuts, delays and rewrites responses.
 Those tests need the emulator specifically and never target production.
 
 The auth integration tests run against Google when `AUTH_TEST_CREDENTIALS`
-names a credentials file of type `authorized_user`; the README shows how.
+names a credentials file, of type `authorized_user` or `service_account`;
+each test runs when the file is the type it exercises. The README shows how.
 
 The metadata server can only be checked where there is one. One test skips
 unless a probe answers, and `examples/whoami.zig` shows the same path by
