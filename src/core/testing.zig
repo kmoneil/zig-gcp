@@ -23,6 +23,9 @@ pub const FakeTokenProvider = struct {
     token: []const u8 = "ya29.fake-token",
     /// When set, `getToken` fails with it.
     fail: ?TokenProvider.Error = null,
+    /// When set, `invalidate` makes this the token from then on, so a test
+    /// can tell a freshly fetched token from the cached one.
+    next_token: ?[]const u8 = null,
     /// What `quotaProject` returns.
     quota_project: ?[]const u8 = null,
     /// `getToken` calls so far, failed ones included.
@@ -63,7 +66,12 @@ pub const FakeTokenProvider = struct {
     }
 
     fn invalidate(ptr: *anyopaque) void {
-        fromPtr(ptr).invalidations += 1;
+        const self = fromPtr(ptr);
+        self.invalidations += 1;
+        if (self.next_token) |token| {
+            self.token = token;
+            self.next_token = null;
+        }
     }
 
     fn quotaProject(ptr: *anyopaque) ?[]const u8 {
