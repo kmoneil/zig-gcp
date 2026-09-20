@@ -82,6 +82,11 @@ pub const Error = error{
 /// token errors above cannot come from it.
 pub const ProjectIdError = error{MetadataUnavailable} || core.transport.Error;
 
+/// What a probe can report instead of an answer. Everything else, from a
+/// refused connection to a reply from something that is not a metadata
+/// server, is the answer "no".
+pub const ProbeError = error{ OutOfMemory, Canceled };
+
 /// Required on every request. Without it the metadata server answers 403,
 /// which is what keeps a browser or a confused service from reaching it.
 const request_headers: []const core.transport.Header = &.{
@@ -177,9 +182,17 @@ pub fn provider(self: *MetadataServer) TokenProvider {
 
 /// True when a metadata server answers within `probe_timeout_ms`. This is
 /// the question "am I running on Google Cloud?", and the answer is trusted
-/// only because of the response header.
+/// only because of the response header. Anything that is not an answer,
+/// including running out of memory, counts as "no".
 pub fn probe(self: *MetadataServer, io: std.Io) bool {
-    const Winner = union(enum) { probe: bool, timer: void };
+    return self.probeChecked(io) catch false;
+}
+
+/// `probe`, keeping apart the two failures that are not answers about
+/// Google Cloud. A caller choosing between credentials needs them: neither
+/// means "there is no metadata server here".
+pub fn probeChecked(self: *MetadataServer, io: std.Io) ProbeError!bool {
+    const Winner = union(enum) { probe: ProbeError!bool, timer: void };
     var slots: [2]Winner = undefined;
     var race: std.Io.Select(Winner) = .init(io, &slots);
     // The probe runs elsewhere, so a server that accepts the connection and
@@ -189,7 +202,7 @@ pub fn probe(self: *MetadataServer, io: std.Io) bool {
     defer race.cancelDiscard();
     // A failed timer leaves the probe to finish on its own.
     race.concurrent(.timer, expire, .{ io, self.probe_timeout_ms }) catch {};
-    return switch (race.await() catch return false) {
+    return switch (race.await() catch |err| return err) {
         .probe => |answered| answered,
         .timer => {
             logging.debug("no metadata server answered on {s} within {d} ms", .{ self.root_url, self.probe_timeout_ms });
@@ -321,17 +334,22 @@ fn get(self: *MetadataServer, arena: Allocator, url: []const u8) Attempt {
     return .{ .fail = error.TokenEndpointRejected };
 }
 
-/// One probe request. Any failure answers "no metadata server here".
-fn probeOnce(self: *MetadataServer) bool {
+/// One probe request. Every failure but the two above answers "no
+/// metadata server here".
+fn probeOnce(self: *MetadataServer) ProbeError!bool {
     var arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena.deinit();
     const res = self.transport.send(.{
         .method = .GET,
         .url = self.root_url,
         .headers = request_headers,
-    }, arena.allocator()) catch |err| {
-        logging.debug("metadata probe on {s}: {t}", .{ self.root_url, err });
-        return false;
+    }, arena.allocator()) catch |err| switch (err) {
+        // Neither says anything about where this code is running.
+        error.OutOfMemory, error.Canceled => |e| return e,
+        else => {
+            logging.debug("metadata probe on {s}: {t}", .{ self.root_url, err });
+            return false;
+        },
     };
     const answered = res.status == 200 and isFromMetadataServer(res);
     logging.debug("metadata probe on {s}: {d}, {s}", .{ self.root_url, res.status, if (answered) "on Google Cloud" else "not the metadata server" });
@@ -629,6 +647,25 @@ test "MetadataServer: probe answers only for a metadata server" {
     try testing.expect(!h.metadata.probe(h.clock.io()));
     try testing.expect(!h.metadata.probe(h.clock.io()));
     try testing.expect(!h.metadata.probe(h.clock.io()));
+}
+
+test "MetadataServer: the probe keeps running out of memory apart from a no" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .fail = error.OutOfMemory },
+        .{ .fail = error.Canceled },
+        .{ .fail = error.ConnectionRefused },
+        .{ .fail = error.OutOfMemory },
+    });
+    defer h.deinit();
+    const io = h.clock.io();
+    // Neither says anything about whether this is Google Cloud.
+    try testing.expectError(error.OutOfMemory, h.metadata.probeChecked(io));
+    try testing.expectError(error.Canceled, h.metadata.probeChecked(io));
+    // A refused connection is an answer, and it is "no".
+    try testing.expect(!try h.metadata.probeChecked(io));
+    // The bool form still answers, because a caller asked for a bool.
+    try testing.expect(!h.metadata.probe(io));
 }
 
 test "MetadataServer: init refuses what it could never ask with" {
