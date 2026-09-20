@@ -12,11 +12,13 @@ pub const RetryPolicy = core.RetryPolicy;
 pub const Cache = @import("Cache.zig");
 pub const AuthorizedUser = @import("AuthorizedUser.zig");
 pub const MetadataServer = @import("MetadataServer.zig");
+pub const Lookup = @import("Lookup.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("AuthorizedUser.zig");
     _ = @import("MetadataServer.zig");
+    _ = @import("Lookup.zig");
     _ = @import("Cache.zig");
     _ = @import("adc_file.zig");
     _ = @import("form.zig");
