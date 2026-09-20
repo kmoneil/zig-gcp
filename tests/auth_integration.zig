@@ -56,3 +56,35 @@ test "a real refresh, then a Pub/Sub call with the token" {
     var page = try client.listTopics(.{ .page_size = 1 });
     page.deinit();
 }
+
+test "on Google Cloud: the metadata server hands out a token for the attached account" {
+    const io = testing.io;
+    var diag: auth.Diagnostics = .{};
+    var metadata: auth.MetadataServer = try .init(testing.allocator, io, .{ .diagnostics = &diag });
+    defer metadata.deinit();
+    // Off Google Cloud there is nothing to talk to, and this is how a
+    // caller finds that out.
+    if (!metadata.probe(io)) return error.SkipZigTest;
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const p = metadata.provider();
+    const first = try p.getToken(io, arena.allocator(), scopes);
+    try testing.expect(auth.TokenProvider.isValidToken(first));
+    try testing.expectEqualStrings(first, try p.getToken(io, arena.allocator(), scopes));
+    p.invalidate();
+    try testing.expect(auth.TokenProvider.isValidToken(try p.getToken(io, arena.allocator(), scopes)));
+
+    // The project it runs in, and a read-only call with the token.
+    const project = try metadata.projectId(io, arena.allocator());
+    try testing.expect(project.len > 0);
+    var client: pubsub.Client = try .init(testing.allocator, io, .{
+        .project_id = project,
+        .token_provider = p,
+        .diagnostics = &diag,
+    });
+    defer client.deinit();
+    var page = try client.listTopics(.{ .page_size = 1 });
+    page.deinit();
+}
