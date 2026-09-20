@@ -1,7 +1,7 @@
 //! RFC 3339 timestamps, the format of `publishTime`.
 
 const std = @import("std");
-const test_util = @import("test_util.zig");
+const test_util = @import("testing.zig");
 
 pub const ParseError = error{InvalidTimestamp};
 

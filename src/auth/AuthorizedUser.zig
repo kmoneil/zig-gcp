@@ -117,6 +117,10 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
             if (diag) |d| d.print("the credentials file is a service account key; use ServiceAccount, or findDefault", .{});
             return error.UnsupportedCredentialType;
         },
+        .external_account => {
+            if (diag) |d| d.print("the credentials file is a workload identity federation file; use ExternalAccount, or findDefault", .{});
+            return error.UnsupportedCredentialType;
+        },
     };
 
     const client_id = try gpa.dupe(u8, file.client_id);

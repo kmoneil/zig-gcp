@@ -19,6 +19,7 @@ const AuthorizedUser = @import("AuthorizedUser.zig");
 const Cache = @import("Cache.zig");
 const Lookup = @import("Lookup.zig");
 const MetadataServer = @import("MetadataServer.zig");
+const ExternalAccount = @import("ExternalAccount.zig");
 const ServiceAccount = @import("ServiceAccount.zig");
 const adc_file = @import("adc_file.zig");
 const logging = @import("logging.zig");
@@ -158,7 +159,7 @@ pub fn quotaProjectId(self: Credentials) ?[]const u8 {
 /// program from being told where it is running.
 pub fn projectId(self: Credentials, io: std.Io, arena: Allocator) MetadataServer.ProjectIdError!?[]const u8 {
     return switch (self.held.impl) {
-        .user => null,
+        .user, .external_account => null,
         .service_account => |*account| if (account.projectId()) |p| try arena.dupe(u8, p) else null,
         .metadata => |*metadata| try metadata.projectId(io, arena),
     };
@@ -180,6 +181,7 @@ const Held = struct {
     const Impl = union(enum) {
         user: AuthorizedUser,
         service_account: ServiceAccount,
+        external_account: ExternalAccount,
         metadata: MetadataServer,
     };
 
@@ -195,6 +197,7 @@ const Held = struct {
         return switch (self.impl) {
             .user => |*u| u.provider(),
             .service_account => |*s| s.provider(),
+            .external_account => |*e| e.provider(),
             .metadata => |*m| m.provider(),
         };
     }
@@ -203,6 +206,7 @@ const Held = struct {
         switch (self.impl) {
             .user => |*u| u.deinit(),
             .service_account => |*s| s.deinit(),
+            .external_account => |*e| e.deinit(),
             .metadata => |*m| m.deinit(),
         }
         if (self.quota_project) |q| gpa.free(q);
@@ -252,6 +256,7 @@ fn fromFile(gpa: Allocator, io: std.Io, path: []const u8, lookup: Lookup, option
     return switch (try adc_file.parse(scratch.allocator(), json, diag)) {
         .authorized_user => .{ .user = try AuthorizedUser.initFromJson(gpa, io, json, userOptions(lookup, options)) },
         .service_account => .{ .service_account = try ServiceAccount.initFromJson(gpa, io, json, serviceOptions(lookup, options)) },
+        .external_account => .{ .external_account = try ExternalAccount.initFromJson(gpa, io, json, externalOptions(lookup, options)) },
     };
 }
 
@@ -259,11 +264,23 @@ fn implDeinit(impl: *Held.Impl) void {
     switch (impl.*) {
         .user => |*u| u.deinit(),
         .service_account => |*s| s.deinit(),
+        .external_account => |*e| e.deinit(),
         .metadata => |*m| m.deinit(),
     }
 }
 
 fn userOptions(lookup: Lookup, options: Options) AuthorizedUser.Options {
+    return .{
+        .retry = options.retry,
+        .cache = options.cache,
+        .user_agent = options.user_agent,
+        .request_timeout_ms = options.request_timeout_ms,
+        .diagnostics = lookup.diagnostics,
+        .transport = options.transport,
+    };
+}
+
+fn externalOptions(lookup: Lookup, options: Options) ExternalAccount.Options {
     return .{
         .retry = options.retry,
         .cache = options.cache,
@@ -377,7 +394,7 @@ test "findDefault: a file the environment names must work, or nothing does" {
     // The other two sources are available, and must not be reached.
     _ = try config.write(&path_buf, Lookup.adc_file_name, gcloud_json);
     var external_buf: [160]u8 = undefined;
-    const external_path = try config.write(&external_buf, "external.json", "{\"type\":\"external_account\"}");
+    const external_path = try config.write(&external_buf, "external.json", "{\"type\":\"external_account_authorized_user\"}");
     var partial_buf: [160]u8 = undefined;
     const partial_path = try config.write(&partial_buf, "partial.json", "{\"type\":\"service_account\",\"client_email\":\"e@p\"}");
     var junk_buf: [160]u8 = undefined;
@@ -463,6 +480,40 @@ test "findDefault: a service account key file works from either file source" {
     });
     defer second.deinit();
     try testing.expectEqual(.gcloud_file, second.source);
+}
+
+test "findDefault: a workload identity federation file works from the environment" {
+    var config: TmpConfig = undefined;
+    try config.init();
+    defer config.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    // The subject token, where the file's credential source points.
+    var subject_buf: [160]u8 = undefined;
+    _ = try config.write(&subject_buf, "subject", "external-subject-token");
+    const external_json = try std.fmt.allocPrint(arena.allocator(),
+        \\{{"type": "external_account",
+        \\ "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/x",
+        \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        \\ "token_url": "https://sts.googleapis.com/v1/token",
+        \\ "credential_source": {{"file": "{s}/subject"}}}}
+    , .{config.dir});
+    var env_buf: [160]u8 = undefined;
+    const env_path = try config.write(&env_buf, "external.json", external_json);
+
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{user_token});
+    defer fake.deinit();
+    var creds = try find(testing.allocator, testing.io, .{ .credentials_path = env_path }, .{
+        .transport = fake.transport(),
+    });
+    defer creds.deinit();
+    try testing.expectEqual(.env_file, creds.source);
+    try testing.expectEqual(null, try creds.projectId(testing.io, arena.allocator()));
+    try testing.expectEqualStrings("ya29.from-file", try creds.provider().getToken(testing.io, arena.allocator(), test_scopes));
+    const sent = try fake.request(0);
+    try testing.expectEqualStrings("https://sts.googleapis.com/v1/token", sent.url);
+    try testing.expect(std.mem.indexOf(u8, sent.body.?, "subject_token=external-subject-token") != null);
 }
 
 test "findDefault: gcloud's login file is next, and its token comes from it" {

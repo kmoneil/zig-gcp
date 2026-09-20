@@ -43,10 +43,9 @@ request_timeout_ms: u32,
 retry: core.RetryPolicy,
 diagnostics: ?*Diagnostics,
 cache: Cache,
-/// The scopes of this provider's tokens, space-joined, fixed by the first
-/// `getToken`. Guarded by `scopes_mutex`; read freely once set.
-scopes: ?[]u8,
-scopes_mutex: std.Io.Mutex,
+/// The scopes this provider's tokens are minted for, fixed by the first
+/// `getToken`.
+scopes: Cache.ScopeSet,
 transport: Transport,
 /// The built-in transport, when `Options.transport` was null.
 http: ?*HttpTransport,
@@ -130,6 +129,10 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
             if (diag) |d| d.print("the credentials file is an OAuth user login; use AuthorizedUser, or findDefault", .{});
             return error.UnsupportedCredentialType;
         },
+        .external_account => {
+            if (diag) |d| d.print("the credentials file is a workload identity federation file; use ExternalAccount, or findDefault", .{});
+            return error.UnsupportedCredentialType;
+        },
     };
     var key = rsa.parsePem(file.private_key) catch |err| switch (err) {
         error.InvalidPrivateKey => {
@@ -184,8 +187,7 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
         .retry = options.retry,
         .diagnostics = diag,
         .cache = cache,
-        .scopes = null,
-        .scopes_mutex = .init,
+        .scopes = .{},
         .transport = transport,
         .http = http,
     };
@@ -203,7 +205,7 @@ pub fn deinit(self: *ServiceAccount) void {
     if (self.private_key_id) |kid| wipeFree(self.gpa, kid);
     if (self.quota_project_id) |q| wipeFree(self.gpa, q);
     if (self.project_id) |p| wipeFree(self.gpa, p);
-    if (self.scopes) |s| wipeFree(self.gpa, s);
+    self.scopes.deinit(self.gpa);
     wipeFree(self.gpa, self.token_url);
     wipeFree(self.gpa, self.user_agent);
     self.* = undefined;
@@ -236,7 +238,7 @@ fn fromPtr(ptr: *anyopaque) *ServiceAccount {
 
 fn getToken(ptr: *anyopaque, io: std.Io, arena: Allocator, scopes: []const []const u8) TokenProvider.Error![]const u8 {
     const self = fromPtr(ptr);
-    try self.bindScopes(io, scopes);
+    try self.scopes.bind(io, self.gpa, scopes, self.diagnostics, "ServiceAccount");
     return self.cache.getToken(io, arena, .{ .ptr = self, .fetchFn = fetch });
 }
 
@@ -349,7 +351,7 @@ fn assertion(self: *ServiceAccount, io: std.Io, arena: Allocator) TokenProvider.
         var json: std.json.Stringify = .{ .writer = &claims.writer };
         json.beginObject() catch return error.OutOfMemory;
         writeField(&json, "iss", self.client_email) catch return error.OutOfMemory;
-        writeField(&json, "scope", self.scopes.?) catch return error.OutOfMemory;
+        writeField(&json, "scope", self.scopes.joined.?) catch return error.OutOfMemory;
         writeField(&json, "aud", self.token_url) catch return error.OutOfMemory;
         writeField(&json, "iat", now) catch return error.OutOfMemory;
         writeField(&json, "exp", now + assertion_lifetime_s) catch return error.OutOfMemory;

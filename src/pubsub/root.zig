@@ -40,7 +40,7 @@ pub const SubscriptionInfo = @import("types.zig").SubscriptionInfo;
 pub const SubscriptionPage = @import("types.zig").SubscriptionPage;
 
 /// Parses a `publish_time` (RFC 3339) to nanoseconds since the Unix epoch.
-pub const parseTimestamp = @import("timestamp.zig").parse;
+pub const parseTimestamp = core.timestamp.parse;
 
 /// The fixed API limits and naming rules the client checks before sending.
 pub const limits = @import("validate.zig");
@@ -101,7 +101,6 @@ test {
     _ = @import("logging.zig");
     _ = @import("rpc.zig");
     _ = @import("test_util.zig");
-    _ = @import("timestamp.zig");
     _ = @import("types.zig");
     _ = @import("url.zig");
     _ = @import("validate.zig");
