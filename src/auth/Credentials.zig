@@ -577,6 +577,13 @@ test "findDefault: every allocation failure is OutOfMemory without leaks" {
             _ = try creds.provider().getToken(testing.io, arena.allocator(), test_scopes);
         }
 
+        fn fromNamedFile(gpa: Allocator, path: []const u8) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{user_token});
+            defer fake.deinit();
+            var creds = try find(gpa, testing.io, .{ .credentials_path = path }, .{ .transport = fake.transport() });
+            defer creds.deinit();
+        }
+
         fn fromMetadata(gpa: Allocator, dir: []const u8) !void {
             var fake: test_util.FakeTransport = .init(testing.allocator, &.{ metadata_listing, metadata_token });
             defer fake.deinit();
@@ -604,6 +611,9 @@ test "findDefault: every allocation failure is OutOfMemory without leaks" {
     var path_buf: [160]u8 = undefined;
     _ = try with_file.write(&path_buf, Lookup.adc_file_name, gcloud_json);
     try testing.checkAllAllocationFailures(testing.allocator, Run.fromFile, .{with_file.dir});
+    var named_buf: [160]u8 = undefined;
+    const named = try std.fmt.bufPrint(&named_buf, "{s}/{s}", .{ with_file.dir, Lookup.adc_file_name });
+    try testing.checkAllAllocationFailures(testing.allocator, Run.fromNamedFile, .{named});
 
     var empty: TmpConfig = undefined;
     try empty.init();
