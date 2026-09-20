@@ -247,6 +247,17 @@ test "Lookup: fromEnv reads this process's environment" {
     }
 }
 
+test "Lookup: every allocation failure while reading the environment is OutOfMemory" {
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            _ = try fromEnv(testing.environ, arena.allocator());
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+}
+
 fn varsProperty(_: void, input: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
