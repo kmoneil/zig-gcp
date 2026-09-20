@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.5.0 (unreleased)
+## 0.5.0 (2026-09-20)
 
 - core: every request now carries a deadline. `Request.timeout_ms` bounds
   one request, and one that outlives it is the new `error.TimedOut`, which
