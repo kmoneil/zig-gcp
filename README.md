@@ -271,10 +271,12 @@ The HTTP transport works around these, each covered by a regression test in
   failed.
 - The TLS certificate clock is read once per client; the transport reloads it
   hourly and after a TLS failure.
-- On Windows, a refused connection and a peer that hangs up both come back
-  as `error.Unexpected`, because std does not map their NTSTATUS codes. The
-  transport reports a dropped connection, so the call is retried; it cannot
-  tell the two apart.
+- On Windows, std maps neither `0xC0000236` (connection refused) nor
+  `0xC000013B` (the peer hung up), so both arrive as `error.Unexpected`.
+  The transport reads that as a dropped connection and retries, which is
+  right for those two and is also what any other unmapped Windows error
+  gets: a retry it may not deserve. On other platforms `error.Unexpected`
+  stays a permanent `NetworkFailure`.
 - `zig build test --fuzz` does not compile; see `-Dfuzz-runner` below.
 
 ## Development
