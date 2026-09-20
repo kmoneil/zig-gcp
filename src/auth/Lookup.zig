@@ -58,27 +58,17 @@ pub const Platform = enum {
     }
 };
 
-pub const FromEnvError = error{
-    /// The environment block could not be read at all. WASI only.
-    EnvironmentUnavailable,
-    OutOfMemory,
-};
-
-/// Reads the variables from the environment `main` received. Every string
-/// is copied into `arena`, which must outlive the lookup.
-pub fn fromEnv(environ: std.process.Environ, arena: Allocator) FromEnvError!Lookup {
-    var map = environ.createMap(arena) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Unexpected => return error.EnvironmentUnavailable,
-    };
-    defer map.deinit();
+/// Reads the variables from the environment `main` received, the same
+/// shape `pubsub.Endpoint.fromEnv` takes. Every string it keeps is copied
+/// into `arena`, which must outlive the lookup.
+pub fn fromEnv(environ: *const std.process.Environ.Map, arena: Allocator) Allocator.Error!Lookup {
     return fromVars(.{
-        .google_application_credentials = map.get("GOOGLE_APPLICATION_CREDENTIALS"),
-        .cloudsdk_config = map.get("CLOUDSDK_CONFIG"),
-        .home = map.get("HOME"),
-        .appdata = map.get("APPDATA"),
-        .gce_metadata_host = map.get("GCE_METADATA_HOST"),
-        .google_cloud_quota_project = map.get("GOOGLE_CLOUD_QUOTA_PROJECT"),
+        .google_application_credentials = environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
+        .cloudsdk_config = environ.get("CLOUDSDK_CONFIG"),
+        .home = environ.get("HOME"),
+        .appdata = environ.get("APPDATA"),
+        .gce_metadata_host = environ.get("GCE_METADATA_HOST"),
+        .google_cloud_quota_project = environ.get("GOOGLE_CLOUD_QUOTA_PROJECT"),
     }, .host, arena);
 }
 
@@ -231,7 +221,7 @@ test "Lookup: fromEnv reads this process's environment" {
     const a = arena.allocator();
     var map = try testing.environ.createMap(testing.allocator);
     defer map.deinit();
-    const l = try fromEnv(testing.environ, a);
+    const l = try fromEnv(&map, a);
 
     if (map.get("GOOGLE_APPLICATION_CREDENTIALS")) |path| {
         if (path.len > 0) try testing.expectEqualStrings(path, l.credentials_path.?);
@@ -252,7 +242,9 @@ test "Lookup: every allocation failure while reading the environment is OutOfMem
         fn run(gpa: Allocator) !void {
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
-            _ = try fromEnv(testing.environ, arena.allocator());
+            var map = try testing.environ.createMap(gpa);
+            defer map.deinit();
+            _ = try fromEnv(&map, arena.allocator());
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});

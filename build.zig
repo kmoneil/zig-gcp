@@ -125,14 +125,19 @@ pub fn build(b: *std.Build) void {
     run_auth_integration.has_side_effects = true;
     integration_step.dependOn(&run_auth_integration.step);
 
-    inline for (.{ "publish", "worker" }) |name| {
+    inline for (.{ "publish", "worker", "whoami" }) |name| {
+        // whoami is the one example that picks its own credentials.
+        const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
+            &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
+        else
+            &.{.{ .name = "pubsub", .module = mod }};
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("examples/" ++ name ++ ".zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "pubsub", .module = mod }},
+                .imports = imports,
             }),
         });
         const run = b.addRunArtifact(exe);

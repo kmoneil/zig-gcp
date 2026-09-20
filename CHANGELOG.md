@@ -29,6 +29,13 @@ including the ones that did not change.
   build on, refreshes a token before it expires, runs one fetch at a time,
   keeps using a still-valid token when an early refresh fails, and wipes
   every copy it frees. `StaticToken` is also available here.
+- pubsub: sends `x-goog-user-project` when the credentials name a project
+  to charge for quota, which user credentials do. `send_quota_project` in
+  `Client.Options` turns it off. A 401 now drops the cached token, fetches
+  another and retries once, even for a publish with retries off: the server
+  refused the request before storing anything. `examples/whoami.zig` prints
+  which credentials the machine offers and lists the project's topics with
+  them.
 - pubsub: breaking: `retry_publish` moved from `RetryPolicy` to
   `Client.Options`. Write `.retry_publish = false` instead of
   `.retry = .{ .retry_publish = false }`.

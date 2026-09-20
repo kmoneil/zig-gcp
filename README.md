@@ -11,8 +11,8 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 271 unit, property and fuzz tests; 20 Pub/Sub integration
-  tests that pass against both the emulator and production; and 2 auth tests
+- Tested with 280 unit, property and fuzz tests; 20 Pub/Sub integration
+  tests that pass against both the emulator and production; and 3 auth tests
   against Google's token endpoint.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
 
@@ -72,7 +72,8 @@ such as `orders`. Creating one sends nothing. The operations:
 | --- | --- | --- |
 | `listTopics`, `listSubscriptions` | `create`, `get`, `delete`, `publish` | `create`, `get`, `delete`, `pull`, `ack`, `modifyAckDeadline`, `nack` |
 
-See `examples/publish.zig` and `examples/worker.zig` for complete programs.
+See `examples/publish.zig` and `examples/worker.zig` for complete programs,
+and `examples/whoami.zig` for one that finds its own credentials.
 
 ### Production credentials
 
@@ -83,7 +84,7 @@ Run without a flag:
 ```zig
 var arena: std.heap.ArenaAllocator = .init(gpa);
 defer arena.deinit();
-const lookup = try auth.Lookup.fromEnv(init.environ, arena.allocator());
+const lookup = try auth.Lookup.fromEnv(init.environ_map, arena.allocator());
 var creds = try auth.findDefault(gpa, io, lookup, .{});
 defer creds.deinit();
 std.log.info("credentials from {t}", .{creds.source});
@@ -93,6 +94,11 @@ var client = try pubsub.Client.init(gpa, io, .{
     .token_provider = creds.provider(),
 });
 ```
+
+`creds.provider()` also carries the project to charge for quota, which
+user credentials name: the client sends it as `x-goog-user-project`, and
+`send_quota_project` turns that off. When a call comes back 401, the client
+drops the cached token, fetches another and tries once more.
 
 It looks in three places, in this order:
 
@@ -278,6 +284,7 @@ zig build test-integration             # needs a server, see below
 zig build coverage                     # line coverage; needs kcov (see below)
 zig build example-publish -- orders 5
 zig build example-worker -- orders orders-worker
+zig build example-whoami               # which credentials, and the topics they see
 zig build fmt                          # zig fmt --check
 ```
 
