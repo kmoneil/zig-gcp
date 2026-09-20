@@ -8,11 +8,48 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Stringify = std.json.Stringify;
+const Writer = std.Io.Writer;
 const core = @import("core");
 const types = @import("types.zig");
 const test_util = @import("test_util.zig");
 
 pub const DecodeError = error{ InvalidResponse, OutOfMemory };
+
+// Requests
+
+/// The `secrets.addVersion` body. The checksum is computed over the raw
+/// bytes, before base64, and travels as a decimal string beside them.
+pub fn encodeAddVersion(arena: Allocator, data: []const u8, checksum: u32) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeAddVersion(&jw, data, checksum) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeAddVersion(jw: *Stringify, data: []const u8, checksum: u32) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("payload");
+    try jw.beginObject();
+    try jw.objectField("data");
+    // Streamed, so the secret is never copied on its way to base64.
+    try core.base64.writeJsonString(jw, data);
+    try jw.objectField("dataCrc32c");
+    var buf: [10]u8 = undefined;
+    try jw.write(std.fmt.bufPrint(&buf, "{d}", .{checksum}) catch unreachable);
+    try jw.endObject();
+    try jw.endObject();
+}
+
+/// How long `encodeAddVersion` will be, so its buffer is allocated once and
+/// never grown, copied and freed with the secret inside it.
+pub fn addVersionBodyLen(data: []const u8, checksum: u32) usize {
+    var digits: usize = 1;
+    var rest = checksum;
+    while (rest >= 10) : (rest /= 10) digits += 1;
+    return "{\"payload\":{\"data\":\"\",\"dataCrc32c\":\"\"}}".len +
+        core.base64.encodedLen(data.len) + digits;
+}
 
 const parse_options: std.json.ParseOptions = .{
     .ignore_unknown_fields = true,
@@ -38,7 +75,7 @@ pub fn decodeAccess(arena: Allocator, body: []const u8) DecodeError!Access {
     return .{
         .name = wire.name orelse "",
         .data = payload.data orelse "",
-        .checksum = try checksum(payload.dataCrc32c),
+        .checksum = try parseChecksum(payload.dataCrc32c),
     };
 }
 
@@ -57,7 +94,7 @@ const WirePayload = struct {
 /// that is not a CRC-32C is a broken response, not a missing checksum:
 /// treating it as missing would quietly skip the verification the caller
 /// asked for.
-fn checksum(value: ?std.json.Value) DecodeError!?u32 {
+fn parseChecksum(value: ?std.json.Value) DecodeError!?u32 {
     const v = value orelse return null;
     const wide: i65 = switch (v) {
         .null => return null,
@@ -68,6 +105,43 @@ fn checksum(value: ?std.json.Value) DecodeError!?u32 {
     };
     if (wide < 0 or wide > std.math.maxInt(u32)) return error.InvalidResponse;
     return @intCast(wide);
+}
+
+/// The `SecretVersion` that add, get, enable, disable and destroy return.
+pub fn decodeVersion(arena: Allocator, body: []const u8) DecodeError!types.VersionInfo {
+    return versionFromWire(try parseWire(WireVersion, arena, body));
+}
+
+const WireVersion = struct {
+    name: ?[]const u8 = null,
+    createTime: ?[]const u8 = null,
+    destroyTime: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    etag: ?[]const u8 = null,
+    clientSpecifiedPayloadChecksum: ?bool = null,
+};
+
+fn versionFromWire(wire: WireVersion) types.VersionInfo {
+    return .{
+        .name = wire.name orelse "",
+        .create_time = wire.createTime orelse "",
+        .destroy_time = wire.destroyTime orelse "",
+        .state = state(wire.state),
+        .etag = wire.etag orelse "",
+        .client_specified_payload_checksum = wire.clientSpecifiedPayloadChecksum orelse false,
+    };
+}
+
+const states = std.StaticStringMap(types.State).initComptime(.{
+    .{ "ENABLED", types.State.enabled },
+    .{ "DISABLED", types.State.disabled },
+    .{ "DESTROYED", types.State.destroyed },
+});
+
+/// A state the server has not used before maps to `.unknown` rather than
+/// failing, so a new one never breaks an old client.
+fn state(text: ?[]const u8) types.State {
+    return states.get(text orelse return .unknown) orelse .unknown;
 }
 
 /// Parses `body` into `T`. A blank body counts as `{}`.
@@ -81,6 +155,71 @@ fn parseWire(comptime T: type, arena: Allocator, body: []const u8) DecodeError!T
 }
 
 const testing = std.testing;
+
+test "golden: the addVersion body production accepts" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "{\"payload\":{\"data\":\"czNjcjN0\",\"dataCrc32c\":\"825573743\"}}",
+        try encodeAddVersion(a, "s3cr3t", core.crc32c.hash("s3cr3t")),
+    );
+    // Bytes that are not text, and a checksum of a single digit.
+    try testing.expectEqualStrings(
+        "{\"payload\":{\"data\":\"AAECA/8=\",\"dataCrc32c\":\"0\"}}",
+        try encodeAddVersion(a, "\x00\x01\x02\x03\xff", 0),
+    );
+    // The largest checksum takes ten digits.
+    try testing.expectEqualStrings(
+        "{\"payload\":{\"data\":\"aGk=\",\"dataCrc32c\":\"4294967295\"}}",
+        try encodeAddVersion(a, "hi", std.math.maxInt(u32)),
+    );
+}
+
+test "decode version: the shape production sends" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const got = try decodeVersion(arena.allocator(),
+        \\{"name":"projects/82150720798/secrets/db-password/versions/3",
+        \\ "createTime":"2026-09-20T23:09:39.716394Z",
+        \\ "state":"ENABLED",
+        \\ "replicationStatus":{"automatic":{}},
+        \\ "etag":"\"165bf23a79782f\"",
+        \\ "clientSpecifiedPayloadChecksum":true}
+    );
+    try testing.expectEqualStrings("projects/82150720798/secrets/db-password/versions/3", got.name);
+    try testing.expectEqualStrings("2026-09-20T23:09:39.716394Z", got.create_time);
+    try testing.expectEqual(.enabled, got.state);
+    try testing.expectEqualStrings("\"165bf23a79782f\"", got.etag);
+    try testing.expect(got.client_specified_payload_checksum);
+    try testing.expectEqualStrings("", got.destroy_time);
+    try testing.expectEqual(3, got.number().?);
+}
+
+test "decode version: states, and what the server leaves out" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A destroyed version keeps its destroyTime, with nanosecond precision.
+    const destroyed = try decodeVersion(a,
+        \\{"name":"v/1","state":"DESTROYED","destroyTime":"2026-09-20T23:09:41.500615147Z"}
+    );
+    try testing.expectEqual(.destroyed, destroyed.state);
+    try testing.expectEqualStrings("2026-09-20T23:09:41.500615147Z", destroyed.destroy_time);
+
+    try testing.expectEqual(.disabled, (try decodeVersion(a, "{\"state\":\"DISABLED\"}")).state);
+    // A state this client has never heard of is not an error.
+    try testing.expectEqual(.unknown, (try decodeVersion(a, "{\"state\":\"SCHEDULED_FOR_DESTRUCTION\"}")).state);
+    try testing.expectEqual(.unknown, (try decodeVersion(a, "{\"state\":\"enabled\"}")).state);
+    try testing.expectEqual(.unknown, (try decodeVersion(a, "{}")).state);
+    // proto3 JSON leaves out a false boolean, as production does for a
+    // version whose checksum the server computed.
+    try testing.expect(!(try decodeVersion(a, "{\"name\":\"v/2\"}")).client_specified_payload_checksum);
+    for ([_][]const u8{ "[]", "<html>", "{\"state\":1}" }) |body| {
+        try testing.expectError(error.InvalidResponse, decodeVersion(a, body));
+    }
+}
 
 test "decode access: the shape production sends" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -168,6 +307,35 @@ fn decodeProperty(_: void, input: []const u8) !void {
     };
     // A checksum that survived decoding is one a u32 can hold.
     if (got.checksum) |c| try testing.expect(c <= std.math.maxInt(u32));
+}
+
+fn addVersionProperty(_: void, input: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sum = core.crc32c.hash(input);
+    const body = try encodeAddVersion(a, input, sum);
+
+    // The length is known before the body is built, so its buffer is
+    // allocated once: a grown buffer would leave a copy of the secret
+    // behind until the arena was wiped.
+    try testing.expectEqual(body.len, addVersionBodyLen(input, sum));
+    // Any bytes at all survive the trip through the body.
+    const parsed = try decodeAccess(a, body);
+    try testing.expectEqual(sum, parsed.checksum.?);
+    try testing.expectEqualSlices(u8, input, try core.base64.decode(a, parsed.data));
+    // Whatever the payload, the body is printable ASCII JSON.
+    for (body) |c| try testing.expect(c >= ' ' and c < 0x7f);
+}
+
+test "fuzz addVersion: any bytes round-trip, and the length is known first" {
+    try test_util.fuzzBytes({}, addVersionProperty, .{ .corpus = &.{
+        "s3cr3t",
+        "",
+        "\x00\x01\x02\x03\xff",
+        "{\"json\":\"inside\"}",
+        "line\nbreak\r\n",
+    } });
 }
 
 test "fuzz decode access: arbitrary bodies never crash" {
