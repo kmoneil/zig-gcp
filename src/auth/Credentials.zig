@@ -54,7 +54,7 @@ pub const Options = struct {
     /// `error.TimedOut`. 0 removes the limit.
     request_timeout_ms: u32 = 30_000,
     /// Printable ASCII.
-    user_agent: []const u8 = "zig-gcp-auth/0.6",
+    user_agent: []const u8 = "zig-gcp-auth/0.7",
     /// How long to wait for a metadata server before deciding there is
     /// none. One attempt, not three: a machine without one should reach
     /// `NoCredentialsFound` in about a second.

@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.7.0 (unreleased)
+## 0.7.0 (2026-09-20)
 
 - pubsub: `Subscriber`, the worker loop consuming a subscription used to
   mean writing by hand: it pulls, hands each message to a handler on one
