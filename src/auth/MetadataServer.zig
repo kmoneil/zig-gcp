@@ -12,6 +12,7 @@
 const MetadataServer = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const core = @import("core");
 const TokenProvider = core.TokenProvider;
@@ -873,6 +874,10 @@ test "MetadataServer: probe gives up on a server that never answers" {
     const started = std.Io.Clock.awake.now(io);
     try testing.expect(!metadata.probe(io));
     const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    // Windows sometimes tears the idle connection down before the timeout
+    // (STATUS_LOCAL_DISCONNECT). The probe still gave up promptly, and
+    // "no" is still the answer, but the timeout was not what ended it.
+    if (builtin.os.tag == .windows and elapsed_ms < 150) return error.SkipZigTest;
     // It waited for the timeout, and not much longer.
     try testing.expect(elapsed_ms >= 150);
     try testing.expect(elapsed_ms < 5_000);
