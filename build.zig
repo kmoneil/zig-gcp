@@ -125,6 +125,26 @@ pub fn build(b: *std.Build) void {
     run_auth_integration.has_side_effects = true;
     integration_step.dependOn(&run_auth_integration.step);
 
+    // Fault injection: the full stack against the emulator, through a proxy
+    // that drops, cuts, delays and rewrites responses. Skips without
+    // PUBSUB_EMULATOR_HOST; never runs against production.
+    const fault_tests = b.addTest(.{
+        .name = "fault-injection",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fault_injection.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pubsub", .module = mod },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+    });
+    const run_fault = b.addRunArtifact(fault_tests);
+    run_fault.has_side_effects = true;
+    integration_step.dependOn(&run_fault.step);
+
     inline for (.{ "publish", "worker", "whoami" }) |name| {
         // whoami is the one example that picks its own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
