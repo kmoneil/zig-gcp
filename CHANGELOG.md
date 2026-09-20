@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.9.0 (unreleased)
+## 0.9.0 (2026-09-20)
 
 - auth: fixed: `MetadataServer` accepted a host whose colon was followed
   by something other than a port, such as `metadata:host`, and the
