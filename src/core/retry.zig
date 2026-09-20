@@ -110,12 +110,13 @@ test "retryable errors are exactly the transient ones" {
         error.TlsFailure,
     }) |err| try testing.expect(isRetryable(err));
     for ([_]anyerror{
-        error.InvalidArgument,  error.FailedPrecondition, error.Unauthenticated,
-        error.PermissionDenied, error.NotFound,           error.AlreadyExists,
-        error.ServerCancelled,  error.Canceled,           error.Aborted,
-        error.Unknown,          error.InvalidResponse,    error.InvalidEndpoint,
-        error.UnknownHostName,  error.ResponseTooLarge,   error.OutOfMemory,
-        error.InvalidMessage,   error.TokenUnavailable,   error.HttpProtocolError,
+        error.InvalidArgument,      error.FailedPrecondition, error.Unauthenticated,
+        error.PermissionDenied,     error.NotFound,           error.AlreadyExists,
+        error.ServerCancelled,      error.Canceled,           error.Aborted,
+        error.Unknown,              error.InvalidResponse,    error.InvalidEndpoint,
+        error.UnknownHostName,      error.ResponseTooLarge,   error.OutOfMemory,
+        error.InvalidMessage,       error.TokenUnavailable,   error.HttpProtocolError,
+        error.InvalidRequestHeader,
     }) |err| try testing.expect(!isRetryable(err));
 }
 

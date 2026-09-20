@@ -19,7 +19,38 @@ pub const Request = struct {
     /// DELETE never carry a body.
     body: ?[]const u8 = null,
     content_type: ContentType = .json,
+    /// Sent after the headers above, in order. A name or value that could
+    /// end the header line is `error.InvalidRequestHeader`, never a second
+    /// request smuggled into this one.
+    headers: []const Header = &.{},
 };
+
+/// One header, as `std.http` writes it.
+pub const Header = http.Header;
+
+/// RFC 9110 field names: at least one character, all of them token
+/// characters, so the name cannot carry a separator or end the line.
+pub fn isValidHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| {
+        if (std.ascii.isAlphanumeric(c)) continue;
+        if (std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) == null) return false;
+    }
+    return true;
+}
+
+/// RFC 9110 field values: visible ASCII, space and tab, with no space or
+/// tab at either end, where the receiver would strip it anyway. An empty
+/// value is legal.
+pub fn isValidHeaderValue(value: []const u8) bool {
+    for (value) |c| if (c != '\t' and (c < ' ' or c >= 0x7f)) return false;
+    if (value.len == 0) return true;
+    return !isSpaceOrTab(value[0]) and !isSpaceOrTab(value[value.len - 1]);
+}
+
+fn isSpaceOrTab(c: u8) bool {
+    return c == ' ' or c == '\t';
+}
 
 /// How a request body is encoded.
 pub const ContentType = enum {
@@ -63,6 +94,8 @@ pub const Error = error{
     ResponseTooLarge,
     /// The URL has an unsupported scheme or no host.
     InvalidEndpoint,
+    /// A header on the request has a name or value that HTTP cannot carry.
+    InvalidRequestHeader,
     /// Any other operating-system network failure.
     NetworkFailure,
     /// The surrounding `std.Io` task was canceled.
@@ -148,6 +181,9 @@ pub const HttpTransport = struct {
         req: Request,
         arena: Allocator,
     ) Error!Response {
+        for (req.headers) |h| {
+            if (!isValidHeaderName(h.name) or !isValidHeaderValue(h.value)) return error.InvalidRequestHeader;
+        }
         const authorization: ?[]const u8 = if (req.bearer) |token|
             try std.fmt.allocPrint(arena, "Bearer {s}", .{token})
         else
@@ -183,6 +219,7 @@ pub const HttpTransport = struct {
                 .content_type = if (has_body) .{ .override = req.content_type.mediaType() } else .omit,
                 .authorization = if (authorization) |v| .{ .override = v } else .omit,
             },
+            .extra_headers = req.headers,
         }) catch |err| return mapError(err, null);
         defer request.deinit();
         const connection = request.connection.?;
@@ -595,6 +632,101 @@ test "HttpTransport sends a form body with its content type" {
     const post = server.request(0);
     try expectHeader(post, "content-type: application/x-www-form-urlencoded\r\n");
     try testing.expect(std.mem.endsWith(u8, post, "\r\n\r\ngrant_type=refresh_token&refresh_token=1%2F%2Fabc"));
+}
+
+test "HttpTransport sends extra headers, in order, after its own" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try ht.transport().send(.{
+        .method = .GET,
+        .url = server.url(&buf, "/computeMetadata/v1/"),
+        .headers = &.{
+            .{ .name = "Metadata-Flavor", .value = "Google" },
+            .{ .name = "x-goog-user-project", .value = "billing-project" },
+        },
+    }, arena.allocator());
+    try serving.await(io);
+
+    const get = server.request(0);
+    try expectHeader(get, "Metadata-Flavor: Google\r\n");
+    try expectHeader(get, "x-goog-user-project: billing-project\r\n");
+    // After the ones the transport writes itself, so neither can be replaced.
+    try testing.expect(std.mem.indexOf(u8, get, "user-agent: t\r\n").? < std.mem.indexOf(u8, get, "Metadata-Flavor").?);
+}
+
+test "HttpTransport refuses a header that would end the line, before it connects" {
+    var ht: HttpTransport = .init(testing.allocator, testing.io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    for ([_]Header{
+        .{ .name = "X-Evil", .value = "1\r\nX-Injected: 2" },
+        .{ .name = "X-Evil", .value = "1\n" },
+        .{ .name = "X-Evil", .value = " 1" },
+        .{ .name = "X-Evil", .value = "1\t" },
+        .{ .name = "X-Evil", .value = "caf\xc3\xa9" },
+        .{ .name = "X-Evil\r\nX-Injected", .value = "1" },
+        .{ .name = "X Evil", .value = "1" },
+        .{ .name = "", .value = "1" },
+    }) |h| {
+        // Nothing listens on port 1: a connection attempt would be refused,
+        // so InvalidRequestHeader proves the check runs first.
+        try testing.expectError(error.InvalidRequestHeader, ht.transport().send(.{
+            .method = .GET,
+            .url = "http://127.0.0.1:1/",
+            .headers = &.{h},
+        }, arena.allocator()));
+    }
+}
+
+test "header names and values follow RFC 9110" {
+    try testing.expect(isValidHeaderName("Metadata-Flavor"));
+    try testing.expect(isValidHeaderName("x-goog-user-project"));
+    try testing.expect(!isValidHeaderName("X:Y"));
+    try testing.expect(!isValidHeaderName("X Y"));
+    try testing.expect(!isValidHeaderName(""));
+    try testing.expect(isValidHeaderValue("Google"));
+    try testing.expect(isValidHeaderValue("a b"));
+    try testing.expect(isValidHeaderValue(""));
+    try testing.expect(!isValidHeaderValue("a\x00b"));
+    try testing.expect(!isValidHeaderValue("a\r\nb"));
+    try testing.expect(!isValidHeaderValue(" a"));
+    try testing.expect(!isValidHeaderValue("a "));
+}
+
+fn headerProperty(_: void, input: []const u8) !void {
+    // An accepted header can never end its line or start another one.
+    if (isValidHeaderName(input)) {
+        try testing.expect(std.mem.indexOfAny(u8, input, "\r\n\x00 \t:") == null);
+        try testing.expect(input.len > 0);
+    }
+    if (isValidHeaderValue(input)) {
+        try testing.expect(std.mem.indexOfAny(u8, input, "\r\n\x00") == null);
+        if (input.len > 0) try testing.expect(input[0] != ' ' and input[input.len - 1] != ' ');
+    }
+}
+
+test "fuzz headers: nothing accepted can break the request" {
+    try test_util.fuzzBytes({}, headerProperty, .{ .corpus = &.{
+        "Metadata-Flavor",
+        "Google",
+        "a\r\nX-Injected: 1",
+        " lead",
+        "trail\t",
+        "caf\xc3\xa9",
+        "",
+    } });
 }
 
 test "HttpTransport reaches IPv6 literal hosts, as PUBSUB_EMULATOR_HOST=[::1]:8085" {
