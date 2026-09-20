@@ -8,6 +8,13 @@
 /// way, or to fake the server in tests.
 pub const transport = @import("transport.zig");
 
+/// The request loop every service module runs: credentials, retries, error
+/// mapping and diagnostics.
+pub const rpc = @import("rpc.zig");
+
+/// Resource-name rules more than one service needs.
+pub const names = @import("names.zig");
+
 pub const RetryPolicy = @import("retry.zig").RetryPolicy;
 pub const isRetryable = @import("retry.zig").isRetryable;
 
@@ -48,8 +55,10 @@ test {
     _ = @import("crc32c.zig");
     _ = @import("errors.zig");
     _ = @import("logging.zig");
+    _ = @import("names.zig");
     _ = @import("owned.zig");
     _ = @import("query.zig");
+    _ = @import("rpc.zig");
     _ = @import("retry.zig");
     _ = @import("testing.zig");
     _ = @import("timestamp.zig");
