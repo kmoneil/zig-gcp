@@ -30,6 +30,7 @@ project_url: []u8,
 root_url: []u8,
 user_agent: []u8,
 probe_timeout_ms: u32,
+request_timeout_ms: u32,
 retry: core.RetryPolicy,
 diagnostics: ?*Diagnostics,
 cache: Cache,
@@ -52,6 +53,10 @@ pub const Options = struct {
     /// than an API call would.
     retry: core.RetryPolicy = .{ .max_attempts = 3 },
     cache: Cache.Options = .{},
+    /// How long one request may take before it is `error.TimedOut`. The
+    /// metadata server is on this machine's own network, so a request that
+    /// takes seconds is already wrong. 0 removes the limit.
+    request_timeout_ms: u32 = 10_000,
     /// Printable ASCII.
     user_agent: []const u8 = "zig-gcp-auth/0.4",
     /// Filled with the details of the last failure. Never holds a token.
@@ -148,6 +153,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) InitError!MetadataServ
         .root_url = root_url,
         .user_agent = user_agent,
         .probe_timeout_ms = options.probe_timeout_ms,
+        .request_timeout_ms = options.request_timeout_ms,
         .retry = options.retry,
         .diagnostics = diag,
         .cache = cache,
@@ -309,6 +315,7 @@ fn get(self: *MetadataServer, arena: Allocator, url: []const u8) Attempt {
         .method = .GET,
         .url = url,
         .headers = request_headers,
+        .timeout_ms = self.request_timeout_ms,
     }, arena) catch |err| {
         if (self.diagnostics) |d| d.print("the metadata server could not be reached: {t}", .{err});
         return if (core.isRetryable(err)) .{ .retry = err } else .{ .fail = err };
@@ -343,6 +350,8 @@ fn probeOnce(self: *MetadataServer) ProbeError!bool {
         .method = .GET,
         .url = self.root_url,
         .headers = request_headers,
+        // The race in `probeChecked` is this request's real limit.
+        .timeout_ms = self.probe_timeout_ms,
     }, arena.allocator()) catch |err| switch (err) {
         // Neither says anything about where this code is running.
         error.OutOfMemory, error.Canceled => |e| return e,
@@ -439,6 +448,7 @@ const token_ok: Reply = .{ .respond = .{
     .headers = flavor,
 } };
 const busy: Reply = .{ .respond = .{ .status = 503, .body = "Service Unavailable", .headers = flavor } };
+const metadata_listing: Reply = .{ .respond = .{ .body = "computeMetadata/\n", .headers = flavor } };
 const test_scopes: []const []const u8 = &.{"https://www.googleapis.com/auth/cloud-platform"};
 
 /// A `MetadataServer` wired to a fake transport and a fake clock.
@@ -494,6 +504,18 @@ test "MetadataServer: the token request carries Metadata-Flavor and no token of 
     try testing.expectEqual(null, req.body);
     // A service account bills its own project.
     try testing.expectEqual(null, h.metadata.provider().quotaProject());
+}
+
+test "MetadataServer: requests carry a deadline, and the probe a shorter one" {
+    var h: Harness = undefined;
+    try h.init(&.{ token_ok, metadata_listing });
+    defer h.deinit();
+    _ = try h.get();
+    // The metadata server is on this machine's own network.
+    try testing.expectEqual(10_000, (try h.fake.request(0)).timeout_ms);
+    // The probe answers "is this Google Cloud?", so it gives up sooner.
+    try testing.expect(h.metadata.probe(h.clock.io()));
+    try testing.expectEqual(500, (try h.fake.request(1)).timeout_ms);
 }
 
 test "MetadataServer: an answer without Metadata-Flavor is not the metadata server's" {
