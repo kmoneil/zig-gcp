@@ -60,7 +60,13 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
 ## Changes
 
 - `main` is protected: open a pull request, and CI must pass before it
-  merges.
+  merges. Six checks are required by name: `test`, `release (ReleaseSafe)`,
+  `release (ReleaseFast)`, `platforms (macos-latest)`,
+  `platforms (windows-latest)` and `coverage`. Renaming one of those jobs,
+  or changing a matrix value that appears in its name, leaves every pull
+  request waiting for a check that will never report; change the rule for
+  `main` in the same breath. The nightly `fuzz` job is not required,
+  because it does not run on pull requests.
 - A bug fix comes with a test that fails without it. When the fuzzer finds
   a failing input, add that input to the property's corpus. The fuzzer
   saves it as `.zig-cache/f/crash`, and the nightly CI run attaches it as
