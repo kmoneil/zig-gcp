@@ -25,6 +25,12 @@ pub const StaticToken = @import("StaticToken.zig");
 /// An allocator that wipes memory before freeing it, for secrets.
 pub const WipingAllocator = @import("WipingAllocator.zig");
 
+/// CRC-32C, the checksum Google sends beside payload bytes.
+pub const crc32c = @import("crc32c.zig");
+
+/// Percent-encoding for request paths, and a query-string builder.
+pub const query = @import("query.zig");
+
 /// Logging under each module's own scope, captured in test builds.
 pub const logging = @import("logging.zig");
 
@@ -39,9 +45,11 @@ test {
     _ = @import("StaticToken.zig");
     _ = @import("TokenProvider.zig");
     _ = @import("WipingAllocator.zig");
+    _ = @import("crc32c.zig");
     _ = @import("errors.zig");
     _ = @import("logging.zig");
     _ = @import("owned.zig");
+    _ = @import("query.zig");
     _ = @import("retry.zig");
     _ = @import("testing.zig");
     _ = @import("timestamp.zig");

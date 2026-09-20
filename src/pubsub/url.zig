@@ -1,50 +1,16 @@
-//! Request paths and query strings.
-//!
-//! Path segments are encoded minimally: every character RFC 3986 allows in a
-//! segment stays literal, the rest is percent-encoded. Measured against
-//! production, Google's front end decodes escapes like `%25` but leaves
-//! escapes of reserved characters alone, so an encoded `+` (`%2B`) would name
-//! a different topic than a literal `+`. For valid ids, only `%` is encoded;
-//! without that, a raw `orders%41` would address the topic `ordersA`.
-//!
-//! Query values (page tokens) are encoded strictly: everything outside the
-//! unreserved set, so `+` and `=` survive form-style decoding.
+//! Pub/Sub request paths: the resource path every call builds on, the list
+//! query, and the resource name that goes inside bodies. The percent-encoding
+//! rules, and the measurements behind them, live in `core.query`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
-const test_util = @import("test_util.zig");
+const query = @import("core").query;
 
 pub const Collection = enum {
     topics,
     subscriptions,
 };
-
-pub fn isUnreserved(c: u8) bool {
-    return switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
-        else => false,
-    };
-}
-
-/// RFC 3986 `pchar` without `pct-encoded`: what may appear literally in a
-/// path segment.
-pub fn isPathChar(c: u8) bool {
-    return isUnreserved(c) or switch (c) {
-        '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':', '@' => true,
-        else => false,
-    };
-}
-
-/// Writes `text` as one path segment: bytes outside `isPathChar` become `%XX`.
-pub fn writeSegment(w: *Writer, text: []const u8) Writer.Error!void {
-    return std.Uri.Component.percentEncode(w, text, isPathChar);
-}
-
-/// Writes `text` as a query value: bytes outside the unreserved set become `%XX`.
-pub fn writeQueryValue(w: *Writer, text: []const u8) Writer.Error!void {
-    return std.Uri.Component.percentEncode(w, text, isUnreserved);
-}
 
 /// `/v1/projects/{project}/{collection}/{id}{suffix}`, with `project` and `id`
 /// encoded. `suffix` is a literal method such as `:publish`, or "".
@@ -69,9 +35,9 @@ fn writeResourcePath(
     suffix: []const u8,
 ) Writer.Error!void {
     try w.writeAll("/v1/projects/");
-    try writeSegment(w, project);
+    try query.writeSegment(w, project);
     try w.print("/{t}/", .{collection});
-    try writeSegment(w, id);
+    try query.writeSegment(w, id);
     try w.writeAll(suffix);
 }
 
@@ -98,17 +64,11 @@ fn writeListPath(
     page_token: ?[]const u8,
 ) Writer.Error!void {
     try w.writeAll("/v1/projects/");
-    try writeSegment(w, project);
+    try query.writeSegment(w, project);
     try w.print("/{t}", .{collection});
-    var separator: u8 = '?';
-    if (page_size != 0) {
-        try w.print("{c}pageSize={d}", .{ separator, page_size });
-        separator = '&';
-    }
-    if (page_token) |token| if (token.len != 0) {
-        try w.print("{c}pageToken=", .{separator});
-        try writeQueryValue(w, token);
-    };
+    var params: query.Params = .init(w);
+    try params.addNonZero("pageSize", page_size);
+    try params.addOptional("pageToken", page_token);
 }
 
 /// The unencoded resource name, `projects/{project}/{collection}/{id}`, as it
@@ -175,45 +135,4 @@ test "resourceName is not encoded" {
         "projects/test/topics/a%41",
         try resourceName(arena.allocator(), "test", .topics, "a%41"),
     );
-}
-
-fn expectEncoding(encoded: []const u8, input: []const u8, comptime isAllowed: fn (u8) bool) !void {
-    // Only allowed bytes and well-formed %XX escapes...
-    var i: usize = 0;
-    while (i < encoded.len) : (i += 1) {
-        if (encoded[i] == '%') {
-            try testing.expect(i + 2 < encoded.len);
-            try testing.expect(std.ascii.isHex(encoded[i + 1]) and std.ascii.isHex(encoded[i + 2]));
-            i += 2;
-        } else {
-            try testing.expect(isAllowed(encoded[i]));
-        }
-    }
-    // ...and decoding gives the input back.
-    var copy: [3 * test_util.max_fuzz_input]u8 = undefined;
-    @memcpy(copy[0..encoded.len], encoded);
-    try testing.expectEqualSlices(u8, input, std.Uri.percentDecodeInPlace(copy[0..encoded.len]));
-}
-
-fn encodeProperty(_: void, input: []const u8) !void {
-    var buf: [3 * test_util.max_fuzz_input]u8 = undefined;
-    var w: Writer = .fixed(&buf);
-    try writeSegment(&w, input);
-    try expectEncoding(w.buffered(), input, isPathChar);
-    // A segment never contains a separator the server would split on.
-    try testing.expect(std.mem.indexOfAny(u8, w.buffered(), "/?#") == null);
-
-    w = .fixed(&buf);
-    try writeQueryValue(&w, input);
-    try expectEncoding(w.buffered(), input, isUnreserved);
-}
-
-test "fuzz percent-encoding round-trips and emits only safe bytes" {
-    try test_util.fuzzBytes({}, encodeProperty, .{ .corpus = &.{
-        "orders",
-        "a%41b+c",
-        "projects/p/topics/x+=",
-        "\x00\xff /?#[]@!$&'()*,;=",
-        "mi-t\xc3\xb3pico",
-    } });
 }
