@@ -105,6 +105,7 @@ pub const FakeTransport = struct {
         body: ?[]u8,
         content_type: ContentType,
         headers: []Header,
+        timeout_ms: u32,
 
         /// The value sent for `name`, matched as HTTP matches names, or null.
         pub fn header(self: Recorded, name: []const u8) ?[]const u8 {
@@ -202,6 +203,7 @@ pub const FakeTransport = struct {
             .body = body,
             .content_type = req.content_type,
             .headers = headers,
+            .timeout_ms = req.timeout_ms,
         });
     }
 };
