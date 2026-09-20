@@ -13,12 +13,18 @@ pub const Cache = @import("Cache.zig");
 pub const AuthorizedUser = @import("AuthorizedUser.zig");
 pub const MetadataServer = @import("MetadataServer.zig");
 pub const Lookup = @import("Lookup.zig");
+pub const Credentials = @import("Credentials.zig");
+/// The credentials this environment points at: the file
+/// `GOOGLE_APPLICATION_CREDENTIALS` names, the file gcloud's login wrote,
+/// or the metadata server, in that order.
+pub const findDefault = Credentials.find;
 
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("AuthorizedUser.zig");
     _ = @import("MetadataServer.zig");
     _ = @import("Lookup.zig");
+    _ = @import("Credentials.zig");
     _ = @import("Cache.zig");
     _ = @import("adc_file.zig");
     _ = @import("form.zig");
