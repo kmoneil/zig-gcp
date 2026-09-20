@@ -36,6 +36,7 @@ base_url: []const u8,
 token_provider: TokenProvider,
 verify_checksum: types.ChecksumMode,
 retry: RetryPolicy,
+retry_add_version: bool,
 send_quota_project: bool,
 request_timeout_ms: u32,
 diagnostics: ?*Diagnostics,
@@ -60,6 +61,11 @@ pub const Options = struct {
     /// What to do about the checksum stored with a secret's bytes.
     verify_checksum: types.ChecksumMode = .if_present,
     retry: RetryPolicy = .{},
+    /// A retried `addVersion` can store the same bytes twice: after a 504,
+    /// say, the server may have stored them already. A duplicate version is
+    /// harmless where a missing one is not, so retries are on by default.
+    /// Callers who count versions can turn them off.
+    retry_add_version: bool = true,
     /// How long one request may take before it is `error.TimedOut`, which is
     /// retried like any other transient failure. 0 removes the limit, and
     /// nothing bounds a call then but the caller's own `std.Io`.
@@ -130,6 +136,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
         .token_provider = options.token_provider,
         .verify_checksum = options.verify_checksum,
         .retry = options.retry,
+        .retry_add_version = options.retry_add_version,
         .send_quota_project = options.send_quota_project,
         .request_timeout_ms = options.request_timeout_ms,
         .diagnostics = diag,
