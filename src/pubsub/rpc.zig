@@ -1,177 +1,63 @@
-//! Runs one API call: builds the URL, attaches credentials, sends through
-//! the client's transport, maps failures to errors, retries transient ones
-//! with jittered backoff, and keeps `Diagnostics` and the log current.
+//! Runs one API call: core's request engine builds the URL, attaches
+//! credentials, sends through the client's transport, maps failures to
+//! errors, retries transient ones with jittered backoff, and keeps
+//! `Diagnostics` and the log current. This file binds that engine to a
+//! Pub/Sub client and holds the checks its public calls share.
 //! `Client`, `Topic` and `Subscription` call into here.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const core = @import("core");
+const Allocator = std.mem.Allocator;
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
 const validate = @import("validate.zig");
-const isRetryable = core.isRetryable;
-const Method = core.transport.Method;
-const Response = core.transport.Response;
 const Error = errors.Error;
+const isRetryable = core.isRetryable;
 
 /// The OAuth scope the client asks its token provider for.
 pub const scope = "https://www.googleapis.com/auth/pubsub";
 
-pub const Call = struct {
-    method: Method,
-    /// Path and query, starting with `/v1/`.
-    path: []const u8,
-    body: ?[]const u8 = null,
-    /// False where the caller opted out of retries, as for publish.
-    retry: bool = true,
-};
+/// The shared engine, logging under this module's scope.
+const Engine = core.rpc.Engine(.gcp_pubsub);
+
+pub const Call = core.rpc.Call;
+
+/// The engine, filled in from one client's settings.
+fn engine(client: *Client) Engine {
+    return .{
+        .gpa = client.gpa,
+        .io = client.io,
+        .transport = client.transport,
+        .base_url = client.base_url,
+        .auth_scope = scope,
+        .token_provider = client.token_provider,
+        // The emulator speaks plain HTTP and never receives credentials.
+        .unauthenticated = client.emulator,
+        .send_quota_project = client.send_quota_project,
+        .retry = client.retry,
+        .request_timeout_ms = client.request_timeout_ms,
+        .diagnostics = client.diagnostics,
+    };
+}
 
 /// Starts a public call: `Diagnostics` describe only the latest call.
 pub fn begin(client: *Client) void {
-    if (client.diagnostics) |d| d.clear();
+    engine(client).begin();
 }
 
 /// Sends `call`, retrying transient failures, and returns the body of the
 /// first 2xx response. The body lives in `response`, which is reset between
 /// attempts and so must hold nothing else.
 pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
-    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
-    defer scratch.deinit();
-    const url = try std.mem.concat(scratch.allocator(), u8, &.{ client.base_url, call.path });
-    // Query strings carry page tokens; they stay out of the log.
-    const log_path = call.path[0 .. std.mem.indexOfScalar(u8, call.path, '?') orelse call.path.len];
-    var max_attempts: u32 = if (call.retry) client.retry.max_attempts else 1;
-
-    var header_buf: [1]core.transport.Header = undefined;
-    var headers: []const core.transport.Header = &.{};
-    if (try quotaProject(client)) |project| {
-        header_buf[0] = .{ .name = "x-goog-user-project", .value = project };
-        headers = header_buf[0..1];
-    }
-
-    var reauthenticated = false;
-    var attempt: u32 = 1;
-    while (true) : (attempt += 1) {
-        const bearer = try bearerToken(client, scratch.allocator());
-        const started = std.Io.Clock.awake.now(client.io);
-        const outcome = client.transport.send(.{
-            .method = call.method,
-            .url = url,
-            .bearer = bearer,
-            .body = call.body,
-            .headers = headers,
-            .timeout_ms = client.request_timeout_ms,
-        }, response.allocator());
-        const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(client.io)).toMilliseconds();
-
-        const err: Error = if (outcome) |res| e: {
-            logging.debug("{t} {s} -> {d} in {d} ms (attempt {d} of {d})", .{
-                call.method, log_path, res.status, elapsed_ms, attempt, max_attempts,
-            });
-            if (res.status >= 200 and res.status < 300) {
-                if (client.diagnostics) |d| d.clear();
-                return res.body;
-            }
-            break :e failure(client, scratch.allocator(), res);
-        } else |err| e: {
-            logging.debug("{t} {s} -> {t} in {d} ms (attempt {d} of {d})", .{
-                call.method, log_path, err, elapsed_ms, attempt, max_attempts,
-            });
-            if (client.diagnostics) |d| d.print("{t}", .{err});
-            break :e err;
-        };
-
-        // A 401 usually means the token died between being fetched and
-        // being used. The server rejected the request before acting on it,
-        // so trying again with a fresh token is safe even for a publish,
-        // which otherwise never retries.
-        if (err == error.Unauthenticated and !reauthenticated and dropCachedToken(client)) {
-            reauthenticated = true;
-            max_attempts += 1;
-            logging.warn("{t} {s} was refused as unauthenticated; retrying once with a fresh token", .{ call.method, log_path });
-            _ = response.reset(.retain_capacity);
-            continue;
-        }
-
-        if (attempt >= max_attempts or !isRetryable(err)) return err;
-        const delay_ms = client.retry.backoffMs(attempt, entropy(client.io));
-        logging.warn("{t} {s} failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
-            call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
-        });
-        _ = response.reset(.retain_capacity);
-        try client.io.sleep(.fromMilliseconds(delay_ms), .awake);
-    }
+    return engine(client).execute(response, call);
 }
 
 /// `execute` for calls whose response body is not needed.
 pub fn executeDiscard(client: *Client, call: Call) Error!void {
-    var response: std.heap.ArenaAllocator = .init(client.gpa);
-    defer response.deinit();
-    _ = try execute(client, &response, call);
-}
-
-/// Maps a non-2xx response and records its details.
-fn failure(client: *Client, scratch: Allocator, res: Response) Error {
-    const body = core.errors.decodeErrorBody(scratch, res.body) catch |err| return err;
-    const status = if (body) |b| b.status else "";
-    // A body that is not the standard error shape, such as a proxy's page,
-    // is the best message there is.
-    const message = if (body) |b| b.message else res.body;
-    if (client.diagnostics) |d| d.set(res.status, status, message);
-    return core.errors.fromResponse(res.status, status);
-}
-
-/// The token for one attempt, copied into `scratch`, which outlives the
-/// request and is freed when the call returns.
-fn bearerToken(client: *Client, scratch: Allocator) Error!?[]const u8 {
-    // Never send credentials to the emulator: it speaks plain HTTP.
-    if (client.emulator) return null;
-    const provider = client.token_provider orelse return null;
-    const token = provider.getToken(client.io, scratch, &.{scope}) catch |err| {
-        if (client.diagnostics) |d| d.print("the token provider failed: {t}", .{err});
-        return err;
-    };
-    if (!core.TokenProvider.isValidToken(token)) {
-        if (client.diagnostics) |d| d.print("the token provider returned an empty token, or one with spaces, newlines or non-ASCII bytes", .{});
-        return error.TokenUnavailable;
-    }
-    return token;
-}
-
-/// The project to charge for quota, sent as `x-goog-user-project`. User
-/// credentials name one; a service account bills its own project. The
-/// emulator never sees it, and `send_quota_project` turns it off.
-fn quotaProject(client: *Client) Error!?[]const u8 {
-    if (client.emulator or !client.send_quota_project) return null;
-    const provider = client.token_provider orelse return null;
-    const project = provider.quotaProject() orelse return null;
-    if (!validate.isProjectId(project)) {
-        if (client.diagnostics) |d| d.print(
-            "invalid quota project: expected a project id, from the credentials or GOOGLE_CLOUD_QUOTA_PROJECT",
-            .{},
-        );
-        return error.InvalidResourceId;
-    }
-    return project;
-}
-
-/// Drops the cached token after a 401, so the next attempt fetches a new
-/// one. False when there is no provider to ask, which makes a second
-/// attempt pointless.
-fn dropCachedToken(client: *Client) bool {
-    if (client.emulator) return false;
-    const provider = client.token_provider orelse return false;
-    provider.invalidate();
-    return true;
-}
-
-fn entropy(io: std.Io) u64 {
-    var bytes: [8]u8 = undefined;
-    io.random(&bytes);
-    return std.mem.readInt(u64, &bytes, .little);
+    return engine(client).executeDiscard(call);
 }
 
 /// Checks a topic or subscription id before any request.

@@ -59,16 +59,9 @@ pub fn isResourceId(id: []const u8) bool {
 }
 
 /// Project ids and numbers, including legacy domain-scoped ids such as
-/// `example.com:my-project`. Checked loosely, only so the id is safe in a
-/// URL and a JSON string; the server decides whether it exists.
-pub fn isProjectId(id: []const u8) bool {
-    if (id.len == 0 or id.len > 100) return false;
-    for (id) |c| switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', ':', '_' => {},
-        else => return false,
-    };
-    return true;
-}
+/// `example.com:my-project`. Shared with the other service modules, so it
+/// lives in core; the tests for it are there too.
+pub const isProjectId = @import("core").names.isProjectId;
 
 /// Checks a publish call: message count, per-message rules, UTF-8, and the
 /// size of the encoded request.
@@ -182,17 +175,6 @@ test "resource ids: the documented rules at their boundaries" {
     try testing.expect(!isResourceId(""));
 }
 
-test "project ids" {
-    try testing.expect(isProjectId("test"));
-    try testing.expect(isProjectId("my-project-123"));
-    try testing.expect(isProjectId("123456789123"));
-    try testing.expect(isProjectId("example.com:my-project"));
-    try testing.expect(!isProjectId(""));
-    try testing.expect(!isProjectId("a/b"));
-    try testing.expect(!isProjectId("a b"));
-    try testing.expect(!isProjectId("a\"b"));
-    try testing.expect(!isProjectId("x" ** 101));
-}
 
 fn expectRejected(messages: []const types.Message, ordering_key: ?[]const u8, want: []const u8) !void {
     var d: Diagnostics = .{};

@@ -406,15 +406,8 @@ fn isValidServiceAccount(name: []const u8) bool {
 }
 
 /// Project ids and numbers, including legacy domain-scoped ids such as
-/// `example.com:my-project`.
-fn isProjectId(id: []const u8) bool {
-    if (id.len == 0 or id.len > 100) return false;
-    for (id) |c| switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', ':', '_' => {},
-        else => return false,
-    };
-    return true;
-}
+/// `example.com:my-project`. Shared with the service modules.
+const isProjectId = core.names.isProjectId;
 
 fn isPrintable(text: []const u8) bool {
     if (text.len == 0) return false;
