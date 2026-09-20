@@ -23,7 +23,8 @@ including the ones that did not change.
   `MetadataServer` fetches tokens for the service account attached to a
   workload on Google Cloud, reads its project id, and tells you whether
   there is a metadata server at all.
-  `AuthorizedUser` reads the credentials file that
+  `Credentials.projectId` says which project a workload runs in, when the
+  credentials know. `AuthorizedUser` reads the credentials file that
   `gcloud auth application-default login` writes, and trades its refresh
   token for access tokens at Google's token endpoint. `Cache`, which both
   build on, refreshes a token before it expires, runs one fetch at a time,
