@@ -88,3 +88,25 @@ test "on Google Cloud: the metadata server hands out a token for the attached ac
     var page = try client.listTopics(.{ .page_size = 1 });
     page.deinit();
 }
+
+test "findDefault: the file the environment names, used against Google" {
+    var env = try testing.environ.createMap(testing.allocator);
+    defer env.deinit();
+    const path = env.get("AUTH_TEST_CREDENTIALS") orelse return error.SkipZigTest;
+    var diag: auth.Diagnostics = .{};
+    errdefer std.debug.print("diagnostics: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+
+    // The whole chain, as an application would run it, with the first
+    // source pointed at a real credentials file.
+    var creds = try auth.findDefault(testing.allocator, testing.io, .{
+        .credentials_path = path,
+        .diagnostics = &diag,
+    }, .{});
+    defer creds.deinit();
+    try testing.expectEqual(.env_file, creds.source);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const token = try creds.provider().getToken(testing.io, arena.allocator(), scopes);
+    try testing.expect(auth.TokenProvider.isValidToken(token));
+}
