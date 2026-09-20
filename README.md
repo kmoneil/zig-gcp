@@ -11,9 +11,10 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 280 unit, property and fuzz tests; 20 Pub/Sub integration
-  tests that pass against both the emulator and production; and 3 auth tests
-  against Google's token endpoint.
+- Tested with 282 unit, property and fuzz tests; 20 Pub/Sub integration
+  tests that pass against both the emulator and production; 3 auth tests
+  against Google's token endpoint; and a run on a Compute Engine VM, where
+  the metadata server is the one that answers.
 - Until 1.0, a minor release may break any module. `CHANGELOG.md` says how.
 
 ## Install
@@ -99,6 +100,9 @@ var client = try pubsub.Client.init(gpa, io, .{
 user credentials name: the client sends it as `x-goog-user-project`, and
 `send_quota_project` turns that off. When a call comes back 401, the client
 drops the cached token, fetches another and tries once more.
+`creds.projectId(io, arena)` says which project the program runs in, when
+the credentials know: the metadata server does, a credentials file does
+not. On Google Cloud that means a program needs no configuration at all.
 
 It looks in three places, in this order:
 

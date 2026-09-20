@@ -147,6 +147,17 @@ pub fn quotaProjectId(self: Credentials) ?[]const u8 {
     return self.held.provider().quotaProject();
 }
 
+/// The project this workload runs in, when the credentials can say: the
+/// metadata server knows, a credentials file does not. Copied into
+/// `arena`. On Google Cloud this saves a program from being told where it
+/// is running.
+pub fn projectId(self: Credentials, io: std.Io, arena: Allocator) MetadataServer.ProjectIdError!?[]const u8 {
+    return switch (self.held.impl) {
+        .user => null,
+        .metadata => |*metadata| try metadata.projectId(io, arena),
+    };
+}
+
 pub fn deinit(self: *Credentials) void {
     self.held.deinit(self.gpa);
     self.gpa.destroy(self.held);
@@ -443,6 +454,44 @@ test "findDefault: the metadata server is the last resort" {
     try testing.expectEqualStrings("ya29.from-metadata", try creds.provider().getToken(testing.io, arena.allocator(), test_scopes));
     try testing.expectEqualStrings("http://169.254.169.254/", (try fake.request(0)).url);
     try testing.expect(std.mem.startsWith(u8, (try fake.request(1)).url, "http://169.254.169.254/computeMetadata/"));
+}
+
+test "findDefault: the metadata server says which project this runs in" {
+    var config: TmpConfig = undefined;
+    try config.init();
+    defer config.deinit();
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        metadata_listing,
+        .{ .respond = .{ .body = "my-project-123", .headers = flavor } },
+    });
+    defer fake.deinit();
+
+    var creds = try find(testing.allocator, testing.io, .{ .gcloud_config_dir = config.dir }, .{
+        .transport = fake.transport(),
+    });
+    defer creds.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("my-project-123", (try creds.projectId(testing.io, arena.allocator())).?);
+}
+
+test "findDefault: a credentials file does not know the project, and says so without asking" {
+    var config: TmpConfig = undefined;
+    try config.init();
+    defer config.deinit();
+    var path_buf: [160]u8 = undefined;
+    _ = try config.write(&path_buf, Lookup.adc_file_name, gcloud_json);
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{});
+    defer fake.deinit();
+
+    var creds = try find(testing.allocator, testing.io, .{ .gcloud_config_dir = config.dir }, .{
+        .transport = fake.transport(),
+    });
+    defer creds.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(null, try creds.projectId(testing.io, arena.allocator()));
+    try testing.expectEqual(0, fake.requests.items.len);
 }
 
 test "findDefault: with nothing anywhere, it says what it tried" {

@@ -35,10 +35,13 @@ pub fn main(init: std.process.Init) !void {
     try out.print("credentials: {t}\n", .{creds.source});
     if (creds.quotaProjectId()) |project| try out.print("quota project: {s}\n", .{project});
 
-    // On Google Cloud, auth.MetadataServer.projectId says which project
-    // this runs in. Everywhere else the caller picks.
+    // On Google Cloud the credentials know which project this runs in.
+    // Everywhere else the caller picks.
+    const detected = creds.projectId(init.io, arena) catch |err| return fail(err, &diag);
+    if (detected) |project| try out.print("running in: {s}\n", .{project});
     const project = init.environ_map.get("GOOGLE_CLOUD_PROJECT") orelse
         init.environ_map.get("PUBSUB_PROJECT_ID") orelse
+        detected orelse
         creds.quotaProjectId() orelse
         {
             try out.print("set GOOGLE_CLOUD_PROJECT to list topics\n", .{});
