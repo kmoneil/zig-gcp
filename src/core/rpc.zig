@@ -218,7 +218,10 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
     };
 }
 
-fn entropy(io: std.Io) u64 {
+/// Randomness for a jittered backoff. Public so a module that retries a call
+/// of its own, as Secret Manager does after a checksum mismatch, waits the
+/// same way the loop does.
+pub fn entropy(io: std.Io) u64 {
     var bytes: [8]u8 = undefined;
     io.random(&bytes);
     return std.mem.readInt(u64, &bytes, .little);
