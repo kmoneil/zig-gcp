@@ -29,6 +29,9 @@ const FaultProxy = struct {
     port: u16,
     upstream: net.IpAddress,
     plan: []const Fault,
+    /// Guards the counters: connections are served concurrently, because a
+    /// Subscriber runs two clients at once.
+    mutex: std.Io.Mutex = .init,
     /// Requests read from clients so far, which is also the plan index.
     requests: usize = 0,
     /// Requests that reached the emulator. `close_before_response` is the
@@ -79,15 +82,17 @@ const FaultProxy = struct {
         p.server.deinit(io);
     }
 
-    /// Serves until canceled. A connection the client abandons is normal
-    /// here, not an error; the loop moves on to the next one.
+    /// Serves until canceled, each connection on a task of its own, since
+    /// a client may hold several at once. A connection the client abandons
+    /// is normal here, not an error.
     ///
     /// Cancellation must land in `accept`: a canceled read surfaces as
-    /// `ReadFailed` and consumes the request, so a cancel during `serve`
-    /// would leave the next `accept` blocking forever. `Fixture.deinit`
-    /// closes the client first, which parks this loop in `accept`, and
-    /// cancels then.
+    /// `ReadFailed` and consumes the request, so a cancel during a serve
+    /// would leave `accept` blocking forever. `Fixture.deinit` closes the
+    /// clients first, which quiets the serving tasks, and cancels then.
     fn run(p: *FaultProxy, io: std.Io) std.Io.Cancelable!void {
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
         while (true) {
             const stream = p.server.accept(io) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
@@ -96,12 +101,23 @@ const FaultProxy = struct {
                     return;
                 },
             };
-            p.connections += 1;
-            p.serve(io, stream) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => {},
+            {
+                p.mutex.lockUncancelable(io);
+                defer p.mutex.unlock(io);
+                p.connections += 1;
+            }
+            group.concurrent(io, serveTask, .{ p, io, stream }) catch {
+                // No task for it: serve on this one, as a lone client allows.
+                serveTask(p, io, stream) catch |err| return err;
             };
         }
+    }
+
+    fn serveTask(p: *FaultProxy, io: std.Io, stream: net.Stream) std.Io.Cancelable!void {
+        p.serve(io, stream) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {},
+        };
     }
 
     fn serve(p: *FaultProxy, io: std.Io, stream: net.Stream) !void {
@@ -116,6 +132,8 @@ const FaultProxy = struct {
             defer request.deinit();
             if (!try readRequest(&reader.interface, &request)) return;
             const fault = f: {
+                p.mutex.lockUncancelable(io);
+                defer p.mutex.unlock(io);
                 defer p.requests += 1;
                 break :f if (p.requests < p.plan.len) p.plan[p.requests] else .pass;
             };
@@ -201,7 +219,9 @@ const FaultProxy = struct {
         var writer = upstream.writer(io, &write_buf);
         try writer.interface.writeAll(request);
         try writer.interface.flush();
+        p.mutex.lockUncancelable(io);
         p.forwarded += 1;
+        p.mutex.unlock(io);
 
         var read_buf: [16 * 1024]u8 = undefined;
         var reader = upstream.reader(io, &read_buf);
@@ -829,4 +849,103 @@ test "fuzz faults: any misdelivery yields a clean outcome and a usable client" {
         .random_runs = 25,
         .max_len = 16,
     });
+}
+
+/// A handler for the subscriber test: counts distinct bodies and stops the
+/// subscriber once `want` of them succeeded.
+const FaultWorker = struct {
+    gpa: Allocator,
+    subscriber: *pubsub.Subscriber,
+    want: usize,
+    mutex: std.Io.Mutex = .init,
+    seen: std.StringHashMapUnmanaged(usize) = .empty,
+
+    fn deinit(w: *FaultWorker) void {
+        var it = w.seen.keyIterator();
+        while (it.next()) |key| w.gpa.free(key.*);
+        w.seen.deinit(w.gpa);
+    }
+
+    fn handler(w: *FaultWorker) pubsub.Subscriber.Handler {
+        return .{ .ptr = w, .vtable = &.{ .handle = handle } };
+    }
+
+    fn handle(ptr: *anyopaque, io: std.Io, message: pubsub.ReceivedMessage) anyerror!void {
+        const w: *FaultWorker = @ptrCast(@alignCast(ptr));
+        w.mutex.lockUncancelable(io);
+        defer w.mutex.unlock(io);
+        const entry = try w.seen.getOrPut(w.gpa, message.data);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = try w.gpa.dupe(u8, message.data);
+            entry.value_ptr.* = 0;
+        }
+        entry.value_ptr.* += 1;
+        if (w.seen.count() >= w.want) w.subscriber.stop();
+    }
+
+    fn done(w: *FaultWorker) bool {
+        w.mutex.lockUncancelable(testing.io);
+        defer w.mutex.unlock(testing.io);
+        return w.seen.count() >= w.want;
+    }
+};
+
+test "the subscriber's loop survives a run of misdeliveries" {
+    var f: Fixture = undefined;
+    // Faults land on whichever of the subscriber's requests comes next:
+    // pulls, acknowledgements and lease extensions all take their turn.
+    if (!try f.init(&.{
+        .{ .cut_tail = 5 },
+        .pass,
+        .close_before_response,
+        .pass,
+        .swallow_response,
+        .pass,
+        .{ .truncate_head = 12 },
+        .{ .cut_tail = 30 },
+        .pass,
+        .swallow_response,
+    }, .{})) return error.SkipZigTest;
+    defer f.deinit();
+    try f.startProxy();
+
+    const topic = try f.directTopic("subf");
+    const sub = try f.directSubscription("subf-sub", .{ .topic_id = topic.id });
+    for (0..10) |i| {
+        var buf: [8]u8 = undefined;
+        var sent = f.direct.topic(topic.id).publish(&.{.{ .data = try std.fmt.bufPrint(&buf, "sub-{d}", .{i}) }}, .{}) catch |err| return f.fail(err);
+        sent.deinit();
+    }
+
+    const io = testing.io;
+    var host_buf: [24]u8 = undefined;
+    const host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{f.proxy.port});
+    var subscriber: pubsub.Subscriber = try .init(testing.allocator, io, .{
+        .subscription_id = sub.id,
+        .client = .{
+            .project_id = f.direct.project_id,
+            .endpoint = .{ .url = host, .emulator = true },
+            .retry = .{ .max_attempts = 5, .initial_backoff_ms = 10, .max_backoff_ms = 100 },
+            .request_timeout_ms = 30_000,
+        },
+        .concurrency = 2,
+    });
+    defer subscriber.deinit();
+    var worker: FaultWorker = .{ .gpa = testing.allocator, .subscriber = &subscriber, .want = 10 };
+    defer worker.deinit();
+
+    var running = try io.concurrent(pubsub.Subscriber.run, .{ &subscriber, worker.handler() });
+    const deadline = nowMs() + 60_000;
+    while (!worker.done()) {
+        if (nowMs() > deadline) {
+            _ = running.cancel(io) catch {};
+            return error.TestTimedOut;
+        }
+        try io.sleep(.fromMilliseconds(100), .awake);
+    }
+    // Every message got through the misdeliveries, and the loop ended clean.
+    running.await(io) catch |err| return f.fail(err);
+    try testing.expectEqual(10, worker.seen.count());
+    const counts = subscriber.stats();
+    try testing.expectEqual(counts.received, counts.acked + counts.nacked);
 }

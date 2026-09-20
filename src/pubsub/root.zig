@@ -10,6 +10,7 @@ const core = @import("core");
 pub const Client = @import("Client.zig");
 pub const Topic = @import("Topic.zig");
 pub const Subscription = @import("Subscription.zig");
+pub const Subscriber = @import("Subscriber.zig");
 pub const Endpoint = @import("Endpoint.zig");
 
 pub const TokenProvider = core.TokenProvider;

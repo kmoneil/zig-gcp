@@ -76,6 +76,49 @@ such as `orders`. Creating one sends nothing. The operations:
 See `examples/publish.zig` and `examples/worker.zig` for complete programs,
 and `examples/whoami.zig` for one that finds its own credentials.
 
+### A worker loop
+
+Consuming a subscription for real means more than `pull` and `ack`: leases
+must be extended while a handler runs, failures released for redelivery,
+work bounded, and shutdown clean. `Subscriber` is that loop:
+
+```zig
+const Printer = struct {
+    fn handler(self: *Printer) pubsub.Subscriber.Handler {
+        return .{ .ptr = self, .vtable = &.{ .handle = handle } };
+    }
+    fn handle(ptr: *anyopaque, io: std.Io, message: pubsub.ReceivedMessage) anyerror!void {
+        std.debug.print("{s}\n", .{message.data}); // return acks; an error releases
+        _ = .{ ptr, io };
+    }
+};
+
+var subscriber = try pubsub.Subscriber.init(gpa, io, .{
+    .subscription_id = "orders-worker",
+    .client = .{ .project_id = "my-project", .token_provider = creds.provider() },
+    .concurrency = 4,
+});
+defer subscriber.deinit();
+try subscriber.run(printer.handler()); // until subscriber.stop(), or a fatal error
+```
+
+`run` blocks and runs everything else on tasks of its own: one puller, one
+janitor that batches acknowledgements, releases and lease extensions, and
+`concurrency` handler tasks. A handler returning acknowledges its message;
+an error releases it for redelivery, so delivery is at least once and a
+handler must tolerate a duplicate. Leases are extended for as long as a
+handler runs, up to `max_extension_s`, after which the handler is presumed
+dead and the server redelivers elsewhere. `max_outstanding` bounds how many
+unresolved messages are held at once, and pulling pauses at the cap.
+
+Transient failures anywhere are retried forever, further and further
+apart; an error retrying cannot fix, such as the subscription being
+deleted, stops the loop and comes back from `run` with the diagnostics
+filled. `stop` is safe to call from a handler or another task: pulling
+stops, running handlers finish and their messages resolve, buffered ones
+are released unhandled, and the last acknowledgements are flushed.
+`stats()` is a consistent snapshot of the counters at any time.
+
 ### Production credentials
 
 Production needs a `TokenProvider`. `auth.findDefault` picks one the way
