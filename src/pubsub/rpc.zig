@@ -43,8 +43,16 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
     const url = try std.mem.concat(scratch.allocator(), u8, &.{ client.base_url, call.path });
     // Query strings carry page tokens; they stay out of the log.
     const log_path = call.path[0 .. std.mem.indexOfScalar(u8, call.path, '?') orelse call.path.len];
-    const max_attempts: u32 = if (call.retry) client.retry.max_attempts else 1;
+    var max_attempts: u32 = if (call.retry) client.retry.max_attempts else 1;
 
+    var header_buf: [1]core.transport.Header = undefined;
+    var headers: []const core.transport.Header = &.{};
+    if (try quotaProject(client)) |project| {
+        header_buf[0] = .{ .name = "x-goog-user-project", .value = project };
+        headers = header_buf[0..1];
+    }
+
+    var reauthenticated = false;
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         const bearer = try bearerToken(client, scratch.allocator());
@@ -54,6 +62,7 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
             .url = url,
             .bearer = bearer,
             .body = call.body,
+            .headers = headers,
         }, response.allocator());
         const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(client.io)).toMilliseconds();
 
@@ -73,6 +82,18 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
             if (client.diagnostics) |d| d.print("{t}", .{err});
             break :e err;
         };
+
+        // A 401 usually means the token died between being fetched and
+        // being used. The server rejected the request before acting on it,
+        // so trying again with a fresh token is safe even for a publish,
+        // which otherwise never retries.
+        if (err == error.Unauthenticated and !reauthenticated and dropCachedToken(client)) {
+            reauthenticated = true;
+            max_attempts += 1;
+            logging.warn("{t} {s} was refused as unauthenticated; retrying once with a fresh token", .{ call.method, log_path });
+            _ = response.reset(.retain_capacity);
+            continue;
+        }
 
         if (attempt >= max_attempts or !isRetryable(err)) return err;
         const delay_ms = client.retry.backoffMs(attempt, entropy(client.io));
@@ -117,6 +138,33 @@ fn bearerToken(client: *Client, scratch: Allocator) Error!?[]const u8 {
         return error.TokenUnavailable;
     }
     return token;
+}
+
+/// The project to charge for quota, sent as `x-goog-user-project`. User
+/// credentials name one; a service account bills its own project. The
+/// emulator never sees it, and `send_quota_project` turns it off.
+fn quotaProject(client: *Client) Error!?[]const u8 {
+    if (client.emulator or !client.send_quota_project) return null;
+    const provider = client.token_provider orelse return null;
+    const project = provider.quotaProject() orelse return null;
+    if (!validate.isProjectId(project)) {
+        if (client.diagnostics) |d| d.print(
+            "invalid quota project: expected a project id, from the credentials or GOOGLE_CLOUD_QUOTA_PROJECT",
+            .{},
+        );
+        return error.InvalidResourceId;
+    }
+    return project;
+}
+
+/// Drops the cached token after a 401, so the next attempt fetches a new
+/// one. False when there is no provider to ask, which makes a second
+/// attempt pointless.
+fn dropCachedToken(client: *Client) bool {
+    if (client.emulator) return false;
+    const provider = client.token_provider orelse return false;
+    provider.invalidate();
+    return true;
 }
 
 fn entropy(io: std.Io) u64 {
@@ -628,4 +676,141 @@ test "credentials: every allocation failure on the token path is OutOfMemory wit
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{});
+}
+
+const unauthenticated: Reply = .{ .respond = .{
+    .status = 401,
+    .body = "{\"error\":{\"code\":401,\"message\":\"Invalid Credentials\",\"status\":\"UNAUTHENTICATED\"}}",
+} };
+
+test "quota: the credentials' project goes out as x-goog-user-project" {
+    var provider: FakeTokenProvider = .{ .quota_project = "billing-project" };
+    var h: Harness = undefined;
+    try h.init(&.{ topic_ok, topic_ok }, .{ .token = "ya29.token" });
+    defer h.deinit();
+    h.client.token_provider = provider.provider();
+
+    var info = try h.client.topic("orders").get();
+    info.deinit();
+    try testing.expectEqualStrings("billing-project", (try h.fake.request(0)).header("x-goog-user-project").?);
+
+    // Off by request: the project owning the resources pays instead.
+    h.client.send_quota_project = false;
+    var again = try h.client.topic("orders").get();
+    again.deinit();
+    try testing.expectEqual(null, (try h.fake.request(1)).header("x-goog-user-project"));
+}
+
+test "quota: credentials that name no project send no header" {
+    // A service account bills its own project, so it reports none.
+    var provider: FakeTokenProvider = .{};
+    var h: Harness = undefined;
+    try h.init(&.{topic_ok}, .{ .token = "ya29.token" });
+    defer h.deinit();
+    h.client.token_provider = provider.provider();
+    var info = try h.client.topic("orders").get();
+    info.deinit();
+    try testing.expectEqual(null, (try h.fake.request(0)).header("x-goog-user-project"));
+}
+
+test "quota: the emulator never gets the project either" {
+    var provider: FakeTokenProvider = .{ .quota_project = "billing-project" };
+    var h: Harness = undefined;
+    try h.init(&.{topic_ok}, .{});
+    defer h.deinit();
+    h.client.token_provider = provider.provider();
+    var info = try h.client.topic("orders").get();
+    info.deinit();
+    try testing.expectEqual(null, (try h.fake.request(0)).header("x-goog-user-project"));
+    try testing.expectEqual(null, (try h.fake.request(0)).bearer);
+}
+
+test "quota: a project id that is not one is refused before anything is sent" {
+    for ([_][]const u8{ "bad project", "billing\r\nX-Injected: 1", "x" ** 101, "" }) |bad| {
+        var provider: FakeTokenProvider = .{ .quota_project = bad };
+        var h: Harness = undefined;
+        try h.init(&.{topic_ok}, .{ .token = "ya29.token" });
+        defer h.deinit();
+        h.client.token_provider = provider.provider();
+        try testing.expectError(error.InvalidResourceId, h.client.topic("orders").get());
+        try h.expectRequestCount(0);
+        try testing.expect(std.mem.startsWith(u8, h.diag.message(), "invalid quota project"));
+    }
+}
+
+test "401: the cached token is dropped and the call retried once with a fresh one" {
+    var provider: FakeTokenProvider = .{ .token = "ya29.stale", .next_token = "ya29.fresh" };
+    var h: Harness = undefined;
+    try h.init(&.{ unauthenticated, topic_ok }, .{ .token = "ya29.token" });
+    defer h.deinit();
+    h.client.token_provider = provider.provider();
+
+    var info = try h.client.topic("orders").get();
+    defer info.deinit();
+    try h.expectRequestCount(2);
+    try testing.expectEqual(1, provider.invalidations);
+    try testing.expectEqualStrings("ya29.stale", (try h.fake.request(0)).bearer.?);
+    try testing.expectEqualStrings("ya29.fresh", (try h.fake.request(1)).bearer.?);
+    // A fresh token is not a transient failure: no backoff, no waiting.
+    try testing.expectEqual(0, h.clock.sleep_count);
+    try testing.expectEqual(0, h.diag.http_status);
+}
+
+test "401: a second one is Unauthenticated, with no third attempt" {
+    var provider: FakeTokenProvider = .{ .token = "ya29.stale", .next_token = "ya29.fresh" };
+    var h: Harness = undefined;
+    try h.init(&.{ unauthenticated, unauthenticated }, .{ .token = "ya29.token" });
+    defer h.deinit();
+    h.client.token_provider = provider.provider();
+
+    try testing.expectError(error.Unauthenticated, h.client.topic("orders").get());
+    try h.expectRequestCount(2);
+    try testing.expectEqual(1, provider.invalidations);
+    try testing.expectEqual(401, h.diag.http_status);
+    try testing.expectEqualStrings("UNAUTHENTICATED", h.diag.status());
+}
+
+test "401: a publish retries too, because the server refused it before storing anything" {
+    var provider: FakeTokenProvider = .{ .token = "ya29.stale", .next_token = "ya29.fresh" };
+    var h: Harness = undefined;
+    const ok: Reply = .{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } };
+    try h.init(&.{ unauthenticated, ok }, .{ .token = "ya29.token", .retry_publish = false });
+    defer h.deinit();
+    h.client.token_provider = provider.provider();
+
+    var result = try h.client.topic("orders").publish(&.{.{ .data = "x" }}, .{});
+    defer result.deinit();
+    try h.expectRequestCount(2);
+    try testing.expectEqualStrings("ya29.fresh", (try h.fake.request(1)).bearer.?);
+    // Still no retrying of anything else: a 503 ends the call.
+    var again: Harness = undefined;
+    try again.init(&.{unavailable}, .{ .token = "ya29.token", .retry_publish = false });
+    defer again.deinit();
+    try testing.expectError(error.Unavailable, again.client.topic("orders").publish(&.{.{ .data = "x" }}, .{}));
+    try again.expectRequestCount(1);
+}
+
+test "401: with no provider to ask, there is nothing to retry with" {
+    var h: Harness = undefined;
+    try h.init(&.{unauthenticated}, .{});
+    defer h.deinit();
+    try testing.expectError(error.Unauthenticated, h.client.topic("orders").get());
+    try h.expectRequestCount(1);
+}
+
+test "401: a call that fails twice over still reports the later failure" {
+    var provider: FakeTokenProvider = .{};
+    var h: Harness = undefined;
+    // One 401, then the retry policy's own attempts for a transient error.
+    try h.init(&.{ unauthenticated, unavailable, unavailable }, .{
+        .token = "ya29.token",
+        .retry = .{ .max_attempts = 2 },
+    });
+    defer h.deinit();
+    h.client.token_provider = provider.provider();
+    try testing.expectError(error.Unavailable, h.client.topic("orders").get());
+    // The fresh token buys one extra attempt, and no more.
+    try h.expectRequestCount(3);
+    try testing.expectEqual(1, provider.invalidations);
+    try testing.expectEqual(1, h.clock.sleep_count);
 }

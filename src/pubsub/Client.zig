@@ -38,6 +38,7 @@ emulator: bool,
 token_provider: ?TokenProvider,
 retry: RetryPolicy,
 retry_publish: bool,
+send_quota_project: bool,
 diagnostics: ?*Diagnostics,
 transport: Transport,
 /// The built-in transport, when `Options.transport` was null.
@@ -58,6 +59,10 @@ pub const Options = struct {
     /// server may already have them. Subscribers must tolerate duplicates
     /// anyway; set false to never retry a publish.
     retry_publish: bool = true,
+    /// Sends `x-goog-user-project` when the credentials name a project to
+    /// charge for quota, as a user's own credentials do. Set false where
+    /// the project owning the resources should pay instead.
+    send_quota_project: bool = true,
     /// Printable ASCII.
     user_agent: []const u8 = "zig-gcp-pubsub/0.3",
     /// Filled with details of every failed call; cleared by each new call.
@@ -123,6 +128,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
         .token_provider = options.token_provider,
         .retry = options.retry,
         .retry_publish = options.retry_publish,
+        .send_quota_project = options.send_quota_project,
         .diagnostics = diag,
         .transport = transport,
         .http = http,
