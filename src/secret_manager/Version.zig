@@ -585,3 +585,39 @@ test "version administration: every allocation failure is OutOfMemory without le
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
 }
+
+test "access: a payload too big for the arena's spare room is OutOfMemory" {
+    // Small payloads are decoded inside the chunk the response body already
+    // sits in, so an allocation-failure sweep never reaches the decode
+    // itself. A payload larger than that chunk does.
+    const big = "0123456789abcdef" ** 3072; // 48 KiB
+    const Run = struct {
+        fn run(gpa: std.mem.Allocator, body: []const u8) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{.{ .respond = .{ .body = body } }});
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: test_util.FakeTokenProvider = .{};
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "extractctl",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+            var value = try client.secret("db-password").access(.latest);
+            defer value.deinit();
+            try testing.expectEqualStrings(big, value.bytes());
+        }
+    };
+    // Built at runtime: hashing 48 KiB at comptime is not what the branch
+    // quota is for.
+    const encoded = try testing.allocator.alloc(u8, core.base64.encodedLen(big.len));
+    defer testing.allocator.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, big);
+    const body = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"name\":\"v/1\",\"payload\":{{\"data\":\"{s}\",\"dataCrc32c\":\"{d}\"}}}}",
+        .{ encoded, core.crc32c.hash(big) },
+    );
+    defer testing.allocator.free(body);
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{body});
+}
