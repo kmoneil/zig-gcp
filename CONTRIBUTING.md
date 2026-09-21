@@ -26,6 +26,10 @@ The step also runs `tests/fault_injection.zig`: the whole stack against the
 emulator, through a proxy that drops, cuts, delays and rewrites responses.
 Those tests need the emulator specifically and never target production.
 
+Each integration suite prints a line as every test starts, and `OK` when it
+passes. In CI the step gives up after ten minutes; if it does, the log's
+last line, a test name with no `OK` after it, is the test that hung.
+
 The auth integration tests run against Google when `AUTH_TEST_CREDENTIALS`
 names a credentials file, of type `authorized_user` or `service_account`;
 each test runs when the file is the type it exercises. The README shows how.

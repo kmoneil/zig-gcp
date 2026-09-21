@@ -124,9 +124,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    const run_integration = b.addRunArtifact(integration_tests);
-    // The result depends on external state, so never serve it from the cache.
-    run_integration.has_side_effects = true;
+    const run_integration = streamed(b, integration_tests);
     const integration_step = b.step(
         "test-integration",
         "Run integration tests against PUBSUB_EMULATOR_HOST, or Google when configured",
@@ -148,8 +146,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    const run_auth_integration = b.addRunArtifact(auth_integration_tests);
-    run_auth_integration.has_side_effects = true;
+    const run_auth_integration = streamed(b, auth_integration_tests);
     integration_step.dependOn(&run_auth_integration.step);
 
     // Secret Manager against a real project: there is no emulator, so these
@@ -166,8 +163,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    const run_gcp = b.addRunArtifact(gcp_tests);
-    run_gcp.has_side_effects = true;
+    const run_gcp = streamed(b, gcp_tests);
     b.step(
         "test-integration-gcp",
         "Run Secret Manager tests against the project GCP_TEST_PROJECT names",
@@ -189,8 +185,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    const run_fault = b.addRunArtifact(fault_tests);
-    run_fault.has_side_effects = true;
+    const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
     inline for (.{ "publish", "worker", "whoami", "secret" }) |name| {
@@ -223,4 +218,18 @@ pub fn build(b: *std.Build) void {
         .check = true,
     });
     b.step("fmt", "Check formatting (zig fmt --check)").dependOn(&fmt.step);
+}
+
+/// Runs an integration suite as a plain program instead of through the build
+/// runner's test protocol, which prints nothing until the suite ends. Run
+/// this way, the test runner prints each test's name as the test starts, so
+/// a suite that hangs leaves a log that says which test it was. Output goes
+/// straight through, which also makes the step run alone: the suites take
+/// turns with the emulator instead of loading it all at once. And such a
+/// step always runs, since its result depends on a server, never the cache.
+fn streamed(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Run {
+    const run = std.Build.Step.Run.create(b, b.fmt("run {s}", .{tests.name}));
+    run.addArtifactArg(tests);
+    run.stdio = .inherit;
+    return run;
 }
