@@ -2813,3 +2813,32 @@ test "slow property Publisher: any script of publishes, answers, time and pauses
         },
     });
 }
+
+test "run: when no sender can start, the timer already running is taken down and run refused" {
+    // The real Io, except that group tasks, the senders, cannot start. The
+    // timer, a task of its own, does start, and must be canceled again.
+    const GroupsRefused = struct {
+        const vtable: std.Io.VTable = v: {
+            var v = testing.io.vtable.*;
+            v.groupConcurrent = std.Io.failingGroupConcurrent;
+            break :v v;
+        };
+
+        fn io() std.Io {
+            return .{ .userdata = testing.io.userdata, .vtable = &vtable };
+        }
+    };
+    var fake: FakeTopic = .{ .gpa = testing.allocator, .io = testing.io };
+    defer fake.deinit();
+    var diag: Diagnostics = .{};
+    var options = testOptions(fake.transport(), .{});
+    options.client.diagnostics = &diag;
+    var publisher: Publisher = try .init(testing.allocator, GroupsRefused.io(), options);
+    defer publisher.deinit();
+    const receipt = try publisher.publish(.{ .data = "stranded" }, .{});
+    defer receipt.release();
+    try testing.expectError(error.InvalidOptions, publisher.run());
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "concurrent tasks") != null);
+    try testing.expectError(error.PublisherStopped, receipt.wait());
+    try testing.expectEqual(0, fake.requestCount());
+}

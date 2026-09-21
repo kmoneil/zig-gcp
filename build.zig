@@ -188,7 +188,7 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "worker", "whoami", "secret" }) |name| {
+    inline for (.{ "publish", "publisher", "worker", "whoami", "secret" }) |name| {
         // whoami and secret pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
