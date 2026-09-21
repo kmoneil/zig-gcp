@@ -17,6 +17,10 @@ pub const Error = core.rpc.Error || error{
     ChecksumMismatch,
     /// `downloadAlloc` met an object larger than its `max_bytes`.
     ObjectTooLarge,
+    /// The caller's writer failed during a download, with the detail
+    /// wherever that concrete writer keeps it. Whatever it holds by then
+    /// must be discarded.
+    WriteFailed,
     /// An object name breaks the rules: empty, over 1,024 bytes, invalid
     /// UTF-8, a carriage return or line feed, or `.` or `..`.
     InvalidObjectName,

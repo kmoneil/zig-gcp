@@ -115,6 +115,24 @@ pub const StreamRequest = struct {
     /// another task, so the body reader and sink writer must not be touched
     /// until the call returns.
     timeout_ms: u32 = 0,
+    /// Filled with the response's status and headers as soon as the head
+    /// arrives, before any body byte moves, and left null when no head
+    /// arrived at all. A download that fails mid-body reads here what it
+    /// was reading, such as the object generation a resume must pin. The
+    /// headers live in the arena passed to the send.
+    head_out: ?*?Head = null,
+
+    pub const Head = struct {
+        status: u16,
+        headers: []const Header,
+
+        /// The value sent for `name`, matched as HTTP matches names, or
+        /// null. The first wins, as `std.http` does.
+        pub fn header(self: Head, name: []const u8) ?[]const u8 {
+            for (self.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+            return null;
+        }
+    };
 
     pub const Body = union(enum) {
         /// No body and no Content-Length, as GET and DELETE send.
@@ -420,6 +438,7 @@ pub const HttpTransport = struct {
         // The head lives in the connection's read buffer, which reading the
         // body overwrites, so copy the headers out first.
         const headers = try collectHeaders(head, arena);
+        if (req.head_out) |out| out.* = .{ .status = status, .headers = headers };
         if (status == 204 or status == 304) {
             // These end at the head; the connection is ready for the next request.
             request.reader.state = .ready;
@@ -1978,6 +1997,49 @@ test "sendStream: a streamed body cut short is a dropped connection, and the wri
     // Delivered bytes stay delivered; a resuming download counts them
     // through its own counting writer.
     try testing.expectEqualStrings("partial data", out.buffered());
+}
+
+test "sendStream: the head is readable even when the body is cut short" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nx-goog-generation: 42\r\nContent-Length: 100\r\n\r\npartial",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var head: ?StreamRequest.Head = null;
+    try testing.expectError(error.ConnectionResetByPeer, ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/a"),
+        .sink = .{ .writer = &out },
+        .head_out = &head,
+    }, arena.allocator()));
+    // The body failed, but the head had already been delivered whole.
+    try testing.expectEqual(200, head.?.status);
+    try testing.expectEqualStrings("42", head.?.header("x-goog-generation").?);
+    try testing.expectEqualStrings("partial", out.buffered());
+
+    // A connection that never answers leaves it null.
+    var refused: ?StreamRequest.Head = null;
+    var closed: ScriptedServer = try .start(io, &.{});
+    const port = closed.port;
+    closed.deinit(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/a", .{port});
+    _ = ht.transport().sendStream(.{
+        .method = .GET,
+        .url = url,
+        .head_out = &refused,
+    }, arena.allocator()) catch {};
+    try testing.expectEqual(null, refused);
 }
 
 test "sendStream: the caller's writer failing mid-body is WriteFailed" {

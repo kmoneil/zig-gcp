@@ -19,8 +19,22 @@ including the ones that did not change.
   are checked against `x-goog-hash`; an object decompressed in transit
   has nothing to check against and reports `checksum_verified = false`.
   Uploads, like deletes without a `generation`, are not retried unless
-  `retry_unconditional_writes` opts in; downloads restart from scratch
-  on transient failures, and partial bytes never leak into the result. Object names travel strictly
+  `retry_unconditional_writes` opts in. `download` streams an object, or
+  a `range` of it, into any `std.Io.Writer`: the bytes are hashed as
+  they pass and checked against `x-goog-hash` at the end, and a
+  transient failure mid-body resumes where the bytes stopped, pinned to
+  the generation the first response named, so an overwrite in between
+  fails cleanly instead of splicing two objects; the attempt counter
+  resets whenever a request delivers bytes. A range read, and an object
+  decompressed in transit, report `checksum_verified = false`, the
+  latter because the stored checksum covers bytes that did not arrive,
+  and it cannot resume either. A range past the end is
+  `error.OutOfRange`, except at offset 0 on an empty object, which is
+  simply zero bytes. `downloadAlloc` is the same download into the
+  library's own capped buffer, resumes included.
+- core: a streaming request can ask for the response head as soon as it
+  arrives, through `head_out`, so a download that fails mid-body still
+  knows the generation it was reading and can resume against it. Object names travel strictly
   percent-encoded, so names with slashes, spaces, `%` or non-ASCII address
   exactly the object they name. The codec reads the API's quirks: `size`
   and generations as string integers (numbers too, for emulators),

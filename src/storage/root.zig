@@ -1,9 +1,10 @@
 //! Cloud Storage JSON API client.
 //!
 //! `Client` holds the configuration and the connection pool; `Bucket` and
-//! `Object` are cheap handles on it. This milestone covers buckets and
-//! object metadata: create, get, list and delete. Uploads and downloads,
-//! with checksums verified in both directions, arrive next.
+//! `Object` are cheap handles on it: buckets and object metadata, uploads
+//! from memory, and downloads that stream into any writer with checksums
+//! verified, ranges, and mid-body resume pinned to one generation.
+//! Uploads from a reader arrive with the resumable-upload milestone.
 //!
 //! Against the `fake-gcs-server` emulator no credentials are needed: pass
 //! `Endpoint.fromEnv(environ)` to honor `STORAGE_EMULATOR_HOST`.
@@ -39,6 +40,7 @@ pub const Metadata = @import("types.zig").Metadata;
 pub const ObjectInfo = @import("types.zig").ObjectInfo;
 pub const ObjectPage = @import("types.zig").ObjectPage;
 pub const PageOptions = @import("types.zig").PageOptions;
+pub const Range = @import("types.zig").Range;
 pub const UploadOptions = @import("types.zig").UploadOptions;
 
 /// Parses a `time_created` (RFC 3339) to nanoseconds since the Unix epoch.

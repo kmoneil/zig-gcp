@@ -70,6 +70,10 @@ pub const StreamCall = struct {
     /// caller's business.
     retry: bool = true,
     retryable: *const fn (err: anyerror, http_status: u16) bool = retryableByDefault,
+    /// Filled with the response head as soon as it arrives, even when the
+    /// body then fails; see `transport.StreamRequest.head_out`. With
+    /// engine-level retries the head is the latest attempt's.
+    head_out: ?*?transport.StreamRequest.Head = null,
 
     pub const Body = union(enum) {
         none,
@@ -229,6 +233,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                     .sink = call.sink,
                     .accept_encoding = call.accept_encoding,
                     .timeout_ms = self.request_timeout_ms,
+                    .head_out = call.head_out,
                 }, response.allocator());
                 const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
 
