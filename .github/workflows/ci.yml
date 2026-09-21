@@ -151,7 +151,10 @@ jobs:
   # them, and the one that signs a JWT with RSA on every run takes 49 ms on
   # its own. That one is named "slow property" rather than "fuzz", so the
   # auth job skips it, and it gets a job of its own at a count it can
-  # finish. A manual run's fuzz_iterations overrides every count.
+  # finish. pubsub's Publisher property plays a whole script against a
+  # publisher and costs about 1.4 ms a run, more than the rest of pubsub's
+  # together, so it is a slow property too. A manual run's fuzz_iterations
+  # overrides every count.
   fuzz:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.fuzz_iterations != '')
     name: fuzz (${{ matrix.job }})
@@ -163,6 +166,7 @@ jobs:
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
           - { job: slow-auth, module: auth, filter: slow property, iterations: 100K }
           - { job: pubsub, module: pubsub, filter: fuzz, iterations: 2M }
+          - { job: slow-pubsub, module: pubsub, filter: slow property, iterations: 1M }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
