@@ -45,6 +45,13 @@ pub fn writeValue(w: *Writer, text: []const u8) Writer.Error!void {
     return std.Uri.Component.percentEncode(w, text, isUnreserved);
 }
 
+/// Writes `text` as one path segment in the strict form a Cloud Storage
+/// object name needs: everything outside the unreserved set becomes `%XX`,
+/// including `/`, so a name with slashes stays one segment. `writeSegment`
+/// would leave characters like `+` literal, which Google's client libraries
+/// avoid by encoding object names this way.
+pub const writeStrictSegment = writeValue;
+
 /// Appends query parameters to a path a writer already holds: `?a=1` for the
 /// first, `&b=2` for the rest. Names and values are both percent-encoded, so
 /// the separators in the result are only ever the ones it wrote.
@@ -180,6 +187,23 @@ test "isEmpty reports whether a query was started" {
     try testing.expect(params.isEmpty());
     try params.add("pageSize", "1");
     try testing.expect(!params.isEmpty());
+}
+
+test "writeStrictSegment encodes an object name as one segment" {
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "reports/2026/q3.txt", "reports%2F2026%2Fq3.txt" },
+        .{ "a b+c", "a%20b%2Bc" },
+        .{ "100%.txt", "100%25.txt" },
+        .{ "q?.txt#1", "q%3F.txt%231" },
+        .{ "caf\xc3\xa9", "caf%C3%A9" },
+        .{ "safe-name_0.9~", "safe-name_0.9~" },
+    };
+    for (cases) |c| {
+        var buf: [64]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        try writeStrictSegment(&w, c[0]);
+        try testing.expectEqualStrings(c[1], w.buffered());
+    }
 }
 
 fn expectEncoding(encoded: []const u8, input: []const u8, comptime isAllowed: fn (u8) bool) !void {
