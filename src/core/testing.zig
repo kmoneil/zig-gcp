@@ -12,9 +12,13 @@ const TransportError = @import("transport.zig").Error;
 const Method = @import("transport.zig").Method;
 const Request = @import("transport.zig").Request;
 const Response = @import("transport.zig").Response;
+const StreamRequest = @import("transport.zig").StreamRequest;
+const StreamResponse = @import("transport.zig").StreamResponse;
+const StreamError = @import("transport.zig").StreamError;
 const ContentType = @import("transport.zig").ContentType;
 const Header = @import("transport.zig").Header;
 const TokenProvider = @import("TokenProvider.zig");
+const Crc32c = @import("crc32c.zig").Hasher;
 
 /// A `TokenProvider` that returns one token, or fails with one error, and
 /// counts how it is used.
@@ -85,6 +89,11 @@ pub const FakeTransport = struct {
     script: []const Reply,
     next: usize = 0,
     requests: std.ArrayList(Recorded) = .empty,
+    stream_requests: std.ArrayList(RecordedStream) = .empty,
+    /// How much of a streamed request body is kept verbatim. The whole body
+    /// is always drained, counted and checksummed, so a test of a large
+    /// upload asserts on `body_len` and `body_crc32c` instead.
+    max_recorded_body: usize = 64 * 1024,
 
     pub const Reply = union(enum) {
         respond: Canned,
@@ -95,6 +104,12 @@ pub const FakeTransport = struct {
         status: u16 = 200,
         body: []const u8 = "{}",
         headers: []const Header = &.{},
+        /// For a streamed sink: deliver only this many body bytes, then fail
+        /// with `cut_error`, like a connection dropped mid-body. A buffered
+        /// reply fails without delivering anything, as the real transport
+        /// never returns a partial buffer.
+        cut_after: ?usize = null,
+        cut_error: TransportError = error.ConnectionResetByPeer,
     };
 
     /// A deep copy of one request, owned by the fake.
@@ -114,6 +129,30 @@ pub const FakeTransport = struct {
         }
     };
 
+    /// A deep copy of one streaming request. The body was drained from its
+    /// source: `body_prefix` holds the first `max_recorded_body` bytes, and
+    /// `body_len` with `body_crc32c` describe all of it.
+    pub const RecordedStream = struct {
+        method: Method,
+        url: []u8,
+        bearer: ?[]u8,
+        content_type: ?[]u8,
+        headers: []Header,
+        body_prefix: []u8,
+        body_len: u64,
+        body_crc32c: u32,
+        body_tag: std.meta.Tag(StreamRequest.Body),
+        sink: std.meta.Tag(StreamRequest.Sink),
+        accept_encoding: StreamRequest.AcceptEncoding,
+        timeout_ms: u32,
+
+        /// The value sent for `name`, matched as HTTP matches names, or null.
+        pub fn header(self: RecordedStream, name: []const u8) ?[]const u8 {
+            for (self.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+            return null;
+        }
+    };
+
     pub fn init(gpa: Allocator, script: []const Reply) FakeTransport {
         return .{ .gpa = gpa, .script = script };
     }
@@ -123,18 +162,24 @@ pub const FakeTransport = struct {
             self.gpa.free(r.url);
             if (r.bearer) |b| self.gpa.free(b);
             if (r.body) |b| self.gpa.free(b);
-            for (r.headers) |h| {
-                self.gpa.free(h.name);
-                self.gpa.free(h.value);
-            }
+            freeHeaders(self.gpa, r.headers);
             self.gpa.free(r.headers);
         }
         self.requests.deinit(self.gpa);
+        for (self.stream_requests.items) |r| {
+            self.gpa.free(r.url);
+            if (r.bearer) |b| self.gpa.free(b);
+            if (r.content_type) |c| self.gpa.free(c);
+            self.gpa.free(r.body_prefix);
+            freeHeaders(self.gpa, r.headers);
+            self.gpa.free(r.headers);
+        }
+        self.stream_requests.deinit(self.gpa);
         self.* = undefined;
     }
 
     pub fn transport(self: *FakeTransport) Transport {
-        return .{ .ptr = self, .vtable = &.{ .send = send } };
+        return .{ .ptr = self, .vtable = &.{ .send = send, .sendStream = sendStream } };
     }
 
     /// The request at `index`, failing the test when there is none.
@@ -144,6 +189,15 @@ pub const FakeTransport = struct {
             return error.TestExpectedRequest;
         }
         return self.requests.items[index];
+    }
+
+    /// The streaming request at `index`, failing the test when there is none.
+    pub fn streamRequest(self: *const FakeTransport, index: usize) !RecordedStream {
+        if (index >= self.stream_requests.items.len) {
+            std.debug.print("expected stream request {d}, saw {d}\n", .{ index, self.stream_requests.items.len });
+            return error.TestExpectedRequest;
+        }
+        return self.stream_requests.items[index];
     }
 
     fn send(ptr: *anyopaque, req: Request, arena: Allocator) TransportError!Response {
@@ -165,6 +219,42 @@ pub const FakeTransport = struct {
         };
     }
 
+    fn sendStream(ptr: *anyopaque, req: StreamRequest, arena: Allocator) StreamError!StreamResponse {
+        const self: *FakeTransport = @ptrCast(@alignCast(ptr));
+        // The body is drained even when the script has run out, as the real
+        // transport writes it before it can read any response.
+        try self.recordStream(req);
+        if (self.next >= self.script.len) return error.HttpProtocolError;
+        const reply = self.script[self.next];
+        self.next += 1;
+        const canned = switch (reply) {
+            .fail => |err| return err,
+            .respond => |canned| canned,
+        };
+        if (canned.status < 300) if (req.sink == .writer) {
+            const w = req.sink.writer;
+            if (canned.cut_after) |cut| {
+                w.writeAll(canned.body[0..@min(cut, canned.body.len)]) catch return error.WriteFailed;
+                return canned.cut_error;
+            }
+            // In two pieces, so code that assumes one delivery shows itself.
+            const half = canned.body.len / 2;
+            w.writeAll(canned.body[0..half]) catch return error.WriteFailed;
+            w.writeAll(canned.body[half..]) catch return error.WriteFailed;
+            return .{
+                .status = canned.status,
+                .headers = try copyHeaders(arena, canned.headers),
+                .bytes_streamed = canned.body.len,
+            };
+        };
+        if (canned.cut_after != null) return canned.cut_error;
+        return .{
+            .status = canned.status,
+            .body = try arena.dupe(u8, canned.body),
+            .headers = try copyHeaders(arena, canned.headers),
+        };
+    }
+
     fn copyHeaders(arena: Allocator, headers: []const Header) Allocator.Error![]const Header {
         const out = try arena.alloc(Header, headers.len);
         for (headers, out) |from, *to| to.* = .{
@@ -174,6 +264,30 @@ pub const FakeTransport = struct {
         return out;
     }
 
+    /// A deep copy of `headers`, whole or not at all.
+    fn dupeHeaders(gpa: Allocator, headers: []const Header) Allocator.Error![]Header {
+        const out = try gpa.alloc(Header, headers.len);
+        var copied: usize = 0;
+        errdefer {
+            freeHeaders(gpa, out[0..copied]);
+            gpa.free(out);
+        }
+        for (headers, out) |from, *to| {
+            const name = try gpa.dupe(u8, from.name);
+            errdefer gpa.free(name);
+            to.* = .{ .name = name, .value = try gpa.dupe(u8, from.value) };
+            copied += 1;
+        }
+        return out;
+    }
+
+    fn freeHeaders(gpa: Allocator, headers: []const Header) void {
+        for (headers) |h| {
+            gpa.free(h.name);
+            gpa.free(h.value);
+        }
+    }
+
     fn record(self: *FakeTransport, req: Request) Allocator.Error!void {
         const url = try self.gpa.dupe(u8, req.url);
         errdefer self.gpa.free(url);
@@ -181,20 +295,10 @@ pub const FakeTransport = struct {
         errdefer if (bearer) |b| self.gpa.free(b);
         const body = if (req.body) |b| try self.gpa.dupe(u8, b) else null;
         errdefer if (body) |b| self.gpa.free(b);
-        const headers = try self.gpa.alloc(Header, req.headers.len);
-        var copied: usize = 0;
+        const headers = try dupeHeaders(self.gpa, req.headers);
         errdefer {
-            for (headers[0..copied]) |h| {
-                self.gpa.free(h.name);
-                self.gpa.free(h.value);
-            }
+            freeHeaders(self.gpa, headers);
             self.gpa.free(headers);
-        }
-        for (req.headers, headers) |from, *to| {
-            const name = try self.gpa.dupe(u8, from.name);
-            errdefer self.gpa.free(name);
-            to.* = .{ .name = name, .value = try self.gpa.dupe(u8, from.value) };
-            copied += 1;
         }
         try self.requests.append(self.gpa, .{
             .method = req.method,
@@ -203,6 +307,72 @@ pub const FakeTransport = struct {
             .body = body,
             .content_type = req.content_type,
             .headers = headers,
+            .timeout_ms = req.timeout_ms,
+        });
+    }
+
+    fn recordStream(self: *FakeTransport, req: StreamRequest) error{ OutOfMemory, ReadFailed, EndOfStream }!void {
+        const gpa = self.gpa;
+        const url = try gpa.dupe(u8, req.url);
+        errdefer gpa.free(url);
+        const bearer = if (req.bearer) |b| try gpa.dupe(u8, b) else null;
+        errdefer if (bearer) |b| gpa.free(b);
+        const content_type = if (req.content_type) |c| try gpa.dupe(u8, c) else null;
+        errdefer if (content_type) |c| gpa.free(c);
+        const headers = try dupeHeaders(gpa, req.headers);
+        errdefer {
+            freeHeaders(gpa, headers);
+            gpa.free(headers);
+        }
+
+        var prefix: std.ArrayList(u8) = .empty;
+        errdefer prefix.deinit(gpa);
+        var crc: Crc32c = .init();
+        var body_len: u64 = 0;
+        switch (req.body) {
+            .none => {},
+            .segments => |segments| for (segments) |s| {
+                crc.update(s);
+                body_len += s.len;
+                if (prefix.items.len < self.max_recorded_body) {
+                    const keep = @min(s.len, self.max_recorded_body - prefix.items.len);
+                    try prefix.appendSlice(gpa, s[0..keep]);
+                }
+            },
+            .stream => |source| {
+                // Drain exactly the declared length, as the real transport
+                // sends it; a short reader fails the same way.
+                var buf: [4096]u8 = undefined;
+                var left = source.len;
+                while (left > 0) {
+                    const want: usize = @intCast(@min(left, buf.len));
+                    const n = source.reader.readSliceShort(buf[0..want]) catch return error.ReadFailed;
+                    if (n == 0) return error.EndOfStream;
+                    crc.update(buf[0..n]);
+                    if (prefix.items.len < self.max_recorded_body) {
+                        const keep = @min(n, self.max_recorded_body - prefix.items.len);
+                        try prefix.appendSlice(gpa, buf[0..keep]);
+                    }
+                    body_len += n;
+                    left -= n;
+                }
+            },
+        }
+
+        const body_prefix = try prefix.toOwnedSlice(gpa);
+        errdefer gpa.free(body_prefix);
+        try self.stream_requests.append(gpa, .{
+            .method = req.method,
+            .url = url,
+            .bearer = bearer,
+            .content_type = content_type,
+            .headers = headers,
+            .body_prefix = body_prefix,
+            .body_len = body_len,
+            .body_crc32c = crc.final(),
+            .body_tag = req.body,
+            .sink = req.sink,
+            .accept_encoding = req.accept_encoding,
             .timeout_ms = req.timeout_ms,
         });
     }
@@ -225,6 +395,10 @@ pub const ScriptedServer = struct {
     linger_ms: i64 = 0,
     seen: [8][2048]u8 = undefined,
     seen_len: [8]usize = @splat(0),
+    /// Per request: the length and CRC-32C of the whole body, however much
+    /// of it fit in `seen`. Streaming uploads are asserted through these.
+    seen_body_len: [8]u64 = @splat(0),
+    seen_body_crc: [8]u32 = @splat(0),
     seen_count: usize = 0,
     connections: usize = 0,
 
@@ -289,20 +463,33 @@ pub const ScriptedServer = struct {
     fn readRequest(s: *ScriptedServer, r: *std.Io.Reader) !void {
         const slot = s.seen_count % s.seen.len;
         var len: usize = 0;
-        var content_length: usize = 0;
+        var content_length: u64 = 0;
         while (true) {
             const line = try r.takeDelimiterInclusive('\n');
             @memcpy(s.seen[slot][len..][0..line.len], line);
             len += line.len;
             if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
                 const value = std.mem.trim(u8, line["content-length:".len..], " \r\n");
-                content_length = try std.fmt.parseInt(usize, value, 10);
+                content_length = try std.fmt.parseInt(u64, value, 10);
             }
             if (std.mem.eql(u8, line, "\r\n")) break;
         }
-        const body = try r.take(content_length);
-        @memcpy(s.seen[slot][len..][0..body.len], body);
-        s.seen_len[slot] = len + body.len;
+        // A body larger than the slot is still read whole; what does not fit
+        // is captured by the running length and checksum instead.
+        var crc: Crc32c = .init();
+        var left = content_length;
+        while (left > 0) {
+            const take: usize = @intCast(@min(left, 1024));
+            const bytes = try r.take(take);
+            crc.update(bytes);
+            const keep = @min(bytes.len, s.seen[slot].len - len);
+            @memcpy(s.seen[slot][len..][0..keep], bytes[0..keep]);
+            len += keep;
+            left -= bytes.len;
+        }
+        s.seen_len[slot] = len;
+        s.seen_body_len[slot] = content_length;
+        s.seen_body_crc[slot] = crc.final();
         s.seen_count += 1;
     }
 };
@@ -677,4 +864,155 @@ test "FakeTransport records the headers a request carried" {
     const sent = try fake.request(0);
     try std.testing.expectEqualStrings("Google", sent.header("metadata-flavor").?);
     try std.testing.expectEqual(null, sent.header("x-goog-user-project"));
+}
+
+test "FakeTransport records streaming requests, prefix and checksum" {
+    var fake: FakeTransport = .init(std.testing.allocator, &.{
+        .{ .respond = .{ .status = 200, .body = "{\"name\":\"o\"}" } },
+        .{ .respond = .{ .status = 308, .headers = &.{.{ .name = "Range", .value = "bytes=0-99" }} } },
+    });
+    defer fake.deinit();
+    fake.max_recorded_body = 16;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const t = fake.transport();
+
+    // A reader body longer than the recorded prefix.
+    var data: [100]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast(i);
+    var reader: std.Io.Reader = .fixed(&data);
+    const first = try t.sendStream(.{
+        .method = .PUT,
+        .url = "http://x/upload",
+        .content_type = "application/octet-stream",
+        .body = .{ .stream = .{ .reader = &reader, .len = data.len } },
+    }, arena.allocator());
+    try std.testing.expectEqual(200, first.status);
+    try std.testing.expectEqualStrings("{\"name\":\"o\"}", first.body);
+
+    const put = try fake.streamRequest(0);
+    try std.testing.expectEqualStrings("http://x/upload", put.url);
+    try std.testing.expectEqualStrings("application/octet-stream", put.content_type.?);
+    try std.testing.expectEqual(.stream, put.body_tag);
+    try std.testing.expectEqualSlices(u8, data[0..16], put.body_prefix);
+    try std.testing.expectEqual(100, put.body_len);
+    try std.testing.expectEqual(Crc32c.hash(&data), put.body_crc32c);
+
+    // Segments are assembled the same way, and reply headers come through.
+    const second = try t.sendStream(.{
+        .method = .PUT,
+        .url = "http://x/session",
+        .headers = &.{.{ .name = "Content-Range", .value = "bytes */100" }},
+        .body = .{ .segments = &.{ "ab", "cd" } },
+    }, arena.allocator());
+    try std.testing.expectEqual(308, second.status);
+    try std.testing.expectEqualStrings("bytes=0-99", second.header("range").?);
+    const query = try fake.streamRequest(1);
+    try std.testing.expectEqual(.segments, query.body_tag);
+    try std.testing.expectEqualStrings("abcd", query.body_prefix);
+    try std.testing.expectEqualStrings("bytes */100", query.header("content-range").?);
+}
+
+test "FakeTransport writes a success into the sink writer, and can cut it short" {
+    var fake: FakeTransport = .init(std.testing.allocator, &.{
+        .{ .respond = .{ .status = 200, .body = "hello world\n", .headers = &.{.{ .name = "x-goog-generation", .value = "9" }} } },
+        .{ .respond = .{ .status = 200, .body = "hello world\n", .cut_after = 5 } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{}}" } },
+    });
+    defer fake.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const t = fake.transport();
+
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const whole = try t.sendStream(.{ .method = .GET, .url = "http://x/o", .sink = .{ .writer = &out } }, arena.allocator());
+    try std.testing.expectEqualStrings("hello world\n", out.buffered());
+    try std.testing.expectEqual(12, whole.bytes_streamed);
+    try std.testing.expectEqualStrings("", whole.body);
+    try std.testing.expectEqualStrings("9", whole.header("x-goog-generation").?);
+
+    // A cut delivers a prefix and then fails, like a dropped connection.
+    out = .fixed(&out_buf);
+    try std.testing.expectError(
+        error.ConnectionResetByPeer,
+        t.sendStream(.{ .method = .GET, .url = "http://x/o", .sink = .{ .writer = &out } }, arena.allocator()),
+    );
+    try std.testing.expectEqualStrings("hello", out.buffered());
+
+    // An error body never reaches the writer.
+    out = .fixed(&out_buf);
+    const failed = try t.sendStream(.{ .method = .GET, .url = "http://x/o", .sink = .{ .writer = &out } }, arena.allocator());
+    try std.testing.expectEqual(404, failed.status);
+    try std.testing.expectEqualStrings("{\"error\":{}}", failed.body);
+    try std.testing.expectEqualStrings("", out.buffered());
+}
+
+fn segmentsProperty(_: void, input: []const u8) !void {
+    var g: ByteGen = .init(input);
+    // Any split of a body into segments records the same length and
+    // checksum as the whole, whether it arrives as segments or as a reader.
+    var segments: [5][]const u8 = undefined;
+    const count = g.intRange(usize, 0, segments.len);
+    var whole: std.ArrayList(u8) = .empty;
+    defer whole.deinit(std.testing.allocator);
+    for (segments[0..count]) |*s| {
+        s.* = g.slice(48);
+        try whole.appendSlice(std.testing.allocator, s.*);
+    }
+
+    var fake: FakeTransport = .init(std.testing.allocator, &.{ .{ .respond = .{} }, .{ .respond = .{} } });
+    defer fake.deinit();
+    fake.max_recorded_body = 8;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    _ = try fake.transport().sendStream(.{
+        .method = .POST,
+        .url = "http://x/upload",
+        .body = .{ .segments = segments[0..count] },
+    }, arena.allocator());
+    var reader: std.Io.Reader = .fixed(whole.items);
+    _ = try fake.transport().sendStream(.{
+        .method = .PUT,
+        .url = "http://x/upload",
+        .body = .{ .stream = .{ .reader = &reader, .len = whole.items.len } },
+    }, arena.allocator());
+
+    const expected_crc = Crc32c.hash(whole.items);
+    const cap = @min(whole.items.len, fake.max_recorded_body);
+    for (0..2) |i| {
+        const rec = try fake.streamRequest(i);
+        try std.testing.expectEqual(whole.items.len, rec.body_len);
+        try std.testing.expectEqual(expected_crc, rec.body_crc32c);
+        try std.testing.expectEqualSlices(u8, whole.items[0..cap], rec.body_prefix);
+    }
+}
+
+test "fuzz FakeTransport: segment splits never change the recorded body" {
+    try fuzzBytes({}, segmentsProperty, .{ .corpus = &.{
+        "\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x05hello\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x06world!",
+        "\x00\x00\x00\x00\x00\x00\x00\x00",
+    } });
+}
+
+test "FakeTransport: a short reader is EndOfStream, and a spent script fails loudly" {
+    var fake: FakeTransport = .init(std.testing.allocator, &.{});
+    defer fake.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var reader: std.Io.Reader = .fixed("short");
+    try std.testing.expectError(error.EndOfStream, fake.transport().sendStream(.{
+        .method = .PUT,
+        .url = "http://x/upload",
+        .body = .{ .stream = .{ .reader = &reader, .len = 100 } },
+    }, arena.allocator()));
+    // A short body means the request never completed, so nothing is kept.
+    try std.testing.expectEqual(0, fake.stream_requests.items.len);
+    var empty: std.Io.Reader = .fixed("ab");
+    try std.testing.expectError(error.HttpProtocolError, fake.transport().sendStream(.{
+        .method = .PUT,
+        .url = "http://x/upload",
+        .body = .{ .stream = .{ .reader = &empty, .len = 2 } },
+    }, arena.allocator()));
+    try std.testing.expectEqual(1, fake.stream_requests.items.len);
 }
