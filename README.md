@@ -8,7 +8,7 @@ modules it imports.
 | --- | --- | --- |
 | `pubsub` | Pub/Sub v1: publish, pull, acknowledge, and topic and subscription management | beta |
 | `secret_manager` | Secret Manager v1: read a secret's bytes, add versions, and manage secrets and their versions, global or regional | experimental |
-| `auth` | Credentials for the service modules: `findDefault` picks between the metadata server on Google Cloud, the login `gcloud auth application-default login` saves, and a file the environment names. | experimental |
+| `auth` | Credentials for the service modules: `findDefault` picks between the metadata server on Google Cloud, the login `gcloud auth application-default login` saves (impersonating a service account or not), and a file the environment names. | experimental |
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
@@ -156,7 +156,8 @@ It looks in three places, in this order:
 
 1. The credentials file `GOOGLE_APPLICATION_CREDENTIALS` names: a user
    login (`authorized_user`), a service account key (`service_account`),
-   or workload identity federation (`external_account`).
+   workload identity federation (`external_account`), or a login that acts
+   as a service account (`impersonated_service_account`).
 2. The file `gcloud auth application-default login` writes, under
    `$HOME/.config/gcloud` or `%APPDATA%\gcloud`.
 3. The metadata server, on Cloud Run, GKE, GCE or Cloud Functions, which
@@ -170,7 +171,8 @@ somebody else, quietly, would be worse. With nothing anywhere, the error is
 
 To choose a source yourself, use `auth.AuthorizedUser.initFromFile` for a
 user login, `auth.ServiceAccount.initFromFile` for a key file,
-`auth.ExternalAccount.initFromFile` for federation, or
+`auth.ExternalAccount.initFromFile` for federation,
+`auth.ImpersonatedServiceAccount.initFromFile` for impersonation, or
 `auth.MetadataServer` on Google Cloud, whose `probe` answers whether there
 is a metadata server to ask (in half a second on a machine that has none)
 and whose `projectId` says which project it runs in. None of them may move
@@ -192,6 +194,24 @@ the IAM Credentials API. Subject tokens rotate, so each fetch reads anew.
 AWS credential sources (which need request signing) and executable sources
 (which run a subprocess) are refused by name. Scopes fix on first use, as
 for a service account.
+
+An `ImpersonatedServiceAccount` is a login that acts as a service account,
+which Google recommends over key files for running locally as one: nothing
+of the service account is stored, only the right to act as it. It is the
+file this writes, which `findDefault` then picks up like any other:
+
+```
+gcloud auth application-default login --impersonate-service-account=SA_EMAIL
+```
+
+Each fetch takes a token from the file's source credentials (a user login,
+or a service account key) and trades it at the IAM Credentials API for one
+that is the service account's. The source keeps its own cached token, so
+most fetches cost one request. Only the account's email is read from the
+file's URL: the request always goes to Google's endpoint, as Google's own
+libraries do, so a crafted file cannot send your token anywhere else. The
+login needs `roles/iam.serviceAccountTokenCreator` on the service account,
+and a refusal says so. Scopes fix on first use, as for a service account.
 
 A static token also works, for about an hour:
 

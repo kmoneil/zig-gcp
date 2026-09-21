@@ -20,6 +20,7 @@ const Cache = @import("Cache.zig");
 const Lookup = @import("Lookup.zig");
 const MetadataServer = @import("MetadataServer.zig");
 const ExternalAccount = @import("ExternalAccount.zig");
+const ImpersonatedServiceAccount = @import("ImpersonatedServiceAccount.zig");
 const ServiceAccount = @import("ServiceAccount.zig");
 const adc_file = @import("adc_file.zig");
 const logging = @import("logging.zig");
@@ -159,7 +160,7 @@ pub fn quotaProjectId(self: Credentials) ?[]const u8 {
 /// program from being told where it is running.
 pub fn projectId(self: Credentials, io: std.Io, arena: Allocator) MetadataServer.ProjectIdError!?[]const u8 {
     return switch (self.held.impl) {
-        .user, .external_account => null,
+        .user, .external_account, .impersonated => null,
         .service_account => |*account| if (account.projectId()) |p| try arena.dupe(u8, p) else null,
         .metadata => |*metadata| try metadata.projectId(io, arena),
     };
@@ -182,6 +183,7 @@ const Held = struct {
         user: AuthorizedUser,
         service_account: ServiceAccount,
         external_account: ExternalAccount,
+        impersonated: ImpersonatedServiceAccount,
         metadata: MetadataServer,
     };
 
@@ -198,6 +200,7 @@ const Held = struct {
             .user => |*u| u.provider(),
             .service_account => |*s| s.provider(),
             .external_account => |*e| e.provider(),
+            .impersonated => |*i| i.provider(),
             .metadata => |*m| m.provider(),
         };
     }
@@ -207,6 +210,7 @@ const Held = struct {
             .user => |*u| u.deinit(),
             .service_account => |*s| s.deinit(),
             .external_account => |*e| e.deinit(),
+            .impersonated => |*i| i.deinit(),
             .metadata => |*m| m.deinit(),
         }
         if (self.quota_project) |q| gpa.free(q);
@@ -257,6 +261,7 @@ fn fromFile(gpa: Allocator, io: std.Io, path: []const u8, lookup: Lookup, option
         .authorized_user => .{ .user = try AuthorizedUser.initFromJson(gpa, io, json, userOptions(lookup, options)) },
         .service_account => .{ .service_account = try ServiceAccount.initFromJson(gpa, io, json, serviceOptions(lookup, options)) },
         .external_account => .{ .external_account = try ExternalAccount.initFromJson(gpa, io, json, externalOptions(lookup, options)) },
+        .impersonated_service_account => .{ .impersonated = try ImpersonatedServiceAccount.initFromJson(gpa, io, json, impersonatedOptions(lookup, options)) },
     };
 }
 
@@ -265,8 +270,20 @@ fn implDeinit(impl: *Held.Impl) void {
         .user => |*u| u.deinit(),
         .service_account => |*s| s.deinit(),
         .external_account => |*e| e.deinit(),
+        .impersonated => |*i| i.deinit(),
         .metadata => |*m| m.deinit(),
     }
+}
+
+fn impersonatedOptions(lookup: Lookup, options: Options) ImpersonatedServiceAccount.Options {
+    return .{
+        .retry = options.retry,
+        .cache = options.cache,
+        .user_agent = options.user_agent,
+        .request_timeout_ms = options.request_timeout_ms,
+        .diagnostics = lookup.diagnostics,
+        .transport = options.transport,
+    };
 }
 
 fn userOptions(lookup: Lookup, options: Options) AuthorizedUser.Options {
@@ -384,6 +401,35 @@ test "findDefault: the file GOOGLE_APPLICATION_CREDENTIALS names wins over every
     try testing.expectEqualStrings("env-project", creds.quotaProjectId().?);
     // Neither the gcloud file nor the metadata server was consulted.
     try testing.expectEqual(0, fake.requests.items.len);
+}
+
+test "findDefault: an impersonated file acts as its service account" {
+    var config: TmpConfig = undefined;
+    try config.init();
+    defer config.deinit();
+    var env_buf: [160]u8 = undefined;
+    const env_path = try config.write(&env_buf, "impersonated.json",
+        \\{"type": "impersonated_service_account",
+        \\ "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken",
+        \\ "source_credentials": {"type": "authorized_user", "client_id": "c", "client_secret": "SECRET", "refresh_token": "SECRET-refresh"},
+        \\ "quota_project_id": "impersonated-billing"}
+    );
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        .{ .respond = .{ .body = "{\"access_token\":\"ya29.SOURCE\",\"expires_in\":3599}" } },
+        .{ .respond = .{ .body = "{\"accessToken\":\"ya29.AS-THE-ACCOUNT\",\"expireTime\":\"2100-01-01T00:00:00Z\"}" } },
+    });
+    defer fake.deinit();
+
+    var creds = try find(testing.allocator, testing.io, .{ .credentials_path = env_path }, .{ .transport = fake.transport() });
+    defer creds.deinit();
+    try testing.expectEqual(.env_file, creds.source);
+    try testing.expectEqualStrings("impersonated-billing", creds.quotaProjectId().?);
+    // A user login's source knows no project to run in, and neither does this.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqual(null, try creds.projectId(testing.io, arena.allocator()));
+    try testing.expectEqualStrings("ya29.AS-THE-ACCOUNT", try creds.provider().getToken(testing.io, arena.allocator(), &.{"https://www.googleapis.com/auth/pubsub"}));
+    try testing.expectEqualStrings("ya29.SOURCE", (try fake.request(1)).bearer.?);
 }
 
 test "findDefault: a file the environment names must work, or nothing does" {
@@ -544,7 +590,7 @@ test "findDefault: a gcloud file that is there but broken stops the search" {
     try config.init();
     defer config.deinit();
     var path_buf: [160]u8 = undefined;
-    _ = try config.write(&path_buf, Lookup.adc_file_name, "{\"type\":\"impersonated_service_account\"}");
+    _ = try config.write(&path_buf, Lookup.adc_file_name, "{\"type\":\"external_account_authorized_user\"}");
     var fake: test_util.FakeTransport = .init(testing.allocator, &.{ metadata_listing, metadata_token });
     defer fake.deinit();
     var diag: Diagnostics = .{};

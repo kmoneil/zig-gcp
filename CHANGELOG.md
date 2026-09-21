@@ -4,6 +4,26 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.11.0 (unreleased)
+
+- auth: impersonated service accounts. `ImpersonatedServiceAccount`
+  reads the `impersonated_service_account` file that
+  `gcloud auth application-default login --impersonate-service-account`
+  writes, takes a token from its source credentials (a user login or a
+  service account key), and trades it at the IAM Credentials API for one
+  that is the service account's. `findDefault` picks the file up wherever
+  it picked up the other types; it used to refuse it. Only the account's
+  email is read from the file's URL, and requests go to Google's endpoint,
+  as Google's own libraries do, so a crafted file cannot send the source
+  token anywhere else. A refusal names the role the login lacks,
+  `roles/iam.serviceAccountTokenCreator`.
+- core: when one `Diagnostics` is given to the credentials and to a client,
+  as an application usually does, a failed token fetch now leaves the
+  provider's own explanation, such as which role an impersonation lacks,
+  where it used to be replaced by "the token provider failed".
+- pubsub, secret_manager: no API changes; they report credential failures
+  in the provider's words through core.
+
 ## 0.10.1 (2026-09-21)
 
 - pubsub: fixed: `Subscriber.run` could hang for good after `stop()`.

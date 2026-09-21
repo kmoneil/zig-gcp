@@ -133,6 +133,10 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
             if (diag) |d| d.print("the credentials file is a workload identity federation file; use ExternalAccount, or findDefault", .{});
             return error.UnsupportedCredentialType;
         },
+        .impersonated_service_account => {
+            if (diag) |d| d.print("the credentials file impersonates a service account; use ImpersonatedServiceAccount, or findDefault", .{});
+            return error.UnsupportedCredentialType;
+        },
     };
     var key = rsa.parsePem(file.private_key) catch |err| switch (err) {
         error.InvalidPrivateKey => {

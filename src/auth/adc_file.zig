@@ -1,12 +1,13 @@
 //! Credential files: the one `GOOGLE_APPLICATION_CREDENTIALS` names, and the
 //! one `gcloud auth application-default login` writes. This version reads
-//! files of type `authorized_user`, `service_account` and
-//! `external_account`, and refuses every other type by name.
+//! files of type `authorized_user`, `service_account`, `external_account`
+//! and `impersonated_service_account`, and refuses every other type by name.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const core = @import("core");
 const Diagnostics = core.Diagnostics;
+const iam_credentials = @import("iam_credentials.zig");
 
 /// The largest credential file read. Real ones are well under 4 KiB.
 pub const max_file_bytes = 64 * 1024;
@@ -27,6 +28,29 @@ pub const Credential = union(enum) {
     authorized_user: AuthorizedUser,
     service_account: ServiceAccount,
     external_account: ExternalAccount,
+    impersonated_service_account: Impersonated,
+};
+
+/// An `impersonated_service_account` file's fields, as
+/// `gcloud auth application-default login --impersonate-service-account`
+/// writes them: source credentials, and the service account they may act as.
+pub const Impersonated = struct {
+    /// The service account's email or unique id, from the file's
+    /// `service_account_impersonation_url`. Only this is taken from the URL:
+    /// the request goes to Google's endpoint, as Google's libraries do, so a
+    /// crafted file cannot send the source token to another host.
+    target: []const u8,
+    /// Accounts between the source and the target, each as
+    /// `projects/-/serviceAccounts/EMAIL`, passed through. Usually none.
+    delegates: []const []const u8,
+    /// The source credentials as JSON of their own, for their provider's
+    /// `initFromJson`. Secret: it holds a refresh token or a private key.
+    source_json: []const u8,
+    source_type: SourceType,
+    /// The project to charge for quota: the file's own, not the source's.
+    quota_project_id: ?[]const u8,
+
+    pub const SourceType = enum { authorized_user, service_account };
 };
 
 /// An `authorized_user` file's fields.
@@ -111,6 +135,23 @@ const WireImpersonation = struct {
     token_lifetime_seconds: ?u32 = null,
 };
 
+/// An impersonated file's `source_credentials`: flat, so a crafted file
+/// cannot nest objects to any depth here, and only the fields the two
+/// source types read.
+const WireSourceCredentials = struct {
+    type: ?[]const u8 = null,
+    client_id: ?[]const u8 = null,
+    client_secret: ?[]const u8 = null,
+    refresh_token: ?[]const u8 = null,
+    client_email: ?[]const u8 = null,
+    private_key: ?[]const u8 = null,
+    private_key_id: ?[]const u8 = null,
+    token_uri: ?[]const u8 = null,
+    project_id: ?[]const u8 = null,
+    quota_project_id: ?[]const u8 = null,
+    universe_domain: ?[]const u8 = null,
+};
+
 const Wire = struct {
     type: ?[]const u8 = null,
     client_id: ?[]const u8 = null,
@@ -130,11 +171,12 @@ const Wire = struct {
     workforce_pool_user_project: ?[]const u8 = null,
     quota_project_id: ?[]const u8 = null,
     universe_domain: ?[]const u8 = null,
+    source_credentials: ?WireSourceCredentials = null,
+    delegates: ?[]const []const u8 = null,
 };
 
 /// Types this version recognizes, and why it refuses them.
 const refused = std.StaticStringMap([]const u8).initComptime(.{
-    .{ "impersonated_service_account", "impersonated service accounts are not supported yet" },
     .{ "external_account_authorized_user", "workforce identity federation is not supported" },
 });
 
@@ -153,7 +195,8 @@ pub fn parse(arena: Allocator, json: []const u8, diag: ?*Diagnostics) Error!Cred
     const kind = wire.type orelse return invalid(diag, "the credentials file has no \"type\"", .{});
     const known = std.mem.eql(u8, kind, "authorized_user") or
         std.mem.eql(u8, kind, "service_account") or
-        std.mem.eql(u8, kind, "external_account");
+        std.mem.eql(u8, kind, "external_account") or
+        std.mem.eql(u8, kind, "impersonated_service_account");
     if (!known) {
         if (diag) |d| {
             if (refused.get(kind)) |why| {
@@ -189,6 +232,9 @@ pub fn parse(arena: Allocator, json: []const u8, diag: ?*Diagnostics) Error!Cred
         .project_id = emptyToNull(wire.project_id),
         .quota_project_id = quota,
     } };
+    if (std.mem.eql(u8, kind, "impersonated_service_account")) {
+        return .{ .impersonated_service_account = try parseImpersonated(arena, wire, quota, diag) };
+    }
     if (std.mem.eql(u8, kind, "external_account")) return .{ .external_account = .{
         .audience = try required(wire.audience, "audience", diag),
         .subject_token_type = try required(wire.subject_token_type, "subject_token_type", diag),
@@ -207,6 +253,67 @@ pub fn parse(arena: Allocator, json: []const u8, diag: ?*Diagnostics) Error!Cred
         .refresh_token = try required(wire.refresh_token, "refresh_token", diag),
         .quota_project_id = quota,
     } };
+}
+
+/// An impersonated file: the account to act as, and source credentials this
+/// version can read on their own.
+fn parseImpersonated(arena: Allocator, wire: Wire, quota: ?[]const u8, diag: ?*Diagnostics) Error!Impersonated {
+    const url = try required(wire.service_account_impersonation_url, "service_account_impersonation_url", diag);
+    const target = iam_credentials.principalFromUrl(url) orelse return invalid(
+        diag,
+        "the credentials file's \"service_account_impersonation_url\" does not end in serviceAccounts/ACCOUNT:generateAccessToken",
+        .{},
+    );
+    const delegates = wire.delegates orelse &.{};
+    for (delegates) |delegate| {
+        // Each travels inside the request's JSON body.
+        if (delegate.len == 0 or !isPrintable(delegate)) {
+            return invalid(diag, "the credentials file has a \"delegates\" entry that is empty or not printable ASCII", .{});
+        }
+    }
+
+    const source = wire.source_credentials orelse return invalid(diag, "the credentials file lacks \"source_credentials\"", .{});
+    const source_kind = source.type orelse return invalid(diag, "the credentials file's \"source_credentials\" has no \"type\"", .{});
+    const source_type: Impersonated.SourceType = if (std.mem.eql(u8, source_kind, "authorized_user"))
+        .authorized_user
+    else if (std.mem.eql(u8, source_kind, "service_account"))
+        .service_account
+    else {
+        if (diag) |d| {
+            if (isPrintable(source_kind)) {
+                d.print("the credentials file impersonates from \"source_credentials\" of type \"{s}\"; only authorized_user and service_account are supported", .{source_kind});
+            } else {
+                d.print("the credentials file impersonates from \"source_credentials\" of a type this version does not know", .{});
+            }
+        }
+        return error.UnsupportedCredentialType;
+    };
+
+    // The source's provider reads JSON, so the source gets JSON of its own,
+    // checked here with the same rules a file of that type meets.
+    const source_json = std.json.Stringify.valueAlloc(arena, source, .{ .emit_null_optional_fields = false }) catch
+        return error.OutOfMemory;
+    _ = parse(arena, source_json, diag) catch |err| return nested(diag, err);
+    return .{
+        .target = target,
+        .delegates = delegates,
+        .source_json = source_json,
+        .source_type = source_type,
+        .quota_project_id = quota,
+    };
+}
+
+/// Says that a failure was inside `source_credentials`, keeping what the
+/// inner parse said about it.
+fn nested(diag: ?*Diagnostics, err: Error) Error {
+    if (diag) |d| {
+        var buf: @FieldType(Diagnostics, "buffer") = undefined;
+        const message = d.message();
+        const copy = buf[0..@min(message.len, buf.len)];
+        @memcpy(copy, message[0..copy.len]);
+        d.print("in \"source_credentials\": {s}", .{copy});
+    }
+    return err;
 }
 
 /// Where an external account's subject token comes from, with everything
@@ -513,11 +620,124 @@ test "adc_file: an external_account file that cannot work says what is wrong" {
 
 test "adc_file: every other type is refused by name" {
     const base = "\"client_id\":\"c\",\"client_secret\":\"SECRET\",\"refresh_token\":\"SECRET\"";
-    try expectParse("{\"type\":\"impersonated_service_account\"," ++ base ++ "}", error.UnsupportedCredentialType, "the credentials file has type \"impersonated_service_account\": impersonated service accounts are not supported yet");
     try expectParse("{\"type\":\"external_account_authorized_user\"," ++ base ++ "}", error.UnsupportedCredentialType, "the credentials file has type \"external_account_authorized_user\": workforce identity federation is not supported");
     try expectParse("{\"type\":\"banana\"," ++ base ++ "}", error.UnsupportedCredentialType, "the credentials file has type \"banana\", which this version does not know");
     try expectParse("{\"type\":\"a\\nb\"," ++ base ++ "}", error.UnsupportedCredentialType, "the credentials file has a type this version does not know");
     try expectParse("{" ++ base ++ "}", error.InvalidCredentialsFile, "the credentials file has no \"type\"");
+}
+
+const impersonation_url = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken";
+const user_source = "{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"SECRET\",\"refresh_token\":\"SECRET-refresh\"}";
+
+fn impersonated(comptime url: []const u8, comptime source: []const u8, comptime extra: []const u8) []const u8 {
+    return "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"" ++ url ++
+        "\",\"source_credentials\":" ++ source ++ extra ++ "}";
+}
+
+test "adc_file: an impersonated file, as gcloud writes it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Field for field what `gcloud auth application-default login
+    // --impersonate-service-account` writes.
+    const got = try parse(a,
+        \\{
+        \\  "delegates": [],
+        \\  "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken",
+        \\  "source_credentials": {
+        \\    "account": "",
+        \\    "client_id": "c.apps.googleusercontent.com",
+        \\    "client_secret": "SECRET",
+        \\    "refresh_token": "1//SECRET-refresh",
+        \\    "type": "authorized_user",
+        \\    "universe_domain": "googleapis.com"
+        \\  },
+        \\  "type": "impersonated_service_account"
+        \\}
+    , null);
+    const i = got.impersonated_service_account;
+    try testing.expectEqualStrings("sa@p.iam.gserviceaccount.com", i.target);
+    try testing.expectEqual(0, i.delegates.len);
+    try testing.expectEqual(.authorized_user, i.source_type);
+    try testing.expectEqual(null, i.quota_project_id);
+    // The source is a file of its own now, read by its provider's rules.
+    const source = (try parse(a, i.source_json, null)).authorized_user;
+    try testing.expectEqualStrings("1//SECRET-refresh", source.refresh_token);
+    try testing.expectEqualStrings("c.apps.googleusercontent.com", source.client_id);
+}
+
+test "adc_file: an impersonated file with a key as its source, delegates and a quota project" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const got = try parse(a, impersonated(
+        impersonation_url,
+        "{\"type\":\"service_account\",\"client_email\":\"source@p.iam.gserviceaccount.com\",\"private_key\":\"-----BEGIN PRIVATE KEY-----\"}",
+        ",\"delegates\":[\"projects/-/serviceAccounts/middle@p.iam.gserviceaccount.com\"],\"quota_project_id\":\"billing\"",
+    ), null);
+    const i = got.impersonated_service_account;
+    try testing.expectEqual(.service_account, i.source_type);
+    try testing.expectEqual(1, i.delegates.len);
+    try testing.expectEqualStrings("projects/-/serviceAccounts/middle@p.iam.gserviceaccount.com", i.delegates[0]);
+    // The file's own quota project, not the source's.
+    try testing.expectEqualStrings("billing", i.quota_project_id.?);
+    try testing.expectEqualStrings("source@p.iam.gserviceaccount.com", (try parse(a, i.source_json, null)).service_account.client_email);
+}
+
+fn expectImpersonatedError(json: []const u8, want: Error, message: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var diag: Diagnostics = .{};
+    try testing.expectError(want, parse(arena.allocator(), json, &diag));
+    try testing.expectEqualStrings(message, diag.message());
+    // Nothing secret is ever repeated, the source's secrets included.
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "SECRET") == null);
+}
+
+test "adc_file: what an impersonated file must have" {
+    try expectImpersonatedError(
+        "{\"type\":\"impersonated_service_account\",\"source_credentials\":" ++ user_source ++ "}",
+        error.InvalidCredentialsFile,
+        "the credentials file lacks \"service_account_impersonation_url\"",
+    );
+    try expectImpersonatedError(
+        impersonated("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p:signJwt", user_source, ""),
+        error.InvalidCredentialsFile,
+        "the credentials file's \"service_account_impersonation_url\" does not end in serviceAccounts/ACCOUNT:generateAccessToken",
+    );
+    try expectImpersonatedError(
+        "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"" ++ impersonation_url ++ "\"}",
+        error.InvalidCredentialsFile,
+        "the credentials file lacks \"source_credentials\"",
+    );
+    try expectImpersonatedError(
+        impersonated(impersonation_url, "{\"refresh_token\":\"SECRET\"}", ""),
+        error.InvalidCredentialsFile,
+        "the credentials file's \"source_credentials\" has no \"type\"",
+    );
+    // A source this version cannot read on its own, named.
+    try expectImpersonatedError(
+        impersonated(impersonation_url, "{\"type\":\"impersonated_service_account\"}", ""),
+        error.UnsupportedCredentialType,
+        "the credentials file impersonates from \"source_credentials\" of type \"impersonated_service_account\"; only authorized_user and service_account are supported",
+    );
+    // A source that is missing something says it is the source.
+    try expectImpersonatedError(
+        impersonated(impersonation_url, "{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"SECRET\"}", ""),
+        error.InvalidCredentialsFile,
+        "in \"source_credentials\": the credentials file lacks \"refresh_token\"",
+    );
+    try expectImpersonatedError(
+        impersonated(impersonation_url, user_source, ",\"delegates\":[\"\"]"),
+        error.InvalidCredentialsFile,
+        "the credentials file has a \"delegates\" entry that is empty or not printable ASCII",
+    );
+    // A nested object where a string belongs is refused, never walked.
+    try expectImpersonatedError(
+        impersonated(impersonation_url, "{\"type\":{\"deeper\":{\"still\":[[[1]]]}}}", ""),
+        error.InvalidCredentialsFile,
+        "the credentials file is not JSON, or a field that should be a string is not",
+    );
 }
 
 test "adc_file: a missing or empty required field" {
@@ -571,6 +791,15 @@ fn arbitraryProperty(_: void, input: []const u8) !void {
             try testing.expect(e.audience.len > 0 and e.subject_token_type.len > 0);
             if (e.quota_project_id) |q| try testing.expect(core.TokenProvider.isValidToken(q));
         },
+        .impersonated_service_account => |i| {
+            // The account can go into Google's URL as it is, the delegates
+            // into the body, and the source is a file its provider reads.
+            try testing.expect(iam_credentials.isPrincipal(i.target));
+            for (i.delegates) |delegate| try testing.expect(isPrintable(delegate));
+            if (i.quota_project_id) |q| try testing.expect(core.TokenProvider.isValidToken(q));
+            const source = try parse(arena.allocator(), i.source_json, null);
+            try testing.expectEqualStrings(@tagName(i.source_type), @tagName(source));
+        },
     }
 }
 
@@ -579,6 +808,8 @@ test "fuzz adc_file: arbitrary input never crashes" {
         "{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"}",
         "{\"type\":\"authorized_user\",\"type\":\"service_account\"}",
         "{\"type\":null}",
+        "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken\",\"source_credentials\":{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"},\"delegates\":[]}",
+        "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"x/a:generateAccessToken\",\"source_credentials\":{\"type\":\"impersonated_service_account\"}}",
     } });
 }
 
@@ -667,6 +898,7 @@ fn structuredProperty(_: void, input: []const u8) !void {
             .authorized_user => |u| u.refresh_token,
             .service_account => |sa| sa.private_key,
             .external_account => |e| e.audience,
+            .impersonated_service_account => |i| i.source_json,
         };
         try testing.expectEqualStrings(if (value.len > 0) value else "v", secret);
     } else |err| {
