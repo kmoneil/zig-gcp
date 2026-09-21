@@ -2560,3 +2560,256 @@ test "keys: each key's messages arrive in publish order, never two requests of a
         }
     }
 }
+
+test "cancel: canceling a wait leaves the message in flight" {
+    var l: Live = undefined;
+    try l.init(.{ .max_batch_delay_ms = 1 });
+    defer l.deinit();
+    l.fake.script = &.{.hold};
+    try l.start();
+    const receipt = try l.publisher.publish(.{ .data = "still going" }, .{});
+    defer receipt.release();
+    try untilHeld(&l.fake, 1);
+
+    const Waiting = struct {
+        fn wait(r: Receipt) Error![]const u8 {
+            return r.wait();
+        }
+    };
+    var task = try testing.io.concurrent(Waiting.wait, .{receipt});
+    try testing.io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expectError(error.Canceled, task.cancel(testing.io));
+    // The waiter gave up; the message did not.
+    l.fake.release();
+    try testing.expectEqualStrings("1", try waitBounded(receipt));
+    try l.finish();
+}
+
+/// Rounds of stopping or canceling a publisher with work in flight: the
+/// shape of the hang that core.Condition fixed, where stop's broadcast
+/// raced run's cancel of its idle senders.
+fn stopOrCancelRounds(rounds: usize) !void {
+    for (0..rounds) |round| {
+        var l: Live = undefined;
+        try l.init(.{ .concurrency = 3, .max_batch_messages = 2, .max_batch_delay_ms = 0, .enable_message_ordering = true });
+        defer l.deinit();
+        try l.start();
+        var receipts: [12]Receipt = undefined;
+        var made: usize = 0;
+        defer for (receipts[0..made]) |r| r.release();
+        for (&receipts, 0..) |*r, i| {
+            r.* = try l.publisher.publish(.{ .data = "load" }, .{ .ordering_key = if (i % 3 == 0) "" else "k" });
+            made += 1;
+        }
+        // Both bound their waits and panic when run does not return.
+        if (round % 2 == 0) try l.finish() else l.cancel() catch {};
+        for (receipts) |r| try testing.expect(r.batch.resolved.isSet());
+    }
+}
+
+test "run: stopping or canceling a busy publisher, round after round, never hangs" {
+    try stopOrCancelRounds(100);
+}
+
+test "log hygiene: no data, attribute value or ordering key reaches the log" {
+    var s: Solo = undefined;
+    try s.init(.{ .enable_message_ordering = true, .max_batch_messages = 1 });
+    defer s.deinit();
+    s.fake.script = &.{ .{ .status = .{ 503, "UNAVAILABLE" } }, .{ .status = .{ 404, "NOT_FOUND" } } };
+    logging.capture.reset();
+    const data = "data-7f3a91c2";
+    const value = "value-8e2b44d1";
+    const key = "key-5c19ae07";
+    const first = try s.publisher.publish(.{ .data = data, .attributes = &.{.{ .key = "attr", .value = value }} }, .{ .ordering_key = key });
+    defer first.release();
+    const second = try s.publisher.publish(.{ .data = data }, .{ .ordering_key = key });
+    defer second.release();
+    // A retry, a failure for good, a pause, a refusal, an expiry.
+    try s.publisher.sendDue();
+    try testing.expectError(error.OrderingKeyPaused, s.publisher.publish(.{ .data = data }, .{ .ordering_key = key }));
+    const late = try s.publishText(data);
+    defer late.release();
+    s.advance(120_000);
+
+    const log = logging.capture.text();
+    try testing.expect(logging.capture.lines >= 3);
+    const encoded = try codec.encodeMessage(testing.allocator, .{ .data = data }, null);
+    defer testing.allocator.free(encoded);
+    for ([_][]const u8{ data, value, key, encoded }) |secret| {
+        if (std.mem.indexOf(u8, log, secret) != null) {
+            std.debug.print("the log holds \"{s}\":\n{s}\n", .{ secret, log });
+            return error.TestLeakedToLog;
+        }
+    }
+}
+
+/// Data for publish number `seq`: its number, then filler to at least
+/// `len` bytes. Empty when `len` is 0, which makes the message invalid.
+fn scriptData(buf: []u8, seq: u32, len: u8) []const u8 {
+    if (len == 0) return "";
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("#{d}:", .{seq}) catch {};
+    while (w.end < len) w.writeByte('.') catch break;
+    return w.buffered();
+}
+
+const script_keys = [_][]const u8{ "", "a", "b", "c" };
+
+/// A byte-driven script of publishes, server answers, sends, time, resumes
+/// and a stop, run on one task against a fake clock, and checked against
+/// what the publisher promises: every receipt resolves; the counts balance;
+/// no request mixes keys or breaks a threshold; the caps hold at every
+/// step; each key's stored messages are in publish order; and after a
+/// key's message fails, none published after it is stored until a resume.
+fn scriptProperty(_: void, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    var answers: [12]FakeTopic.Answer = undefined;
+    for (&answers) |*a| a.* = switch (g.intRange(u8, 0, 9)) {
+        0 => .{ .status = .{ 503, "UNAVAILABLE" } },
+        1 => .{ .status = .{ 404, "NOT_FOUND" } },
+        2 => .{ .status = .{ 409, "ABORTED" } },
+        3 => .{ .fail = error.ConnectionResetByPeer },
+        4 => .short,
+        else => .ok,
+    };
+    const batch_messages = g.intRange(u8, 1, 4);
+    const batch_bytes: u32 = 40 + @as(u32, g.byte());
+    const options: TestOptions = .{
+        .max_batch_messages = batch_messages,
+        .max_batch_bytes = batch_bytes,
+        .max_batch_delay_ms = g.intRange(u8, 0, 20),
+        .publish_timeout_ms = 100 + @as(u32, g.byte()) * 10,
+        .max_outstanding = batch_messages + g.intRange(u8, 0, 8),
+        // Half the time as small as allowed, so a big message meets it.
+        .max_outstanding_bytes = batch_bytes + if (g.boolean()) 0 else @as(u64, g.byte()) * 4,
+        // On one task, a publish that waited for room would wait forever.
+        .when_full = .fail,
+        .enable_message_ordering = true,
+        .retry_publish = g.intRange(u8, 0, 3) != 0,
+        .retry = .{ .initial_backoff_ms = 10, .max_backoff_ms = 100 },
+    };
+
+    var s: Solo = undefined;
+    try s.init(options);
+    defer s.deinit();
+    s.fake.script = &answers;
+    const p = &s.publisher;
+
+    const Published = struct { receipt: Receipt, key: u8, seq: u32 };
+    var published: std.ArrayList(Published) = .empty;
+    defer {
+        for (published.items) |item| item.receipt.release();
+        published.deinit(testing.allocator);
+    }
+    // Each resume, as the key and the number the next publish would get.
+    const Resume = struct { key: u8, from: u32 };
+    var resumes: std.ArrayList(Resume) = .empty;
+    defer resumes.deinit(testing.allocator);
+
+    var seq: u32 = 0;
+    for (0..g.intRange(u8, 0, 40)) |_| {
+        switch (g.intRange(u8, 0, 9)) {
+            0...4 => {
+                const key = g.intRange(u8, 0, script_keys.len - 1);
+                var buf: [300]u8 = undefined;
+                const data = scriptData(&buf, seq, g.byte());
+                const held = p.stats().outstanding;
+                if (p.publish(.{ .data = data }, .{ .ordering_key = script_keys[key] })) |receipt| {
+                    try published.append(testing.allocator, .{ .receipt = receipt, .key = key, .seq = seq });
+                } else |err| switch (err) {
+                    // With nothing outstanding any message fits, however big.
+                    error.PublisherFull => try testing.expect(held > 0),
+                    error.OrderingKeyPaused, error.InvalidMessage, error.PublisherStopped => {},
+                    else => return err,
+                }
+                seq += 1;
+            },
+            5 => s.advance(g.intRange(u8, 0, 50)),
+            6 => try p.sendDue(),
+            7 => {
+                const batch = b: {
+                    p.mutex.lockUncancelable(p.io);
+                    defer p.mutex.unlock(p.io);
+                    break :b p.tryTake();
+                };
+                if (batch) |b| try p.sendAndResolve(0, b);
+            },
+            8 => {
+                const key = g.intRange(u8, 1, script_keys.len - 1);
+                p.resumePublish(script_keys[key]);
+                try resumes.append(testing.allocator, .{ .key = key, .from = seq });
+            },
+            else => p.stop(),
+        }
+        // The caps hold after every step. Only a lone message may go past
+        // the byte cap, let in because nothing else was outstanding.
+        const now = p.stats();
+        try testing.expect(now.outstanding <= options.max_outstanding);
+        if (now.outstanding_bytes > options.max_outstanding_bytes) try testing.expectEqual(1, now.outstanding);
+    }
+    // Wind down: stop makes everything due, and it all goes.
+    p.stop();
+    try p.sendDue();
+
+    for (published.items) |item| try testing.expect(item.receipt.batch.resolved.isSet());
+    const final = p.stats();
+    try testing.expectEqual(published.items.len, final.published);
+    try testing.expectEqual(final.published, final.succeeded + final.failed);
+    try testing.expectEqual(0, final.outstanding);
+    try testing.expectEqual(0, final.outstanding_bytes);
+    try testing.expect(!s.fake.anyMixed());
+    for (s.fake.requests.items) |seen| {
+        try testing.expect(seen.data.len <= batch_messages);
+        if (seen.data.len > 1) try testing.expect(seen.bytes <= batch_bytes);
+    }
+    // Only paused keys keep a record.
+    var records = p.keys.valueIterator();
+    while (records.next()) |record| try testing.expect(record.*.paused != null);
+
+    for (1..script_keys.len) |k| {
+        // Stored in publish order: the fake hands out ids in arrival order.
+        var last_id: u64 = 0;
+        for (published.items) |item| {
+            if (item.key != k) continue;
+            const id = item.receipt.wait() catch continue;
+            const n = try std.fmt.parseInt(u64, id, 10);
+            try testing.expect(n > last_id);
+            last_id = n;
+        }
+        // Nothing published after a failed message is stored, until a
+        // resume.
+        for (published.items) |failed| {
+            if (failed.key != k) continue;
+            if (failed.receipt.wait()) |_| continue else |_| {}
+            for (published.items) |later| {
+                if (later.key != k or later.seq <= failed.seq) continue;
+                const resumed = for (resumes.items) |r| {
+                    if (r.key == k and r.from > failed.seq and r.from <= later.seq) break true;
+                } else false;
+                if (resumed) break;
+                if (later.receipt.wait()) |_| return error.TestStoredAfterAFailure else |_| {}
+            }
+        }
+    }
+}
+
+test "slow property Publisher: any script of publishes, answers, time and pauses keeps every promise" {
+    try test_util.fuzzBytes({}, scriptProperty, .{
+        .random_runs = 300,
+        .max_len = 160,
+        .corpus = &.{
+            // All answers fine; batches of 2; publishes on keys a and b,
+            // a send, a stop.
+            "\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x01\x40\x05\x20\x04\x80\x01\x08" ++
+                "\x00\x01\x10\x00\x02\x10\x00\x01\x10\x06\x09",
+            // The first answer NOT_FOUND on key a: a pause, publishes
+            // behind it, a resume, more publishes, sends.
+            "\x01\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x09\x00\xff\x00\x40\x06\xff\x01\x10" ++
+                "\x00\x01\x10\x00\x01\x10\x06\x00\x01\x10\x08\x00\x00\x01\x10\x06",
+            // Unavailable, then aborted, then a reset: retries and
+            // expiries against a short deadline, with time moving.
+            "\x00\x02\x03\x00\x02\x03\x09\x09\x09\x09\x09\x09\x02\x20\x0a\x00\x02\x10\x03\x14" ++
+                "\x00\x02\x30\x05\x32\x00\x03\x30\x07\x05\x32\x06\x00\x00\x20",
+        },
+    });
+}
