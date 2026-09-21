@@ -88,6 +88,95 @@ pub const Response = struct {
     }
 };
 
+/// A request whose bodies can stream. `Request` covers small bodies held in
+/// memory; this covers uploads read from a caller's reader, multipart bodies
+/// sent as segments without copying, and downloads written straight into a
+/// caller's writer. Cloud Storage objects reach 5 TiB, so neither body may
+/// ever be held whole.
+pub const StreamRequest = struct {
+    method: Method,
+    /// Absolute URL.
+    url: []const u8,
+    /// Token for `Authorization: Bearer <token>`; null sends no Authorization header.
+    bearer: ?[]const u8 = null,
+    /// The `Content-Type` value sent verbatim when there is a body, such as
+    /// `multipart/related; boundary=...`. Null sends no Content-Type.
+    content_type: ?[]const u8 = null,
+    /// Sent after the transport's own headers, in order, validated as
+    /// `Request.headers` is.
+    headers: []const Header = &.{},
+    body: Body = .none,
+    /// Where a successful response body goes.
+    sink: Sink = .buffer,
+    /// What `Accept-Encoding` offers the server. Either way, a compressed
+    /// response body is decompressed on its way to the sink.
+    accept_encoding: AcceptEncoding = .identity,
+    /// As `Request.timeout_ms`. While the clock runs the request runs on
+    /// another task, so the body reader and sink writer must not be touched
+    /// until the call returns.
+    timeout_ms: u32 = 0,
+
+    pub const Body = union(enum) {
+        /// No body and no Content-Length, as GET and DELETE send.
+        none,
+        /// Sent back to back with an exact Content-Length, without being
+        /// copied into one buffer. A multipart body is framing, caller data,
+        /// closing framing. Empty segments send `Content-Length: 0`, which a
+        /// resumable-upload status query needs where `.none` would send no
+        /// length at all.
+        segments: []const []const u8,
+        /// Exactly `len` bytes read from `reader`, sent as the
+        /// Content-Length. A reader that ends before `len` bytes is
+        /// `error.EndOfStream`, and the connection is closed.
+        stream: struct { reader: *std.Io.Reader, len: u64 },
+    };
+
+    pub const Sink = union(enum) {
+        /// Buffer the body into the arena, bounded by the transport's
+        /// response limit.
+        buffer,
+        /// Stream a 2xx body into this writer, unbounded. Error bodies are
+        /// still buffered. The transport never flushes it: the writer and
+        /// its buffer belong to the caller.
+        writer: *std.Io.Writer,
+    };
+
+    pub const AcceptEncoding = enum {
+        /// Ask for plain bytes, as a download whose bytes must match a
+        /// checksum wants.
+        identity,
+        /// Offer gzip and deflate, as `send` does for JSON responses.
+        compressed,
+    };
+};
+
+pub const StreamResponse = struct {
+    /// HTTP status code. Non-2xx statuses are responses, not transport
+    /// errors; 308 is how a resumable upload answers a chunk, so it must
+    /// come back untouched, never followed as a redirect.
+    status: u16,
+    /// Every header the response carried, in order, allocated in the arena.
+    headers: []const Header = &.{},
+    /// The buffered body: always set for non-2xx, and for 2xx when the sink
+    /// is `.buffer`. Empty when the body went to the sink writer.
+    body: []const u8 = "",
+    /// Bytes handed to the sink writer, buffered there or not.
+    bytes_streamed: u64 = 0,
+
+    /// The value sent for `name`, matched as HTTP matches names, or null.
+    /// The first wins, as `std.http` does for the headers it reads itself.
+    pub fn header(self: StreamResponse, name: []const u8) ?[]const u8 {
+        for (self.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+        return null;
+    }
+};
+
+/// `Error`, plus the caller's own streams failing. `ReadFailed` is the body
+/// reader and `WriteFailed` the sink writer; each records its detail
+/// wherever that concrete reader or writer keeps it. `EndOfStream` is a body
+/// reader that ended before the declared length.
+pub const StreamError = Error || error{ ReadFailed, WriteFailed, EndOfStream };
+
 /// Failures below HTTP: no response arrived, or none that can be used.
 pub const Error = error{
     /// Nothing is listening at the endpoint.
@@ -129,10 +218,19 @@ pub const Transport = struct {
         /// Sends `req` and reads the whole response. The response body is
         /// allocated in `arena`.
         send: *const fn (ptr: *anyopaque, req: Request, arena: Allocator) Error!Response,
+        /// Sends a request with streaming bodies, or null for a transport
+        /// that cannot stream. Fakes that only ever see `send` leave it out.
+        sendStream: ?*const fn (ptr: *anyopaque, req: StreamRequest, arena: Allocator) StreamError!StreamResponse = null,
     };
 
     pub fn send(self: Transport, req: Request, arena: Allocator) Error!Response {
         return self.vtable.send(self.ptr, req, arena);
+    }
+
+    /// Sends a streaming request. Calling this through a transport whose
+    /// vtable has no `sendStream` is a programmer bug.
+    pub fn sendStream(self: Transport, req: StreamRequest, arena: Allocator) StreamError!StreamResponse {
+        return self.vtable.sendStream.?(self.ptr, req, arena);
     }
 };
 
@@ -161,18 +259,50 @@ pub const HttpTransport = struct {
     }
 
     pub fn transport(self: *HttpTransport) Transport {
-        return .{ .ptr = self, .vtable = &.{ .send = send } };
+        return .{ .ptr = self, .vtable = &.{ .send = send, .sendStream = sendStream } };
     }
 
+    /// `send` is the streaming path with the body as one segment and the
+    /// response buffered, so both entries share one implementation.
     fn send(ptr: *anyopaque, req: Request, arena: Allocator) Error!Response {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
+        const has_body = switch (req.method) {
+            .GET, .DELETE => false,
+            .PUT, .POST => true,
+        };
+        const segments = [_][]const u8{req.body orelse ""};
+        const res = self.sendStreamNow(.{
+            .method = req.method,
+            .url = req.url,
+            .bearer = req.bearer,
+            .content_type = if (has_body) req.content_type.mediaType() else null,
+            .headers = req.headers,
+            .body = if (has_body) .{ .segments = &segments } else .none,
+            .sink = .buffer,
+            .accept_encoding = .compressed,
+            .timeout_ms = req.timeout_ms,
+        }, arena) catch |err| switch (err) {
+            // No caller streams here: a slice body cannot fail or end early,
+            // and buffering into the arena cannot fail the sink.
+            error.ReadFailed, error.WriteFailed, error.EndOfStream => unreachable,
+            else => |e| return e,
+        };
+        return .{ .status = res.status, .body = res.body, .headers = res.headers };
+    }
+
+    fn sendStream(ptr: *anyopaque, req: StreamRequest, arena: Allocator) StreamError!StreamResponse {
+        const self: *HttpTransport = @ptrCast(@alignCast(ptr));
+        return self.sendStreamNow(req, arena);
+    }
+
+    fn sendStreamNow(self: *HttpTransport, req: StreamRequest, arena: Allocator) StreamError!StreamResponse {
         if (req.timeout_ms == 0) return self.sendNow(req, arena);
 
         // The request runs elsewhere, so a server that accepts the
         // connection and then says nothing costs `timeout_ms` rather than
         // the rest of the program's life. Canceling it interrupts the
         // blocked read, and the connection it was using is not reused.
-        const Winner = union(enum) { sent: Error!Response, expired: void };
+        const Winner = union(enum) { sent: StreamError!StreamResponse, expired: void };
         var slots: [2]Winner = undefined;
         var race: std.Io.Select(Winner) = .init(self.client.io, &slots);
         // Without a second thread there is no timeout to be had, and the
@@ -191,7 +321,7 @@ pub const HttpTransport = struct {
         io.sleep(.fromMilliseconds(ms), .awake) catch {};
     }
 
-    fn sendNow(self: *HttpTransport, req: Request, arena: Allocator) Error!Response {
+    fn sendNow(self: *HttpTransport, req: StreamRequest, arena: Allocator) StreamError!StreamResponse {
         const uri = std.Uri.parse(req.url) catch return error.InvalidEndpoint;
         const protocol = http.Client.Protocol.fromUri(uri) orelse return error.InvalidEndpoint;
         if (protocol == .tls) self.expireTlsClock(.when_stale);
@@ -221,20 +351,17 @@ pub const HttpTransport = struct {
         self: *HttpTransport,
         uri: std.Uri,
         protocol: http.Client.Protocol,
-        req: Request,
+        req: StreamRequest,
         arena: Allocator,
-    ) Error!Response {
+    ) StreamError!StreamResponse {
         for (req.headers) |h| {
             if (!isValidHeaderName(h.name) or !isValidHeaderValue(h.value)) return error.InvalidRequestHeader;
         }
+        if (req.content_type) |ct| if (!isValidHeaderValue(ct)) return error.InvalidRequestHeader;
         const authorization: ?[]const u8 = if (req.bearer) |token|
             try std.fmt.allocPrint(arena, "Bearer {s}", .{token})
         else
             null;
-        const has_body = switch (req.method) {
-            .GET, .DELETE => false,
-            .PUT, .POST => true,
-        };
 
         // std.http hands an IPv6 literal to the resolver with its brackets
         // ("[::1]"), which finds nothing. The emulator binds [::1] by default,
@@ -259,18 +386,27 @@ pub const HttpTransport = struct {
             .redirect_behavior = .unhandled,
             .headers = .{
                 .user_agent = .{ .override = self.user_agent },
-                .content_type = if (has_body) .{ .override = req.content_type.mediaType() } else .omit,
+                .content_type = if (req.content_type) |ct| .{ .override = ct } else .omit,
                 .authorization = if (authorization) |v| .{ .override = v } else .omit,
+                .accept_encoding = switch (req.accept_encoding) {
+                    .compressed => .default,
+                    .identity => .{ .override = "identity" },
+                },
             },
             .extra_headers = req.headers,
         }) catch |err| return mapError(err, null);
         defer request.deinit();
         const connection = request.connection.?;
 
-        sendRequest(&request, if (has_body) req.body orelse "" else null) catch |err| {
+        sendBody(&request, req.body) catch |err| {
             // A failed write leaves the connection in an unknown state.
             connection.closing = true;
-            return mapError(err, connection);
+            return switch (err) {
+                // The caller's reader failed, or ended before the declared
+                // length; the response, if any, is not read.
+                error.ReadFailed, error.EndOfStream => |e| e,
+                error.WriteFailed => mapError(err, connection),
+            };
         };
 
         const response = request.receiveHead(&.{}) catch |err| {
@@ -287,14 +423,21 @@ pub const HttpTransport = struct {
         if (status == 204 or status == 304) {
             // These end at the head; the connection is ready for the next request.
             request.reader.state = .ready;
-            return .{ .status = status, .body = "", .headers = headers };
+            return .{ .status = status, .headers = headers };
         }
         if (status < 200) {
             // An informational response precedes the real one, which this
             // client does not wait for. The connection cannot be reused.
             connection.closing = true;
-            return .{ .status = status, .body = "", .headers = headers };
+            return .{ .status = status, .headers = headers };
         }
+
+        // Only a success streams to the sink writer; an error body is
+        // buffered, so the caller can always read what the server said.
+        const to_writer: ?*std.Io.Writer = switch (req.sink) {
+            .buffer => null,
+            .writer => |w| if (status < 300) w else null,
+        };
 
         const encoding = head.content_encoding;
         const decompress_buffer: []u8 = switch (encoding) {
@@ -312,23 +455,47 @@ pub const HttpTransport = struct {
         var transfer_buffer: [64]u8 = undefined;
         var dechunker: Dechunker = undefined;
         const chunked = head.transfer_encoding == .chunked;
+        // A streamed body has no size limit: it goes to the caller, not the
+        // arena. The chunk-size bound only guards the buffered path's memory.
+        const max_chunk: u64 = if (to_writer == null) self.max_response_bytes *| 2 +| 1024 else std.math.maxInt(u64);
         const transfer: *std.Io.Reader = if (chunked) t: {
-            dechunker = .init(request.reader.in, &transfer_buffer, self.max_response_bytes *| 2 +| 1024);
+            dechunker = .init(request.reader.in, &transfer_buffer, max_chunk);
             break :t &dechunker.interface;
         } else request.reader.bodyReader(&transfer_buffer, head.transfer_encoding, head.content_length);
         var decompress: http.Decompress = undefined;
         const reader = decompress.init(transfer, decompress_buffer, encoding);
 
-        // The limit is exclusive: `allocRemaining` fails when it is reached.
-        const limit: std.Io.Limit = .limited(self.max_response_bytes +| 1);
-        const body = reader.allocRemaining(arena, limit) catch |err| {
-            connection.closing = true;
-            return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.StreamTooLong => error.ResponseTooLarge,
-                error.ReadFailed => bodyError(&request, if (chunked) &dechunker else null, transfer, encoding),
+        var body: []const u8 = "";
+        var streamed: u64 = 0;
+        if (to_writer) |w| {
+            while (true) {
+                const n = reader.stream(w, .unlimited) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    // The caller's writer failed; the rest of the body is
+                    // abandoned, so the connection cannot be reused.
+                    error.WriteFailed => {
+                        connection.closing = true;
+                        return error.WriteFailed;
+                    },
+                    error.ReadFailed => {
+                        connection.closing = true;
+                        return bodyError(&request, if (chunked) &dechunker else null, transfer, encoding);
+                    },
+                };
+                streamed += n;
+            }
+        } else {
+            // The limit is exclusive: `allocRemaining` fails when it is reached.
+            const limit: std.Io.Limit = .limited(self.max_response_bytes +| 1);
+            body = reader.allocRemaining(arena, limit) catch |err| {
+                connection.closing = true;
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.StreamTooLong => error.ResponseTooLarge,
+                    error.ReadFailed => bodyError(&request, if (chunked) &dechunker else null, transfer, encoding),
+                };
             };
-        };
+        }
         // A decompressor stops at the end of its own stream, which can leave
         // the last chunk unread (Google's front end sends gzip in chunks).
         // Consume the rest of the framing, so the connection can be reused and
@@ -354,7 +521,7 @@ pub const HttpTransport = struct {
             connection.closing = true;
             return error.ConnectionResetByPeer;
         }
-        return .{ .status = status, .body = body, .headers = headers };
+        return .{ .status = status, .body = body, .headers = headers, .bytes_streamed = streamed };
     }
 
     /// Every header of `head`, copied into `arena`. std.http bounds the head
@@ -379,13 +546,38 @@ fn ipv6Literal(uri: std.Uri) ?[]const u8 {
     return host[1 .. host.len - 1];
 }
 
-fn sendRequest(request: *http.Client.Request, body: ?[]const u8) std.Io.Writer.Error!void {
-    const payload = body orelse return request.sendBodiless();
-    request.transfer_encoding = .{ .content_length = payload.len };
-    var body_writer = try request.sendBodyUnflushed(&.{});
-    try body_writer.writer.writeAll(payload);
-    try body_writer.end();
-    try request.connection.?.flush();
+/// Sends the request head and body. `ReadFailed` is the caller's body
+/// reader, `EndOfStream` a body reader that ended before its declared
+/// length, and `WriteFailed` the connection, whose detail `mapError` reads.
+fn sendBody(
+    request: *http.Client.Request,
+    body: StreamRequest.Body,
+) error{ ReadFailed, WriteFailed, EndOfStream }!void {
+    switch (body) {
+        .none => return request.sendBodiless(),
+        .segments => |segments| {
+            var total: u64 = 0;
+            for (segments) |s| total += s.len;
+            request.transfer_encoding = .{ .content_length = total };
+            var body_writer = try request.sendBodyUnflushed(&.{});
+            for (segments) |s| try body_writer.writer.writeAll(s);
+            try body_writer.end();
+            try request.connection.?.flush();
+        },
+        .stream => |source| {
+            request.transfer_encoding = .{ .content_length = source.len };
+            var body_writer = try request.sendBodyUnflushed(&.{});
+            var left = source.len;
+            while (left > 0) {
+                left -= source.reader.stream(&body_writer.writer, .limited64(left)) catch |err| switch (err) {
+                    error.EndOfStream => return error.EndOfStream,
+                    error.ReadFailed, error.WriteFailed => |e| return e,
+                };
+            }
+            try body_writer.end();
+            try request.connection.?.flush();
+        },
+    }
 }
 
 /// Maps a failed body read. A body cut short by a dropped connection is
@@ -604,6 +796,7 @@ fn socketOk(connection: *const http.Client.Connection) Error {
 const testing = std.testing;
 const net = std.Io.net;
 const test_util = @import("testing.zig");
+const crc32c = @import("crc32c.zig");
 
 const ScriptedServer = test_util.ScriptedServer;
 
@@ -1508,6 +1701,334 @@ test "HttpTransport rejects unusable URLs without panicking" {
     try testing.expectError(error.InvalidEndpoint, t.send(.{ .method = .GET, .url = "ftp://h/x" }, arena.allocator()));
     // A PUT with no body still sends a well-formed request line; it fails at connect here.
     try testing.expectError(error.InvalidEndpoint, t.send(.{ .method = .PUT, .url = "gopher://h" }, arena.allocator()));
+}
+
+test "sendStream uploads from a reader with an exact Content-Length" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+
+    // Larger than the server's record slot: the body is checked by checksum.
+    var data: [8000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast(i % 251);
+    var reader: std.Io.Reader = .fixed(&data);
+    const res = try ht.transport().sendStream(.{
+        .method = .PUT,
+        .url = server.url(&buf, "/upload/storage/v1/b/b/o"),
+        .bearer = "tok-stream",
+        .content_type = "application/octet-stream",
+        .body = .{ .stream = .{ .reader = &reader, .len = data.len } },
+    }, arena.allocator());
+    try testing.expectEqual(200, res.status);
+    try testing.expectEqualStrings("{}", res.body);
+    try testing.expectEqual(0, res.bytes_streamed);
+    try serving.await(io);
+
+    const put = server.request(0);
+    try testing.expect(std.mem.startsWith(u8, put, "PUT /upload/storage/v1/b/b/o HTTP/1.1\r\n"));
+    try expectHeader(put, "content-length: 8000\r\n");
+    try expectHeader(put, "content-type: application/octet-stream\r\n");
+    try expectHeader(put, "authorization: Bearer tok-stream\r\n");
+    try testing.expectEqual(8000, server.seen_body_len[0]);
+    try testing.expectEqual(crc32c.hash(&data), server.seen_body_crc[0]);
+}
+
+test "sendStream sends segments back to back as one body" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+
+    // A multipart/related shape: framing, caller data, closing framing.
+    const framing = "--b\r\nContent-Type: application/json\r\n\r\n{\"name\":\"x\"}\r\n--b\r\nContent-Type: text/plain\r\n\r\n";
+    const data = "hello world\n";
+    const closing = "\r\n--b--\r\n";
+    const res = try ht.transport().sendStream(.{
+        .method = .POST,
+        .url = server.url(&buf, "/upload/storage/v1/b/b/o?uploadType=multipart"),
+        .content_type = "multipart/related; boundary=b",
+        .body = .{ .segments = &.{ framing, data, closing } },
+    }, arena.allocator());
+    try testing.expectEqual(200, res.status);
+    try serving.await(io);
+
+    const post = server.request(0);
+    var length_line: [64]u8 = undefined;
+    try expectHeader(post, try std.fmt.bufPrint(&length_line, "content-length: {d}\r\n", .{framing.len + data.len + closing.len}));
+    try expectHeader(post, "content-type: multipart/related; boundary=b\r\n");
+    try testing.expect(std.mem.endsWith(u8, post, "\r\n\r\n" ++ framing ++ data ++ closing));
+}
+
+test "sendStream: empty segments send Content-Length: 0, as a status query needs" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 308 Permanent Redirect\r\nRange: bytes=0-1023\r\nContent-Length: 0\r\n\r\n",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    const res = try ht.transport().sendStream(.{
+        .method = .PUT,
+        .url = server.url(&buf, "/session"),
+        .headers = &.{.{ .name = "Content-Range", .value = "bytes */20000000" }},
+        .body = .{ .segments = &.{} },
+    }, arena.allocator());
+    // 308 is how a resumable upload answers: returned untouched, never
+    // followed as a redirect, with its headers readable.
+    try testing.expectEqual(308, res.status);
+    try testing.expectEqualStrings("bytes=0-1023", res.header("Range").?);
+    try serving.await(io);
+    try testing.expectEqual(1, server.connections);
+    try expectHeader(server.request(0), "content-length: 0\r\n");
+    try expectHeader(server.request(0), "Content-Range: bytes */20000000\r\n");
+}
+
+test "sendStream: a reader that ends before its declared length is EndOfStream" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var reader: std.Io.Reader = .fixed("only ten b");
+    try testing.expectError(error.EndOfStream, ht.transport().sendStream(.{
+        .method = .PUT,
+        .url = server.url(&buf, "/session"),
+        .body = .{ .stream = .{ .reader = &reader, .len = 100 } },
+    }, arena.allocator()));
+}
+
+test "sendStream downloads into a writer, with headers readable" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nx-goog-hash: crc32c=8P9ykg==\r\nx-goog-generation: 175\r\n" ++
+            "Content-Length: 12\r\n\r\nhello world\n",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const res = try ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/storage/v1/b/b/o/x?alt=media"),
+        .sink = .{ .writer = &out },
+    }, arena.allocator());
+    try testing.expectEqual(200, res.status);
+    // The body went to the writer, not the arena.
+    try testing.expectEqualStrings("", res.body);
+    try testing.expectEqual(12, res.bytes_streamed);
+    try testing.expectEqualStrings("hello world\n", out.buffered());
+    try testing.expectEqualStrings("crc32c=8P9ykg==", res.header("x-goog-hash").?);
+    try testing.expectEqualStrings("175", res.header("x-goog-generation").?);
+    try serving.await(io);
+    // The plain-bytes request asked for plain bytes.
+    try expectHeader(server.request(0), "accept-encoding: identity\r\n");
+}
+
+test "sendStream streams a chunked body and keeps the connection" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+    });
+    defer server.deinit(io);
+    server.per_connection = 2;
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const res = try ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/a"),
+        .sink = .{ .writer = &out },
+    }, arena.allocator());
+    try testing.expectEqualStrings("{\"a\":1}", out.buffered());
+    try testing.expectEqual(7, res.bytes_streamed);
+
+    const next = try ht.transport().send(.{ .method = .GET, .url = server.url(&buf, "/b") }, arena.allocator());
+    try testing.expectEqualStrings("{}", next.body);
+    try serving.await(io);
+    try testing.expectEqual(1, server.connections);
+}
+
+test "sendStream decompresses a gzip body on its way to the writer" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "14\x0d\x0a\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xabV*\xc9/\xc8L.V\xb2\x0d\x0a2c\x0d\x0a\x8a\xaeV\xcaK\xccMU\xb2R*(\xca\xcfJM.)\xd6/\xd0\x87H\xeaWe\x16\x14\xa4\xa6(\xd5\xc6\xd6\x02\x00\x80\xdd\xe810\x00\x00\x00\x0d\x0a0\x0d\x0a\x0d\x0a",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [128]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const res = try ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/a"),
+        .sink = .{ .writer = &out },
+        .accept_encoding = .compressed,
+    }, arena.allocator());
+    const expected = "{\"topics\":[{\"name\":\"projects/p/topics/zipped\"}]}";
+    try testing.expectEqualStrings(expected, out.buffered());
+    try testing.expectEqual(expected.len, res.bytes_streamed);
+    try serving.await(io);
+    try expectHeader(server.request(0), "accept-encoding: gzip, deflate\r\n");
+}
+
+test "sendStream buffers an error body even when a writer was given" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 44\r\n\r\n{\"error\":{\"code\":404,\"message\":\"no object\"}}",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const res = try ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/a"),
+        .sink = .{ .writer = &out },
+    }, arena.allocator());
+    try testing.expectEqual(404, res.status);
+    try testing.expectEqualStrings("{\"error\":{\"code\":404,\"message\":\"no object\"}}", res.body);
+    // The caller's writer saw nothing of it.
+    try testing.expectEqualStrings("", out.buffered());
+    try testing.expectEqual(0, res.bytes_streamed);
+}
+
+test "sendStream: a streamed body cut short is a dropped connection, and the writer keeps what arrived" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial data",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [128]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    try testing.expectError(error.ConnectionResetByPeer, ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/a"),
+        .sink = .{ .writer = &out },
+    }, arena.allocator()));
+    // Delivered bytes stay delivered; a resuming download counts them
+    // through its own counting writer.
+    try testing.expectEqualStrings("partial data", out.buffered());
+}
+
+test "sendStream: the caller's writer failing mid-body is WriteFailed" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nhello world\n",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [4]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    try testing.expectError(error.WriteFailed, ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/a"),
+        .sink = .{ .writer = &out },
+    }, arena.allocator()));
+}
+
+test "sendStream: a server that says nothing is TimedOut" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"});
+    defer server.deinit(io);
+    server.hang = true;
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const outcome = ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/slow"),
+        .sink = .{ .writer = &out },
+        .timeout_ms = 150,
+    }, arena.allocator());
+    // Windows may tear the idle connection down first; see the send test.
+    if (builtin.os.tag == .windows) {
+        if (outcome) |_| {} else |err| if (err == error.ConnectionResetByPeer) return error.SkipZigTest;
+    }
+    try testing.expectError(error.TimedOut, outcome);
 }
 
 test "HttpTransport returns error.Canceled when its task is canceled" {
