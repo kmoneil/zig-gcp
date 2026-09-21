@@ -31,6 +31,12 @@
 //! are retried until the batch's deadline, `publish_timeout_ms` after its
 //! first message was published.
 //!
+//! What a publisher holds is capped: `max_outstanding` messages and
+//! `max_outstanding_bytes` of request body, counting everything accepted and
+//! not yet resolved. At a cap, `publish` waits for room, or with
+//! `when_full = .fail` refuses at once. `flush` sends everything now and
+//! waits for what was accepted before it.
+//!
 //! A publisher runs once and must not be moved after `init`. Its allocator is
 //! used from several tasks at once.
 
@@ -64,6 +70,9 @@ max_batch_messages: u32,
 max_batch_bytes: usize,
 max_batch_delay_ms: u32,
 publish_timeout_ms: u32,
+max_outstanding: u32,
+max_outstanding_bytes: u64,
+when_full: WhenFull,
 /// The backoff between attempts; its `max_attempts` does not apply, since a
 /// publisher retries by time.
 retry: RetryPolicy,
@@ -115,10 +124,28 @@ pub const Options = struct {
     /// A batch that is not full goes out once its first message has waited
     /// this long. 0 sends as soon as a connection is free.
     max_batch_delay_ms: u32 = 10,
+    /// The most messages held at once: accepted and not yet resolved,
+    /// whether buffered, in flight or waiting to be retried. At least
+    /// `max_batch_messages`.
+    max_outstanding: u32 = 1000,
+    /// The same cap in bytes of request body. At least `max_batch_bytes`.
+    /// A message bigger than this on its own is let in when nothing else is
+    /// outstanding, so none waits forever.
+    max_outstanding_bytes: u64 = 10_000_000,
+    /// What `publish` does at either cap.
+    when_full: WhenFull = .block,
     /// How long a message may take from `publish` to its result, retries
     /// included. Transient failures are retried until then; a batch still
     /// unsent then fails with `error.TimedOut`.
     publish_timeout_ms: u32 = 60_000,
+};
+
+pub const WhenFull = enum {
+    /// `publish` waits for room. The wait can be canceled, and then nothing
+    /// is published. Before `run` starts, it waits for `run`.
+    block,
+    /// `publish` returns `error.PublisherFull` at once.
+    fail,
 };
 
 pub const PublishOptions = struct {
@@ -133,6 +160,8 @@ pub const Error = errors.Error || error{
     /// known. A request in flight when `run` was canceled may have been
     /// stored.
     PublisherStopped,
+    /// `when_full` is `.fail` and a cap is reached.
+    PublisherFull,
 };
 
 /// Counters since `init`. A consistent snapshot from `stats`.
@@ -312,6 +341,9 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Publisher {
         .max_batch_bytes = options.max_batch_bytes,
         .max_batch_delay_ms = options.max_batch_delay_ms,
         .publish_timeout_ms = options.publish_timeout_ms,
+        .max_outstanding = options.max_outstanding,
+        .max_outstanding_bytes = options.max_outstanding_bytes,
+        .when_full = options.when_full,
         .retry = options.client.retry,
         .retry_publish = options.client.retry_publish,
         .request_timeout_ms = options.client.request_timeout_ms,
@@ -344,6 +376,13 @@ fn optionsProblem(options: Options) ?[]const u8 {
     if (options.max_batch_delay_ms >= options.publish_timeout_ms) {
         return "max_batch_delay_ms must be less than publish_timeout_ms";
     }
+    // A cap below one full batch would keep every batch from filling.
+    if (options.max_outstanding < options.max_batch_messages) {
+        return "max_outstanding must hold at least one full batch, max_batch_messages";
+    }
+    if (options.max_outstanding_bytes < options.max_batch_bytes) {
+        return "max_outstanding_bytes must hold at least one full batch, max_batch_bytes";
+    }
     return null;
 }
 
@@ -360,7 +399,8 @@ pub fn deinit(self: *Publisher) void {
 }
 
 /// Encodes `message` into a batch and returns its receipt. Safe from any
-/// task. The message is copied: the caller may free it at once.
+/// task. The message is copied: the caller may free it at once. At a cap,
+/// waits for room or refuses, as `Options.when_full` says.
 pub fn publish(self: *Publisher, message: types.Message, options: PublishOptions) Error!Receipt {
     const diag = options.diagnostics;
     if (diag) |d| d.clear();
@@ -373,11 +413,43 @@ pub fn publish(self: *Publisher, message: types.Message, options: PublishOptions
     const io = self.io;
     try self.mutex.lock(io);
     defer self.mutex.unlock(io);
-    if (self.stopping) {
-        if (diag) |d| d.print("the publisher is stopped and takes no more messages", .{});
-        return error.PublisherStopped;
+    const key = &self.unkeyed;
+    while (true) {
+        if (self.stopping) {
+            if (diag) |d| d.print("the publisher is stopped and takes no more messages", .{});
+            return error.PublisherStopped;
+        }
+        if (self.hasRoom(key, encoded.len)) break;
+        switch (self.when_full) {
+            .fail => {
+                if (diag) |d| d.print(
+                    "the publisher is full: {d} messages and {d} bytes are waiting to be sent, and its caps are {d} and {d}",
+                    .{ self.outstanding, self.outstanding_bytes, self.max_outstanding, self.max_outstanding_bytes },
+                );
+                return error.PublisherFull;
+            },
+            // Every batch that resolves broadcasts, and so does stop().
+            .block => try self.cond.wait(io, &self.mutex),
+        }
     }
-    return self.add(&self.unkeyed, encoded);
+    return self.add(key, encoded);
+}
+
+/// Sends every batch now, without waiting out delays, and returns once
+/// every message accepted before the call has resolved, sent or failed.
+/// Safe from any task. Before `run` starts, it waits for `run`.
+pub fn flush(self: *Publisher) std.Io.Cancelable!void {
+    const io = self.io;
+    try self.mutex.lock(io);
+    defer self.mutex.unlock(io);
+    const through = self.sequence;
+    self.makeAllDue();
+    // The oldest unresolved batch is first, so once it began after `through`,
+    // everything before has resolved.
+    while (self.unresolved.first) |node| {
+        if (Batch.ofAllNode(node).first_sequence >= through) return;
+        try self.cond.wait(io, &self.mutex);
+    }
 }
 
 /// Accepts no more messages. `run` sends everything it holds and returns
@@ -471,9 +543,7 @@ fn abandon(self: *Publisher) void {
 /// Appends an encoded message to `key`'s open batch, opening one when there
 /// is none or when the message would take it past a threshold.
 fn add(self: *Publisher, key: *KeyState, encoded: []const u8) Allocator.Error!Receipt {
-    if (key.open) |open| {
-        if (open.count >= self.max_batch_messages or open.bytes + 1 + encoded.len > self.max_batch_bytes) self.close(open);
-    }
+    if (key.open) |open| if (!self.joins(open, encoded.len)) self.close(open);
     var fresh = false;
     const batch = key.open orelse b: {
         fresh = true;
@@ -500,6 +570,26 @@ fn add(self: *Publisher, key: *KeyState, encoded: []const u8) Allocator.Error!Re
     const receipt: Receipt = .{ .batch = batch, .index = batch.count - 1 };
     if (batch.count >= self.max_batch_messages or batch.bytes >= self.max_batch_bytes) self.close(batch);
     return receipt;
+}
+
+/// Whether a message of `len` encoded bytes fits in the open batch `open`.
+fn joins(self: *const Publisher, open: *const Batch, len: usize) bool {
+    return open.count < self.max_batch_messages and open.bytes + 1 + len <= self.max_batch_bytes;
+}
+
+/// The request bytes a message of `len` encoded bytes would add: a comma
+/// and itself in `key`'s open batch, or a new batch around it.
+fn bytesAdded(self: *const Publisher, key: *const KeyState, len: usize) usize {
+    if (key.open) |open| if (self.joins(open, len)) return 1 + len;
+    return codec.publish_body_head.len + len + codec.publish_body_tail.len;
+}
+
+/// Whether a message of `len` encoded bytes fits under the caps. With
+/// nothing outstanding anything fits, so no message waits forever.
+fn hasRoom(self: *const Publisher, key: *const KeyState, len: usize) bool {
+    if (self.outstanding == 0) return true;
+    if (self.outstanding >= self.max_outstanding) return false;
+    return self.outstanding_bytes + self.bytesAdded(key, len) <= self.max_outstanding_bytes;
 }
 
 /// A new batch for `key`, with room for a first message of `first_len`
@@ -841,8 +931,9 @@ const FakeTopic = struct {
     max_in_flight: u32 = 0,
     /// Held requests, right now.
     held: u32 = 0,
-    /// Lets every held request go, and every later one through.
-    released: bool = false,
+    /// Held requests go once fewer than this many requests came before
+    /// them: `release` lets them all go, `releaseThrough` the earliest.
+    released_through: usize = 0,
 
     const Seen = struct {
         /// The messages' data, decoded.
@@ -885,10 +976,16 @@ const FakeTopic = struct {
         return .{ .ptr = f, .vtable = &.{ .send = send } };
     }
 
+    /// Lets every held request go, and every later one through.
     fn release(f: *FakeTopic) void {
+        f.releaseThrough(std.math.maxInt(usize));
+    }
+
+    /// Lets the first `n` requests go, if held.
+    fn releaseThrough(f: *FakeTopic, n: usize) void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
-        f.released = true;
+        f.released_through = n;
         f.cond.broadcast(f.io);
     }
 
@@ -928,7 +1025,7 @@ const FakeTopic = struct {
                 else => error.HttpProtocolError,
             };
 
-        const answer = a: {
+        const index, const answer = a: {
             f.mutex.lockUncancelable(io);
             defer f.mutex.unlock(io);
             try f.record(wire, body.len, req.timeout_ms);
@@ -936,7 +1033,7 @@ const FakeTopic = struct {
             f.max_in_flight = @max(f.max_in_flight, f.in_flight);
             const answer: Answer = if (f.scripted < f.script.len) f.script[f.scripted] else .ok;
             f.scripted += 1;
-            break :a answer;
+            break :a .{ f.requests.items.len - 1, answer };
         };
         defer {
             f.mutex.lockUncancelable(io);
@@ -950,7 +1047,7 @@ const FakeTopic = struct {
                 defer f.mutex.unlock(io);
                 f.held += 1;
                 defer f.held -= 1;
-                while (!f.released) f.cond.wait(io, &f.mutex) catch return error.Canceled;
+                while (index >= f.released_through) f.cond.wait(io, &f.mutex) catch return error.Canceled;
             },
             .slow => |ms| io.sleep(.fromMilliseconds(ms), .awake) catch return error.Canceled,
             .status => |s| {
@@ -1021,6 +1118,10 @@ const TestOptions = struct {
     max_batch_bytes: u32 = 1_000_000,
     max_batch_delay_ms: u32 = 10,
     publish_timeout_ms: u32 = 60_000,
+    // Far above what any test publishes, except the tests of the caps.
+    max_outstanding: u32 = 100_000,
+    max_outstanding_bytes: u64 = 1 << 30,
+    when_full: WhenFull = .block,
     retry: RetryPolicy = .{ .initial_backoff_ms = 100, .max_backoff_ms = 1_000 },
     retry_publish: bool = true,
     request_timeout_ms: u32 = 180_000,
@@ -1042,6 +1143,9 @@ fn testOptions(transport: Transport, o: TestOptions) Options {
         .max_batch_bytes = o.max_batch_bytes,
         .max_batch_delay_ms = o.max_batch_delay_ms,
         .publish_timeout_ms = o.publish_timeout_ms,
+        .max_outstanding = o.max_outstanding,
+        .max_outstanding_bytes = o.max_outstanding_bytes,
+        .when_full = o.when_full,
     };
 }
 
@@ -1490,6 +1594,66 @@ test "init refuses what cannot work, and says why" {
     o = base;
     o.max_batch_delay_ms = o.publish_timeout_ms;
     try expectRefused(o, error.InvalidOptions, "max_batch_delay_ms");
+    o = base;
+    o.max_outstanding = o.max_batch_messages - 1;
+    try expectRefused(o, error.InvalidOptions, "max_outstanding must hold");
+    o = base;
+    o.max_outstanding_bytes = o.max_batch_bytes - 1;
+    try expectRefused(o, error.InvalidOptions, "max_outstanding_bytes must hold");
+}
+
+test "flow control: .fail refuses at the message cap, says why, and lets in again once a batch resolves" {
+    var s: Solo = undefined;
+    try s.init(.{ .max_batch_messages = 3, .max_outstanding = 3, .when_full = .fail });
+    defer s.deinit();
+    var receipts: [3]Receipt = undefined;
+    for (&receipts) |*r| r.* = try s.publishText("in");
+    defer for (receipts) |r| r.release();
+    var diag: Diagnostics = .{};
+    try testing.expectError(error.PublisherFull, s.publisher.publish(.{ .data = "over" }, .{ .diagnostics = &diag }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "full: 3 messages") != null);
+    try testing.expectEqual(3, s.publisher.stats().published);
+
+    // The full batch goes, and its room comes back.
+    try s.publisher.sendDue();
+    const after = try s.publishText("room again");
+    defer after.release();
+    try testing.expectEqual(4, s.publisher.stats().published);
+}
+
+test "flow control: the byte cap counts request bytes exactly" {
+    const one = try codec.encodeMessage(testing.allocator, .{ .data = "abc" }, null);
+    defer testing.allocator.free(one);
+    const two: u32 = @intCast(codec.publish_body_head.len + 2 * one.len + 1 + codec.publish_body_tail.len);
+    var s: Solo = undefined;
+    try s.init(.{ .max_batch_bytes = two, .max_outstanding_bytes = two, .when_full = .fail });
+    defer s.deinit();
+    // Two messages come to exactly the cap, so both are let in.
+    const a = try s.publishText("abc");
+    defer a.release();
+    const b = try s.publishText("abc");
+    defer b.release();
+    try testing.expectEqual(two, s.publisher.stats().outstanding_bytes);
+    try testing.expectError(error.PublisherFull, s.publishText("abc"));
+    try s.publisher.sendDue();
+    try testing.expectEqual(0, s.publisher.stats().outstanding_bytes);
+    const c = try s.publishText("abc");
+    defer c.release();
+}
+
+test "flow control: a message bigger than the byte cap gets in when nothing else is outstanding" {
+    var s: Solo = undefined;
+    try s.init(.{ .max_batch_bytes = 1000, .max_outstanding_bytes = 1000, .when_full = .fail });
+    defer s.deinit();
+    const big: [2000]u8 = @splat('b');
+    const alone = try s.publisher.publish(.{ .data = &big }, .{});
+    defer alone.release();
+    try testing.expect(s.publisher.stats().outstanding_bytes > 1000);
+    // With it outstanding, even a small one has no room.
+    try testing.expectError(error.PublisherFull, s.publishText("small"));
+    try s.publisher.sendDue();
+    const small = try s.publishText("small");
+    defer small.release();
 }
 
 test "init and deinit: every allocation failure is OutOfMemory without leaks" {
@@ -1628,7 +1792,7 @@ test "run: several tasks publish, every message goes out once, in fewer requests
     try l.start();
 
     const per_task = 60;
-    const Publishing = struct {
+    const Tasks = struct {
         fn publishMany(publisher: *Publisher, task: usize, ids: *[per_task][]const u8) anyerror!void {
             var receipts: [per_task]Receipt = undefined;
             var made: usize = 0;
@@ -1648,7 +1812,7 @@ test "run: several tasks publish, every message goes out once, in fewer requests
     var started: usize = 0;
     defer for (tasks[0..started]) |*task| task.cancel(testing.io) catch {};
     for (&tasks, 0..) |*task, t| {
-        task.* = try testing.io.concurrent(Publishing.publishMany, .{ &l.publisher, t, &ids[t] });
+        task.* = try testing.io.concurrent(Tasks.publishMany, .{ &l.publisher, t, &ids[t] });
         started += 1;
     }
     for (&tasks) |*task| try task.await(testing.io);
@@ -1770,4 +1934,143 @@ test "run: canceling run fails what is unsent with PublisherStopped, and leaks n
     // In flight when canceled: the server may have them.
     try testing.expect(std.mem.indexOf(u8, receipts[0].diagnostics().message(), "may have stored") != null);
     try testing.expectEqual(4, l.publisher.stats().failed);
+}
+
+/// Waits until the fake holds `n` requests, or panics after 5 s.
+fn untilHeld(fake: *FakeTopic, n: u32) !void {
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 5_000;
+    while (fake.heldCount() < n) {
+        if (std.Io.Clock.awake.now(testing.io).toMilliseconds() > deadline) @panic("the fake never held the requests expected");
+        try testing.io.sleep(.fromMilliseconds(2), .awake);
+    }
+}
+
+/// A `publish` on a task of its own, so a test can watch it wait.
+const Publishing = struct {
+    publisher: *Publisher,
+    receipt: ?Receipt = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn go(p: *Publishing, text: []const u8) Error!void {
+        defer p.done.store(true, .release);
+        p.receipt = try p.publisher.publish(.{ .data = text }, .{});
+    }
+
+    fn isDone(p: *Publishing) bool {
+        return p.done.load(.acquire);
+    }
+};
+
+test "flow control: .block waits for room, and wakes when a batch resolves" {
+    var l: Live = undefined;
+    try l.init(.{ .max_batch_messages = 2, .max_outstanding = 2, .max_batch_delay_ms = 1 });
+    defer l.deinit();
+    l.fake.script = &.{.hold};
+    try l.start();
+    const one = try l.publisher.publish(.{ .data = "one" }, .{});
+    defer one.release();
+    const two = try l.publisher.publish(.{ .data = "two" }, .{});
+    defer two.release();
+    try untilHeld(&l.fake, 1);
+
+    var third: Publishing = .{ .publisher = &l.publisher };
+    defer if (third.receipt) |r| r.release();
+    var task = try testing.io.concurrent(Publishing.go, .{ &third, "three" });
+    // It waits: both slots are taken by the held batch.
+    try testing.io.sleep(.fromMilliseconds(50), .awake);
+    try testing.expect(!third.isDone());
+    try testing.expectEqual(2, l.publisher.stats().published);
+
+    l.fake.release();
+    if (!try waitUntil(10_000, &third, Publishing.isDone)) @panic("publish never got room after the batch resolved");
+    try task.await(testing.io);
+    try testing.expectEqualStrings("3", try waitBounded(third.receipt.?));
+    try l.finish();
+}
+
+test "flow control: a publish waiting for room can be canceled, and publishes nothing" {
+    var l: Live = undefined;
+    try l.init(.{ .max_batch_messages = 1, .max_outstanding = 1, .max_batch_delay_ms = 1 });
+    defer l.deinit();
+    l.fake.script = &.{.hold};
+    try l.start();
+    const held = try l.publisher.publish(.{ .data = "held" }, .{});
+    defer held.release();
+    try untilHeld(&l.fake, 1);
+
+    var waiting: Publishing = .{ .publisher = &l.publisher };
+    var task = try testing.io.concurrent(Publishing.go, .{ &waiting, "never" });
+    try testing.io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expectError(error.Canceled, task.cancel(testing.io));
+    try testing.expectEqual(null, waiting.receipt);
+    try testing.expectEqual(1, l.publisher.stats().published);
+
+    l.fake.release();
+    try l.finish();
+    try testing.expectEqual(1, l.fake.requestCount());
+}
+
+/// `flush` on a task of its own.
+const Flushing = struct {
+    publisher: *Publisher,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn go(f: *Flushing) std.Io.Cancelable!void {
+        defer f.done.store(true, .release);
+        return f.publisher.flush();
+    }
+
+    fn isDone(f: *Flushing) bool {
+        return f.done.load(.acquire);
+    }
+};
+
+test "flush: sends what is buffered without waiting out the delay, and returns once it has resolved" {
+    var l: Live = undefined;
+    // A delay far longer than the test is willing to wait.
+    try l.init(.{ .max_batch_delay_ms = 50_000, .publish_timeout_ms = 120_000 });
+    defer l.deinit();
+    try l.start();
+    var receipts: [3]Receipt = undefined;
+    for (&receipts) |*r| r.* = try l.publisher.publish(.{ .data = "buffered" }, .{});
+    defer for (receipts) |r| r.release();
+
+    var flushing: Flushing = .{ .publisher = &l.publisher };
+    var task = try testing.io.concurrent(Flushing.go, .{&flushing});
+    if (!try waitUntil(10_000, &flushing, Flushing.isDone)) @panic("flush never returned");
+    try task.await(testing.io);
+    for (receipts) |r| try testing.expect(r.batch.resolved.isSet());
+    try testing.expectEqual(1, l.fake.requestCount());
+    try l.finish();
+}
+
+test "flush: waits for what was published before it, and nothing after" {
+    var l: Live = undefined;
+    try l.init(.{ .concurrency = 2, .max_batch_messages = 1, .max_batch_delay_ms = 1 });
+    defer l.deinit();
+    l.fake.script = &.{ .hold, .hold };
+    try l.start();
+    const early = try l.publisher.publish(.{ .data = "before flush" }, .{});
+    defer early.release();
+    try untilHeld(&l.fake, 1);
+
+    var flushing: Flushing = .{ .publisher = &l.publisher };
+    var task = try testing.io.concurrent(Flushing.go, .{&flushing});
+    try testing.io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expect(!flushing.isDone());
+    const late = try l.publisher.publish(.{ .data = "after flush" }, .{});
+    defer late.release();
+    try untilHeld(&l.fake, 2);
+
+    // Only the earlier request answers; flush returns with the later one
+    // still in flight.
+    l.fake.releaseThrough(1);
+    if (!try waitUntil(10_000, &flushing, Flushing.isDone)) @panic("flush never returned");
+    try task.await(testing.io);
+    try testing.expect(early.batch.resolved.isSet());
+    try testing.expect(!late.batch.resolved.isSet());
+
+    l.fake.release();
+    try testing.expectEqualStrings("2", try waitBounded(late));
+    try l.finish();
 }
