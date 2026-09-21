@@ -502,6 +502,14 @@ test "decode access: a checksum that is not one is a broken response" {
     }
 }
 
+test "a JSON null checksum means the version has none" {
+    // std.json turns an explicit `null` into a missing optional, so this
+    // arm is only reachable if that ever changes. A literal null means
+    // absent in proto3 JSON, and absent is not the same as unreadable.
+    try testing.expectEqual(null, try parseChecksum(std.json.Value{ .null = {} }));
+    try testing.expectEqual(null, try parseChecksum(null));
+}
+
 test "decode access: bodies that are not the expected shape" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
