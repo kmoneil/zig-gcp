@@ -4,6 +4,20 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.11.1 (unreleased)
+
+- pubsub: fixed: canceling `Subscriber.run` could hang it for good. `run`
+  waits on a condition variable that every resolved message signals, and
+  `std.Io.Condition` in Zig 0.16.0 drops a cancel that arrives while
+  another waiter's signal is still pending. std delivers a cancel once, so
+  the next wait could not be canceled and `run` never returned. A worker
+  waiting in the message queue could lose its cancel the same way. `run`
+  now waits on `core.Condition`, and closes the queue on every way out.
+- core: `Condition` is `std.Io.Condition` with that flaw fixed: a canceled
+  `wait` always returns `error.Canceled`, and any signal it took on the way
+  goes to the next waiter.
+- auth, secret_manager: unchanged.
+
 ## 0.11.0 (2026-09-21)
 
 - auth: impersonated service accounts. `ImpersonatedServiceAccount`
