@@ -109,6 +109,41 @@ pub fn requireNumber(client: *Client, ref: types.VersionRef, what: []const u8) E
     }
 }
 
+/// Checks a secret's configuration before it is encoded: labels must be
+/// valid UTF-8, because JSON strings are and `std.json.Stringify` does not
+/// check, and a user-managed replication must name locations. Everything
+/// else about a label is the server's business.
+pub fn checkConfig(client: *Client, config: types.SecretConfig) Error!void {
+    for (config.labels) |label| {
+        if (std.unicode.utf8ValidateSlice(label.key) and std.unicode.utf8ValidateSlice(label.value)) continue;
+        if (client.diagnostics) |d| d.print("invalid label: keys and values must be valid UTF-8", .{});
+        return error.InvalidArgument;
+    }
+    // A regional secret sends no replication at all, so there is nothing
+    // there to check.
+    if (client.location != null) return;
+    switch (config.replication) {
+        .automatic => {},
+        .user_managed => |locations| {
+            if (locations.len == 0) {
+                if (client.diagnostics) |d| d.print(
+                    "invalid replication: user-managed replication needs at least one location",
+                    .{},
+                );
+                return error.InvalidArgument;
+            }
+            for (locations) |location| {
+                if (validate.isLocation(location)) continue;
+                if (client.diagnostics) |d| d.print(
+                    "invalid replication location: expected a location id such as \"europe-west1\"",
+                    .{},
+                );
+                return error.InvalidLocation;
+            }
+        },
+    }
+}
+
 /// Reports a 2xx body that did not decode.
 pub fn decodeFailed(client: *Client, err: codec.DecodeError, what: []const u8) Error {
     if (err == error.InvalidResponse) {

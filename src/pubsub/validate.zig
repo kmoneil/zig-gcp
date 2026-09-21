@@ -175,7 +175,6 @@ test "resource ids: the documented rules at their boundaries" {
     try testing.expect(!isResourceId(""));
 }
 
-
 fn expectRejected(messages: []const types.Message, ordering_key: ?[]const u8, want: []const u8) !void {
     var d: Diagnostics = .{};
     try testing.expectError(error.InvalidMessage, publish(messages, ordering_key, &d));

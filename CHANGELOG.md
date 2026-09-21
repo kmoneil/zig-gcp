@@ -4,6 +4,35 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.10.0 (unreleased)
+
+- secret_manager: new module, stability `experimental`. A client for
+  Secret Manager v1. `access` fetches a version's bytes, verifies the
+  CRC-32C stored beside them and returns a `SecretValue` whose `deinit`
+  wipes every buffer the call touched: the response body, the parser's
+  scratch space, the decoded bytes and the bearer token. `addVersion`
+  stores new bytes with a checksum the server verifies, from a request
+  body built in wiped memory. `create`, `get`, `list` and `delete` cover
+  secrets, and `get`, `list`, `enable`, `disable` and `destroy` cover
+  their versions; the three that change a version's state take a number
+  rather than `latest`. Secrets are global or regional, which decides both
+  the host and the resource names. A `SecretValue` prints as `[REDACTED]`
+  however it is formatted, and nothing about a secret reaches the log, not
+  even its length. Read secrets at startup or on a timer: access calls are
+  quota-limited and billed per call, and the library caches nothing.
+- core: gains what the new module needed, all of it useful to later
+  services. `rpc` is the request loop that lived in pubsub: credentials,
+  the quota-project header, retries with jittered backoff, the 401
+  re-authentication, error mapping and diagnostics, bound to each module's
+  log scope. A call can now be marked as carrying secrets, and then its
+  scratch memory is wiped and a failed attempt's response freed at once
+  rather than kept for the next attempt. `crc32c` is CRC-32C, with the
+  RFC 3720 vectors pinned. `query` holds percent-encoding and a
+  query-string builder. `base64` and `endpoint` moved out of pubsub, and
+  `names.isProjectId` replaces the copy pubsub and auth each had.
+- auth, pubsub: no API changes. What they lost to core they now import
+  from it, and their own tests are unchanged.
+
 ## 0.9.0 (2026-09-20)
 
 - auth: fixed: `MetadataServer` accepted a host whose colon was followed

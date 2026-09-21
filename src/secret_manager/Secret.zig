@@ -35,6 +35,82 @@ pub fn access(self: Secret, ref: types.VersionRef) Error!SecretValue {
     return self.version(ref).access();
 }
 
+/// Creates this secret, which holds no versions until `addVersion` adds one.
+///
+/// A global secret names its replication, which is immutable afterwards. A
+/// regional client sends none: the client's location decides, and `config`'s
+/// replication is ignored.
+pub fn create(self: Secret, config: types.SecretConfig) Error!types.Owned(types.SecretInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkSecretId(c, self.id);
+    try rpc.checkConfig(c, config);
+
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try names.createPath(scratch.allocator(), c.parent(), self.id);
+    const body = try codec.encodeSecret(scratch.allocator(), config, c.location != null);
+
+    var result: types.Owned(types.SecretInfo) = try .init(c.gpa);
+    errdefer result.deinit();
+    const response = try rpc.execute(c, result.arena, .{ .method = .POST, .path = path, .body = body });
+    result.value = codec.decodeSecret(result.arena.allocator(), response) catch |err|
+        return rpc.decodeFailed(c, err, "secret");
+    return result;
+}
+
+/// This secret's metadata: when it was created, its labels and its etag.
+/// Nothing about its versions, and none of its bytes.
+pub fn get(self: Secret) Error!types.Owned(types.SecretInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkSecretId(c, self.id);
+
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try names.secretPath(scratch.allocator(), c.parent(), self.id, "");
+
+    var result: types.Owned(types.SecretInfo) = try .init(c.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(c, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeSecret(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(c, err, "secret");
+    return result;
+}
+
+/// Deletes this secret and every version of it. There is no undo.
+///
+/// A delete whose answer was lost and then retried reports `NotFound`, since
+/// the first attempt had already succeeded.
+pub fn delete(self: Secret) Error!void {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkSecretId(c, self.id);
+
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try names.secretPath(scratch.allocator(), c.parent(), self.id, "");
+    return rpc.executeDiscard(c, .{ .method = .DELETE, .path = path });
+}
+
+/// One page of this secret's versions, newest first.
+pub fn listVersions(self: Secret, options: types.ListOptions) Error!types.Owned(types.VersionPage) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkSecretId(c, self.id);
+
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try names.versionsPath(scratch.allocator(), c.parent(), self.id, options);
+
+    var result: types.Owned(types.VersionPage) = try .init(c.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(c, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeVersionPage(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(c, err, "version list");
+    return result;
+}
+
 /// Stores `data` as a new version and returns what the server made of it.
 ///
 /// `data` is borrowed: the only copy this library makes is the base64 in the
@@ -266,6 +342,161 @@ test "addVersion: every allocation failure is OutOfMemory without leaks" {
             defer client.deinit();
             var added = try client.secret("db-password").addVersion("s3cr3t");
             added.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+}
+
+const created_secret: Reply = .{ .respond = .{ .body =
+    \\{"name":"projects/82150720798/secrets/db-password",
+    \\ "replication":{"automatic":{}},
+    \\ "createTime":"2026-09-20T23:10:15.057958Z",
+    \\ "labels":{"zig-gcp-test":"1"},
+    \\ "etag":"\"165bf23c7b1c62\""}
+} };
+
+test "golden: create, global and regional" {
+    var h: Harness = undefined;
+    try h.init(&.{ created_secret, created_secret, created_secret }, .{});
+    defer h.deinit();
+
+    var created = try h.client.secret("db-password").create(.{});
+    defer created.deinit();
+    try h.expectRequest(
+        0,
+        .POST,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets?secretId=db-password",
+        "{\"replication\":{\"automatic\":{}}}",
+    );
+    try testing.expectEqualStrings("db-password", created.value.id());
+    try testing.expectEqualStrings("1", created.value.label("zig-gcp-test").?);
+
+    var labelled = try h.client.secret("db-password").create(.{
+        .labels = &.{.{ .key = "zig-gcp-test", .value = "1" }},
+        .replication = .{ .user_managed = &.{ "europe-west1", "us-east1" } },
+    });
+    defer labelled.deinit();
+    try h.expectRequest(
+        1,
+        .POST,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets?secretId=db-password",
+        "{\"replication\":{\"userManaged\":{\"replicas\":[{\"location\":\"europe-west1\"},{\"location\":\"us-east1\"}]}},\"labels\":{\"zig-gcp-test\":\"1\"}}",
+    );
+
+    var regional: Harness = undefined;
+    try regional.init(&.{created_secret}, .{ .location = "europe-west3" });
+    defer regional.deinit();
+    // A regional create sends no replication, whatever the config says.
+    var there = try regional.client.secret("db-password").create(.{
+        .replication = .{ .user_managed = &.{"europe-west1"} },
+    });
+    defer there.deinit();
+    try regional.expectRequest(
+        0,
+        .POST,
+        "https://secretmanager.europe-west3.rep.googleapis.com/v1/projects/extractctl/locations/europe-west3/secrets?secretId=db-password",
+        "{}",
+    );
+}
+
+test "golden: get, delete and listVersions" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        created_secret,
+        .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .body =
+        \\{"versions":[{"name":"projects/1/secrets/db-password/versions/2","state":"ENABLED"},
+        \\ {"name":"projects/1/secrets/db-password/versions/1","state":"DESTROYED","destroyTime":"2026-09-20T23:09:41.5Z"}],
+        \\ "nextPageToken":"tok","totalSize":2}
+        } },
+    }, .{});
+    defer h.deinit();
+
+    var got = try h.client.secret("db-password").get();
+    defer got.deinit();
+    try h.expectRequest(0, .GET, "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets/db-password", null);
+
+    try h.client.secret("db-password").delete();
+    try h.expectRequest(1, .DELETE, "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets/db-password", null);
+
+    var versions = try h.client.secret("db-password").listVersions(.{ .page_size = 2 });
+    defer versions.deinit();
+    try h.expectRequest(
+        2,
+        .GET,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets/db-password/versions?pageSize=2",
+        null,
+    );
+    try testing.expectEqual(2, versions.value.versions.len);
+    try testing.expectEqual(2, versions.value.versions[0].number().?);
+    try testing.expectEqual(.destroyed, versions.value.versions[1].state);
+    try testing.expectEqualStrings("2026-09-20T23:09:41.5Z", versions.value.versions[1].destroy_time);
+    try testing.expectEqualStrings("tok", versions.value.next_page_token.?);
+    try testing.expectEqual(2, versions.value.total_size);
+}
+
+test "create: what the server refuses, and what never reaches it" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 409, .body = "{\"error\":{\"status\":\"ALREADY_EXISTS\",\"message\":\"Secret [projects/1/secrets/db-password] already exists.\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"status\":\"NOT_FOUND\",\"message\":\"Secret [projects/1/secrets/gone] not found.\"}}" } },
+    }, .{});
+    defer h.deinit();
+
+    try testing.expectError(error.AlreadyExists, h.client.secret("db-password").create(.{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "already exists") != null);
+    // A delete whose first attempt got through reports NotFound on the retry.
+    try testing.expectError(error.NotFound, h.client.secret("gone").delete());
+
+    // A label that is not UTF-8 would be copied into the body as broken
+    // JSON, so it never gets that far.
+    try testing.expectError(error.InvalidArgument, h.client.secret("db-password").create(.{
+        .labels = &.{.{ .key = "team", .value = "pay\xffments" }},
+    }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "valid UTF-8") != null);
+    try testing.expectError(error.InvalidArgument, h.client.secret("db-password").create(.{
+        .replication = .{ .user_managed = &.{} },
+    }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "at least one location") != null);
+    try testing.expectError(error.InvalidLocation, h.client.secret("db-password").create(.{
+        .replication = .{ .user_managed = &.{"Europe-West1"} },
+    }));
+    try testing.expectError(error.InvalidResourceId, h.client.secret("db.password").create(.{}));
+    try testing.expectError(error.InvalidResourceId, h.client.secret("").get());
+    try testing.expectError(error.InvalidResourceId, h.client.secret("a/b").delete());
+    try h.expectRequestCount(2);
+}
+
+test "secret administration: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                created_secret,
+                created_secret,
+                .{ .respond = .{ .body = "{\"secrets\":[{\"name\":\"projects/1/secrets/a\",\"labels\":{\"k\":\"v\"}}],\"nextPageToken\":\"t\"}" } },
+                .{ .respond = .{ .body = "{\"versions\":[{\"name\":\"projects/1/secrets/a/versions/1\",\"state\":\"ENABLED\"}]}" } },
+                .{ .respond = .{ .body = "{}" } },
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: test_util.FakeTokenProvider = .{ .quota_project = "billing-project" };
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "extractctl",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+
+            const secret = client.secret("db-password");
+            var created = try secret.create(.{ .labels = &.{.{ .key = "zig-gcp-test", .value = "1" }} });
+            created.deinit();
+            var got = try secret.get();
+            got.deinit();
+            var listed = try client.listSecrets(.{ .page_size = 2, .filter = "labels.zig-gcp-test=1" });
+            listed.deinit();
+            var versions = try secret.listVersions(.{});
+            versions.deinit();
+            try secret.delete();
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});

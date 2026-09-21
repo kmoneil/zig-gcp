@@ -76,6 +76,74 @@ pub fn access(self: Version) Error!SecretValue {
     }
 }
 
+/// This version's metadata: its state, when it was created, and whether the
+/// checksum stored with it came from the client. None of its bytes.
+pub fn get(self: Version) Error!types.Owned(types.VersionInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkSecretId(c, self.secret_id);
+    try rpc.checkRef(c, self.ref);
+
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try names.versionPath(scratch.allocator(), c.parent(), self.secret_id, self.ref, "");
+
+    var result: types.Owned(types.VersionInfo) = try .init(c.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(c, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeVersion(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(c, err, "version");
+    return result;
+}
+
+/// Makes a disabled version accessible again. Takes a version number.
+pub fn enable(self: Version) Error!types.Owned(types.VersionInfo) {
+    return self.change("enable", ":enable");
+}
+
+/// Keeps the version and its bytes, but refuses to serve them: accessing a
+/// disabled version answers `error.FailedPrecondition`. Takes a version
+/// number.
+pub fn disable(self: Version) Error!types.Owned(types.VersionInfo) {
+    return self.change("disable", ":disable");
+}
+
+/// Destroys the bytes. The version stays, with its state and the time it
+/// was destroyed, but what it held is gone for good. Takes a version
+/// number.
+///
+/// Unlike `enable` and `disable`, this one is not idempotent: a second
+/// destroy answers `error.FailedPrecondition`, with "SecretVersion.state is
+/// already DESTROYED". A destroy whose answer was lost and then retried
+/// reports that, which means the first attempt worked.
+pub fn destroy(self: Version) Error!types.Owned(types.VersionInfo) {
+    return self.change("destroy", ":destroy");
+}
+
+/// The three calls that change a version's state. Each takes an explicit
+/// number: "whatever is latest right now" is the wrong target for a change
+/// that lasts, and production refuses `latest` for these three anyway.
+fn change(self: Version, what: []const u8, suffix: []const u8) Error!types.Owned(types.VersionInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkSecretId(c, self.secret_id);
+    const number = try rpc.requireNumber(c, self.ref, what);
+
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try names.versionPath(scratch.allocator(), c.parent(), self.secret_id, .{ .number = number }, suffix);
+
+    var result: types.Owned(types.VersionInfo) = try .init(c.gpa);
+    errdefer result.deinit();
+    // Enabling an enabled version and disabling a disabled one are both
+    // answered with 200 and the same state, so a lost answer costs nothing
+    // to ask again. Destroying twice is not; `destroy` says so.
+    const body = try rpc.execute(c, result.arena, .{ .method = .POST, .path = path, .body = "{}" });
+    result.value = codec.decodeVersion(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(c, err, "version");
+    return result;
+}
+
 /// Checks the bytes against the checksum the server sent, as far as the
 /// client's mode asks. Neither the checksum nor the length of the bytes
 /// reaches the log or the diagnostics.
@@ -396,6 +464,117 @@ test "access: every allocation failure is OutOfMemory without leaks" {
             value.deinit();
             var again = try client.secret("db-password").version(.{ .alias = "prod" }).access();
             again.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+}
+
+const destroyed_version: Reply = .{ .respond = .{ .body =
+    \\{"name":"projects/82150720798/secrets/db-password/versions/1",
+    \\ "createTime":"2026-09-20T23:09:39.716394Z",
+    \\ "destroyTime":"2026-09-20T23:09:41.500615147Z",
+    \\ "state":"DESTROYED","etag":"\"165bf23a79782f\"",
+    \\ "clientSpecifiedPayloadChecksum":true}
+} };
+
+test "golden: get, enable, disable and destroy" {
+    const enabled: Reply = .{ .respond = .{ .body = "{\"name\":\"projects/1/secrets/db-password/versions/1\",\"state\":\"ENABLED\"}" } };
+    const disabled: Reply = .{ .respond = .{ .body = "{\"name\":\"projects/1/secrets/db-password/versions/1\",\"state\":\"DISABLED\"}" } };
+    var h: Harness = undefined;
+    try h.init(&.{ enabled, disabled, enabled, destroyed_version }, .{});
+    defer h.deinit();
+    const base = "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets/db-password/versions/1";
+
+    var got = try h.client.secret("db-password").version(.{ .number = 1 }).get();
+    defer got.deinit();
+    try h.expectRequest(0, .GET, base, null);
+    try testing.expectEqual(.enabled, got.value.state);
+
+    var off = try h.client.secret("db-password").version(.{ .number = 1 }).disable();
+    defer off.deinit();
+    try h.expectRequest(1, .POST, base ++ ":disable", "{}");
+    try testing.expectEqual(.disabled, off.value.state);
+
+    var on = try h.client.secret("db-password").version(.{ .number = 1 }).enable();
+    defer on.deinit();
+    try h.expectRequest(2, .POST, base ++ ":enable", "{}");
+    try testing.expectEqual(.enabled, on.value.state);
+
+    var gone = try h.client.secret("db-password").version(.{ .number = 1 }).destroy();
+    defer gone.deinit();
+    try h.expectRequest(3, .POST, base ++ ":destroy", "{}");
+    try testing.expectEqual(.destroyed, gone.value.state);
+    try testing.expectEqualStrings("2026-09-20T23:09:41.500615147Z", gone.value.destroy_time);
+}
+
+test "the guard: a lasting change needs a version number" {
+    var h: Harness = undefined;
+    try h.init(&.{secret_access}, .{});
+    defer h.deinit();
+    const secret = h.client.secret("db-password");
+
+    for ([_]types.VersionRef{ .latest, .{ .alias = "prod" } }) |ref| {
+        try testing.expectError(error.ExplicitVersionRequired, secret.version(ref).destroy());
+        try testing.expectError(error.ExplicitVersionRequired, secret.version(ref).disable());
+        try testing.expectError(error.ExplicitVersionRequired, secret.version(ref).enable());
+    }
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "explicit version number") != null);
+    // Production refuses `latest` for these three as well, so nothing was
+    // lost by refusing here: no request went out at all.
+    try h.expectRequestCount(0);
+
+    // A number is what they take, and 0 is not one.
+    try testing.expectError(error.InvalidResourceId, secret.version(.{ .number = 0 }).destroy());
+    // Reading is different: any reference will do.
+    var value = try secret.access(.latest);
+    value.deinit();
+    try h.expectRequestCount(1);
+}
+
+test "a version that cannot serve its bytes says so" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"status\":\"FAILED_PRECONDITION\",\"message\":\"Secret Version [projects/1/secrets/db/versions/1] is in DESTROYED state.\"}}" } },
+        destroyed_version,
+    }, .{});
+    defer h.deinit();
+
+    try testing.expectError(error.FailedPrecondition, h.client.secret("db-password").access(.{ .number = 1 }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "DESTROYED state") != null);
+    // The version itself is still there to look at, destroy time and all.
+    var got = try h.client.secret("db-password").version(.{ .number = 1 }).get();
+    defer got.deinit();
+    try testing.expectEqual(.destroyed, got.value.state);
+}
+
+test "version administration: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                destroyed_version,
+                destroyed_version,
+                destroyed_version,
+                destroyed_version,
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: test_util.FakeTokenProvider = .{ .quota_project = "billing-project" };
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "extractctl",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+
+            const version = client.secret("db-password").version(.{ .number = 1 });
+            var got = try version.get();
+            got.deinit();
+            var off = try version.disable();
+            off.deinit();
+            var on = try version.enable();
+            on.deinit();
+            var gone = try version.destroy();
+            gone.deinit();
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
