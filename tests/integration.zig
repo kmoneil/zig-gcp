@@ -817,3 +817,308 @@ test "subscriber: lease extension carries a handler past the ack deadline" {
     try testing.expectEqual(1, counts.acked);
     try expectNoMessages(&f, sub);
 }
+
+// Publisher.
+
+const Publisher = pubsub.Publisher;
+
+const PublisherKnobs = struct {
+    concurrency: u16 = 4,
+    max_batch_messages: u16 = 100,
+    max_batch_bytes: u32 = 1_000_000,
+    max_batch_delay_ms: u32 = 10,
+    enable_message_ordering: bool = false,
+    max_outstanding_bytes: u64 = 10_000_000,
+};
+
+/// Options for a publisher on the fixture's server.
+fn publisherOptions(f: *Fixture, topic_id: []const u8, knobs: PublisherKnobs) Publisher.Options {
+    return .{
+        .topic_id = topic_id,
+        .client = .{
+            .project_id = f.client.project_id,
+            .endpoint = .{ .url = f.client.base_url, .emulator = f.client.emulator },
+            .token_provider = if (f.production) f.token.provider() else null,
+            .user_agent = "zig-pubsub-integration/0.1",
+            // A publisher never holds a pull open: a stalled request should
+            // be retried long before the default three minutes.
+            .request_timeout_ms = 30_000,
+        },
+        .concurrency = knobs.concurrency,
+        .max_batch_messages = knobs.max_batch_messages,
+        .max_batch_bytes = knobs.max_batch_bytes,
+        .max_batch_delay_ms = knobs.max_batch_delay_ms,
+        .enable_message_ordering = knobs.enable_message_ordering,
+        .max_outstanding_bytes = knobs.max_outstanding_bytes,
+    };
+}
+
+/// A publisher running on a task of its own until `finish`.
+const LivePublisher = struct {
+    publisher: Publisher,
+    running: ?std.Io.Future(Publisher.Error!void) = null,
+
+    fn start(l: *LivePublisher, options: Publisher.Options) !void {
+        l.* = .{ .publisher = try .init(testing.allocator, testing.io, options) };
+        errdefer l.publisher.deinit();
+        l.running = try testing.io.concurrent(Publisher.run, .{&l.publisher});
+    }
+
+    /// Stops the publisher and returns what `run` returns.
+    fn finish(l: *LivePublisher) Publisher.Error!void {
+        l.publisher.stop();
+        var running = l.running orelse return;
+        l.running = null;
+        return running.await(testing.io);
+    }
+
+    fn deinit(l: *LivePublisher) void {
+        if (l.running != null) l.finish() catch {};
+        l.publisher.deinit();
+    }
+};
+
+/// `receipt.wait()`, failing rather than hanging after `timeout_s`.
+fn waitReceipt(receipt: Publisher.Receipt, timeout_s: i64) ![]const u8 {
+    const deadline = nowMs() + timeout_s * 1000;
+    while (!receipt.batch.resolved.isSet()) {
+        if (nowMs() > deadline) return error.TestTimedOut;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return receipt.wait();
+}
+
+test "publisher: several tasks publish 1,000 messages in far fewer requests, and every one arrives" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("pubv");
+    const sub = try f.createSubscription("pubv-sub", .{ .topic_id = topic.id });
+
+    var live: LivePublisher = undefined;
+    try live.start(publisherOptions(&f, topic.id, .{}));
+    defer live.deinit();
+
+    const per_task = 250;
+    const Task = struct {
+        fn publishMany(p: *Publisher, task: usize) anyerror!void {
+            var receipts: [per_task]Publisher.Receipt = undefined;
+            var made: usize = 0;
+            defer for (receipts[0..made]) |r| r.release();
+            for (&receipts, 0..) |*r, i| {
+                var buf: [16]u8 = undefined;
+                r.* = try p.publish(.{ .data = try std.fmt.bufPrint(&buf, "t{d}-{d:0>3}", .{ task, i }) }, .{});
+                made += 1;
+            }
+            for (receipts) |r| _ = try waitReceipt(r, 60);
+        }
+    };
+    var tasks: [4]std.Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    defer for (tasks[0..started]) |*task| task.cancel(testing.io) catch {};
+    for (&tasks, 0..) |*task, i| {
+        task.* = try testing.io.concurrent(Task.publishMany, .{ &live.publisher, i });
+        started += 1;
+    }
+    for (tasks[0..started]) |*task| try task.await(testing.io);
+    try live.finish();
+
+    const counts = live.publisher.stats();
+    try testing.expectEqual(4 * per_task, counts.succeeded);
+    try testing.expect(counts.requests < 100);
+
+    var got: Collector = .init();
+    defer got.deinit();
+    try pullUntil(&f, sub, 4 * per_task, f.patience(), &got, true);
+    for (0..4) |t| for (0..per_task) |i| {
+        var buf: [16]u8 = undefined;
+        const data = try std.fmt.bufPrint(&buf, "t{d}-{d:0>3}", .{ t, i });
+        if (got.find(data) == null) {
+            std.debug.print("{s} never arrived\n", .{data});
+            return error.TestMessageMissing;
+        }
+    };
+}
+
+test "publisher: each ordering key's messages arrive in publish order on an ordered subscription" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("pubord");
+    const sub = try f.createSubscription("pubord-sub", .{ .topic_id = topic.id, .enable_message_ordering = true });
+
+    var live: LivePublisher = undefined;
+    try live.start(publisherOptions(&f, topic.id, .{ .max_batch_messages = 5, .enable_message_ordering = true }));
+    defer live.deinit();
+
+    // Three tasks, a key each, publishing at once: the keys' batches
+    // interleave across the four connections.
+    const per_key = 20;
+    const Task = struct {
+        fn publishKey(p: *Publisher, k: usize) anyerror!void {
+            var key_buf: [8]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "key-{d}", .{k});
+            var receipts: [per_key]Publisher.Receipt = undefined;
+            var made: usize = 0;
+            defer for (receipts[0..made]) |r| r.release();
+            for (&receipts, 0..) |*r, i| {
+                var buf: [16]u8 = undefined;
+                r.* = try p.publish(.{ .data = try std.fmt.bufPrint(&buf, "k{d}-{d:0>2}", .{ k, i }) }, .{ .ordering_key = key });
+                made += 1;
+            }
+            for (receipts) |r| _ = try waitReceipt(r, 60);
+        }
+    };
+    var tasks: [3]std.Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    defer for (tasks[0..started]) |*task| task.cancel(testing.io) catch {};
+    for (&tasks, 0..) |*task, k| {
+        task.* = try testing.io.concurrent(Task.publishKey, .{ &live.publisher, k });
+        started += 1;
+    }
+    for (tasks[0..started]) |*task| try task.await(testing.io);
+    try live.finish();
+
+    var got: Collector = .init();
+    defer got.deinit();
+    try pullUntil(&f, sub, 3 * per_key, f.patience(), &got, true);
+    // Each key's messages in order, counting a redelivered one once.
+    for (0..3) |k| {
+        var next: usize = 0;
+        var key_buf: [8]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "key-{d}", .{k});
+        for (got.messages.items) |m| {
+            if (!std.mem.eql(u8, m.ordering_key, key)) continue;
+            var buf: [16]u8 = undefined;
+            if (next < per_key and std.mem.eql(u8, m.data, try std.fmt.bufPrint(&buf, "k{d}-{d:0>2}", .{ k, next }))) {
+                next += 1;
+            } else {
+                // Anything else must be a repeat of one already seen.
+                const i = try std.fmt.parseInt(usize, m.data[m.data.len - 2 ..], 10);
+                try testing.expect(i < next);
+            }
+        }
+        try testing.expectEqual(per_key, next);
+    }
+}
+
+test "publisher: a lone message goes out once its delay runs out" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("pubdelay");
+    var live: LivePublisher = undefined;
+    try live.start(publisherOptions(&f, topic.id, .{ .max_batch_delay_ms = 50 }));
+    defer live.deinit();
+
+    const started = nowMs();
+    const receipt = try live.publisher.publish(.{ .data = "alone" }, .{});
+    defer receipt.release();
+    _ = try waitReceipt(receipt, 30);
+    const elapsed = nowMs() - started;
+    // Not before the delay, and not long after: no stop, only the timer.
+    try testing.expect(elapsed >= 45);
+    try testing.expect(elapsed < 10_000);
+    try live.finish();
+    try testing.expectEqual(1, live.publisher.stats().requests);
+}
+
+test "publisher: a batch at exactly the 10,485,760-byte limit is accepted, and a byte more splits it" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("publimit");
+    const gpa = testing.allocator;
+    const limit = pubsub.limits.max_publish_request_bytes;
+
+    // Two messages that fill a request to the byte: one of plain data, and
+    // one whose attribute takes up the last few bytes.
+    const first_data = try gpa.alloc(u8, 3_900_000);
+    defer gpa.free(first_data);
+    @memset(first_data, 'a');
+    const second_data = try gpa.alloc(u8, 3_964_600);
+    defer gpa.free(second_data);
+    @memset(second_data, 'b');
+    const pad: [8]u8 = @splat('p');
+    const first: pubsub.Message = .{ .data = first_data };
+    // Base64 moves in steps of four bytes; the attribute fills the gap.
+    var fit: ?struct { usize, usize } = null;
+    search: for (0..600) |trim| for (0..pad.len - 1) |pad_len| {
+        const second: pubsub.Message = .{
+            .data = second_data[0 .. second_data.len - trim],
+            .attributes = &.{.{ .key = "pad", .value = pad[0..pad_len] }},
+        };
+        if (pubsub.limits.publishRequestBytes(&.{ first, second }, null) == limit) {
+            fit = .{ trim, pad_len };
+            break :search;
+        }
+    };
+    const trim, const pad_len = fit orelse return error.TestNoExactFit;
+    const exact: pubsub.Message = .{
+        .data = second_data[0 .. second_data.len - trim],
+        .attributes = &.{.{ .key = "pad", .value = pad[0..pad_len] }},
+    };
+    const over: pubsub.Message = .{
+        .data = second_data[0 .. second_data.len - trim],
+        .attributes = &.{.{ .key = "pad", .value = pad[0 .. pad_len + 1] }},
+    };
+    try testing.expectEqual(limit + 1, pubsub.limits.publishRequestBytes(&.{ first, over }, null));
+
+    var live: LivePublisher = undefined;
+    try live.start(publisherOptions(&f, topic.id, .{
+        .concurrency = 1,
+        .max_batch_messages = 1000,
+        .max_batch_bytes = limit,
+        // The default cap is smaller than a batch this big.
+        .max_outstanding_bytes = 3 * limit,
+        // Encoding a 4 MB message outlasts a short delay, which would send
+        // the first message alone. Only size or flush may close a batch.
+        .max_batch_delay_ms = 30_000,
+    }));
+    defer live.deinit();
+    for ([_]pubsub.Message{ exact, over }, [_]u64{ 1, 3 }) |second, requests| {
+        const a = try live.publisher.publish(first, .{});
+        defer a.release();
+        const b = try live.publisher.publish(second, .{});
+        defer b.release();
+        try live.publisher.flush();
+        _ = waitReceipt(a, 120) catch |err| return f.fail(err);
+        _ = waitReceipt(b, 120) catch |err| return f.fail(err);
+        // At the limit, one request; a byte over, two.
+        try testing.expectEqual(requests, live.publisher.stats().requests);
+    }
+    try live.finish();
+}
+
+test "publisher: after its topic is deleted, receipts fail with NotFound and the publisher carries on" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("pubgone");
+    var live: LivePublisher = undefined;
+    try live.start(publisherOptions(&f, topic.id, .{}));
+    defer live.deinit();
+
+    const before = try live.publisher.publish(.{ .data = "before" }, .{});
+    defer before.release();
+    _ = try waitReceipt(before, 30);
+    topic.delete() catch |err| return f.fail(err);
+
+    // The deletion can take a moment to reach publishing.
+    const deadline = nowMs() + f.patience() * 1000;
+    var failures: usize = 0;
+    while (failures < 2) {
+        if (nowMs() > deadline) return error.TestTimedOut;
+        const after = try live.publisher.publish(.{ .data = "after" }, .{});
+        defer after.release();
+        if (waitReceipt(after, 30)) |_| {
+            try testing.io.sleep(.fromMilliseconds(500), .awake);
+        } else |err| {
+            try testing.expectEqual(error.NotFound, err);
+            failures += 1;
+        }
+    }
+    // Still running: stop drains and returns.
+    try live.finish();
+    try testing.expect(live.publisher.stats().failed >= 2);
+}
