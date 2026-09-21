@@ -39,6 +39,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
+    // Cloud Storage. It imports core, never a service.
+    const storage = b.addModule("storage", .{
+        .root_source_file = b.path("src/storage/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+
     // Fuzzing on Zig 0.16.0 needs two things the defaults lack: a test runner
     // that compiles in fuzz mode (see tools/test_runner.zig), and the LLVM
     // backend. The self-hosted x86_64 backend, the Debug default there,
@@ -57,6 +65,7 @@ pub fn build(b: *std.Build) void {
         .{ "auth", auth },
         .{ "pubsub", mod },
         .{ "secret_manager", secret_manager },
+        .{ "storage", storage },
     };
     // The nightly fuzz job runs one module per job, so each gets the whole
     // time budget: `--fuzz=N` fuzzes every property N times, and the
@@ -64,12 +73,12 @@ pub fn build(b: *std.Build) void {
     const only_module = b.option(
         []const u8,
         "module",
-        "Run only this module's unit tests: core, auth, pubsub or secret_manager",
+        "Run only this module's unit tests: core, auth, pubsub, secret_manager or storage",
     );
     if (only_module) |name| {
         for (unit_modules) |entry| {
             if (std.mem.eql(u8, entry[0], name)) break;
-        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub or secret_manager", .{name});
+        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager or storage", .{name});
     }
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     for (unit_modules) |entry| {
@@ -130,6 +139,24 @@ pub fn build(b: *std.Build) void {
         "Run integration tests against PUBSUB_EMULATOR_HOST, or Google when configured",
     );
     integration_step.dependOn(&run_integration.step);
+
+    // Cloud Storage against fake-gcs-server (STORAGE_EMULATOR_HOST). The
+    // tests skip cleanly when it is not set.
+    const storage_integration_tests = b.addTest(.{
+        .name = "storage-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "storage", .module = storage },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+    });
+    const run_storage_integration = streamed(b, storage_integration_tests);
+    integration_step.dependOn(&run_storage_integration.step);
 
     // auth against Google's token endpoint, when AUTH_TEST_CREDENTIALS names
     // a credentials file. They skip otherwise.

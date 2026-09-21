@@ -51,6 +51,17 @@ jobs:
           docker logs pubsub
           exit 1
 
+      - name: Start fake-gcs-server
+        run: |
+          docker run -d --name fake-gcs -p 4443:4443 \
+            fsouza/fake-gcs-server -scheme http -port 4443
+          for _ in $(seq 1 30); do
+            curl -sf "http://127.0.0.1:4443/storage/v1/b?project=test" >/dev/null && exit 0
+            sleep 2
+          done
+          docker logs fake-gcs
+          exit 1
+
       # About a minute normally. A suite that hangs fails here in ten rather
       # than using up the job's thirty, and the build streams each test's
       # name as it starts, so the log's last line names the one that hung.
@@ -58,6 +69,7 @@ jobs:
         timeout-minutes: 10
         env:
           PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
+          STORAGE_EMULATOR_HOST: http://127.0.0.1:4443
         run: zig build test-integration --summary all
 
       - name: Examples
