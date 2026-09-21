@@ -64,7 +64,6 @@ const PublishBody = struct {
     }
 };
 
-
 /// The `subscriptions.pull` body. `max_messages` must already be clamped.
 pub fn encodePull(arena: Allocator, max_messages: u32, return_immediately: bool) Allocator.Error![]u8 {
     return render(arena, PullBody{ .max_messages = max_messages, .return_immediately = return_immediately });
@@ -598,7 +597,6 @@ test "decode publish: ids must match the message count" {
     try testing.expectError(error.InvalidResponse, decodePublish(a, "{\"messageIds\":[null]}", 1));
 }
 
-
 test "jsonStringLen matches Stringify" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -629,7 +627,6 @@ test "AckChunks splits by size and count, in order" {
 }
 
 // Fuzz properties
-
 
 fn decodeArbitrary(_: void, input: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);

@@ -138,6 +138,27 @@ pub fn build(b: *std.Build) void {
     run_auth_integration.has_side_effects = true;
     integration_step.dependOn(&run_auth_integration.step);
 
+    // Secret Manager against a real project: there is no emulator, so these
+    // need GCP_TEST_PROJECT and GCP_TEST_TOKEN, and skip without them. They
+    // are a step of their own, never part of `test-integration`, because
+    // they need cloud credentials that CI does not have.
+    const gcp_tests = b.addTest(.{
+        .name = "secret-manager-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/secret_manager_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "secret_manager", .module = secret_manager }},
+        }),
+        .filters = test_filters,
+    });
+    const run_gcp = b.addRunArtifact(gcp_tests);
+    run_gcp.has_side_effects = true;
+    b.step(
+        "test-integration-gcp",
+        "Run Secret Manager tests against the project GCP_TEST_PROJECT names",
+    ).dependOn(&run_gcp.step);
+
     // Fault injection: the full stack against the emulator, through a proxy
     // that drops, cuts, delays and rewrites responses. Skips without
     // PUBSUB_EMULATOR_HOST; never runs against production.

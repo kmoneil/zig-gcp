@@ -14,8 +14,10 @@ const Allocator = std.mem.Allocator;
 const core = @import("core");
 
 const Secret = @import("Secret.zig");
+const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
+const rpc = @import("rpc.zig");
 const types = @import("types.zig");
 const validate = @import("validate.zig");
 const Diagnostics = core.Diagnostics;
@@ -186,6 +188,22 @@ pub fn secret(self: *Client, id: []const u8) Secret {
     return .{ .client = self, .id = id };
 }
 
+/// One page of this project's secrets, in this client's namespace: a global
+/// client never sees a regional secret, or the other way round.
+pub fn listSecrets(self: *Client, options: types.ListOptions) Error!types.Owned(types.SecretPage) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const path = try names.secretsPath(scratch.allocator(), self.parent(), options);
+
+    var result: types.Owned(types.SecretPage) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeSecretPage(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "secret list");
+    return result;
+}
+
 const testing = std.testing;
 const test_util = @import("test_util.zig");
 
@@ -289,4 +307,61 @@ test "init: every allocation failure is OutOfMemory without leaks" {
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+}
+
+test "golden: listSecrets pages, filters and stops" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"secrets":[{"name":"projects/82150720798/secrets/zigps-a","labels":{"zig-gcp-test":"1"}},
+        \\ {"name":"projects/82150720798/secrets/zigps-b"}],
+        \\ "nextPageToken":"2Aeg8oI9ojTXZ","totalSize":3}
+        } },
+        .{ .respond = .{ .body = "{\"secrets\":[{\"name\":\"projects/82150720798/secrets/zigps-c\"}]}" } },
+        .{ .respond = .{ .body = "{}" } },
+    }, .{});
+    defer h.deinit();
+
+    var first = try h.client.listSecrets(.{ .page_size = 2, .filter = "labels.zig-gcp-test=1" });
+    defer first.deinit();
+    try h.expectRequest(
+        0,
+        .GET,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets?pageSize=2&filter=labels.zig-gcp-test%3D1",
+        null,
+    );
+    try testing.expectEqual(2, first.value.secrets.len);
+    try testing.expectEqualStrings("zigps-a", first.value.secrets[0].id());
+    try testing.expectEqual(3, first.value.total_size);
+
+    var second = try h.client.listSecrets(.{ .page_size = 2, .page_token = first.value.next_page_token });
+    defer second.deinit();
+    try h.expectRequest(
+        1,
+        .GET,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets?pageSize=2&pageToken=2Aeg8oI9ojTXZ",
+        null,
+    );
+    // The last page has no token, so a loop over pages ends here.
+    try testing.expectEqual(null, second.value.next_page_token);
+
+    // An empty project answers `{}`, and the defaults send no query at all.
+    var none = try h.client.listSecrets(.{});
+    defer none.deinit();
+    try h.expectRequest(2, .GET, "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets", null);
+    try testing.expectEqual(0, none.value.secrets.len);
+}
+
+test "golden: listSecrets in a regional namespace" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .body = "{}" } }}, .{ .location = "europe-west3" });
+    defer h.deinit();
+    var page = try h.client.listSecrets(.{});
+    defer page.deinit();
+    try h.expectRequest(
+        0,
+        .GET,
+        "https://secretmanager.europe-west3.rep.googleapis.com/v1/projects/extractctl/locations/europe-west3/secrets",
+        null,
+    );
 }

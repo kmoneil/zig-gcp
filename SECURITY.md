@@ -112,6 +112,49 @@ code in `src/`.
   later`, `AuthorizedUser: secrets reach neither the log nor Diagnostics`,
   `MetadataServer: the token reaches neither the log nor Diagnostics`.
 
+## Secret bytes
+
+The `secret_manager` module is built around one promise: a secret that
+passes through this library leaves no copy behind.
+
+- **Every buffer that holds a secret is wiped.** The response body, which
+  carries it in base64, the JSON parser's scratch space, the decoded bytes,
+  and the bearer token the request was made with all live in one arena over
+  `core.WipingAllocator`, and one `deinit` zeroes the lot. The tests put a
+  whole client on a fixed buffer and read that memory afterwards, so
+  "wiped" means zero rather than merely dropped. `nothing of the secret
+  survives deinit, or a failed call`, `no copy of the payload outlives the
+  call`, `deinit wipes every byte the arena held`.
+- **A failed attempt is wiped before the next one,** rather than kept until
+  the call ends. `a retried access wipes the attempt that failed, not just
+  the last one`, `wipe: a failed attempt's body is wiped before the next
+  attempt`, `wipe: the bearer token does not outlive the call`.
+- **No format specifier prints a secret.** `{f}` gives `[REDACTED]`, and
+  `{}` and `{any}`, which print a struct's fields whatever its `format`
+  method says, find a pointer and a length. `no format specifier prints the
+  bytes`.
+- **Nothing about a secret reaches the log:** not the bytes, not the base64
+  they arrived in, not their checksum, and not their length, which is
+  information too. `log hygiene: no secret, no length, no checksum, no
+  token`, `log hygiene: addVersion logs no payload, size or checksum`.
+- **Bytes that fail their checksum are never handed over.** They are wiped,
+  fetched again under the retry policy, and finally reported as
+  `error.ChecksumMismatch`. `a mismatch that never clears is an error, and
+  the bytes are never handed over`, `a mismatch is fetched again, and a good
+  answer ends it`.
+- **A location cannot redirect a request.** `Options.location` becomes part
+  of a host name, so it is checked against a strict pattern before it gets
+  there. `locations are host-name safe`, `init rejects bad options before
+  allocating`.
+- **These calls always use https.** There is no emulator and no
+  unauthenticated mode, and an endpoint override that is not https is
+  refused before a token is ever fetched. `credentials never go to a
+  plain-http endpoint`.
+
+What this does not defend against: swap, a core dump, a debugger, and the
+buffers inside the HTTP and TLS layers, which this library cannot reach.
+Once a caller copies the bytes elsewhere, that copy is theirs to manage.
+
 ## Talking to a server
 
 - **Any response yields a value or an error, never a crash or a leak.**
@@ -152,6 +195,11 @@ code in `src/`.
   attribute, an ordering key or an ack id is refused, not replaced.
   `publish rules: empty messages, duplicate keys, UTF-8`, `ack ids and
   deadlines`.
+- **Documented limits are checked before a request is built,** so a payload
+  that could not be stored is never encoded, never sent and never
+  base64-copied. `limits: an empty payload and one byte too many are
+  refused before sending`, `publish limits: each at its boundary and one
+  past it`.
 
 ## Supply chain
 
