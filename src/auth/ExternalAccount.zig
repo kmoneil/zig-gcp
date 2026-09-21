@@ -96,7 +96,7 @@ pub const Options = struct {
     /// the retry policy treats as transient. 0 removes the limit.
     request_timeout_ms: u32 = 30_000,
     /// Printable ASCII.
-    user_agent: []const u8 = "zig-gcp-auth/0.12",
+    user_agent: []const u8 = "zig-gcp-auth/0.13",
     /// Filled with the details of the last failure, while reading the file
     /// or from the endpoints. Never holds a secret.
     diagnostics: ?*Diagnostics = null,
