@@ -6,7 +6,7 @@ modules it imports.
 
 | Module | Covers | Stability |
 | --- | --- | --- |
-| `pubsub` | Pub/Sub v1: publish, pull, acknowledge, and topic and subscription management | beta |
+| `pubsub` | Pub/Sub v1: publish, one call at a time or batched from many tasks, pull, a worker loop, acknowledge, and topic and subscription management | beta |
 | `secret_manager` | Secret Manager v1: read a secret's bytes, add versions, and manage secrets and their versions, global or regional | experimental |
 | `auth` | Credentials for the service modules: `findDefault` picks between the metadata server on Google Cloud, the login `gcloud auth application-default login` saves (impersonating a service account or not), and a file the environment names. | experimental |
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
@@ -78,8 +78,9 @@ such as `orders`. Creating one sends nothing. The operations:
 | --- | --- | --- |
 | `listTopics`, `listSubscriptions` | `create`, `get`, `delete`, `publish` | `create`, `get`, `delete`, `pull`, `ack`, `modifyAckDeadline`, `nack` |
 
-See `examples/publish.zig` and `examples/worker.zig` for complete programs,
-and `examples/whoami.zig` for one that finds its own credentials.
+See `examples/publish.zig`, `examples/publisher.zig` and `examples/worker.zig`
+for complete programs, and `examples/whoami.zig` for one that finds its own
+credentials.
 
 ### A worker loop
 
@@ -123,6 +124,71 @@ filled. `stop` is safe to call from a handler or another task: pulling
 stops, running handlers finish and their messages resolve, buffered ones
 are released unhandled, and the last acknowledgements are flushed.
 `stats()` is a consistent snapshot of the counters at any time.
+
+### Publishing at volume
+
+`Topic.publish` sends one request per call, and a client serves one task at
+a time. An application that publishes a message at a time from many tasks
+wants `Publisher`: any task hands it messages, it batches them into
+requests, and it sends those on tasks of its own.
+
+```zig
+var publisher = try pubsub.Publisher.init(gpa, io, .{
+    .topic_id = "orders",
+    .client = .{ .project_id = "my-project", .token_provider = creds.provider() },
+});
+defer publisher.deinit();
+var running = try io.concurrent(pubsub.Publisher.run, .{&publisher});
+defer {
+    publisher.stop(); // sends what is left; run returns when all of it has resolved
+    running.await(io) catch {};
+}
+
+// From any task:
+const receipt = try publisher.publish(.{ .data = "hello" }, .{});
+defer receipt.release();
+const id = try receipt.wait(); // the server's message id, or the error
+```
+
+A request with a hundred small messages takes about as long as one with a
+single message (27 ms against 26, measured against production), and Google
+bills every request as at least 1,000 bytes. From a laptop, the example
+publishes 10,000 messages from 8 tasks in 102 requests and about a second.
+A batch goes out when one of `concurrency` connections (4) is free and the
+batch is full, at `max_batch_messages` (100) or `max_batch_bytes` of request
+body as sent (1,000,000), or its first message has waited
+`max_batch_delay_ms` (10); until a connection takes it, it keeps filling.
+Release every receipt, whether or not anyone waits on it. A failure no one
+waits for still counts in `stats()` and is logged.
+
+What a publisher holds is capped at 1,000 messages and 10,000,000 bytes by
+default (`max_outstanding`, `max_outstanding_bytes`), counting everything
+accepted and not yet resolved. At a cap `publish` waits for room, or with
+`when_full = .fail` returns `error.PublisherFull` at once, for a server that
+would rather shed load. Each cap must hold a full batch, so raising
+`max_batch_bytes` toward the 10,485,760-byte limit means raising
+`max_outstanding_bytes` with it.
+
+Transient failures are retried, with the statuses Google's own clients
+retry for publishing, until `publish_timeout_ms` (60 s) after the message
+was published. Each attempt is also bounded by the client's
+`request_timeout_ms`, whose 3-minute default is sized for held pulls; a
+publisher is better served by about 30 seconds. As with `Topic.publish`, a
+retry after a lost response can store a message twice, with a new message
+id. `flush` sends everything at once and waits for what was published
+before it. `stop` sends what is left; canceling `run` gives up on it, and
+those receipts report `error.PublisherStopped`.
+
+Ordering keys need `enable_message_ordering`. Messages with the same key
+reach an ordered subscription in publish order: no request mixes keys, and
+a key has one request in flight at a time. When one of a key's batches
+fails for good, the key pauses: the messages queued behind it fail with
+`error.OrderingKeyPaused` without being sent, and `publish` refuses the key
+until `resumePublish(key)`, so a message is never stored ahead of one that
+failed. Google requires every message of a key to be published in one
+region. A publisher outside Google Cloud, or spread across regions, should
+use a locational endpoint, such as
+`.endpoint = .{ .url = "https://us-east1-pubsub.googleapis.com" }`.
 
 ### Production credentials
 

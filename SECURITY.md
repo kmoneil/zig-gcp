@@ -115,7 +115,9 @@ code in `src/`.
 - **Nothing sensitive reaches the log:** no tokens, message data, attribute
   keys or values, ordering keys or page tokens. Tokens stay out of
   `Diagnostics` too. `log hygiene: no token, payload or attribute value ever
-  reaches the log`, `log hygiene: page tokens stay out of the log`, `fuzz: a
+  reaches the log`, `log hygiene: page tokens stay out of the log`, `log
+  hygiene: no data, attribute value or ordering key reaches the log` (a
+  publisher's retries, failures, pauses and expiries), `fuzz: a
   provider's token reaches the request intact or not at all`, `Cache: a
   failed early refresh returns the cached token, warns, and retries 10 s
   later`, `AuthorizedUser: secrets reach neither the log nor Diagnostics`,

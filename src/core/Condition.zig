@@ -226,6 +226,29 @@ test "signal and broadcast wake real waiters" {
     try testing.expectEqual(4, shared.woke);
 }
 
+test "waitUncancelable is woken by a signal" {
+    const io = testing.io;
+    const Shared = struct {
+        mutex: Mutex = .init,
+        cond: Condition = .init,
+        go: bool = false,
+
+        fn waiter(s: *@This()) void {
+            s.mutex.lockUncancelable(io);
+            defer s.mutex.unlock(io);
+            while (!s.go) s.cond.waitUncancelable(io, &s.mutex);
+        }
+    };
+    var shared: Shared = .{};
+    var task = try io.concurrent(Shared.waiter, .{&shared});
+    io.sleep(.fromMilliseconds(5), .awake) catch {};
+    shared.mutex.lockUncancelable(io);
+    shared.go = true;
+    shared.cond.signal(io);
+    shared.mutex.unlock(io);
+    task.await(io);
+}
+
 /// Rounds of the race std's Condition loses, over condition type `C`: each
 /// cancels several waiters just as a broadcast wakes them.
 fn Broadcasts(comptime C: type) type {

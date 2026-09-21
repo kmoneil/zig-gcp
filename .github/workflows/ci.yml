@@ -67,6 +67,7 @@ jobs:
         run: |
           zig build example-worker
           zig build example-publish -- orders 3
+          zig build example-publisher -- orders 500 4
           zig build example-worker
 
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
