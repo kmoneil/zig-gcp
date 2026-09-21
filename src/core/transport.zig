@@ -715,14 +715,17 @@ test "HttpTransport: a server that accepts and then says nothing is TimedOut" {
     // Windows sometimes tears the idle connection down before the timeout
     // (STATUS_LOCAL_DISCONNECT, which `mapError` reads as a dropped
     // connection). The request still ended promptly, but it is not the
-    // timeout under test, so prove the drop and bow out.
-    if (builtin.os.tag == .windows and elapsed_ms < 150) {
-        try testing.expectError(error.ConnectionResetByPeer, outcome);
-        return error.SkipZigTest;
+    // timeout under test, so bow out. The outcome says which it was; the
+    // time cannot, since a Windows timer can fire a hair before this clock
+    // says it is due, and a real timeout then measures 149 ms.
+    if (builtin.os.tag == .windows) {
+        if (outcome) |_| {} else |err| if (err == error.ConnectionResetByPeer) return error.SkipZigTest;
     }
     try testing.expectError(error.TimedOut, outcome);
-    // It waited for the timeout, and not much longer.
-    try testing.expect(elapsed_ms >= 150);
+    // It waited for the timeout, and not much longer. Windows gets a timer
+    // tick of slack.
+    const slack_ms: i64 = if (builtin.os.tag == .windows) 16 else 0;
+    try testing.expect(elapsed_ms >= 150 - slack_ms);
     try testing.expect(elapsed_ms < 5_000);
 }
 
