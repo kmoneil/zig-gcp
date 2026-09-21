@@ -111,6 +111,37 @@ pub fn decodeObjectPage(arena: Allocator, body: []const u8) DecodeError!types.Ob
     };
 }
 
+/// One answer of the rewrite loop behind `copyTo`.
+pub const Rewrite = struct {
+    done: bool,
+    /// Continues an unfinished rewrite. Null once done, or when the server
+    /// sent none.
+    rewrite_token: ?[]const u8,
+    /// The finished object, on the final answer.
+    resource: ?types.ObjectInfo,
+    total_bytes_rewritten: u64,
+    object_size: u64,
+};
+
+pub fn decodeRewrite(arena: Allocator, body: []const u8) DecodeError!Rewrite {
+    const wire = try parseWire(WireRewrite, arena, body);
+    return .{
+        .done = wire.done orelse false,
+        .rewrite_token = nonEmpty(wire.rewriteToken),
+        .resource = if (wire.resource) |w| try objectFromWire(arena, w) else null,
+        .total_bytes_rewritten = try u64FromValue(wire.totalBytesRewritten),
+        .object_size = try u64FromValue(wire.objectSize),
+    };
+}
+
+const WireRewrite = struct {
+    done: ?bool = null,
+    rewriteToken: ?[]const u8 = null,
+    totalBytesRewritten: ?std.json.Value = null,
+    objectSize: ?std.json.Value = null,
+    resource: ?WireObject = null,
+};
+
 /// One Bucket resource.
 pub fn decodeBucket(arena: Allocator, body: []const u8) DecodeError!types.BucketInfo {
     return bucketFromWire(try parseWire(WireBucket, arena, body));
@@ -411,4 +442,32 @@ test "fuzz decoding: arbitrary bodies never crash" {
         "<html>502</html>",
         "{\"crc32c\":\"\\u0000\"}",
     } });
+}
+
+test "decode rewrite answers: unfinished, finished, and odd ones" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const unfinished = try decodeRewrite(a,
+        \\{"kind":"storage#rewriteResponse","totalBytesRewritten":"1048576",
+        \\ "objectSize":"20971520","done":false,"rewriteToken":"abc"}
+    );
+    try testing.expect(!unfinished.done);
+    try testing.expectEqualStrings("abc", unfinished.rewrite_token.?);
+    try testing.expectEqual(1048576, unfinished.total_bytes_rewritten);
+    try testing.expectEqual(null, unfinished.resource);
+
+    const finished = try decodeRewrite(a,
+        \\{"done":true,"totalBytesRewritten":20971520,"objectSize":20971520,
+        \\ "resource":{"name":"copy.bin","generation":"9","size":"20971520"}}
+    );
+    try testing.expect(finished.done);
+    try testing.expectEqual(null, finished.rewrite_token);
+    try testing.expectEqual(9, finished.resource.?.generation);
+
+    const bare = try decodeRewrite(a, "{}");
+    try testing.expect(!bare.done);
+    try testing.expectEqual(null, bare.rewrite_token);
+    try testing.expectError(error.InvalidResponse, decodeRewrite(a, "{\"totalBytesRewritten\":\"x\"}"));
 }

@@ -1,8 +1,8 @@
-//! A cheap handle on one object: metadata, existence, deletion, uploading
-//! bytes from memory, and downloads that stream into any writer, verify
-//! their checksum, take ranges, and resume mid-body pinned to one
-//! generation. Making one sends nothing. Streaming uploads arrive with the
-//! resumable-upload milestone.
+//! A cheap handle on one object: metadata, existence, deletion, uploads
+//! from memory or any reader, downloads that stream into any writer with
+//! ranges and mid-body resume, server-side copies, and generation
+//! preconditions on all of it, checksummed in both directions. Making one
+//! sends nothing.
 
 const Object = @This();
 
@@ -35,7 +35,7 @@ pub fn get(self: Object, options: types.GetOptions) Error!types.Owned(types.Obje
     try rpc.checkObjectName(self.client, self.name);
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
-    const path = try names.objectPath(scratch.allocator(), self.bucket, self.name, options.generation);
+    const path = try names.objectPath(scratch.allocator(), self.bucket, self.name, options.generation, options.preconditions);
 
     var result: types.Owned(types.ObjectInfo) = try .init(self.client.gpa);
     errdefer result.deinit();
@@ -67,11 +67,13 @@ pub fn delete(self: Object, options: types.DeleteOptions) Error!void {
     try rpc.checkObjectName(self.client, self.name);
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
-    const path = try names.objectPath(scratch.allocator(), self.bucket, self.name, options.generation);
+    const path = try names.objectPath(scratch.allocator(), self.bucket, self.name, options.generation, options.preconditions);
     try rpc.executeDiscard(self.client, .{
         .method = .DELETE,
         .path = path,
-        .retry = options.generation != null or self.client.retry_unconditional_writes,
+        .retry = options.generation != null or
+            options.preconditions.makesWriteSafe() or
+            self.client.retry_unconditional_writes,
     });
 }
 
@@ -120,7 +122,7 @@ pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Erro
 
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
-    const path = try names.uploadMultipartPath(scratch.allocator(), self.bucket);
+    const path = try names.uploadMultipartPath(scratch.allocator(), self.bucket, options.preconditions);
     const parts = try multipart.build(scratch.allocator(), self.client.io, self.name, options, checksum);
 
     var result: types.Owned(types.ObjectInfo) = try .init(self.client.gpa);
@@ -130,10 +132,13 @@ pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Erro
         .path = path,
         .content_type = parts.content_type,
         .body = .{ .segments = &.{ parts.opening, data, parts.closing } },
-        .retry = self.client.retry_unconditional_writes,
+        .retry = options.preconditions.makesWriteSafe() or self.client.retry_unconditional_writes,
     }) catch |err| switch (err) {
         // The sink is a buffer; there is no caller writer to fail.
         error.WriteFailed => unreachable,
+        error.FailedPrecondition => return self.ambiguous412(
+            options.preconditions.makesWriteSafe() or self.client.retry_unconditional_writes,
+        ),
         else => |e| return e,
     };
     result.value = codec.decodeObject(result.arena.allocator(), res.body) catch |err|
@@ -191,6 +196,96 @@ pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOpt
         .{ streamed, expected },
     );
     return error.ChecksumMismatch;
+}
+
+/// A 412 on a call that may have been retried is ambiguous: an earlier
+/// attempt may have landed, and the repeat then failed its own
+/// precondition against the object it just created. The diagnostics say
+/// so, so the caller can `get` the object and compare checksums.
+fn ambiguous412(self: Object, retried: bool) Error {
+    if (retried) {
+        if (self.client.diagnostics) |d| {
+            var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
+            const status_text = d.status();
+            @memcpy(status_buf[0..status_text.len], status_text);
+            d.set(
+                412,
+                status_buf[0..status_text.len],
+                "the precondition failed; if this call was a retry, an earlier attempt may have succeeded: get the object and compare checksums",
+            );
+        }
+    }
+    return error.FailedPrecondition;
+}
+
+/// Server-side copy to `dest`, looping over rewrite calls until the
+/// service reports done; the caller never sees a rewrite token. The copy
+/// runs on this object's client, `dest` only naming the destination. The
+/// first call is retried only when the destination carries
+/// `if_generation_match`, or the client opted into unconditional retries;
+/// follow-up calls hold a rewrite token, which makes them safe anyway.
+pub fn copyTo(self: Object, dest: Object, options: types.CopyOptions) Error!types.Owned(types.ObjectInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    try rpc.checkBucketName(self.client, dest.bucket);
+    try rpc.checkObjectName(self.client, dest.name);
+    var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
+    defer scratch.deinit();
+    var response: std.heap.ArenaAllocator = .init(self.client.gpa);
+    defer response.deinit();
+
+    const first_retries = options.preconditions.makesWriteSafe() or self.client.retry_unconditional_writes;
+    var token: ?[]const u8 = null;
+    var rounds: u32 = 0;
+    while (true) {
+        rounds += 1;
+        if (rounds > 100_000) {
+            // Progress is the server's promise; a loop this long has none.
+            if (self.client.diagnostics) |d| d.print("the rewrite loop never reported done", .{});
+            return error.InvalidResponse;
+        }
+        _ = response.reset(.retain_capacity);
+        const path = try names.rewritePath(
+            scratch.allocator(),
+            self.bucket,
+            self.name,
+            dest.bucket,
+            dest.name,
+            options,
+            token,
+        );
+        const body = rpc.execute(self.client, &response, .{
+            .method = .POST,
+            .path = path,
+            .body = "{}",
+            .retry = token != null or first_retries,
+        }) catch |err| switch (err) {
+            error.FailedPrecondition => return self.ambiguous412(first_retries),
+            else => |e| return e,
+        };
+        const rewrite = codec.decodeRewrite(response.allocator(), body) catch |err|
+            return rpc.decodeFailed(self.client, err, "rewrite");
+        if (rewrite.done) {
+            var result: types.Owned(types.ObjectInfo) = try .init(self.client.gpa);
+            errdefer result.deinit();
+            // Decoded again into the result's arena, which outlives this loop.
+            const kept = codec.decodeRewrite(result.arena.allocator(), body) catch |err|
+                return rpc.decodeFailed(self.client, err, "rewrite");
+            result.value = kept.resource orelse {
+                if (self.client.diagnostics) |d| d.print("the final rewrite response carried no object resource", .{});
+                return error.InvalidResponse;
+            };
+            return result;
+        }
+        const next = rewrite.rewrite_token orelse {
+            if (self.client.diagnostics) |d| d.print("the rewrite is not done, but the response carried no token to continue with", .{});
+            return error.InvalidResponse;
+        };
+        // The token must outlive the response arena it was decoded into.
+        token = try scratch.allocator().dupe(u8, next);
+        logging.debug("rewrite of {s}: {d} bytes so far, continuing", .{ self.name, rewrite.total_bytes_rewritten });
+    }
 }
 
 fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void {
@@ -254,7 +349,7 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
         const start = base_offset + delivered;
         const resuming = delivered > 0;
         const wants_partial = options.range != null or resuming;
-        const path = try names.objectMediaPath(scratch.allocator(), self.bucket, self.name, generation);
+        const path = try names.objectMediaPath(scratch.allocator(), self.bucket, self.name, generation, options.preconditions);
         var range_buf: [64]u8 = undefined;
         var header_storage: [1]core.transport.Header = undefined;
         var headers: []const core.transport.Header = &.{};
@@ -1012,4 +1107,199 @@ test "bad object names fail before sending" {
     try testing.expectError(error.InvalidObjectName, bucket.object("..").exists());
     try testing.expectError(error.InvalidObjectName, bucket.object("a\nb").get(.{}));
     try h.expectRequestCount(0);
+}
+
+test "preconditions ride get, download, delete and both upload protocols" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"name\":\"a\"}" } },
+        .{ .respond = .{ .body = "x" } },
+        .{ .respond = .{ .status = 204, .body = "" } },
+        .{ .respond = .{ .body = "{\"name\":\"a\"}" } },
+    }, .{});
+    defer h.deinit();
+    const obj = h.client.bucket("b").object("a");
+
+    var got = try obj.get(.{ .preconditions = .{ .if_metageneration_match = 3 } });
+    got.deinit();
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/storage/v1/b/b/o/a?ifMetagenerationMatch=3",
+        (try h.fake.request(0)).url,
+    );
+
+    var out_buf: [8]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    _ = try obj.download(&out, .{ .preconditions = .{ .if_generation_match = 7 } });
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/storage/v1/b/b/o/a?alt=media&ifGenerationMatch=7",
+        (try h.fake.streamRequest(0)).url,
+    );
+
+    try obj.delete(.{ .preconditions = .{ .if_generation_match = 7 } });
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/storage/v1/b/b/o/a?ifGenerationMatch=7",
+        (try h.fake.request(1)).url,
+    );
+
+    var uploaded = try obj.upload("data", .{ .preconditions = .does_not_exist });
+    uploaded.deinit();
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/upload/storage/v1/b/b/o?uploadType=multipart&ifGenerationMatch=0",
+        (try h.fake.streamRequest(1)).url,
+    );
+}
+
+test "an if...NotMatch that matches is NotModified, an answer, never retried" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 304, .body = "" } },
+        .{ .respond = .{ .status = 304, .body = "" } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    defer h.deinit();
+    const obj = h.client.bucket("b").object("a");
+
+    try testing.expectError(error.NotModified, obj.get(.{ .preconditions = .{ .if_generation_not_match = 7 } }));
+    try h.expectRequestCount(1);
+    try testing.expectEqual(304, h.diag.http_status);
+
+    var out_buf: [8]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    try testing.expectError(error.NotModified, obj.download(&out, .{ .preconditions = .{ .if_generation_not_match = 7 } }));
+    // The writer saw nothing: a 304 ends at the head.
+    try testing.expectEqual(0, out.buffered().len);
+    try testing.expectEqual(0, h.clock.sleep_count);
+}
+
+test "preconditioned writes retry; a 412 after retries names the ambiguity" {
+    const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{}" } };
+    const precondition_failed: test_util.FakeTransport.Reply = .{ .respond = .{
+        .status = 412,
+        .body = "{\"error\":{\"code\":412,\"message\":\"Precondition Failed\",\"errors\":[{\"reason\":\"conditionNotMet\"}]}}",
+    } };
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        // The upload's first attempt fails transiently, the second lands.
+        unavailable,
+        .{ .respond = .{ .body = "{\"name\":\"a\"}" } },
+        // A delete with if_generation_match retries the same way.
+        unavailable,
+        .{ .respond = .{ .status = 204, .body = "" } },
+        // An upload whose retry may have landed answers 412.
+        unavailable,
+        precondition_failed,
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    defer h.deinit();
+    const obj = h.client.bucket("b").object("a");
+
+    var uploaded = try obj.upload("data", .{ .preconditions = .does_not_exist });
+    uploaded.deinit();
+    try testing.expectEqual(2, h.fake.stream_requests.items.len);
+
+    try obj.delete(.{ .preconditions = .{ .if_generation_match = 7 } });
+    try testing.expectEqual(2, h.fake.requests.items.len);
+
+    try testing.expectError(error.FailedPrecondition, obj.upload("data", .{ .preconditions = .does_not_exist }));
+    try testing.expectEqual(412, h.diag.http_status);
+    try testing.expectEqualStrings("conditionNotMet", h.diag.status());
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "an earlier attempt may have succeeded") != null);
+}
+
+test "unconditioned writes still do not retry" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .body = "{}" } },
+        .{ .respond = .{ .status = 503, .body = "{}" } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    defer h.deinit();
+    const obj = h.client.bucket("b").object("a");
+    // A not-match condition does not make a write idempotent.
+    try testing.expectError(error.Unavailable, obj.upload("data", .{
+        .preconditions = .{ .if_generation_not_match = 7 },
+    }));
+    try testing.expectEqual(1, h.fake.stream_requests.items.len);
+    try testing.expectError(error.Unavailable, obj.delete(.{
+        .preconditions = .{ .if_metageneration_match = 1 },
+    }));
+    try h.expectRequestCount(1);
+}
+
+test "golden: copyTo loops over rewrite calls and hides the token" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"done":false,"totalBytesRewritten":"1048576","objectSize":"3145728","rewriteToken":"t+1"}
+        } },
+        .{ .respond = .{ .body =
+        \\{"done":false,"totalBytesRewritten":"2097152","objectSize":"3145728","rewriteToken":"t2"}
+        } },
+        .{ .respond = .{ .body =
+        \\{"done":true,"totalBytesRewritten":"3145728","objectSize":"3145728",
+        \\ "resource":{"name":"copy/q3.txt","bucket":"dst-b","generation":"9","size":"3145728"}}
+        } },
+    }, .{});
+    defer h.deinit();
+    const src = h.client.bucket("src-b").object("reports/q3.txt");
+    const dest = h.client.bucket("dst-b").object("copy/q3.txt");
+
+    var copied = try src.copyTo(dest, .{ .source_generation = 5 });
+    defer copied.deinit();
+    try testing.expectEqualStrings("copy/q3.txt", copied.value.name);
+    try testing.expectEqual(9, copied.value.generation);
+
+    try h.expectRequest(
+        0,
+        .POST,
+        "https://storage.googleapis.com/storage/v1/b/src-b/o/reports%2Fq3.txt/rewriteTo/b/dst-b/o/copy%2Fq3.txt?sourceGeneration=5",
+        "{}",
+    );
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/storage/v1/b/src-b/o/reports%2Fq3.txt/rewriteTo/b/dst-b/o/copy%2Fq3.txt?sourceGeneration=5&rewriteToken=t%2B1",
+        (try h.fake.request(1)).url,
+    );
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/storage/v1/b/src-b/o/reports%2Fq3.txt/rewriteTo/b/dst-b/o/copy%2Fq3.txt?sourceGeneration=5&rewriteToken=t2",
+        (try h.fake.request(2)).url,
+    );
+}
+
+test "copyTo retries the first call only under a destination condition, token calls always" {
+    const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{}" } };
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        // Unconditioned: the first call is not retried.
+        unavailable,
+        // Conditioned: it is.
+        unavailable,
+        .{ .respond = .{ .body = "{\"done\":false,\"rewriteToken\":\"t\"}" } },
+        // The token call is safe to retry whatever the conditions.
+        unavailable,
+        .{ .respond = .{ .body = "{\"done\":true,\"resource\":{\"name\":\"c\"}}" } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    defer h.deinit();
+    const src = h.client.bucket("s").object("a");
+    const dest = h.client.bucket("d").object("c");
+
+    try testing.expectError(error.Unavailable, src.copyTo(dest, .{}));
+    try h.expectRequestCount(1);
+
+    var copied = try src.copyTo(dest, .{ .preconditions = .does_not_exist });
+    defer copied.deinit();
+    try h.expectRequestCount(5);
+}
+
+test "copyTo refuses a loop that cannot continue" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"done\":false}" } },
+        .{ .respond = .{ .body = "{\"done\":true}" } },
+    }, .{});
+    defer h.deinit();
+    const src = h.client.bucket("s").object("a");
+    const dest = h.client.bucket("d").object("c");
+    // Not done, but no token to continue with.
+    try testing.expectError(error.InvalidResponse, src.copyTo(dest, .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "no token") != null);
+    // Done, but no object resource.
+    try testing.expectError(error.InvalidResponse, src.copyTo(dest, .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "no object resource") != null);
 }

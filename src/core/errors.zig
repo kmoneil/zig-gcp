@@ -35,6 +35,10 @@ pub const ApiError = error{
     Unavailable,
     /// Retried.
     DeadlineExceeded,
+    /// HTTP 304: an `if...NotMatch` condition sent with the request was
+    /// met by the current resource, so there is nothing new to return. An
+    /// answer, not a failure; never retried.
+    NotModified,
 };
 
 const by_status = std.StaticStringMap(ApiError).initComptime(.{
@@ -69,6 +73,7 @@ pub fn fromResponse(http_status: u16, status: []const u8) ApiError {
 /// proxy's HTML page.
 pub fn fromHttpStatus(http_status: u16) ApiError {
     return switch (http_status) {
+        304 => error.NotModified,
         400, 413 => error.InvalidArgument,
         401 => error.Unauthenticated,
         403 => error.PermissionDenied,
@@ -246,6 +251,9 @@ test "error mapping: status wins over HTTP code; unknown status falls back" {
     // The statuses Cloud Storage's preconditions and ranges answer with.
     try testing.expectEqual(error.FailedPrecondition, fromHttpStatus(412));
     try testing.expectEqual(error.OutOfRange, fromHttpStatus(416));
+    // 304 is an answer to a conditional read, not a failure.
+    try testing.expectEqual(error.NotModified, fromHttpStatus(304));
+    try testing.expectEqual(error.NotModified, fromResponse(304, ""));
 }
 
 test "decode the older error shape Cloud Storage sends" {

@@ -63,6 +63,32 @@ pub const ObjectPage = struct {
     next_page_token: ?[]const u8,
 };
 
+/// Conditions a call must meet, matched against the object's generations
+/// on the server. A failed condition is `error.FailedPrecondition` (HTTP
+/// 412), except `if_generation_not_match` and `if_metageneration_not_match`
+/// on a read, whose "condition met, nothing new" answer is
+/// `error.NotModified` (HTTP 304). A write with `if_generation_match` is
+/// safe to retry: a repeat of one that already landed fails cleanly
+/// instead of overwriting whatever is there by now.
+pub const Preconditions = struct {
+    /// Succeed only if the live generation is exactly this. 0 means "no
+    /// live object with this name".
+    if_generation_match: ?u64 = null,
+    if_generation_not_match: ?u64 = null,
+    /// Precondition on the metadata generation of the live object.
+    if_metageneration_match: ?u64 = null,
+    if_metageneration_not_match: ?u64 = null,
+
+    /// Succeed only if no live object has this name: create-only
+    /// semantics, and what makes an upload safe to retry.
+    pub const does_not_exist: Preconditions = .{ .if_generation_match = 0 };
+
+    /// Whether these conditions make a write idempotent.
+    pub fn makesWriteSafe(self: Preconditions) bool {
+        return self.if_generation_match != null;
+    }
+};
+
 pub const UploadOptions = struct {
     content_type: []const u8 = "application/octet-stream",
     cache_control: ?[]const u8 = null,
@@ -79,6 +105,8 @@ pub const UploadOptions = struct {
     /// with more is `error.StreamTooLong`. `upload` checks it against the
     /// slice it was given.
     size: ?u64 = null,
+    /// `.does_not_exist` makes an upload create-only and safe to retry.
+    preconditions: Preconditions = .{},
 };
 
 /// A byte range of an object: `length` bytes from `offset`, or everything
@@ -94,6 +122,7 @@ pub const DownloadOptions = struct {
     /// Download part of the object. The checksum covers the whole object,
     /// so a range read reports `checksum_verified = false`.
     range: ?Range = null,
+    preconditions: Preconditions = .{},
 };
 
 pub const DownloadResult = struct {
@@ -115,6 +144,7 @@ pub const Downloaded = struct {
 pub const GetOptions = struct {
     /// Address one specific generation instead of the live one.
     generation: ?u64 = null,
+    preconditions: Preconditions = .{},
 };
 
 pub const DeleteOptions = struct {
@@ -122,6 +152,16 @@ pub const DeleteOptions = struct {
     /// makes a delete safe to retry: with it, a repeat of a delete that
     /// already happened is `error.NotFound`, never someone else's object.
     generation: ?u64 = null,
+    /// `if_generation_match` also makes a delete safe to retry.
+    preconditions: Preconditions = .{},
+};
+
+pub const CopyOptions = struct {
+    /// Copy one specific generation of the source instead of the live one.
+    source_generation: ?u64 = null,
+    /// Conditions on the destination. `if_generation_match` makes the
+    /// copy safe to retry.
+    preconditions: Preconditions = .{},
 };
 
 /// What `Bucket.create` sends. Everything else stays at the server default.
