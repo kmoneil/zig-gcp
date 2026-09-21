@@ -50,6 +50,21 @@ including the ones that did not change.
   polices the reader in both directions. The session URI is treated as
   the credential it is: never logged, never in `Diagnostics`, and
   requests to it carry no Authorization header.
+- storage: `Preconditions` on gets, downloads, deletes, uploads and
+  copies: generation and metageneration conditions, with
+  `.does_not_exist` named because it is the most useful one, making an
+  upload create-only and safe to retry. Retries follow the calls'
+  idempotency: a write carrying `if_generation_match` is retried,
+  because a repeat of one that already landed fails cleanly with 412
+  instead of overwriting whatever is there by now, and a 412 on such a
+  call says in the diagnostics that an earlier attempt may have
+  succeeded. An `if...NotMatch` condition met by the current object is
+  `error.NotModified`, an answer rather than a failure, never retried.
+  `copyTo` copies server-side, looping over rewrite calls until done;
+  the caller never sees a rewrite token, and only the tokenless first
+  call needs a destination condition to be retried.
+- core: `error.NotModified`, mapped from HTTP 304, for conditional
+  reads whose condition was met: there is nothing new to return.
 - core: a streaming request can ask for the response head as soon as it
   arrives, through `head_out`, so a download that fails mid-body still
   knows the generation it was reading and can resume against it.

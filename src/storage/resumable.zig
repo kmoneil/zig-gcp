@@ -219,7 +219,7 @@ const Machine = struct {
         metadata_crc: ?[8]u8,
     ) Error![]const u8 {
         const a = scratch.allocator();
-        const path = try names.uploadResumablePath(a, bucket_name);
+        const path = try names.uploadResumablePath(a, bucket_name, options.preconditions);
         const metadata = try codec.encodeUploadMetadata(a, object_name, options, metadata_crc);
         var length_buf: [20]u8 = undefined;
         var headers: std.ArrayList(core.transport.Header) = .empty;

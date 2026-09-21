@@ -486,3 +486,69 @@ test "resumable: upload above the single-request limit, chunks sliced from memor
     defer downloaded.deinit();
     try testing.expectEqualSlices(u8, data, downloaded.value.data);
 }
+
+test "copyTo within a bucket and across two buckets" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const data = "hello world\n";
+    try f.upload("reports/original.txt", data);
+
+    // Within the bucket.
+    const src = f.bucket().object("reports/original.txt");
+    var copied = try src.copyTo(f.bucket().object("copies/first.txt"), .{});
+    defer copied.deinit();
+    try testing.expectEqualStrings("copies/first.txt", copied.value.name);
+    try testing.expectEqual(data.len, copied.value.size);
+    var round = try f.bucket().object("copies/first.txt").downloadAlloc(1024, .{});
+    defer round.deinit();
+    try testing.expectEqualStrings(data, round.value.data);
+
+    // Across buckets: a second one, cleaned up by hand.
+    var other_name: [16]u8 = undefined;
+    var random: [4]u8 = undefined;
+    testing.io.random(&random);
+    _ = try std.fmt.bufPrint(&other_name, "zigps-cp-{x}", .{random[0..3]});
+    const other = f.client.bucket(other_name[0..15]);
+    var other_created = try other.create(.{});
+    other_created.deinit();
+    defer other.delete() catch {};
+    defer other.object("far.txt").delete(.{}) catch {};
+
+    var far = try src.copyTo(other.object("far.txt"), .{});
+    defer far.deinit();
+    try testing.expectEqual(data.len, far.value.size);
+    var far_round = try other.object("far.txt").downloadAlloc(1024, .{});
+    defer far_round.deinit();
+    try testing.expectEqualStrings(data, far_round.value.data);
+}
+
+test "does_not_exist uploads succeed once, then fail their precondition" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const obj = f.bucket().object("create-only.txt");
+
+    var first = try obj.upload("one", .{ .preconditions = .does_not_exist });
+    first.deinit();
+    try testing.expectError(error.FailedPrecondition, obj.upload("two", .{ .preconditions = .does_not_exist }));
+    try testing.expectEqual(412, f.diag.http_status);
+
+    // The object is untouched by the refused overwrite.
+    var round = try obj.downloadAlloc(64, .{});
+    defer round.deinit();
+    try testing.expectEqualStrings("one", round.value.data);
+
+    // A delete conditioned on the right generation goes through. (That a
+    // wrong generation is refused is the real-bucket suite's business:
+    // fake-gcs-server does not enforce preconditions on deletes.)
+    var info = try obj.get(.{});
+    const generation = info.value.generation;
+    info.deinit();
+    try obj.delete(.{ .preconditions = .{ .if_generation_match = generation } });
+    try testing.expect(!try obj.exists());
+}

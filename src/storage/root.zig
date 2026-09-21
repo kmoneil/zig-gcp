@@ -30,6 +30,7 @@ pub const Owned = @import("types.zig").Owned;
 pub const BucketConfig = @import("types.zig").BucketConfig;
 pub const BucketInfo = @import("types.zig").BucketInfo;
 pub const BucketPage = @import("types.zig").BucketPage;
+pub const CopyOptions = @import("types.zig").CopyOptions;
 pub const DeleteOptions = @import("types.zig").DeleteOptions;
 pub const DownloadOptions = @import("types.zig").DownloadOptions;
 pub const DownloadResult = @import("types.zig").DownloadResult;
@@ -40,6 +41,7 @@ pub const Metadata = @import("types.zig").Metadata;
 pub const ObjectInfo = @import("types.zig").ObjectInfo;
 pub const ObjectPage = @import("types.zig").ObjectPage;
 pub const PageOptions = @import("types.zig").PageOptions;
+pub const Preconditions = @import("types.zig").Preconditions;
 pub const Range = @import("types.zig").Range;
 pub const UploadOptions = @import("types.zig").UploadOptions;
 
