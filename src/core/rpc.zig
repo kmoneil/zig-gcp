@@ -48,6 +48,40 @@ pub const Call = struct {
     wipe: bool = false,
 };
 
+/// One streaming request, as a service module describes it: the body from
+/// replayable segments, the response buffered or streamed into a writer,
+/// response headers included in the result. A reader-backed body cannot be
+/// replayed for a retry, so it has no place in this loop; a module that
+/// streams an upload from a reader runs its own.
+pub const StreamCall = struct {
+    method: transport.Method,
+    /// Path and query, appended to the base URL.
+    path: []const u8,
+    /// The Content-Type sent with the body, verbatim.
+    content_type: ?[]const u8 = null,
+    headers: []const transport.Header = &.{},
+    body: Body = .none,
+    sink: transport.StreamRequest.Sink = .buffer,
+    accept_encoding: transport.StreamRequest.AcceptEncoding = .identity,
+    /// A writer sink narrows what a retry may repeat: a non-2xx response is
+    /// buffered and leaves the writer untouched, so it retries as usual,
+    /// but a transport failure may have delivered part of the body, which
+    /// cannot be taken back, so it is returned instead. Resuming is the
+    /// caller's business.
+    retry: bool = true,
+    retryable: *const fn (err: anyerror, http_status: u16) bool = retryableByDefault,
+
+    pub const Body = union(enum) {
+        none,
+        /// Sent back to back with an exact Content-Length; replayable.
+        segments: []const []const u8,
+    };
+};
+
+/// `Error`, plus the caller's sink writer failing, with the detail wherever
+/// that concrete writer keeps it.
+pub const StreamCallError = Error || error{WriteFailed};
+
 pub fn Engine(comptime log_scope: @EnumLiteral()) type {
     return struct {
         gpa: Allocator,
@@ -146,6 +180,109 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                     call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
                 });
                 self.resetResponse(response, call);
+                try self.io.sleep(.fromMilliseconds(delay_ms), .awake);
+            }
+        }
+
+        /// Sends `call` through the transport's streaming entry, retrying
+        /// transient failures, and returns the first 2xx response whole:
+        /// status, headers, and the body, buffered or already delivered to
+        /// the sink writer. Everything returned lives in `response`, which
+        /// is reset between attempts and so must hold nothing else.
+        pub fn executeStream(
+            self: Self,
+            response: *std.heap.ArenaAllocator,
+            call: StreamCall,
+        ) StreamCallError!transport.StreamResponse {
+            var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+            defer scratch.deinit();
+            const url = try std.mem.concat(scratch.allocator(), u8, &.{ self.base_url, call.path });
+            // Query strings carry page tokens and object names; they stay
+            // out of the log.
+            const log_path = call.path[0 .. std.mem.indexOfScalar(u8, call.path, '?') orelse call.path.len];
+            var max_attempts: u32 = if (call.retry) self.retry.max_attempts else 1;
+
+            // The caller's headers, plus the quota project when there is one.
+            var headers = try scratch.allocator().alloc(transport.Header, call.headers.len + 1);
+            @memcpy(headers[0..call.headers.len], call.headers);
+            var header_count = call.headers.len;
+            if (try self.quotaProject()) |project| {
+                headers[header_count] = .{ .name = "x-goog-user-project", .value = project };
+                header_count += 1;
+            }
+
+            var reauthenticated = false;
+            var attempt: u32 = 1;
+            while (true) : (attempt += 1) {
+                const bearer = try self.bearerToken(scratch.allocator());
+                const started = std.Io.Clock.awake.now(self.io);
+                const outcome = self.transport.sendStream(.{
+                    .method = call.method,
+                    .url = url,
+                    .bearer = bearer,
+                    .content_type = call.content_type,
+                    .headers = headers[0..header_count],
+                    .body = switch (call.body) {
+                        .none => .none,
+                        .segments => |segments| .{ .segments = segments },
+                    },
+                    .sink = call.sink,
+                    .accept_encoding = call.accept_encoding,
+                    .timeout_ms = self.request_timeout_ms,
+                }, response.allocator());
+                const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
+
+                var http_status: u16 = 0;
+                var mid_body = false;
+                const err: StreamCallError = if (outcome) |res| e: {
+                    http_status = res.status;
+                    log.debug("{t} {s} -> {d} in {d} ms (attempt {d} of {d})", .{
+                        call.method, log_path, res.status, elapsed_ms, attempt, max_attempts,
+                    });
+                    if (res.status >= 200 and res.status < 300) {
+                        if (self.diagnostics) |d| d.clear();
+                        return res;
+                    }
+                    break :e self.failure(scratch.allocator(), .{
+                        .status = res.status,
+                        .body = res.body,
+                        .headers = res.headers,
+                    });
+                } else |err| e: {
+                    log.debug("{t} {s} -> {t} in {d} ms (attempt {d} of {d})", .{
+                        call.method, log_path, err, elapsed_ms, attempt, max_attempts,
+                    });
+                    if (self.diagnostics) |d| d.print("{t}", .{err});
+                    break :e switch (err) {
+                        // The caller's sink writer failed; nothing to retry.
+                        error.WriteFailed => return error.WriteFailed,
+                        // No reader-backed body ever goes through this loop.
+                        error.ReadFailed, error.EndOfStream => unreachable,
+                        else => |e| b: {
+                            // A transport failure may have delivered part of
+                            // the body to a writer sink already.
+                            mid_body = call.sink == .writer;
+                            break :b e;
+                        },
+                    };
+                };
+
+                // A 401 response is buffered whatever the sink, so retrying
+                // it once with a fresh token is safe even there.
+                if (err == error.Unauthenticated and !reauthenticated and self.dropCachedToken()) {
+                    reauthenticated = true;
+                    max_attempts += 1;
+                    log.warn("{t} {s} was refused as unauthenticated; retrying once with a fresh token", .{ call.method, log_path });
+                    _ = response.reset(.retain_capacity);
+                    continue;
+                }
+
+                if (mid_body or attempt >= max_attempts or !call.retryable(err, http_status)) return err;
+                const delay_ms = self.retry.backoffMs(attempt, entropy(self.io));
+                log.warn("{t} {s} failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
+                    call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
+                });
+                _ = response.reset(.retain_capacity);
                 try self.io.sleep(.fromMilliseconds(delay_ms), .awake);
             }
         }
@@ -650,4 +787,124 @@ test "fuzz retry: attempts and waits follow the policy for any sequence of failu
         "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x03\x03\x03\x03\x03\x03\x03\x03",
         "\x06\x00\x00\x03\xe8\x00\x00\x27\x10\x02\x00\x01\x02\x03\x00\x01",
     } });
+}
+
+// The streaming loop, driven the same way.
+
+test "executeStream: a success returns status, headers and body, and sends segments" {
+    var h: Harness = undefined;
+    h.init(&.{.{ .respond = .{
+        .status = 200,
+        .body = "{\"name\":\"o\"}",
+        .headers = &.{.{ .name = "x-goog-generation", .value = "7" }},
+    } }});
+    defer h.deinit();
+    const e = h.engine();
+    e.begin();
+    const res = try e.executeStream(&h.arena, .{
+        .method = .POST,
+        .path = "/upload/v1/b/b/o?uploadType=multipart",
+        .content_type = "multipart/related; boundary=b",
+        .body = .{ .segments = &.{ "--b\r\n", "data", "\r\n--b--\r\n" } },
+    });
+    try testing.expectEqual(200, res.status);
+    try testing.expectEqualStrings("{\"name\":\"o\"}", res.body);
+    try testing.expectEqualStrings("7", res.header("x-goog-generation").?);
+
+    const sent = try h.fake.streamRequest(0);
+    try testing.expectEqualStrings("https://service.googleapis.com/upload/v1/b/b/o?uploadType=multipart", sent.url);
+    try testing.expectEqualStrings("multipart/related; boundary=b", sent.content_type.?);
+    try testing.expectEqualStrings("--b\r\ndata\r\n--b--\r\n", sent.body_prefix);
+    try testing.expectEqualStrings("ya29.fake-token", sent.bearer.?);
+}
+
+test "executeStream: a non-2xx maps by status and fills the diagnostics" {
+    var h: Harness = undefined;
+    h.init(&.{.{ .respond = .{
+        .status = 404,
+        .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}",
+    } }});
+    defer h.deinit();
+    const e = h.engine();
+    e.begin();
+    try testing.expectError(error.NotFound, e.executeStream(&h.arena, .{ .method = .GET, .path = "/v1/o" }));
+    try testing.expectEqual(404, h.diag.http_status);
+    try testing.expectEqualStrings("notFound", h.diag.status());
+    try testing.expectEqualStrings("No such object", h.diag.message());
+}
+
+test "executeStream: a buffered sink retries statuses and transport failures alike" {
+    var h: Harness = undefined;
+    h.init(&.{ unavailable, .{ .fail = error.ConnectionResetByPeer }, ok });
+    defer h.deinit();
+    const res = try h.engine().executeStream(&h.arena, .{ .method = .GET, .path = "/v1/things" });
+    try testing.expectEqual(200, res.status);
+    try testing.expectEqual(3, h.fake.stream_requests.items.len);
+    try testing.expectEqual(2, h.clock.sleep_count);
+}
+
+test "executeStream: a writer sink retries a status but never a mid-body failure" {
+    var h: Harness = undefined;
+    h.init(&.{
+        // A 503 is buffered, the writer untouched: safe to retry.
+        unavailable,
+        // Then the connection drops after five bytes reached the writer.
+        .{ .respond = .{ .status = 200, .body = "hello world\n", .cut_after = 5 } },
+    });
+    defer h.deinit();
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    try testing.expectError(error.ConnectionResetByPeer, h.engine().executeStream(&h.arena, .{
+        .method = .GET,
+        .path = "/v1/o?alt=media",
+        .sink = .{ .writer = &out },
+    }));
+    // Both requests went out: the 503 was retried, the cut was not.
+    try testing.expectEqual(2, h.fake.stream_requests.items.len);
+    try testing.expectEqualStrings("hello", out.buffered());
+}
+
+test "executeStream: the caller's writer failing is final" {
+    var h: Harness = undefined;
+    h.init(&.{.{ .respond = .{ .status = 200, .body = "hello world\n" } }});
+    defer h.deinit();
+    var out_buf: [4]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    try testing.expectError(error.WriteFailed, h.engine().executeStream(&h.arena, .{
+        .method = .GET,
+        .path = "/v1/o?alt=media",
+        .sink = .{ .writer = &out },
+    }));
+    try testing.expectEqual(1, h.fake.stream_requests.items.len);
+}
+
+test "executeStream: a 401 is retried once with a fresh token, whatever the sink" {
+    var h: Harness = undefined;
+    h.init(&.{ unauthorized, ok });
+    defer h.deinit();
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const res = try h.engine().executeStream(&h.arena, .{
+        .method = .GET,
+        .path = "/v1/o?alt=media",
+        .sink = .{ .writer = &out },
+        .retry = false,
+    });
+    try testing.expectEqual(200, res.status);
+    try testing.expectEqual(1, h.token.invalidations);
+    try testing.expectEqual(2, h.fake.stream_requests.items.len);
+}
+
+test "executeStream: retry off means one attempt" {
+    var h: Harness = undefined;
+    h.init(&.{unavailable});
+    defer h.deinit();
+    try testing.expectError(error.Unavailable, h.engine().executeStream(&h.arena, .{
+        .method = .POST,
+        .path = "/v1/upload",
+        .body = .{ .segments = &.{"data"} },
+        .retry = false,
+    }));
+    try testing.expectEqual(1, h.fake.stream_requests.items.len);
+    try testing.expectEqual(0, h.clock.sleep_count);
 }

@@ -31,6 +31,7 @@ pub const Harness = struct {
         project_id: ?[]const u8 = "extractctl",
         retry: RetryPolicy = .{},
         retry_unconditional_writes: bool = false,
+        verify_checksums: bool = true,
         quota_project: ?[]const u8 = null,
     };
 
@@ -48,6 +49,7 @@ pub const Harness = struct {
             .token_provider = h.token.provider(),
             .retry = options.retry,
             .retry_unconditional_writes = options.retry_unconditional_writes,
+            .verify_checksums = options.verify_checksums,
             .diagnostics = &h.diag,
             .transport = h.fake.transport(),
         });

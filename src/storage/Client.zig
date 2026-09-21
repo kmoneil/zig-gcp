@@ -38,6 +38,7 @@ unauthenticated: bool,
 scope: rpc.Scope,
 retry: RetryPolicy,
 retry_unconditional_writes: bool,
+verify_checksums: bool,
 send_quota_project: bool,
 request_timeout_ms: u32,
 diagnostics: ?*Diagnostics,
@@ -63,6 +64,9 @@ pub const Options = struct {
     /// retried unless this opts in; a delete with a `generation` always is,
     /// because a repeat fails cleanly instead.
     retry_unconditional_writes: bool = false,
+    /// Compute and check CRC-32C checksums on uploads and downloads. Off,
+    /// nothing is computed, checked, or sent beyond what the caller passed.
+    verify_checksums: bool = true,
     /// How long one request may take before it is `error.TimedOut`, which
     /// is retried like any other transient failure. 0 removes the limit,
     /// and nothing bounds a call then but the caller's own `std.Io`.
@@ -141,6 +145,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
         .scope = options.scope,
         .retry = options.retry,
         .retry_unconditional_writes = options.retry_unconditional_writes,
+        .verify_checksums = options.verify_checksums,
         .send_quota_project = options.send_quota_project,
         .request_timeout_ms = options.request_timeout_ms,
         .diagnostics = diag,

@@ -46,10 +46,33 @@ pub fn objectPath(arena: Allocator, bucket: []const u8, object: []const u8, gene
     return out.toOwnedSlice();
 }
 
+/// `/storage/v1/b/{bucket}/o/{object}?alt=media`: the object's bytes.
+pub fn objectMediaPath(arena: Allocator, bucket: []const u8, object: []const u8, generation: ?u64) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{ .bucket = bucket, .object = object, .alt_media = true, .generation = generation }) catch
+        return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// `/upload/storage/v1/b/{bucket}/o?uploadType=multipart`. The object name
+/// travels in the metadata part, not here.
+pub fn uploadMultipartPath(arena: Allocator, bucket: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeUpload(&out.writer, bucket) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeUpload(w: *Writer, bucket: []const u8) Writer.Error!void {
+    try w.writeAll("/upload/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/o?uploadType=multipart");
+}
+
 const Parts = struct {
     bucket: ?[]const u8 = null,
     object: ?[]const u8 = null,
     list_objects: bool = false,
+    alt_media: bool = false,
     project: ?[]const u8 = null,
     generation: ?u64 = null,
     prefix: ?[]const u8 = null,
@@ -70,6 +93,7 @@ fn write(w: *Writer, parts: Parts) Writer.Error!void {
         try query.writeStrictSegment(w, object);
     }
     var params: query.Params = .init(w);
+    if (parts.alt_media) try params.add("alt", "media");
     try params.addOptional("project", parts.project);
     if (parts.generation) |g| try params.addInt("generation", g);
     try params.addOptional("prefix", parts.prefix);
@@ -109,6 +133,22 @@ test "object paths encode the name as one segment" {
     try expectPath("/storage/v1/b/b/o/caf%C3%A9", try objectPath(gpa, "b", "caf\xc3\xa9", null));
     // A name that is only slashes stays addressable.
     try expectPath("/storage/v1/b/b/o/%2F%2F%2F", try objectPath(gpa, "b", "///", null));
+}
+
+test "media and upload paths" {
+    const gpa = testing.allocator;
+    try expectPath(
+        "/storage/v1/b/my-bucket/o/backup.tar?alt=media",
+        try objectMediaPath(gpa, "my-bucket", "backup.tar", null),
+    );
+    try expectPath(
+        "/storage/v1/b/my-bucket/o/a%2Fb?alt=media&generation=7",
+        try objectMediaPath(gpa, "my-bucket", "a/b", 7),
+    );
+    try expectPath(
+        "/upload/storage/v1/b/my-bucket/o?uploadType=multipart",
+        try uploadMultipartPath(gpa, "my-bucket"),
+    );
 }
 
 test "object listing paths" {
