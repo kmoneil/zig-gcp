@@ -80,6 +80,7 @@ pub fn publish(
         .path = path,
         .body = body,
         .retry = c.retry_publish,
+        .retryable = rpc.isPublishRetryable,
     });
     result.value = codec.decodePublish(result.arena.allocator(), response, messages.len) catch |err|
         return rpc.decodeFailed(c, err, "publish");
@@ -190,6 +191,45 @@ test "publish: retried by default" {
     var sent = try h.client.topic("orders").publish(&.{.{ .data = "x" }}, .{});
     defer sent.deinit();
     try h.expectRequestCount(2);
+}
+
+test "publish: ABORTED, CANCELLED and a 5xx UNKNOWN are retried, as Google's clients retry Publish" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 409, .body = "{\"error\":{\"code\":409,\"status\":\"ABORTED\"}}" } },
+        .{ .respond = .{ .status = 499, .body = "{\"error\":{\"code\":499,\"status\":\"CANCELLED\"}}" } },
+        .{ .respond = .{ .status = 500, .body = "{\"error\":{\"code\":500,\"status\":\"UNKNOWN\"}}" } },
+        .{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } },
+    }, .{});
+    defer h.deinit();
+    var sent = try h.client.topic("orders").publish(&.{.{ .data = "x" }}, .{});
+    defer sent.deinit();
+    try h.expectRequestCount(4);
+}
+
+test "publish: an HTTP status the client cannot place is Unknown and not retried" {
+    // A proxy's 405 page maps to error.Unknown, like the server's UNKNOWN
+    // status, but nothing about it will change on a second attempt.
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 405, .body = "<html>Method Not Allowed</html>" } },
+        .{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } },
+    }, .{});
+    defer h.deinit();
+    try testing.expectError(error.Unknown, h.client.topic("orders").publish(&.{.{ .data = "x" }}, .{}));
+    try h.expectRequestCount(1);
+    try testing.expectEqual(405, h.diag.http_status);
+}
+
+test "publish: the wider retry set is still off with retry_publish = false" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 409, .body = "{\"error\":{\"status\":\"ABORTED\"}}" } },
+        .{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } },
+    }, .{ .retry_publish = false });
+    defer h.deinit();
+    try testing.expectError(error.Aborted, h.client.topic("orders").publish(&.{.{ .data = "x" }}, .{}));
+    try h.expectRequestCount(1);
 }
 
 test "publish: a response with the wrong number of ids is InvalidResponse" {

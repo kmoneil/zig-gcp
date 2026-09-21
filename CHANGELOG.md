@@ -4,6 +4,19 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.12.0 (unreleased)
+
+- pubsub: `Topic.publish` now also retries ABORTED, CANCELLED and UNKNOWN,
+  the statuses Google's own clients retry for Publish beyond the four it
+  already did. UNKNOWN is retried only when the server answered with a 5xx:
+  an HTTP status the library cannot place, such as a proxy's 405, reads as
+  `error.Unknown` too, and it is permanent. `retry_publish = false` still
+  turns every retry off.
+- core: `rpc.Call.retryable` lets a call decide which failures are worth
+  another attempt, given the error and the HTTP status. The default is
+  `isRetryable`, as before.
+- auth, secret_manager: unchanged.
+
 ## 0.11.1 (2026-09-21)
 
 - pubsub: fixed: canceling `Subscriber.run` could hang it for good. `run`

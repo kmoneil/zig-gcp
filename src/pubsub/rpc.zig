@@ -60,6 +60,21 @@ pub fn executeDiscard(client: *Client, call: Call) Error!void {
     return engine(client).executeDiscard(call);
 }
 
+/// Whether a failed publish attempt is worth another. Google's own clients
+/// retry Publish on seven statuses (googleapis' service config): the four
+/// `core.isRetryable` knows, plus ABORTED, CANCELLED and UNKNOWN. UNKNOWN
+/// counts only on a 5xx answer: every HTTP status core does not know, 405
+/// and 415 among them, also reads as `error.Unknown`, and those are
+/// permanent. Go's REST client likewise retries 500 but no 4xx it cannot
+/// place.
+pub fn isPublishRetryable(err: anyerror, http_status: u16) bool {
+    return switch (err) {
+        error.Aborted, error.ServerCancelled => true,
+        error.Unknown => http_status >= 500 and http_status < 600,
+        else => isRetryable(err),
+    };
+}
+
 /// Checks a topic or subscription id before any request.
 pub fn checkId(client: *Client, kind: []const u8, id: []const u8) Error!void {
     if (validate.isResourceId(id)) return;
@@ -192,6 +207,44 @@ test "retry: transient transport failures retry, permanent ones do not" {
     try dns.expectRequestCount(1);
     try testing.expectEqual(0, dns.diag.http_status);
     try testing.expectEqualStrings("UnknownHostName", dns.diag.message());
+}
+
+test "retry: a publish retries the seven statuses Google's clients retry, and UNKNOWN only on a 5xx" {
+    const cases = [_]struct { anyerror, u16, bool }{
+        // The service config's seven, as the server reports them.
+        .{ error.Aborted, 409, true },
+        .{ error.ServerCancelled, 499, true },
+        .{ error.Internal, 500, true },
+        .{ error.ResourceExhausted, 429, true },
+        .{ error.Unknown, 500, true },
+        .{ error.Unavailable, 503, true },
+        .{ error.DeadlineExceeded, 504, true },
+        // An HTTP status core cannot place also reads as Unknown.
+        .{ error.Unknown, 505, true },
+        .{ error.Unknown, 405, false },
+        .{ error.Unknown, 415, false },
+        .{ error.Unknown, 0, false },
+        // Transport failures follow core.isRetryable.
+        .{ error.ConnectionResetByPeer, 0, true },
+        .{ error.TimedOut, 0, true },
+        .{ error.UnknownHostName, 0, false },
+        // Everything else is final.
+        .{ error.InvalidArgument, 400, false },
+        .{ error.FailedPrecondition, 400, false },
+        .{ error.NotFound, 404, false },
+        .{ error.PermissionDenied, 403, false },
+        .{ error.Canceled, 0, false },
+        .{ error.InvalidResponse, 200, false },
+    };
+    for (cases) |c| {
+        const err, const status, const want = c;
+        if (isPublishRetryable(err, status) != want) {
+            std.debug.print("isPublishRetryable({t}, {d}) should be {}\n", .{ err, status, want });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Anything core retries, a publish retries too.
+    for (cases) |c| if (isRetryable(c[0])) try testing.expect(isPublishRetryable(c[0], c[1]));
 }
 
 test "retry: a canceled backoff sleep returns error.Canceled" {

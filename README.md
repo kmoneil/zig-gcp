@@ -254,8 +254,9 @@ Transient failures are retried with full-jitter exponential backoff
 (`RetryPolicy`: 5 attempts, 100 ms doubling to at most 10 s). Retried:
 RESOURCE_EXHAUSTED, INTERNAL, UNAVAILABLE (and HTTP 502), DEADLINE_EXCEEDED,
 connections that were refused, reset or timed out, and failed TLS handshakes
-(std reports a connection dropped mid-handshake as a TLS failure). A retried
-publish can store messages twice; set `Client.Options.retry_publish = false`
+(std reports a connection dropped mid-handshake as a TLS failure). A publish
+is also retried on ABORTED, CANCELLED, and UNKNOWN answered with a 5xx, as
+Google's own clients retry it. A retried publish can store messages twice; set `Client.Options.retry_publish = false`
 to opt out, and note that such a publish also fails, rather than retries, when
 the server has closed an idle connection. Retried creates and deletes can report
 `AlreadyExists` or `NotFound` for an attempt that succeeded but whose
