@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.11.1 (unreleased)
+## 0.11.1 (2026-09-21)
 
 - pubsub: fixed: canceling `Subscriber.run` could hang it for good. `run`
   waits on a condition variable that every resolved message signals, and
