@@ -521,8 +521,9 @@ CI runs the unit tests on Linux, macOS and Windows, and on Linux also in
 ReleaseSafe and ReleaseFast; the integration tests and examples against the
 emulator; and coverage, whose summary and report are attached to each run. Every night it
 also fuzzes, one job per module, each starting from the corpus that earlier
-nights built up for it. A failing input is attached to the run as
-`fuzz-failure-<module>`, such as `fuzz-failure-pubsub`.
+nights built up for it, with auth's RSA-signing property in a job of its
+own. A failing input is attached to the run as `fuzz-failure-<job>`, such
+as `fuzz-failure-pubsub`.
 
 Integration tests skip unless a server is configured:
 

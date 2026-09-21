@@ -885,7 +885,10 @@ fn anyReplyProperty(_: void, input: []const u8) !void {
     try testing.expect(TokenProvider.isValidToken(token));
 }
 
-test "fuzz ServiceAccount: any token endpoint reply yields a token or an error" {
+// Named "slow property", not "fuzz": each run signs a JWT with RSA, about
+// 49 ms, so the nightly fuzz job for auth skips it and a job of its own
+// fuzzes it fewer times. `zig build test` runs it like any other.
+test "slow property ServiceAccount: any token endpoint reply yields a token or an error" {
     try test_util.fuzzBytes({}, anyReplyProperty, .{
         .corpus = &.{
             "\x00\x00\x00\x00\x00\x00\x00\x00{\"access_token\":\"ya29.x\",\"expires_in\":3599}",
