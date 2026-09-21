@@ -21,6 +21,10 @@ pub const endpoint = @import("endpoint.zig");
 /// Base64, as Google's JSON APIs carry `bytes` fields.
 pub const base64 = @import("base64.zig");
 
+/// `std.Io.Condition`, except that a canceled wait always reports the
+/// cancel. std's can lose it, and then the task never ends.
+pub const Condition = @import("Condition.zig");
+
 pub const RetryPolicy = @import("retry.zig").RetryPolicy;
 pub const isRetryable = @import("retry.zig").isRetryable;
 

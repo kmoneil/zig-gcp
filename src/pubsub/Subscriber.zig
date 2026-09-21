@@ -64,7 +64,7 @@ janitor_diag: Diagnostics,
 mutex: std.Io.Mutex,
 /// Signaled when a message resolves, when `stop` is called, and when a
 /// fatal error is recorded.
-cond: std.Io.Condition,
+cond: core.Condition,
 queue: std.Io.Queue(*Tracked),
 queue_buffer: []*Tracked,
 /// Scratch for the janitor's lease snapshot, sized `max_outstanding`.
@@ -284,6 +284,11 @@ pub fn run(self: *Subscriber, handler: Handler) Error!void {
     defer if (janitor_running) discard(janitor_task.cancel(io));
     var workers: std.Io.Group = .init;
     defer workers.cancel(io);
+    // Runs before the cancel above, on every way out. A worker parked in
+    // the queue's own wait can miss a cancel: std's queue, like its
+    // Condition, takes a message handed over as the cancel lands and drops
+    // the cancel. A closed queue sends every worker home anyway.
+    defer self.queue.close(io);
     for (0..self.concurrency) |_| workers.concurrent(io, workerLoop, .{ self, handler }) catch {
         var d: Diagnostics = .{};
         d.print("this Io cannot run concurrent tasks, which a Subscriber needs", .{});
@@ -684,7 +689,7 @@ const FakePubSub = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     /// Wakes pulls blocked on an empty backlog.
-    cond: std.Io.Condition = .init,
+    cond: core.Condition = .init,
     pending: std.ArrayList(Msg) = .empty,
     /// Delivered and not yet acknowledged, by ack id.
     leased: std.StringHashMapUnmanaged(Msg) = .empty,
@@ -1210,6 +1215,46 @@ test "Subscriber: canceling run takes every task down and leaks nothing" {
     var running = try testing.io.concurrent(Subscriber.run, .{ &h.subscriber, h.handler.handler() });
     try testing.io.sleep(.fromMilliseconds(100), .awake);
     try testing.expectError(error.Canceled, running.cancel(testing.io));
+}
+
+/// Rounds of canceling a busy subscriber: every resolved message
+/// broadcasts, and with `max_outstanding = 1` the puller waits on the same
+/// condition as `run`, so a cancel keeps landing mid-broadcast.
+fn cancelBusyRounds(rounds: usize, done: *std.atomic.Value(bool)) anyerror!void {
+    const io = testing.io;
+    defer done.store(true, .release);
+    for (0..rounds) |round| {
+        var h: Harness = undefined;
+        try h.init(.{ .concurrency = 2, .max_outstanding = 1 });
+        defer h.deinit();
+        for (0..30) |i| {
+            var buf: [24]u8 = undefined;
+            try h.fake.publish(try std.fmt.bufPrint(&buf, "round {d} message {d}", .{ round, i }));
+        }
+        var running = try io.concurrent(Subscriber.run, .{ &h.subscriber, h.handler.handler() });
+        const pause_us: i64 = @intCast(100 + round % 7 * 150);
+        io.sleep(.fromMicroseconds(pause_us), .awake) catch {};
+        running.cancel(io) catch {};
+    }
+}
+
+test "Subscriber: canceling run while handlers resolve messages never hangs" {
+    // Regression. run() waits on a condition that every resolved message
+    // broadcasts. std's Condition in Zig 0.16.0 drops a cancel that lands
+    // while another waiter's signal is pending, and then run() never
+    // returned: its next wait could not be canceled. core.Condition keeps
+    // the cancel. Rather than hang the suite, this gives up after 60 s.
+    const io = testing.io;
+    var done: std.atomic.Value(bool) = .init(false);
+    var rounds = try io.concurrent(cancelBusyRounds, .{ 150, &done });
+    const deadline = std.Io.Clock.awake.now(io).toMilliseconds() + 60_000;
+    while (!done.load(.acquire)) {
+        if (std.Io.Clock.awake.now(io).toMilliseconds() > deadline) {
+            @panic("Subscriber.run never returned from a cancel: the cancel was lost");
+        }
+        try io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try rounds.await(io);
 }
 
 test "Subscriber: init refuses what cannot work" {
