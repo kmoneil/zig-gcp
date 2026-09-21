@@ -38,31 +38,55 @@ const PublishBody = struct {
         try jw.beginObject();
         try jw.objectField("messages");
         try jw.beginArray();
-        for (self.messages) |m| {
-            try jw.beginObject();
-            if (m.data.len > 0) {
-                try jw.objectField("data");
-                try base64.writeJsonString(jw, m.data);
-            }
-            if (m.attributes.len > 0) {
-                try jw.objectField("attributes");
-                try jw.beginObject();
-                for (m.attributes) |a| {
-                    try jw.objectField(a.key);
-                    try jw.write(a.value);
-                }
-                try jw.endObject();
-            }
-            if (self.ordering_key) |key| if (key.len > 0) {
-                try jw.objectField("orderingKey");
-                try jw.write(key);
-            };
-            try jw.endObject();
-        }
+        for (self.messages) |m| try writeMessage(jw, m, self.ordering_key);
         try jw.endArray();
         try jw.endObject();
     }
 };
+
+/// What a publish body holds before its first message and after its last.
+/// A body is `publish_body_head`, then the messages `encodeMessage` writes,
+/// joined by commas, then `publish_body_tail`: byte for byte what
+/// `encodePublish` writes for the same messages.
+pub const publish_body_head = "{\"messages\":[";
+pub const publish_body_tail = "]}";
+
+/// One message of a publish body, as `encodePublish` writes it. A publisher
+/// builds a request from these one message at a time. Caller owns the result.
+pub fn encodeMessage(gpa: Allocator, message: types.Message, ordering_key: ?[]const u8) Allocator.Error![]u8 {
+    return render(gpa, MessageBody{ .message = message, .ordering_key = ordering_key });
+}
+
+const MessageBody = struct {
+    message: types.Message,
+    ordering_key: ?[]const u8,
+
+    fn write(self: MessageBody, jw: *Stringify) Stringify.Error!void {
+        try writeMessage(jw, self.message, self.ordering_key);
+    }
+};
+
+fn writeMessage(jw: *Stringify, m: types.Message, ordering_key: ?[]const u8) Stringify.Error!void {
+    try jw.beginObject();
+    if (m.data.len > 0) {
+        try jw.objectField("data");
+        try base64.writeJsonString(jw, m.data);
+    }
+    if (m.attributes.len > 0) {
+        try jw.objectField("attributes");
+        try jw.beginObject();
+        for (m.attributes) |a| {
+            try jw.objectField(a.key);
+            try jw.write(a.value);
+        }
+        try jw.endObject();
+    }
+    if (ordering_key) |key| if (key.len > 0) {
+        try jw.objectField("orderingKey");
+        try jw.write(key);
+    };
+    try jw.endObject();
+}
 
 /// The `subscriptions.pull` body. `max_messages` must already be clamped.
 pub fn encodePull(arena: Allocator, max_messages: u32, return_immediately: bool) Allocator.Error![]u8 {
@@ -139,9 +163,11 @@ pub fn encodeTopic(arena: Allocator, config: types.TopicConfig) Allocator.Error!
 }
 
 /// Runs `body.write` into a fresh buffer. The only way an allocating writer
-/// fails is running out of memory.
-fn render(arena: Allocator, body: anytype) Allocator.Error![]u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
+/// fails is running out of memory, and then nothing is left behind, so a
+/// general-purpose allocator is as safe here as an arena.
+fn render(allocator: Allocator, body: anytype) Allocator.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
     var jw: Stringify = .{ .writer = &out.writer };
     body.write(&jw) catch return error.OutOfMemory;
     return out.toOwnedSlice();
@@ -856,6 +882,57 @@ test "fuzz publishBodyLen: always equals the encoded length" {
         "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00",
         "\x02\x05\x01\x40\x07\xff\xff\xff\xff\x01\x02\x03",
     } });
+}
+
+fn assembledBodyProperty(_: void, input: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g: ByteGen = .init(input);
+    var key_buf: [24]u8 = undefined;
+    const ordering_key: ?[]const u8 = switch (g.intRange(u8, 0, 2)) {
+        0 => null,
+        1 => "",
+        else => g.utf8(&key_buf, 24),
+    };
+    const all = try genMessages(&g, a);
+    const messages = all[0..g.intRange(usize, 0, all.len)];
+
+    // A publisher's body, one message at a time.
+    var assembled: std.ArrayList(u8) = .empty;
+    try assembled.appendSlice(a, publish_body_head);
+    for (messages, 0..) |m, i| {
+        if (i > 0) try assembled.append(a, ',');
+        const one = try encodeMessage(testing.allocator, m, ordering_key);
+        defer testing.allocator.free(one);
+        try assembled.appendSlice(a, one);
+    }
+    try assembled.appendSlice(a, publish_body_tail);
+
+    try testing.expectEqualStrings(try encodePublish(a, messages, ordering_key), assembled.items);
+    try testing.expectEqual(publishBodyLen(messages, ordering_key), assembled.items.len);
+}
+
+test "fuzz encodeMessage: a body built one message at a time is the body encodePublish writes" {
+    try test_util.fuzzBytes({}, assembledBodyProperty, .{ .corpus = &.{
+        "\x00\x01\x08\x02\x10\x00\x00\x00\x00\x00\x00\x00\x03abc",
+        "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        "\x02\x05\x01\x40\x07\xff\xff\xff\xff\x01\x02\x03",
+    } });
+}
+
+test "encodeMessage: each field, and an empty key left out" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { types.Message, ?[]const u8, []const u8 }{
+        .{ .{ .data = "hi" }, null, "{\"data\":\"aGk=\"}" },
+        .{ .{ .data = "hi" }, "", "{\"data\":\"aGk=\"}" },
+        .{ .{ .attributes = &.{.{ .key = "k", .value = "v\"" }} }, "user-42", "{\"attributes\":{\"k\":\"v\\\"\"},\"orderingKey\":\"user-42\"}" },
+    };
+    for (cases) |c| {
+        const got = try encodeMessage(gpa, c[0], c[1]);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(c[2], got);
+    }
 }
 
 test "publishBodyLen: empty publish and each field" {
