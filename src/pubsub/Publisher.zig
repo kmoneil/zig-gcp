@@ -37,6 +37,14 @@
 //! `when_full = .fail` refuses at once. `flush` sends everything now and
 //! waits for what was accepted before it.
 //!
+//! With `enable_message_ordering`, a message may carry an ordering key.
+//! Messages with the same key reach ordered subscriptions in publish order:
+//! no request mixes keys, and a key has one request in flight at a time.
+//! When one of a key's batches fails for good, the key pauses: what was
+//! queued behind that batch fails unsent, and `publish` refuses the key
+//! until `resumePublish`, so a later message can never be stored ahead of
+//! one that failed.
+//!
 //! A publisher runs once and must not be moved after `init`. Its allocator is
 //! used from several tasks at once.
 
@@ -73,6 +81,7 @@ publish_timeout_ms: u32,
 max_outstanding: u32,
 max_outstanding_bytes: u64,
 when_full: WhenFull,
+enable_message_ordering: bool,
 /// The backoff between attempts; its `max_attempts` does not apply, since a
 /// publisher retries by time.
 retry: RetryPolicy,
@@ -90,6 +99,9 @@ cond: core.Condition,
 /// Set when a batch opens, so the timer looks again.
 timer_event: std.Io.Event,
 unkeyed: KeyState,
+/// The ordering keys with batches unresolved, or paused, by key. A key's
+/// record goes when it has neither.
+keys: std.StringHashMapUnmanaged(*KeyState),
 /// Every batch not yet resolved, in the order it opened.
 unresolved: List,
 /// Open batches whose delay has not run out, in the order they opened.
@@ -134,6 +146,10 @@ pub const Options = struct {
     max_outstanding_bytes: u64 = 10_000_000,
     /// What `publish` does at either cap.
     when_full: WhenFull = .block,
+    /// Allows ordering keys. A key changes what a failure does: the key
+    /// pauses until `resumePublish`. Without this, `publish` refuses a
+    /// message with a key.
+    enable_message_ordering: bool = false,
     /// How long a message may take from `publish` to its result, retries
     /// included. Transient failures are retried until then; a batch still
     /// unsent then fails with `error.TimedOut`.
@@ -149,6 +165,10 @@ pub const WhenFull = enum {
 };
 
 pub const PublishOptions = struct {
+    /// Messages with the same key reach subscriptions that enable message
+    /// ordering in publish order. Needs `Options.enable_message_ordering`.
+    /// Up to 1,024 bytes of UTF-8; an empty key is no key.
+    ordering_key: ?[]const u8 = null,
     /// Filled when `publish` itself fails, such as for a message over a
     /// limit. Many tasks publish at once, so this is per call.
     diagnostics: ?*Diagnostics = null,
@@ -162,6 +182,10 @@ pub const Error = errors.Error || error{
     PublisherStopped,
     /// `when_full` is `.fail` and a cap is reached.
     PublisherFull,
+    /// An earlier message with this ordering key failed, or was refused
+    /// with `PublisherFull`, so the key is paused until `resumePublish`.
+    /// The diagnostics are those of that failure.
+    OrderingKeyPaused,
 };
 
 /// Counters since `init`. A consistent snapshot from `stats`.
@@ -284,12 +308,25 @@ const Batch = struct {
 /// The state batches of one ordering key share. Messages without a key
 /// share `Publisher.unkeyed`.
 const KeyState = struct {
+    /// Owned, and "" for messages without a key.
+    key: []const u8 = "",
     /// The batch taking this key's messages, if any.
     open: ?*Batch = null,
-    /// Requests in flight.
+    /// Requests in flight. An ordered key has at most one.
     in_flight: u32 = 0,
     /// Batches not yet resolved.
     batches: u32 = 0,
+    /// Why the key is paused, if it is. Only an ordered key pauses.
+    paused: ?Error = null,
+    pause_diag: Diagnostics = .{},
+
+    fn ordered(k: *const KeyState) bool {
+        return k.key.len > 0;
+    }
+
+    fn idle(k: *const KeyState) bool {
+        return k.batches == 0 and k.paused == null;
+    }
 };
 
 /// Checks the options and builds the clients. Sends nothing.
@@ -344,6 +381,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Publisher {
         .max_outstanding = options.max_outstanding,
         .max_outstanding_bytes = options.max_outstanding_bytes,
         .when_full = options.when_full,
+        .enable_message_ordering = options.enable_message_ordering,
         .retry = options.client.retry,
         .retry_publish = options.client.retry_publish,
         .request_timeout_ms = options.client.request_timeout_ms,
@@ -352,6 +390,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Publisher {
         .cond = .init,
         .timer_event = .unset,
         .unkeyed = .{},
+        .keys = .empty,
         .unresolved = .{},
         .waiting = .{},
         .due = .{},
@@ -391,6 +430,9 @@ fn optionsProblem(options: Options) ?[]const u8 {
 /// allocator must outlive them.
 pub fn deinit(self: *Publisher) void {
     self.abandon();
+    var records = self.keys.valueIterator();
+    while (records.next()) |record| self.freeKey(record.*);
+    self.keys.deinit(self.gpa);
     for (self.senders) |*client| client.deinit();
     self.gpa.free(self.senders);
     self.gpa.free(self.sender_diags);
@@ -404,35 +446,72 @@ pub fn deinit(self: *Publisher) void {
 pub fn publish(self: *Publisher, message: types.Message, options: PublishOptions) Error!Receipt {
     const diag = options.diagnostics;
     if (diag) |d| d.clear();
-    try validate.publish(&.{message}, null, diag);
+    const ordering_key = options.ordering_key orelse "";
+    if (ordering_key.len > 0 and !self.enable_message_ordering) {
+        if (diag) |d| d.print("this message has an ordering key: set Options.enable_message_ordering to publish it", .{});
+        return error.InvalidMessage;
+    }
+    try validate.publish(&.{message}, ordering_key, diag);
     // Encoded before taking the lock: base64 of a large message takes a
     // while, and the other tasks need not wait for it.
-    const encoded = try codec.encodeMessage(self.gpa, message, null);
+    const encoded = try codec.encodeMessage(self.gpa, message, ordering_key);
     defer self.gpa.free(encoded);
 
     const io = self.io;
     try self.mutex.lock(io);
     defer self.mutex.unlock(io);
-    const key = &self.unkeyed;
     while (true) {
         if (self.stopping) {
             if (diag) |d| d.print("the publisher is stopped and takes no more messages", .{});
             return error.PublisherStopped;
         }
-        if (self.hasRoom(key, encoded.len)) break;
+        // Looked up afresh after every wait: while this task waited, the
+        // key's record may have gone idle and been freed.
+        const key = try self.keyState(ordering_key);
+        if (key.paused != null) {
+            if (diag) |d| d.* = key.pause_diag;
+            return error.OrderingKeyPaused;
+        }
+        if (self.hasRoom(key, encoded.len)) {
+            return self.add(key, encoded) catch |err| {
+                self.dropIfIdle(key);
+                return err;
+            };
+        }
         switch (self.when_full) {
             .fail => {
-                if (diag) |d| d.print(
+                var full: Diagnostics = .{};
+                full.print(
                     "the publisher is full: {d} messages and {d} bytes are waiting to be sent, and its caps are {d} and {d}",
                     .{ self.outstanding, self.outstanding_bytes, self.max_outstanding, self.max_outstanding_bytes },
                 );
+                if (diag) |d| d.* = full;
+                // A refused message with a key pauses the key, or the key's
+                // next message could be stored while this one never was.
+                // What was queued before it still goes.
+                if (key.ordered()) self.pauseKey(key, error.PublisherFull, &full) else self.dropIfIdle(key);
                 return error.PublisherFull;
             },
-            // Every batch that resolves broadcasts, and so does stop().
-            .block => try self.cond.wait(io, &self.mutex),
+            .block => {
+                self.dropIfIdle(key);
+                // Every batch that resolves broadcasts, and so does stop().
+                try self.cond.wait(io, &self.mutex);
+            },
         }
     }
-    return self.add(key, encoded);
+}
+
+/// Lets `publish` take `ordering_key` again after a failure paused it. Safe
+/// from any task. What was queued behind the failure has failed already;
+/// messages published from now on go after anything with this key still in
+/// flight.
+pub fn resumePublish(self: *Publisher, ordering_key: []const u8) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    const key = self.keys.get(ordering_key) orelse return;
+    key.paused = null;
+    key.pause_diag = .{};
+    self.dropIfIdle(key);
 }
 
 /// Sends every batch now, without waiting out delays, and returns once
@@ -572,6 +651,61 @@ fn add(self: *Publisher, key: *KeyState, encoded: []const u8) Allocator.Error!Re
     return receipt;
 }
 
+/// The record for `ordering_key`, made if there is none. Messages without
+/// a key share `unkeyed`.
+fn keyState(self: *Publisher, ordering_key: []const u8) Allocator.Error!*KeyState {
+    if (ordering_key.len == 0) return &self.unkeyed;
+    const gpa = self.gpa;
+    const entry = try self.keys.getOrPut(gpa, ordering_key);
+    if (entry.found_existing) return entry.value_ptr.*;
+    errdefer self.keys.removeByPtr(entry.key_ptr);
+    const key = try gpa.create(KeyState);
+    errdefer gpa.destroy(key);
+    key.* = .{ .key = try gpa.dupe(u8, ordering_key) };
+    entry.key_ptr.* = key.key;
+    entry.value_ptr.* = key;
+    return key;
+}
+
+/// Frees an ordered key's record once nothing needs it: no batch
+/// unresolved, and no pause to remember.
+fn dropIfIdle(self: *Publisher, key: *KeyState) void {
+    if (!key.ordered() or !key.idle()) return;
+    std.debug.assert(key.open == null and key.in_flight == 0);
+    _ = self.keys.remove(key.key);
+    self.freeKey(key);
+}
+
+fn freeKey(self: *Publisher, key: *KeyState) void {
+    self.gpa.free(key.key);
+    self.gpa.destroy(key);
+}
+
+/// `publish` refuses the key from now until `resumePublish`. The first
+/// cause stands.
+fn pauseKey(self: *Publisher, key: *KeyState, cause: Error, diag: ?*const Diagnostics) void {
+    _ = self;
+    std.debug.assert(key.ordered());
+    if (key.paused != null) return;
+    key.paused = cause;
+    key.pause_diag = if (diag) |d| d.* else .{};
+    // Never the key itself: keys often carry user or account ids.
+    logging.warn("an ordering key paused after {t}; it takes messages again after resumePublish", .{cause});
+}
+
+/// Fails every batch of `key` not yet sent. One of its batches failed for
+/// good, and these were queued behind it: sending them would store later
+/// messages ahead of the ones that failed.
+fn failQueued(self: *Publisher, key: *KeyState) void {
+    var it = self.unresolved.first;
+    while (it) |node| {
+        it = node.next;
+        const batch = Batch.ofAllNode(node);
+        if (batch.key != key or batch.state == .sending) continue;
+        self.finish(batch, .{ .failed = error.OrderingKeyPaused }, &key.pause_diag);
+    }
+}
+
 /// Whether a message of `len` encoded bytes fits in the open batch `open`.
 fn joins(self: *const Publisher, open: *const Batch, len: usize) bool {
     return open.count < self.max_batch_messages and open.bytes + 1 + len <= self.max_batch_bytes;
@@ -676,13 +810,21 @@ fn insertDue(self: *Publisher, batch: *Batch) void {
 
 /// The due batch a sender should send next, taken off the list, or null.
 fn tryTake(self: *Publisher) ?*Batch {
-    const node = self.due.first orelse return null;
-    const batch: *Batch = Batch.ofQueueNode(node);
-    self.due.remove(node);
-    if (batch.key.open == batch) batch.key.open = null;
-    batch.state = .sending;
-    batch.key.in_flight += 1;
-    return batch;
+    var it = self.due.first;
+    while (it) |node| : (it = node.next) {
+        const batch: *Batch = Batch.ofQueueNode(node);
+        const key = batch.key;
+        // A key sends one batch at a time, so its messages are stored in
+        // the order they were published. Its batches are due in that order
+        // too, so the first one met here is its oldest.
+        if (key.ordered() and key.in_flight > 0) continue;
+        self.due.remove(node);
+        if (key.open == batch) key.open = null;
+        batch.state = .sending;
+        key.in_flight += 1;
+        return batch;
+    }
+    return null;
 }
 
 /// Records what became of a batch, wakes its receipts, and drops the
@@ -757,9 +899,11 @@ fn tick(self: *Publisher) ?std.Io.Timestamp {
     while (self.due.first) |node| {
         const batch: *Batch = Batch.ofQueueNode(node);
         if (batch.deadline.nanoseconds > now.nanoseconds) break;
+        const key = batch.key;
         var d: Diagnostics = .{};
         d.print("the batch was still unsent at its deadline, {d} ms after its first message", .{self.publish_timeout_ms});
         self.finish(batch, .{ .failed = error.TimedOut }, &d);
+        self.failedForGood(key, error.TimedOut, &d);
     }
 
     var next: ?std.Io.Timestamp = null;
@@ -816,7 +960,23 @@ fn sendAndResolve(self: *Publisher, index: usize, batch: *Batch) std.Io.Cancelab
 fn resolve(self: *Publisher, batch: *Batch, outcome: Outcome, diag: ?*const Diagnostics) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
+    const key = batch.key;
     self.finish(batch, outcome, diag);
+    switch (outcome) {
+        .sent => self.dropIfIdle(key),
+        .failed => |err| self.failedForGood(key, err, diag),
+    }
+}
+
+/// After one of `key`'s batches failed for good: an ordered key pauses, and
+/// what was queued behind the batch fails unsent. A batch stopped with the
+/// publisher pauses nothing; everything else is stopping too.
+fn failedForGood(self: *Publisher, key: *KeyState, cause: Error, diag: ?*const Diagnostics) void {
+    if (key.ordered() and cause != error.PublisherStopped) {
+        self.pauseKey(key, cause, diag);
+        self.failQueued(key);
+    }
+    self.dropIfIdle(key);
 }
 
 /// Sends one batch, retrying transient failures until its deadline. The
@@ -934,10 +1094,18 @@ const FakeTopic = struct {
     /// Held requests go once fewer than this many requests came before
     /// them: `release` lets them all go, `releaseThrough` the earliest.
     released_through: usize = 0,
+    /// Requests in flight per ordering key, and the most any key ever had.
+    key_in_flight: std.StringHashMapUnmanaged(u32) = .empty,
+    max_key_in_flight: u32 = 0,
 
     const Seen = struct {
         /// The messages' data, decoded.
         data: [][]u8,
+        /// The first message's ordering key, or "".
+        key: []u8,
+        /// The messages did not all share `key`. Production refuses such a
+        /// request with FAILED_PRECONDITION, and so does this fake.
+        mixed: bool,
         /// The body's size.
         bytes: usize,
         /// The request's own limit.
@@ -967,9 +1135,30 @@ const FakeTopic = struct {
         for (f.requests.items) |seen| {
             for (seen.data) |d| f.gpa.free(d);
             f.gpa.free(seen.data);
+            f.gpa.free(seen.key);
         }
         f.requests.deinit(f.gpa);
+        f.key_in_flight.deinit(f.gpa);
         f.* = undefined;
+    }
+
+    /// The data of every message with `key` that reached the fake, in the
+    /// order it arrived. Owned by the fake.
+    fn dataFor(f: *FakeTopic, key: []const u8, out: *std.ArrayList([]const u8)) !void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        for (f.requests.items) |seen| {
+            if (!std.mem.eql(u8, seen.key, key)) continue;
+            for (seen.data) |d| try out.append(testing.allocator, d);
+        }
+    }
+
+    /// Whether any request carried messages with more than one key.
+    fn anyMixed(f: *FakeTopic) bool {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        for (f.requests.items) |seen| if (seen.mixed) return true;
+        return false;
     }
 
     fn transport(f: *FakeTopic) Transport {
@@ -1010,7 +1199,10 @@ const FakeTopic = struct {
     }
 
     const Wire = struct {
-        messages: []const struct { data: ?[]const u8 = null } = &.{},
+        messages: []const struct {
+            data: ?[]const u8 = null,
+            orderingKey: ?[]const u8 = null,
+        } = &.{},
     };
 
     fn send(ptr: *anyopaque, req: Request, arena: Allocator) TransportError!Response {
@@ -1025,21 +1217,26 @@ const FakeTopic = struct {
                 else => error.HttpProtocolError,
             };
 
-        const index, const answer = a: {
+        const index, const answer, const key, const mixed = a: {
             f.mutex.lockUncancelable(io);
             defer f.mutex.unlock(io);
             try f.record(wire, body.len, req.timeout_ms);
+            const seen = f.requests.items[f.requests.items.len - 1];
+            try f.countKey(seen.key, 1);
             f.in_flight += 1;
             f.max_in_flight = @max(f.max_in_flight, f.in_flight);
             const answer: Answer = if (f.scripted < f.script.len) f.script[f.scripted] else .ok;
             f.scripted += 1;
-            break :a .{ f.requests.items.len - 1, answer };
+            break :a .{ f.requests.items.len - 1, answer, seen.key, seen.mixed };
         };
         defer {
             f.mutex.lockUncancelable(io);
             f.in_flight -= 1;
+            f.countKey(key, -1) catch unreachable; // the key's entry exists
             f.mutex.unlock(io);
         }
+        // What production answers, where the emulator takes the request.
+        if (mixed) return errorResponse(arena, 400, "FAILED_PRECONDITION");
 
         switch (answer) {
             .hold => {
@@ -1103,12 +1300,31 @@ const FakeTopic = struct {
             made += 1;
             decoder.decode(out.*, text) catch return error.HttpProtocolError;
         }
+        const first_key = if (wire.messages.len > 0) wire.messages[0].orderingKey orelse "" else "";
+        var mixed = false;
+        for (wire.messages) |m| {
+            if (!std.mem.eql(u8, m.orderingKey orelse "", first_key)) mixed = true;
+        }
+        const key = try f.gpa.dupe(u8, first_key);
+        errdefer f.gpa.free(key);
         try f.requests.append(f.gpa, .{
             .data = data,
+            .key = key,
+            .mixed = mixed,
             .bytes = bytes,
             .timeout_ms = timeout_ms,
             .at_ns = std.Io.Clock.awake.now(f.io).nanoseconds,
         });
+    }
+
+    /// Counts a keyed request in or out of flight, and keeps the most any
+    /// one key ever had in flight at once.
+    fn countKey(f: *FakeTopic, key: []const u8, delta: i32) TransportError!void {
+        if (key.len == 0) return;
+        const entry = try f.key_in_flight.getOrPut(f.gpa, key);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* = @intCast(@as(i64, entry.value_ptr.*) + delta);
+        f.max_key_in_flight = @max(f.max_key_in_flight, entry.value_ptr.*);
     }
 };
 
@@ -1122,6 +1338,7 @@ const TestOptions = struct {
     max_outstanding: u32 = 100_000,
     max_outstanding_bytes: u64 = 1 << 30,
     when_full: WhenFull = .block,
+    enable_message_ordering: bool = false,
     retry: RetryPolicy = .{ .initial_backoff_ms = 100, .max_backoff_ms = 1_000 },
     retry_publish: bool = true,
     request_timeout_ms: u32 = 180_000,
@@ -1146,6 +1363,7 @@ fn testOptions(transport: Transport, o: TestOptions) Options {
         .max_outstanding = o.max_outstanding,
         .max_outstanding_bytes = o.max_outstanding_bytes,
         .when_full = o.when_full,
+        .enable_message_ordering = o.enable_message_ordering,
     };
 }
 
@@ -1175,6 +1393,20 @@ const Solo = struct {
 
     fn publishText(s: *Solo, text: []const u8) !Receipt {
         return s.publisher.publish(.{ .data = text }, .{});
+    }
+
+    fn publishKeyed(s: *Solo, text: []const u8, key: []const u8) !Receipt {
+        return s.publisher.publish(.{ .data = text }, .{ .ordering_key = key });
+    }
+
+    /// The data the fake got with `key`, in arrival order, compared with
+    /// `want`.
+    fn expectKeyData(s: *Solo, key: []const u8, want: []const []const u8) !void {
+        var got: std.ArrayList([]const u8) = .empty;
+        defer got.deinit(testing.allocator);
+        try s.fake.dataFor(key, &got);
+        try testing.expectEqual(want.len, got.items.len);
+        for (want, got.items) |w, g| try testing.expectEqualStrings(w, g);
     }
 };
 
@@ -1698,6 +1930,223 @@ test "publish, send and resolve: every allocation failure is OutOfMemory without
     try testing.checkAllAllocationFailures(testing.allocator, Run.wholePath, .{});
 }
 
+test "keys: a key needs enable_message_ordering, an empty key is none, and a bad key is refused" {
+    var s: Solo = undefined;
+    try s.init(.{});
+    defer s.deinit();
+    var diag: Diagnostics = .{};
+    try testing.expectError(error.InvalidMessage, s.publisher.publish(.{ .data = "x" }, .{ .ordering_key = "user-42", .diagnostics = &diag }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "enable_message_ordering") != null);
+    const plain = try s.publishKeyed("x", "");
+    defer plain.release();
+
+    var o: Solo = undefined;
+    try o.init(.{ .enable_message_ordering = true });
+    defer o.deinit();
+    const long: [validate.max_ordering_key_bytes + 1]u8 = @splat('k');
+    try testing.expectError(error.InvalidMessage, o.publishKeyed("x", &long));
+    try testing.expectError(error.InvalidMessage, o.publishKeyed("x", "\xff"));
+    try testing.expectEqual(0, o.publisher.stats().published);
+    try testing.expectEqual(0, o.publisher.keys.count());
+}
+
+test "keys: no request mixes keys, each key's messages stay in publish order, and idle keys are forgotten" {
+    var s: Solo = undefined;
+    try s.init(.{ .enable_message_ordering = true });
+    defer s.deinit();
+    const plan = [_]struct { []const u8, []const u8 }{
+        .{ "a", "a1" }, .{ "b", "b1" }, .{ "a", "a2" },
+        .{ "", "n1" },  .{ "b", "b2" }, .{ "a", "a3" },
+    };
+    var receipts: [plan.len]Receipt = undefined;
+    var made: usize = 0;
+    defer for (receipts[0..made]) |r| r.release();
+    for (plan, &receipts) |p, *r| {
+        r.* = try s.publishKeyed(p[1], p[0]);
+        made += 1;
+    }
+    try testing.expectEqual(2, s.publisher.keys.count());
+    s.advance(10);
+    try s.publisher.sendDue();
+    for (receipts) |r| _ = try idOf(r);
+    try testing.expect(!s.fake.anyMixed());
+    try testing.expectEqual(3, s.fake.requestCount());
+    try s.expectKeyData("a", &.{ "a1", "a2", "a3" });
+    try s.expectKeyData("b", &.{ "b1", "b2" });
+    try s.expectKeyData("", &.{"n1"});
+    try testing.expectEqual(0, s.publisher.keys.count());
+}
+
+test "keys: a key has one batch in flight, and neither other keys nor unkeyed batches wait on it" {
+    var s: Solo = undefined;
+    try s.init(.{ .enable_message_ordering = true, .max_batch_messages = 1 });
+    defer s.deinit();
+    // Each message fills a batch of its own, due at once.
+    const a1 = try s.publishKeyed("a1", "a");
+    defer a1.release();
+    const a2 = try s.publishKeyed("a2", "a");
+    defer a2.release();
+    const b1 = try s.publishKeyed("b1", "b");
+    defer b1.release();
+    const n1 = try s.publishKeyed("n1", "");
+    defer n1.release();
+
+    const p = &s.publisher;
+    p.mutex.lockUncancelable(p.io);
+    const first = p.tryTake().?;
+    const second = p.tryTake().?;
+    const third = p.tryTake().?;
+    const none = p.tryTake();
+    p.mutex.unlock(p.io);
+    try testing.expectEqual(a1.batch, first);
+    // a2 waits behind a1; b1 and the unkeyed batch do not.
+    try testing.expectEqual(b1.batch, second);
+    try testing.expectEqual(n1.batch, third);
+    try testing.expectEqual(null, none);
+
+    try p.sendAndResolve(0, first);
+    p.mutex.lockUncancelable(p.io);
+    const next = p.tryTake();
+    p.mutex.unlock(p.io);
+    try testing.expectEqual(a2.batch, next.?);
+    try p.sendAndResolve(0, next.?);
+    try p.sendAndResolve(0, second);
+    try p.sendAndResolve(0, third);
+    try s.expectKeyData("a", &.{ "a1", "a2" });
+}
+
+test "pause: a failed batch fails what is queued behind it, and the key waits for resumePublish" {
+    var s: Solo = undefined;
+    try s.init(.{ .enable_message_ordering = true, .max_batch_messages = 1 });
+    defer s.deinit();
+    s.fake.script = &.{.{ .status = .{ 404, "NOT_FOUND" } }};
+    logging.capture.reset();
+    const a1 = try s.publishKeyed("a1", "user-42");
+    defer a1.release();
+    const a2 = try s.publishKeyed("a2", "user-42");
+    defer a2.release();
+    const a3 = try s.publishKeyed("a3", "user-42");
+    defer a3.release();
+    const b1 = try s.publishKeyed("b1", "user-7");
+    defer b1.release();
+    try s.publisher.sendDue();
+
+    try testing.expectError(error.NotFound, idOf(a1));
+    // Never sent, and each says why.
+    try testing.expectError(error.OrderingKeyPaused, idOf(a2));
+    try testing.expectError(error.OrderingKeyPaused, idOf(a3));
+    try testing.expectEqualStrings("NOT_FOUND", a3.diagnostics().status());
+    // The first id: the failed request stored nothing.
+    try testing.expectEqualStrings("1", try idOf(b1));
+    try testing.expectEqual(2, s.fake.requestCount());
+
+    var diag: Diagnostics = .{};
+    try testing.expectError(error.OrderingKeyPaused, s.publisher.publish(.{ .data = "a4" }, .{ .ordering_key = "user-42", .diagnostics = &diag }));
+    try testing.expectEqualStrings("NOT_FOUND", diag.status());
+    // The other key carries on.
+    const b2 = try s.publishKeyed("b2", "user-7");
+    defer b2.release();
+    s.advance(10);
+    try s.publisher.sendDue();
+    _ = try idOf(b2);
+
+    s.publisher.resumePublish("user-42");
+    const a5 = try s.publishKeyed("a5", "user-42");
+    defer a5.release();
+    try s.publisher.sendDue();
+    _ = try idOf(a5);
+    try s.expectKeyData("user-42", &.{ "a1", "a5" });
+    try testing.expectEqual(0, s.publisher.keys.count());
+    // The pause is logged, but never the key.
+    const log = logging.capture.text();
+    try testing.expect(std.mem.indexOf(u8, log, "an ordering key paused after NotFound") != null);
+    try testing.expect(std.mem.indexOf(u8, log, "user-42") == null);
+}
+
+test "pause: a keyed batch still unsent at its deadline pauses its key" {
+    var s: Solo = undefined;
+    try s.init(.{ .enable_message_ordering = true, .max_batch_messages = 1, .publish_timeout_ms = 1_000 });
+    defer s.deinit();
+    const a1 = try s.publishKeyed("a1", "a");
+    defer a1.release();
+    const a2 = try s.publishKeyed("a2", "a");
+    defer a2.release();
+    const p = &s.publisher;
+    // a1 is taken, as if in flight, and a2 waits behind it past its
+    // deadline.
+    p.mutex.lockUncancelable(p.io);
+    const taken = p.tryTake().?;
+    p.mutex.unlock(p.io);
+    s.advance(1_000);
+    try testing.expectError(error.TimedOut, idOf(a2));
+    try testing.expectError(error.OrderingKeyPaused, s.publishKeyed("a3", "a"));
+    // The batch in flight still resolves: out of time, it is never sent.
+    try p.sendAndResolve(0, taken);
+    try testing.expectError(error.TimedOut, idOf(a1));
+    try testing.expectEqual(0, s.fake.requestCount());
+}
+
+test "pause: a keyed message refused as full pauses its key, and what came before it still goes" {
+    var s: Solo = undefined;
+    try s.init(.{
+        .enable_message_ordering = true,
+        .max_batch_messages = 2,
+        .max_outstanding = 2,
+        .when_full = .fail,
+    });
+    defer s.deinit();
+    const a1 = try s.publishKeyed("a1", "a");
+    defer a1.release();
+    const a2 = try s.publishKeyed("a2", "a");
+    defer a2.release();
+    try testing.expectError(error.PublisherFull, s.publishKeyed("a3", "a"));
+    try testing.expectError(error.OrderingKeyPaused, s.publishKeyed("a4", "a"));
+    // Refusing a message without a key pauses nothing.
+    try testing.expectError(error.PublisherFull, s.publishText("n1"));
+
+    try s.publisher.sendDue();
+    _ = try idOf(a1);
+    _ = try idOf(a2);
+    const n2 = try s.publishText("n2");
+    defer n2.release();
+    // Room again, but the key waits for resumePublish.
+    try testing.expectError(error.OrderingKeyPaused, s.publishKeyed("a5", "a"));
+    s.publisher.resumePublish("a");
+    const a6 = try s.publishKeyed("a6", "a");
+    defer a6.release();
+}
+
+test "keys: every allocation failure on a keyed path is OutOfMemory without leaks" {
+    const Run = struct {
+        fn keyedPath(gpa: Allocator) !void {
+            var clock: test_util.FakeClock = .{};
+            var fake: FakeTopic = .{ .gpa = testing.allocator, .io = clock.io() };
+            defer fake.deinit();
+            fake.script = &.{.{ .status = .{ 404, "NOT_FOUND" } }};
+            var publisher: Publisher = try .init(gpa, clock.io(), testOptions(fake.transport(), .{
+                .enable_message_ordering = true,
+                .max_batch_messages = 1,
+            }));
+            defer publisher.deinit();
+            const plan = [_]struct { []const u8, []const u8 }{
+                .{ "k1", "one" }, .{ "k1", "two" }, .{ "k2", "three" }, .{ "", "four" },
+            };
+            var receipts: [plan.len]?Receipt = @splat(null);
+            defer for (receipts) |r| if (r) |receipt| receipt.release();
+            for (plan, &receipts) |p, *r| r.* = try publisher.publish(.{ .data = p[1] }, .{ .ordering_key = p[0] });
+            publisher.stop();
+            try publisher.sendDue();
+            for (receipts) |r| _ = r.?.wait() catch |err| switch (err) {
+                // The scripted failure, and the pause it causes.
+                error.NotFound, error.OrderingKeyPaused => {},
+                else => return err,
+            };
+            publisher.resumePublish("k1");
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.keyedPath, .{});
+}
+
 /// A publisher running for real, with its own tasks, against the fake.
 /// Every wait it does is bounded: a stuck publisher panics, naming the test,
 /// where it would otherwise hang the suite silently until CI gives up.
@@ -2073,4 +2522,41 @@ test "flush: waits for what was published before it, and nothing after" {
     l.fake.release();
     try testing.expectEqualStrings("2", try waitBounded(late));
     try l.finish();
+}
+
+test "keys: each key's messages arrive in publish order, never two requests of a key in flight" {
+    var l: Live = undefined;
+    try l.init(.{ .concurrency = 4, .max_batch_messages = 3, .max_batch_delay_ms = 1, .enable_message_ordering = true });
+    defer l.deinit();
+    try l.start();
+    // One task publishes round-robin across three keys, so their batches
+    // interleave, and four senders compete for them.
+    const keys = [_][]const u8{ "alpha", "beta", "gamma" };
+    const per_key = 30;
+    var receipts: [keys.len * per_key]Receipt = undefined;
+    var made: usize = 0;
+    defer for (receipts[0..made]) |r| r.release();
+    for (0..per_key) |i| for (keys) |key| {
+        var buf: [16]u8 = undefined;
+        receipts[made] = try l.publisher.publish(
+            .{ .data = try std.fmt.bufPrint(&buf, "{s}-{d:0>2}", .{ key, i }) },
+            .{ .ordering_key = key },
+        );
+        made += 1;
+    };
+    for (receipts) |r| _ = try waitBounded(r);
+    try l.finish();
+
+    try testing.expect(l.fake.max_key_in_flight == 1);
+    try testing.expect(!l.fake.anyMixed());
+    for (keys) |key| {
+        var got: std.ArrayList([]const u8) = .empty;
+        defer got.deinit(testing.allocator);
+        try l.fake.dataFor(key, &got);
+        try testing.expectEqual(per_key, got.items.len);
+        for (got.items, 0..) |data, i| {
+            var want: [16]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{s}-{d:0>2}", .{ key, i }), data);
+        }
+    }
 }
