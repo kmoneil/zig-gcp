@@ -177,8 +177,13 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             // Never send credentials to an endpoint that speaks plain HTTP.
             if (self.unauthenticated) return null;
             const provider = self.token_provider orelse return null;
+            // A provider given these same diagnostics explains its own
+            // failures better than this loop can, such as which role an
+            // impersonation lacks. Start clean, so that if it fails, what
+            // is left is what it said about this attempt.
+            if (self.diagnostics) |d| d.clear();
             const token = provider.getToken(self.io, scratch, &.{self.auth_scope}) catch |err| {
-                if (self.diagnostics) |d| d.print("the token provider failed: {t}", .{err});
+                if (self.diagnostics) |d| if (d.message().len == 0) d.print("the token provider failed: {t}", .{err});
                 return err;
             };
             if (!TokenProvider.isValidToken(token)) {
@@ -420,6 +425,43 @@ test "credentials: a token that cannot go in a header fails before sending" {
     try testing.expectError(error.TokenUnavailable, h.get());
     try testing.expectEqual(0, h.fake.requests.items.len);
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "newlines") != null);
+}
+
+test "credentials: a provider's own explanation survives in shared diagnostics" {
+    const Explaining = struct {
+        diag: *Diagnostics,
+
+        fn provider(self: *@This()) TokenProvider {
+            return .{ .ptr = self, .vtable = &.{
+                .getToken = getTokenFn,
+                .invalidate = invalidateFn,
+                .quotaProject = quotaProjectFn,
+            } };
+        }
+        fn getTokenFn(ptr: *anyopaque, io: std.Io, arena: Allocator, scopes: []const []const u8) TokenProvider.Error![]const u8 {
+            _ = io;
+            _ = arena;
+            _ = scopes;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.diag.set(403, "PERMISSION_DENIED", "impersonation was refused: grant the role");
+            return error.TokenEndpointRejected;
+        }
+        fn invalidateFn(_: *anyopaque) void {}
+        fn quotaProjectFn(_: *anyopaque) ?[]const u8 {
+            return null;
+        }
+    };
+    var h: Harness = undefined;
+    h.init(&.{ok});
+    defer h.deinit();
+    // What an application does: one Diagnostics, given to the credentials
+    // and to the client alike.
+    var explaining: Explaining = .{ .diag = &h.diag };
+    var e = h.engine();
+    e.token_provider = explaining.provider();
+    try testing.expectError(error.TokenEndpointRejected, e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things" }));
+    try testing.expectEqualStrings("impersonation was refused: grant the role", h.diag.message());
+    try testing.expectEqual(403, h.diag.http_status);
 }
 
 test "credentials: the provider's own failure is returned, not retried" {
