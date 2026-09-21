@@ -143,15 +143,27 @@ jobs:
           name: coverage
           path: zig-out/coverage
 
-  # One job per module, so each gets the whole time budget: `--fuzz=N`
-  # fuzzes every property N times, and the properties of all the modules
-  # together outgrew a single job's 180 minutes.
+  # One job per module, so each gets its own 180 minutes: `--fuzz=N` runs
+  # every property N times, and they outgrew a single job. The counts come
+  # from per-property costs measured on 2026-09-21. core, pubsub and
+  # secret_manager take well under a millisecond a run. auth's properties
+  # build providers and parse keys, about 10 ms for a pass over all of
+  # them, and the one that signs a JWT with RSA on every run takes 49 ms on
+  # its own. That one is named "slow property" rather than "fuzz", so the
+  # auth job skips it, and it gets a job of its own at a count it can
+  # finish. A manual run's fuzz_iterations overrides every count.
   fuzz:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.fuzz_iterations != '')
+    name: fuzz (${{ matrix.job }})
     strategy:
       fail-fast: false
       matrix:
-        module: [core, auth, pubsub, secret_manager]
+        include:
+          - { job: core, module: core, filter: fuzz, iterations: 2M }
+          - { job: auth, module: auth, filter: fuzz, iterations: 500K }
+          - { job: slow-auth, module: auth, filter: slow property, iterations: 100K }
+          - { job: pubsub, module: pubsub, filter: fuzz, iterations: 2M }
+          - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -166,24 +178,25 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache/f
-          key: fuzz-corpus-${{ matrix.module }}-${{ github.run_id }}
-          restore-keys: fuzz-corpus-${{ matrix.module }}-
+          key: fuzz-corpus-${{ matrix.job }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.job }}-
 
       - name: Coverage-guided fuzzing
         env:
-          ITERATIONS: ${{ inputs.fuzz_iterations || '2M' }}
+          ITERATIONS: ${{ inputs.fuzz_iterations || matrix.iterations }}
           MODULE: ${{ matrix.module }}
+          FILTER: ${{ matrix.filter }}
         run: |
           # A failing input saved by an earlier run is not this run's.
           rm -f .zig-cache/f/crash
-          zig build test -Dfuzz-runner "-Dmodule=$MODULE" -Dtest-filter=fuzz "--fuzz=$ITERATIONS"
+          zig build test -Dfuzz-runner "-Dmodule=$MODULE" "-Dtest-filter=$FILTER" "--fuzz=$ITERATIONS"
 
       - name: Save the fuzz corpus
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache/f
-          key: fuzz-corpus-${{ matrix.module }}-${{ github.run_id }}
+          key: fuzz-corpus-${{ matrix.job }}-${{ github.run_id }}
 
       # `crash` is the failing input: a 4-byte little-endian length, then the
       # bytes. CONTRIBUTING.md says how to turn it into a regression test.
@@ -191,7 +204,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fuzz-failure-${{ matrix.module }}
+          name: fuzz-failure-${{ matrix.job }}
           path: |
             .zig-cache/f/crash
             .zig-cache/tmp/libfuzzer.log

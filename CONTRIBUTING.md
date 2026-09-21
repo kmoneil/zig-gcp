@@ -79,9 +79,15 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
 - A bug fix comes with a test that fails without it. When the fuzzer finds
   a failing input, add that input to the property's corpus. The fuzzer
   saves it as `.zig-cache/f/crash`, and the nightly CI run attaches it as
-  the `fuzz-failure-<module>` artifact: a 4-byte little-endian length, then
-  the input. `zig build test -Dfuzz-runner -Dmodule=<module> --fuzz` fuzzes
-  one module the way that job does.
+  the `fuzz-failure-<job>` artifact: a 4-byte little-endian length, then
+  the input. `zig build test -Dfuzz-runner -Dmodule=<module>
+  -Dtest-filter=fuzz --fuzz` fuzzes one module the way its job does.
+- Name a property test `fuzz <what>: <what it holds>`, and the nightly job
+  fuzzes it. A property that costs more than a few milliseconds a run,
+  such as one that signs with RSA every time, is named `slow property
+  <what>: …` instead, so the module's job skips it; add it to the
+  `slow-<module>` job in `.github/workflows/ci.yml`, at a count that fits
+  in the job's 180 minutes. `zig build test` runs both kinds alike.
 - User-visible changes go in `CHANGELOG.md`. Until 1.0, minor versions may
   break the API; say how in the changelog entry.
 - Follow the existing code: `zig fmt`, doc comments on public declarations,
