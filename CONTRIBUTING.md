@@ -70,13 +70,14 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   `platforms (windows-latest)` and `coverage`. Renaming one of those jobs,
   or changing a matrix value that appears in its name, leaves every pull
   request waiting for a check that will never report; change the rule for
-  `main` in the same breath. The nightly `fuzz` job is not required,
-  because it does not run on pull requests.
+  `main` in the same breath. The nightly `fuzz` jobs, one per module, are
+  not required, because they do not run on pull requests.
 - A bug fix comes with a test that fails without it. When the fuzzer finds
   a failing input, add that input to the property's corpus. The fuzzer
   saves it as `.zig-cache/f/crash`, and the nightly CI run attaches it as
-  the `fuzz-failure` artifact: a 4-byte little-endian length, then the
-  input.
+  the `fuzz-failure-<module>` artifact: a 4-byte little-endian length, then
+  the input. `zig build test -Dfuzz-runner -Dmodule=<module> --fuzz` fuzzes
+  one module the way that job does.
 - User-visible changes go in `CHANGELOG.md`. Until 1.0, minor versions may
   break the API; say how in the changelog entry.
 - Follow the existing code: `zig fmt`, doc comments on public declarations,
