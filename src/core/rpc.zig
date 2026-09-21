@@ -37,6 +37,10 @@ pub const Call = struct {
     body: ?[]const u8 = null,
     /// False where the caller opted out of retries, as a publish does.
     retry: bool = true,
+    /// Whether a failed attempt is worth another. `http_status` is the
+    /// response's status, or 0 when the attempt got no response. The
+    /// default is `isRetryable`; a call can widen it, as a publish does.
+    retryable: *const fn (err: anyerror, http_status: u16) bool = retryableByDefault,
     /// This call carries secrets. What the loop allocates for it, the URL
     /// and the bearer token, is wiped when the call returns, and a failed
     /// attempt's response memory is freed at once rather than kept for the
@@ -105,7 +109,9 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                 }, response.allocator());
                 const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
 
+                var http_status: u16 = 0;
                 const err: Error = if (outcome) |res| e: {
+                    http_status = res.status;
                     log.debug("{t} {s} -> {d} in {d} ms (attempt {d} of {d})", .{
                         call.method, log_path, res.status, elapsed_ms, attempt, max_attempts,
                     });
@@ -134,7 +140,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                     continue;
                 }
 
-                if (attempt >= max_attempts or !isRetryable(err)) return err;
+                if (attempt >= max_attempts or !call.retryable(err, http_status)) return err;
                 const delay_ms = self.retry.backoffMs(attempt, entropy(self.io));
                 log.warn("{t} {s} failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
@@ -221,6 +227,11 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             return true;
         }
     };
+}
+
+fn retryableByDefault(err: anyerror, http_status: u16) bool {
+    _ = http_status;
+    return isRetryable(err);
 }
 
 /// Randomness for a jittered backoff. Public so a module that retries a call
@@ -351,6 +362,37 @@ test "retry: a non-retryable status returns at once, and an opted-out call never
     try testing.expectError(error.Unavailable, e.execute(&h.arena, .{ .method = .POST, .path = "/v1/things", .retry = false }));
     try testing.expectEqual(2, h.fake.requests.items.len);
     try testing.expectEqual(0, h.clock.sleep_count);
+}
+
+test "retry: a call can widen what is retried, and sees the HTTP status it decides on" {
+    const Widened = struct {
+        var seen: [4]u16 = undefined;
+        var calls: usize = 0;
+
+        fn retryable(err: anyerror, http_status: u16) bool {
+            seen[calls] = http_status;
+            calls += 1;
+            return err == error.Aborted or isRetryable(err);
+        }
+    };
+    var h: Harness = undefined;
+    h.init(&.{
+        .{ .respond = .{ .status = 409, .body = "{\"error\":{\"status\":\"ABORTED\"}}" } },
+        .{ .fail = error.ConnectionResetByPeer },
+        ok,
+        .{ .respond = .{ .status = 409, .body = "{\"error\":{\"status\":\"ABORTED\"}}" } },
+    });
+    defer h.deinit();
+    const e = h.engine();
+    Widened.calls = 0;
+    _ = try e.execute(&h.arena, .{ .method = .POST, .path = "/v1/things", .retryable = Widened.retryable });
+    try testing.expectEqual(3, h.fake.requests.items.len);
+    // A response's status, and 0 for an attempt that got none.
+    try testing.expectEqualSlices(u16, &.{ 409, 0 }, Widened.seen[0..Widened.calls]);
+
+    // The default leaves ABORTED alone.
+    try testing.expectError(error.Aborted, h.get());
+    try testing.expectEqual(4, h.fake.requests.items.len);
 }
 
 test "a body that is not the standard error shape maps by HTTP status and keeps its text" {
