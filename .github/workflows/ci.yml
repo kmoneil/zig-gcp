@@ -138,8 +138,15 @@ jobs:
           name: coverage
           path: zig-out/coverage
 
+  # One job per module, so each gets the whole time budget: `--fuzz=N`
+  # fuzzes every property N times, and the properties of all the modules
+  # together outgrew a single job's 180 minutes.
   fuzz:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.fuzz_iterations != '')
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [core, auth, pubsub, secret_manager]
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -154,23 +161,24 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache/f
-          key: fuzz-corpus-${{ github.run_id }}
-          restore-keys: fuzz-corpus-
+          key: fuzz-corpus-${{ matrix.module }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.module }}-
 
       - name: Coverage-guided fuzzing
         env:
           ITERATIONS: ${{ inputs.fuzz_iterations || '2M' }}
+          MODULE: ${{ matrix.module }}
         run: |
           # A failing input saved by an earlier run is not this run's.
           rm -f .zig-cache/f/crash
-          zig build test -Dfuzz-runner -Dtest-filter=fuzz "--fuzz=$ITERATIONS"
+          zig build test -Dfuzz-runner "-Dmodule=$MODULE" -Dtest-filter=fuzz "--fuzz=$ITERATIONS"
 
       - name: Save the fuzz corpus
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache/f
-          key: fuzz-corpus-${{ github.run_id }}
+          key: fuzz-corpus-${{ matrix.module }}-${{ github.run_id }}
 
       # `crash` is the failing input: a 4-byte little-endian length, then the
       # bytes. CONTRIBUTING.md says how to turn it into a regression test.
@@ -178,7 +186,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fuzz-failure
+          name: fuzz-failure-${{ matrix.module }}
           path: |
             .zig-cache/f/crash
             .zig-cache/tmp/libfuzzer.log

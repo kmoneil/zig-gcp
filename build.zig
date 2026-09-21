@@ -58,8 +58,22 @@ pub fn build(b: *std.Build) void {
         .{ "pubsub", mod },
         .{ "secret_manager", secret_manager },
     };
+    // The nightly fuzz job runs one module per job, so each gets the whole
+    // time budget: `--fuzz=N` fuzzes every property N times, and the
+    // properties of all the modules together outgrew one job.
+    const only_module = b.option(
+        []const u8,
+        "module",
+        "Run only this module's unit tests: core, auth, pubsub or secret_manager",
+    );
+    if (only_module) |name| {
+        for (unit_modules) |entry| {
+            if (std.mem.eql(u8, entry[0], name)) break;
+        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub or secret_manager", .{name});
+    }
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     for (unit_modules) |entry| {
+        if (only_module) |name| if (!std.mem.eql(u8, entry[0], name)) continue;
         const unit_tests = b.addTest(.{
             .name = entry[0],
             .root_module = entry[1],

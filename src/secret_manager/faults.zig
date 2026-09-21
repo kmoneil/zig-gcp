@@ -209,14 +209,15 @@ fn accessProperty(_: void, input: []const u8) !void {
     }
 
     // Memory-scanned: the same run on a buffer the test can read afterwards.
-    var backing: [512 * 1024]u8 = @splat(0);
+    // A call needs under 5 KiB of it at its peak, measured over the corpus
+    // and a few hundred random inputs. The nightly job runs this property
+    // millions of times, so the buffer is sized to that, not to be lavish:
+    // it is zeroed and scanned on every run.
+    var backing: [32 * 1024]u8 = @splat(0);
     var fba: std.heap.FixedBufferAllocator = .init(&backing);
-    const again = runAccess(fba.allocator(), faults[0..count], mode) catch |err| switch (err) {
-        // The buffer is generous; if it ever runs out, the scan below would
-        // be meaningless.
-        error.OutOfMemory => return,
-        else => return err,
-    };
+    // Running out would mean a call grew to six times its size, which is
+    // worth a failure rather than a scan quietly skipped.
+    const again = try runAccess(fba.allocator(), faults[0..count], mode);
     try testing.expectEqual(outcome.err != null, again.err != null);
     // Whatever happened, nothing of the secret is left: not the bytes, not
     // the base64 they travelled in, not the token they were asked for with.
