@@ -949,3 +949,165 @@ test "the subscriber's loop survives a run of misdeliveries" {
     const counts = subscriber.stats();
     try testing.expectEqual(counts.received, counts.acked + counts.nacked);
 }
+
+// Publisher: the same faults, met by a publisher's senders.
+
+const Publisher = pubsub.Publisher;
+
+const PublisherKnobs = struct {
+    retry_publish: bool = true,
+    request_timeout_ms: u32 = 30_000,
+    enable_message_ordering: bool = false,
+    max_batch_messages: u16 = 100,
+};
+
+/// A publisher whose every request crosses the proxy, running on a task of
+/// its own until `finish`. It holds connections to the proxy, so it must
+/// be gone before the fixture stops the proxy: declare it after.
+const LivePublisher = struct {
+    publisher: Publisher,
+    running: ?std.Io.Future(Publisher.Error!void) = null,
+
+    fn start(l: *LivePublisher, f: *Fixture, topic_id: []const u8, knobs: PublisherKnobs) !void {
+        var host: [24]u8 = undefined;
+        l.* = .{
+            .publisher = try .init(testing.allocator, testing.io, .{
+                .topic_id = topic_id,
+                .client = .{
+                    .project_id = f.direct.project_id,
+                    .endpoint = .{ .url = try std.fmt.bufPrint(&host, "127.0.0.1:{d}", .{f.proxy.port}), .emulator = true },
+                    // Fast backoff: these tests provoke retries on purpose.
+                    .retry = .{ .initial_backoff_ms = 10, .max_backoff_ms = 100 },
+                    .retry_publish = knobs.retry_publish,
+                    .request_timeout_ms = knobs.request_timeout_ms,
+                    .user_agent = "zig-pubsub-faults/0.1",
+                },
+                .concurrency = 1,
+                .max_batch_messages = knobs.max_batch_messages,
+                .max_batch_delay_ms = 1,
+                .enable_message_ordering = knobs.enable_message_ordering,
+            }),
+        };
+        errdefer l.publisher.deinit();
+        l.running = try testing.io.concurrent(Publisher.run, .{&l.publisher});
+    }
+
+    fn finish(l: *LivePublisher) Publisher.Error!void {
+        l.publisher.stop();
+        var running = l.running orelse return;
+        l.running = null;
+        return running.await(testing.io);
+    }
+
+    fn deinit(l: *LivePublisher) void {
+        if (l.running != null) l.finish() catch {};
+        l.publisher.deinit();
+    }
+};
+
+/// `receipt.wait()`, failing rather than hanging after `timeout_s`.
+fn waitReceipt(receipt: Publisher.Receipt, timeout_s: i64) ![]const u8 {
+    const deadline = nowMs() + timeout_s * 1000;
+    while (!receipt.batch.resolved.isSet()) {
+        if (nowMs() > deadline) return error.TestTimedOut;
+        try testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return receipt.wait();
+}
+
+test "publisher: a swallowed response is retried and stored twice, and the receipt succeeds" {
+    var f: Fixture = undefined;
+    if (!try f.init(&.{ .swallow_response, .pass }, .{})) return error.SkipZigTest;
+    defer f.deinit();
+    try f.startProxy();
+    const topic = try f.directTopic("pdup");
+    const sub = try f.directSubscription("pdup-sub", .{ .topic_id = topic.id });
+
+    var live: LivePublisher = undefined;
+    try live.start(&f, topic.id, .{});
+    defer live.deinit();
+    const receipt = try live.publisher.publish(.{ .data = "at-least-once, from a publisher" }, .{});
+    defer receipt.release();
+    _ = try waitReceipt(receipt, 30);
+    try live.finish();
+    try testing.expectEqual(2, f.proxy.forwarded);
+    const got = try f.pullData(sub, 2, 30);
+    try testing.expectEqual(2, got.len);
+}
+
+test "publisher: with retry_publish off, a swallowed response fails the receipt, and the message is stored once" {
+    var f: Fixture = undefined;
+    if (!try f.init(&.{.swallow_response}, .{})) return error.SkipZigTest;
+    defer f.deinit();
+    try f.startProxy();
+    const topic = try f.directTopic("ponce");
+    const sub = try f.directSubscription("ponce-sub", .{ .topic_id = topic.id });
+
+    var live: LivePublisher = undefined;
+    try live.start(&f, topic.id, .{ .retry_publish = false });
+    defer live.deinit();
+    const receipt = try live.publisher.publish(.{ .data = "stored anyway" }, .{});
+    defer receipt.release();
+    try testing.expectError(error.ConnectionResetByPeer, waitReceipt(receipt, 30));
+    try live.finish();
+    try testing.expectEqual(1, f.proxy.forwarded);
+    const got = try f.pullData(sub, 1, 30);
+    try testing.expectEqual(1, got.len);
+    try f.expectNoMessages(sub);
+}
+
+test "publisher: a stalled response is cut at the request limit and retried" {
+    var f: Fixture = undefined;
+    if (!try f.init(&.{ .{ .stall_after = 20 }, .pass }, .{})) return error.SkipZigTest;
+    defer f.deinit();
+    try f.startProxy();
+    const topic = try f.directTopic("pstall");
+
+    var live: LivePublisher = undefined;
+    try live.start(&f, topic.id, .{ .request_timeout_ms = 1000 });
+    defer live.deinit();
+    const started = nowMs();
+    const receipt = try live.publisher.publish(.{ .data = "patient" }, .{});
+    defer receipt.release();
+    _ = try waitReceipt(receipt, 30);
+    const elapsed = nowMs() - started;
+    try live.finish();
+    try testing.expectEqual(2, f.proxy.requests);
+    try testing.expect(elapsed >= 900);
+    try testing.expect(elapsed < 25_000);
+}
+
+test "publisher: a key paused by a lost connection resumes, and its order holds after" {
+    var f: Fixture = undefined;
+    if (!try f.init(&.{.close_before_response}, .{})) return error.SkipZigTest;
+    defer f.deinit();
+    try f.startProxy();
+    const topic = try f.directTopic("ppause");
+    const sub = try f.directSubscription("ppause-sub", .{ .topic_id = topic.id, .enable_message_ordering = true });
+
+    var live: LivePublisher = undefined;
+    try live.start(&f, topic.id, .{ .retry_publish = false, .enable_message_ordering = true, .max_batch_messages = 1 });
+    defer live.deinit();
+    const key: Publisher.PublishOptions = .{ .ordering_key = "user-1" };
+    const lost = try live.publisher.publish(.{ .data = "lost" }, key);
+    defer lost.release();
+    try testing.expectError(error.ConnectionResetByPeer, waitReceipt(lost, 30));
+    // Paused: a later message must not overtake the lost one.
+    try testing.expectError(error.OrderingKeyPaused, live.publisher.publish(.{ .data = "refused" }, key));
+
+    live.publisher.resumePublish("user-1");
+    const first = try live.publisher.publish(.{ .data = "first after" }, key);
+    defer first.release();
+    const second = try live.publisher.publish(.{ .data = "second after" }, key);
+    defer second.release();
+    _ = try waitReceipt(first, 30);
+    _ = try waitReceipt(second, 30);
+    try live.finish();
+
+    // The lost message never reached the server; the rest arrive in order.
+    const got = try f.pullData(sub, 2, 30);
+    try testing.expectEqual(2, got.len);
+    try testing.expectEqualStrings("first after", got[0]);
+    try testing.expectEqualStrings("second after", got[1]);
+    try f.expectNoMessages(sub);
+}
