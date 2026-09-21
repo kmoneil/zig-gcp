@@ -401,3 +401,88 @@ test "a range on an empty object is zero bytes, not an error" {
     const result = try f.bucket().object("empty.bin").download(&out, .{ .range = .{ .offset = 0 } });
     try testing.expectEqual(0, result.bytes_written);
 }
+
+/// A client with the smallest legal chunks, so a modest object forces many
+/// of them.
+fn smallChunkClient(f: *Fixture, diag: *storage.Diagnostics) !storage.Client {
+    return .init(testing.allocator, testing.io, .{
+        .project_id = f.env.get("STORAGE_PROJECT_ID") orelse "test",
+        .endpoint = storage.Endpoint.fromEnv(&f.env),
+        .diagnostics = diag,
+        .chunk_size = 256 * 1024,
+        .single_request_limit = 1024,
+        .user_agent = "zig-gcp-storage-integration/0.1",
+    });
+}
+
+test "resumable: uploadFrom in many chunks, sized, unsized, and on the boundary" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+
+    var diag: storage.Diagnostics = .{};
+    var client = try smallChunkClient(&f, &diag);
+    defer client.deinit();
+    const bucket = client.bucket(&f.bucket_name);
+
+    const gpa = testing.allocator;
+    const big = try gpa.alloc(u8, 20 * 1024 * 1024);
+    defer gpa.free(big);
+    for (big, 0..) |*b, i| b.* = @intCast((i *% 31) % 251);
+    const big_crc = core.crc32c.hash(big);
+
+    // 20 MiB through 256 KiB chunks: eighty round trips, size declared.
+    var sized: std.Io.Reader = .fixed(big);
+    var a = try bucket.object("sized.bin").uploadFrom(&sized, .{ .size = big.len });
+    defer a.deinit();
+    try testing.expectEqual(big.len, a.value.size);
+    if (a.value.crc32c) |crc| try testing.expectEqual(big_crc, crc);
+
+    // The same bytes with the size unknown until the stream ends.
+    var unsized: std.Io.Reader = .fixed(big);
+    var b = try bucket.object("unsized.bin").uploadFrom(&unsized, .{});
+    defer b.deinit();
+    try testing.expectEqual(big.len, b.value.size);
+
+    // A stream that ends exactly on a chunk boundary, finished by the
+    // empty PUT.
+    var boundary: std.Io.Reader = .fixed(big[0 .. 512 * 1024]);
+    var c = try bucket.object("boundary.bin").uploadFrom(&boundary, .{});
+    defer c.deinit();
+    try testing.expectEqual(512 * 1024, c.value.size);
+
+    // What came back is what went in.
+    var downloaded = try bucket.object("sized.bin").downloadAlloc(big.len + 1, .{});
+    defer downloaded.deinit();
+    try testing.expectEqual(big.len, downloaded.value.data.len);
+    try testing.expectEqual(big_crc, core.crc32c.hash(downloaded.value.data));
+}
+
+test "resumable: upload above the single-request limit, chunks sliced from memory" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+
+    var diag: storage.Diagnostics = .{};
+    var client = try smallChunkClient(&f, &diag);
+    defer client.deinit();
+    const bucket = client.bucket(&f.bucket_name);
+
+    const gpa = testing.allocator;
+    const data = try gpa.alloc(u8, 600 * 1024);
+    defer gpa.free(data);
+    for (data, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    var uploaded = try bucket.object("large.bin").upload(data, .{});
+    defer uploaded.deinit();
+    try testing.expectEqual(data.len, uploaded.value.size);
+    if (uploaded.value.crc32c) |crc| try testing.expectEqual(core.crc32c.hash(data), crc);
+
+    var downloaded = try bucket.object("large.bin").downloadAlloc(data.len + 1, .{});
+    defer downloaded.deinit();
+    try testing.expectEqualSlices(u8, data, downloaded.value.data);
+}

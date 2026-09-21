@@ -39,6 +39,8 @@ scope: rpc.Scope,
 retry: RetryPolicy,
 retry_unconditional_writes: bool,
 verify_checksums: bool,
+chunk_size: usize,
+single_request_limit: usize,
 send_quota_project: bool,
 request_timeout_ms: u32,
 diagnostics: ?*Diagnostics,
@@ -67,6 +69,13 @@ pub const Options = struct {
     /// Compute and check CRC-32C checksums on uploads and downloads. Off,
     /// nothing is computed, checked, or sent beyond what the caller passed.
     verify_checksums: bool = true,
+    /// How much of a resumable upload travels per request, and the buffer
+    /// `uploadFrom` holds one chunk in. A multiple of 256 KiB; 8 MiB is
+    /// Google's recommended minimum.
+    chunk_size: usize = 8 * 1024 * 1024,
+    /// `upload` calls at or below this size go out as one multipart
+    /// request; larger ones take the resumable protocol.
+    single_request_limit: usize = 8 * 1024 * 1024,
     /// How long one request may take before it is `error.TimedOut`, which
     /// is retried like any other transient failure. 0 removes the limit,
     /// and nothing bounds a call then but the caller's own `std.Io`.
@@ -99,6 +108,10 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
     if (!validate.isUserAgent(options.user_agent)) {
         if (diag) |d| d.print("invalid user agent: expected printable ASCII", .{});
         return error.InvalidOptions;
+    }
+    if (options.chunk_size == 0 or options.chunk_size % (256 * 1024) != 0) {
+        if (diag) |d| d.print("invalid chunk size: resumable chunks are a positive multiple of 256 KiB", .{});
+        return error.InvalidChunkSize;
     }
 
     const endpoint = options.endpoint orelse Endpoint.production;
@@ -146,6 +159,8 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
         .retry = options.retry,
         .retry_unconditional_writes = options.retry_unconditional_writes,
         .verify_checksums = options.verify_checksums,
+        .chunk_size = options.chunk_size,
+        .single_request_limit = options.single_request_limit,
         .send_quota_project = options.send_quota_project,
         .request_timeout_ms = options.request_timeout_ms,
         .diagnostics = diag,

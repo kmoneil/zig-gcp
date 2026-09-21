@@ -32,9 +32,33 @@ including the ones that did not change.
   `error.OutOfRange`, except at offset 0 on an empty object, which is
   simply zero bytes. `downloadAlloc` is the same download into the
   library's own capped buffer, resumes included.
+- storage: `uploadFrom` streams an object of any size from a
+  `std.Io.Reader` through the resumable protocol, holding one
+  `chunk_size` buffer: the current chunk stays in memory until the
+  server confirms it, so a resume never needs the reader to go
+  backwards. `upload` above `single_request_limit` takes the same
+  protocol with chunks sliced straight from the data and no buffer at
+  all, and a lost session there simply starts over from the same bytes;
+  for a reader the earlier bytes are gone, so a lost session is
+  `error.UploadSessionLost` and the caller reopens the source. A 308's
+  `Range` header is believed, not assumed: sending resumes at what the
+  server kept, a failed chunk leads to a status query first, and the
+  attempt counter resets whenever bytes land. With `options.crc32c` the
+  server verifies the upload; without it `uploadFrom` hashes the stream
+  and compares with the finished object, deleting it again, pinned to
+  the generation just created, on a mismatch. A declared `options.size`
+  polices the reader in both directions. The session URI is treated as
+  the credential it is: never logged, never in `Diagnostics`, and
+  requests to it carry no Authorization header.
 - core: a streaming request can ask for the response head as soon as it
   arrives, through `head_out`, so a download that fails mid-body still
-  knows the generation it was reading and can resume against it. Object names travel strictly
+  knows the generation it was reading and can resume against it.
+- core: fixed: streaming a response body larger than the connection's
+  read buffer into an unbuffered caller writer tripped an assertion in
+  std, because the readers in the chain need a writable destination.
+  The transport now forwards the body through a small buffer of its
+  own, so any writer works, and the request body writer gained the same
+  protection for reader-backed uploads. Object names travel strictly
   percent-encoded, so names with slashes, spaces, `%` or non-ASCII address
   exactly the object they name. The codec reads the API's quirks: `size`
   and generations as string integers (numbers too, for emulators),

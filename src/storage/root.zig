@@ -65,6 +65,7 @@ test {
     _ = @import("multipart.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");
+    _ = @import("resumable.zig");
     _ = @import("rpc.zig");
     _ = @import("test_util.zig");
     _ = @import("types.zig");

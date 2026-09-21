@@ -6,9 +6,9 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Stringify = std.json.Stringify;
 const Writer = std.Io.Writer;
 const core = @import("core");
+const codec = @import("codec.zig");
 const types = @import("types.zig");
 
 const boundary_prefix = "zig_gcp_";
@@ -40,9 +40,14 @@ pub fn build(
     }) catch unreachable;
 
     const content_type = try std.mem.concat(arena, u8, &.{ "multipart/related; boundary=", &boundary });
+    const metadata = try codec.encodeUploadMetadata(arena, object_name, options, crc32c);
 
     var opening: Writer.Allocating = .init(arena);
-    writeOpening(&opening.writer, &boundary, object_name, options, crc32c) catch return error.OutOfMemory;
+    opening.writer.print(
+        "--{s}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{s}" ++
+            "\r\n--{s}\r\nContent-Type: {s}\r\n\r\n",
+        .{ &boundary, metadata, &boundary, options.content_type },
+    ) catch return error.OutOfMemory;
 
     const closing = try std.mem.concat(arena, u8, &.{ "\r\n--", &boundary, "--\r\n" });
     return .{
@@ -50,45 +55,6 @@ pub fn build(
         .opening = try opening.toOwnedSlice(),
         .closing = closing,
     };
-}
-
-fn writeOpening(
-    w: *Writer,
-    boundary: []const u8,
-    object_name: []const u8,
-    options: types.UploadOptions,
-    crc32c: ?[8]u8,
-) Writer.Error!void {
-    try w.print("--{s}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n", .{boundary});
-    var jw: Stringify = .{ .writer = w };
-    try jw.beginObject();
-    try jw.objectField("name");
-    try jw.write(object_name);
-    try jw.objectField("contentType");
-    try jw.write(options.content_type);
-    if (options.cache_control) |value| {
-        try jw.objectField("cacheControl");
-        try jw.write(value);
-    }
-    if (options.content_encoding) |value| {
-        try jw.objectField("contentEncoding");
-        try jw.write(value);
-    }
-    if (options.metadata.len > 0) {
-        try jw.objectField("metadata");
-        try jw.beginObject();
-        for (options.metadata) |entry| {
-            try jw.objectField(entry.key);
-            try jw.write(entry.value);
-        }
-        try jw.endObject();
-    }
-    if (crc32c) |checksum| {
-        try jw.objectField("crc32c");
-        try jw.write(&checksum);
-    }
-    try jw.endObject();
-    try w.print("\r\n--{s}\r\nContent-Type: {s}\r\n\r\n", .{ boundary, options.content_type });
 }
 
 const testing = std.testing;

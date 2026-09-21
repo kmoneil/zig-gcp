@@ -74,6 +74,11 @@ pub const UploadOptions = struct {
     /// The known checksum of the whole object. Checked against the data
     /// before anything is sent, and passed on for the server to verify.
     crc32c: ?u32 = null,
+    /// The total size, when known. `uploadFrom` works without it; with it,
+    /// a reader that ends early is `error.UnexpectedEndOfStream` and one
+    /// with more is `error.StreamTooLong`. `upload` checks it against the
+    /// slice it was given.
+    size: ?u64 = null,
 };
 
 /// A byte range of an object: `length` bytes from `offset`, or everything

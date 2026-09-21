@@ -16,6 +16,7 @@ const errors = @import("errors.zig");
 const logging = @import("logging.zig");
 const multipart = @import("multipart.zig");
 const names = @import("names.zig");
+const resumable = @import("resumable.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
 const Error = errors.Error;
@@ -74,19 +75,27 @@ pub fn delete(self: Object, options: types.DeleteOptions) Error!void {
     });
 }
 
-/// Uploads bytes already in memory as one `multipart/related` request: the
-/// metadata part carries the name and the data's CRC-32C, which the server
-/// verifies before the object exists, and the data travels beside it
-/// without being copied. Peak extra memory: a few kilobytes of framing.
+/// Uploads bytes already in memory. At or below `single_request_limit` the
+/// whole thing is one `multipart/related` request; above it, the resumable
+/// protocol sends chunks sliced straight from `data`. Either way the
+/// metadata carries the data's CRC-32C, which the server verifies before
+/// the object exists, and the data is never copied. Peak extra memory: a
+/// few kilobytes of framing.
 ///
-/// Not retried unless `retry_unconditional_writes` opted in: the first
-/// attempt may have landed before its response was lost, and a blind
-/// repeat would overwrite whatever is there by then.
+/// A multipart upload is not retried unless `retry_unconditional_writes`
+/// opted in: the first attempt may have landed before its response was
+/// lost, and a blind repeat would overwrite whatever is there by then. A
+/// resumable upload always retries: its offsets make a repeat safe, and a
+/// lost session simply starts over from the same bytes.
 pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
     try checkUploadOptions(self.client, options);
+    if (options.size) |size| if (size != data.len) {
+        if (self.client.diagnostics) |d| d.print("options.size says {d} bytes, the data has {d}", .{ size, data.len });
+        return error.InvalidArgument;
+    };
 
     var checksum: ?[8]u8 = null;
     if (self.client.verify_checksums) {
@@ -103,6 +112,10 @@ pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Erro
         // Verification is off, but a checksum the caller asserts still
         // travels, for the server to check.
         checksum = core.crc32c.toBase64(given);
+    }
+
+    if (data.len > self.client.single_request_limit) {
+        return resumable.run(self.client, self.bucket, self.name, .{ .slice = data }, options, checksum);
     }
 
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
@@ -126,6 +139,58 @@ pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Erro
     result.value = codec.decodeObject(result.arena.allocator(), res.body) catch |err|
         return rpc.decodeFailed(self.client, err, "object");
     return result;
+}
+
+/// Uploads from a stream through the resumable protocol, one `chunk_size`
+/// buffer of memory: the current chunk stays there until the server
+/// confirms it, so a resume never needs the reader to go backwards.
+///
+/// With `options.crc32c` the server verifies the checksum; without it the
+/// bytes are hashed as they stream and compared with the finished object's
+/// checksum, and on a mismatch the object is deleted again, pinned to the
+/// generation just created, before `error.ChecksumMismatch` comes back. A
+/// lost session is `error.UploadSessionLost`: the earlier bytes are gone
+/// and the reader cannot supply them again, so the caller reopens the
+/// source and retries.
+pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    try checkUploadOptions(self.client, options);
+
+    const checksum: ?[8]u8 = if (options.crc32c) |given| core.crc32c.toBase64(given) else null;
+    const buffer = try self.client.gpa.alloc(u8, self.client.chunk_size);
+    defer self.client.gpa.free(buffer);
+    var hasher: core.crc32c.Hasher = .init();
+    const verify_after = self.client.verify_checksums and options.crc32c == null;
+
+    var result = try resumable.run(self.client, self.bucket, self.name, .{ .reader = .{
+        .r = reader,
+        .buffer = buffer,
+        .declared = options.size,
+        .hasher = if (verify_after) &hasher else null,
+    } }, options, checksum);
+    if (!verify_after) return result;
+    errdefer result.deinit();
+
+    // The object exists by the time the checksum can be compared. On a
+    // mismatch it is deleted again, pinned to the generation just created,
+    // so nobody else's newer object can be removed.
+    const expected = result.value.crc32c orelse {
+        logging.warn("upload of {s} finished, but the server named no crc32c to verify against", .{self.name});
+        return result;
+    };
+    const streamed = hasher.final();
+    if (streamed == expected) return result;
+    self.delete(.{ .generation = result.value.generation }) catch |err| {
+        logging.warn("deleting the mismatched upload of {s} failed with {t}", .{ self.name, err });
+    };
+    // After the delete, whose own begin cleared the diagnostics.
+    if (self.client.diagnostics) |d| d.print(
+        "checksum mismatch after upload: the stream hashed to {d}, the object stores {d}; the object was deleted again",
+        .{ streamed, expected },
+    );
+    return error.ChecksumMismatch;
 }
 
 fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void {
@@ -863,6 +928,78 @@ test "downloadAlloc: a zero-byte object verifies against the empty checksum" {
     defer got.deinit();
     try testing.expectEqual(0, got.value.data.len);
     try testing.expect(got.value.result.checksum_verified);
+}
+
+test "uploadFrom verifies the finished object and deletes a mismatch" {
+    const session = "https://storage.example.test/upload/session/x1";
+    const opened: test_util.FakeTransport.Reply = .{ .respond = .{
+        .status = 200,
+        .body = "",
+        .headers = &.{.{ .name = "Location", .value = session }},
+    } };
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        opened,
+        // The finished object stores a checksum that is not the stream's.
+        .{ .respond = .{ .body = "{\"name\":\"a\",\"generation\":\"55\",\"crc32c\":\"AAAAAQ==\"}" } },
+        // The cleanup delete.
+        .{ .respond = .{ .status = 204, .body = "" } },
+        // A second, honest run.
+        opened,
+        .{ .respond = .{ .body = "{\"name\":\"a\",\"generation\":\"56\",\"crc32c\":\"8P9ykg==\"}" } },
+    }, .{});
+    defer h.deinit();
+    const obj = h.client.bucket("b").object("a");
+
+    var bad: std.Io.Reader = .fixed("hello world\n");
+    try testing.expectError(error.ChecksumMismatch, obj.uploadFrom(&bad, .{}));
+    // The delete pinned the generation the upload just created.
+    const cleanup = try h.fake.request(0);
+    try testing.expectEqual(.DELETE, cleanup.method);
+    try testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/b/o/a?generation=55", cleanup.url);
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "checksum mismatch after upload") != null);
+
+    var good: std.Io.Reader = .fixed("hello world\n");
+    var info = try obj.uploadFrom(&good, .{});
+    defer info.deinit();
+    try testing.expectEqual(56, info.value.generation);
+    // Without a declared checksum, the session metadata claims none.
+    try testing.expect(std.mem.indexOf(u8, (try h.fake.streamRequest(3)).body_prefix, "crc32c") == null);
+}
+
+test "uploadFrom with a declared checksum sends it and trusts the server" {
+    const opened: test_util.FakeTransport.Reply = .{ .respond = .{
+        .status = 200,
+        .body = "",
+        .headers = &.{.{ .name = "Location", .value = "https://storage.example.test/upload/session/x2" }},
+    } };
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        opened,
+        // The stored checksum does not matter: the server was the verifier.
+        .{ .respond = .{ .body = "{\"name\":\"a\",\"generation\":\"57\",\"crc32c\":\"AAAAAQ==\"}" } },
+    }, .{});
+    defer h.deinit();
+    var reader: std.Io.Reader = .fixed("hello world\n");
+    var info = try h.client.bucket("b").object("a").uploadFrom(&reader, .{
+        .crc32c = 0xf0ff7292,
+        .size = 12,
+    });
+    defer info.deinit();
+    const open = try h.fake.streamRequest(0);
+    try testing.expect(std.mem.indexOf(u8, open.body_prefix, "\"crc32c\":\"8P9ykg==\"") != null);
+    try testing.expectEqualStrings("12", open.header("X-Upload-Content-Length").?);
+}
+
+test "upload: a size that contradicts the data never leaves the client" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    try testing.expectError(
+        error.InvalidArgument,
+        h.client.bucket("b").object("a").upload("hello world\n", .{ .size = 11 }),
+    );
+    try h.expectRequestCount(0);
 }
 
 test "bad object names fail before sending" {

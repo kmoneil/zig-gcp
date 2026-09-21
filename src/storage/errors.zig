@@ -21,6 +21,20 @@ pub const Error = core.rpc.Error || error{
     /// wherever that concrete writer keeps it. Whatever it holds by then
     /// must be discarded.
     WriteFailed,
+    /// A resumable session vanished (HTTP 404 or 410 on its URI) and the
+    /// source cannot be replayed. The caller reopens the source and
+    /// retries; `upload` starts a new session itself, since its bytes are
+    /// still in memory.
+    UploadSessionLost,
+    /// The caller's reader failed during an upload, with the detail
+    /// wherever that concrete reader keeps it. The session was cancelled.
+    ReadFailed,
+    /// `uploadFrom` was given `size`, and the reader ended early.
+    UnexpectedEndOfStream,
+    /// `uploadFrom` was given `size`, and the reader had more.
+    StreamTooLong,
+    /// `Options.chunk_size` is zero or not a multiple of 256 KiB.
+    InvalidChunkSize,
     /// An object name breaks the rules: empty, over 1,024 bytes, invalid
     /// UTF-8, a carriage return or line feed, or `.` or `..`.
     InvalidObjectName,
