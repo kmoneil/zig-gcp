@@ -487,8 +487,14 @@ pub const HttpTransport = struct {
         var body: []const u8 = "";
         var streamed: u64 = 0;
         if (to_writer) |w| {
+            // The body flows through this buffer on its way to the caller's
+            // writer, whatever that writer's own buffering: the readers in
+            // the chain need somewhere writable, and a caller's unbuffered
+            // writer has nowhere.
+            var forward_buffer: [4096]u8 = undefined;
+            var forward: ForwardWriter = .init(w, &forward_buffer);
             while (true) {
-                const n = reader.stream(w, .unlimited) catch |err| switch (err) {
+                const n = reader.stream(&forward.writer, .unlimited) catch |err| switch (err) {
                     error.EndOfStream => break,
                     // The caller's writer failed; the rest of the body is
                     // abandoned, so the connection cannot be reused.
@@ -498,11 +504,18 @@ pub const HttpTransport = struct {
                     },
                     error.ReadFailed => {
                         connection.closing = true;
+                        // What arrived before the failure still belongs to
+                        // the caller; a resume counts on having it.
+                        forward.writer.flush() catch return error.WriteFailed;
                         return bodyError(&request, if (chunked) &dechunker else null, transfer, encoding);
                     },
                 };
                 streamed += n;
             }
+            forward.writer.flush() catch {
+                connection.closing = true;
+                return error.WriteFailed;
+            };
         } else {
             // The limit is exclusive: `allocRemaining` fails when it is reached.
             const limit: std.Io.Limit = .limited(self.max_response_bytes +| 1);
@@ -556,6 +569,36 @@ pub const HttpTransport = struct {
     }
 };
 
+/// A buffered pass-through to another writer. Everything drains straight
+/// on; the buffer only gives the readers upstream somewhere to put bytes,
+/// which they require and which the destination may not have.
+const ForwardWriter = struct {
+    out: *std.Io.Writer,
+    writer: std.Io.Writer,
+
+    fn init(out: *std.Io.Writer, buffer: []u8) ForwardWriter {
+        return .{ .out = out, .writer = .{ .buffer = buffer, .vtable = &.{ .drain = drain } } };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *ForwardWriter = @alignCast(@fieldParentPtr("writer", w));
+        const buffered = w.buffered();
+        if (buffered.len > 0) try self.out.writeAll(buffered);
+        w.end = 0;
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |slice| {
+            try self.out.writeAll(slice);
+            consumed += slice.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| {
+            try self.out.writeAll(pattern);
+            consumed += pattern.len;
+        }
+        return consumed;
+    }
+};
+
 /// The address inside `[...]` when the URI's host is an IPv6 literal.
 fn ipv6Literal(uri: std.Uri) ?[]const u8 {
     const host = switch (uri.host orelse return null) {
@@ -572,20 +615,23 @@ fn sendBody(
     request: *http.Client.Request,
     body: StreamRequest.Body,
 ) error{ ReadFailed, WriteFailed, EndOfStream }!void {
+    // The body writer needs a buffer of its own: a reader-backed source
+    // streams into it, and readers require a writable destination.
+    var body_buffer: [4096]u8 = undefined;
     switch (body) {
         .none => return request.sendBodiless(),
         .segments => |segments| {
             var total: u64 = 0;
             for (segments) |s| total += s.len;
             request.transfer_encoding = .{ .content_length = total };
-            var body_writer = try request.sendBodyUnflushed(&.{});
+            var body_writer = try request.sendBodyUnflushed(&body_buffer);
             for (segments) |s| try body_writer.writer.writeAll(s);
             try body_writer.end();
             try request.connection.?.flush();
         },
         .stream => |source| {
             request.transfer_encoding = .{ .content_length = source.len };
-            var body_writer = try request.sendBodyUnflushed(&.{});
+            var body_writer = try request.sendBodyUnflushed(&body_buffer);
             var left = source.len;
             while (left > 0) {
                 left -= source.reader.stream(&body_writer.writer, .limited64(left)) catch |err| switch (err) {
@@ -2063,6 +2109,41 @@ test "sendStream: the caller's writer failing mid-body is WriteFailed" {
         .url = server.url(&buf, "/a"),
         .sink = .{ .writer = &out },
     }, arena.allocator()));
+}
+
+test "sendStream: a large body streams into an unbuffered writer" {
+    const io = testing.io;
+    // Regression: a body too large for the connection's read buffer goes
+    // through the readers' streaming path, which requires a writable
+    // destination; a caller's unbuffered writer panicked in std.
+    const gpa = testing.allocator;
+    const body_len = 300 * 1024;
+    const reply = try gpa.alloc(u8, 64 + body_len);
+    defer gpa.free(reply);
+    const head = try std.fmt.bufPrint(reply, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body_len});
+    const payload = reply[head.len .. head.len + body_len];
+    for (payload, 0..) |*b, i| b.* = @intCast(i % 251);
+
+    var server: ScriptedServer = try .start(io, &.{reply[0 .. head.len + body_len]});
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(gpa, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+
+    // A writer with no buffer at all: a hasher that discards the bytes.
+    var hashing: std.Io.Writer.Hashing(crc32c.Hasher) = .initHasher(.init(), &.{});
+    const res = try ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/big"),
+        .sink = .{ .writer = &hashing.writer },
+    }, arena.allocator());
+    try testing.expectEqual(body_len, res.bytes_streamed);
+    try testing.expectEqual(crc32c.hash(payload), hashing.hasher.final());
 }
 
 test "sendStream: a server that says nothing is TimedOut" {
