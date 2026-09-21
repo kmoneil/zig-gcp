@@ -6,6 +6,15 @@ including the ones that did not change.
 
 ## 0.12.0 (unreleased)
 
+- pubsub: `Publisher`, new: publishing from many tasks without a round
+  trip per message. It takes messages from any task, batches them into
+  publish requests, and sends those on tasks of its own over `concurrency`
+  connections. A batch goes out when it is full, by message count or by
+  bytes of request body as sent, or when its first message has waited
+  `max_batch_delay_ms`, and until a connection is free it keeps filling.
+  Each message gets a `Receipt` to wait on for its id. Transient failures
+  are retried until `publish_timeout_ms` after the message was published.
+  `run` sends until `stop`, which sends what is left first.
 - pubsub: `Topic.publish` now also retries ABORTED, CANCELLED and UNKNOWN,
   the statuses Google's own clients retry for Publish beyond the four it
   already did. UNKNOWN is retried only when the server answered with a 5xx:
