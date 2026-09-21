@@ -57,6 +57,7 @@ test {
     _ = @import("Version.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
+    _ = @import("faults.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");
     _ = @import("rpc.zig");

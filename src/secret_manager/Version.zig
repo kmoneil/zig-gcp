@@ -25,6 +25,12 @@ ref: types.VersionRef,
 /// wipes. The checksum is verified according to the client's
 /// `verify_checksum`; bytes that fail it are never returned.
 ///
+/// A mismatch is fetched again, since access is idempotent, and that second
+/// fetch may itself be retried for transient failures: against a server
+/// that both corrupts and falters, one call can cost up to
+/// `retry.max_attempts` rounds of the retry policy. Cancel the surrounding
+/// `std.Io` task to bound it tighter than that.
+///
 /// The caller owns the result: `defer value.deinit()`.
 pub fn access(self: Version) Error!SecretValue {
     const c = self.client;
