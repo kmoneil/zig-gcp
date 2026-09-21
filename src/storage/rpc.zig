@@ -70,6 +70,25 @@ pub fn executeDiscard(client: *Client, call: Call) Error!void {
     return engine(client).executeDiscard(call);
 }
 
+pub const StreamCall = core.rpc.StreamCall;
+
+/// Sends a streaming call and returns the first 2xx response whole:
+/// status, headers, and the body, buffered or delivered to the sink.
+pub fn executeStream(
+    client: *Client,
+    response: *std.heap.ArenaAllocator,
+    call: StreamCall,
+) core.rpc.StreamCallError!core.transport.StreamResponse {
+    return engine(client).executeStream(response, call);
+}
+
+/// The wait before an attempt this module retries itself, such as a
+/// download restarted from scratch. The engine's own retries are its
+/// business.
+pub fn backoffMs(client: *Client, attempt: u32) u32 {
+    return client.retry.backoffMs(attempt, core.rpc.entropy(client.io));
+}
+
 /// Checks a bucket name before any request.
 pub fn checkBucketName(client: *Client, name: []const u8) Error!void {
     if (validate.isBucketName(name)) return;

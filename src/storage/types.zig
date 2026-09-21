@@ -63,6 +63,40 @@ pub const ObjectPage = struct {
     next_page_token: ?[]const u8,
 };
 
+pub const UploadOptions = struct {
+    content_type: []const u8 = "application/octet-stream",
+    cache_control: ?[]const u8 = null,
+    /// `gzip` marks the object as stored compressed, which changes how
+    /// downloads behave; see the download options.
+    content_encoding: ?[]const u8 = null,
+    /// Custom metadata. Keys must not be empty.
+    metadata: []const Metadata = &.{},
+    /// The known checksum of the whole object. Checked against the data
+    /// before anything is sent, and passed on for the server to verify.
+    crc32c: ?u32 = null,
+};
+
+pub const DownloadOptions = struct {
+    /// Download one specific generation instead of the live one.
+    generation: ?u64 = null,
+};
+
+pub const DownloadResult = struct {
+    bytes_written: u64,
+    /// The generation that was downloaded, or 0 when the server did not say.
+    generation: u64,
+    /// False when there was nothing to verify against: the server sent no
+    /// checksum, the object was decompressed in transit, or the client
+    /// turned verification off.
+    checksum_verified: bool,
+};
+
+/// A whole object in memory, with how the download went.
+pub const Downloaded = struct {
+    data: []const u8,
+    result: DownloadResult,
+};
+
 pub const GetOptions = struct {
     /// Address one specific generation instead of the live one.
     generation: ?u64 = null,

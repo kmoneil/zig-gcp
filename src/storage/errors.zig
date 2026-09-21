@@ -12,6 +12,11 @@ const core = @import("core");
 
 /// Every error a client call can return.
 pub const Error = core.rpc.Error || error{
+    /// Upload or download bytes do not match the checksum beside them. On
+    /// upload nothing was sent; on download the data is discarded.
+    ChecksumMismatch,
+    /// `downloadAlloc` met an object larger than its `max_bytes`.
+    ObjectTooLarge,
     /// An object name breaks the rules: empty, over 1,024 bytes, invalid
     /// UTF-8, a carriage return or line feed, or `.` or `..`.
     InvalidObjectName,

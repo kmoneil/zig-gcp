@@ -30,12 +30,16 @@ pub const BucketConfig = @import("types.zig").BucketConfig;
 pub const BucketInfo = @import("types.zig").BucketInfo;
 pub const BucketPage = @import("types.zig").BucketPage;
 pub const DeleteOptions = @import("types.zig").DeleteOptions;
+pub const DownloadOptions = @import("types.zig").DownloadOptions;
+pub const DownloadResult = @import("types.zig").DownloadResult;
+pub const Downloaded = @import("types.zig").Downloaded;
 pub const GetOptions = @import("types.zig").GetOptions;
 pub const ListOptions = @import("types.zig").ListOptions;
 pub const Metadata = @import("types.zig").Metadata;
 pub const ObjectInfo = @import("types.zig").ObjectInfo;
 pub const ObjectPage = @import("types.zig").ObjectPage;
 pub const PageOptions = @import("types.zig").PageOptions;
+pub const UploadOptions = @import("types.zig").UploadOptions;
 
 /// Parses a `time_created` (RFC 3339) to nanoseconds since the Unix epoch.
 pub const parseTimestamp = core.timestamp.parse;
@@ -54,7 +58,9 @@ test {
     _ = @import("Endpoint.zig");
     _ = @import("Object.zig");
     _ = @import("codec.zig");
+    _ = @import("download.zig");
     _ = @import("errors.zig");
+    _ = @import("multipart.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");
     _ = @import("rpc.zig");

@@ -7,9 +7,20 @@ including the ones that did not change.
 ## 0.14.0 (unreleased)
 
 - storage: new module, stability `experimental`. A client for the Cloud
-  Storage JSON API, starting with buckets and object metadata: buckets
-  create, get, list and delete; objects get, exists, delete, and listing
-  with prefixes, delimiters and paging. Object names travel strictly
+  Storage JSON API: buckets create, get, list and delete; objects get,
+  exists, delete, and listing with prefixes, delimiters and paging;
+  `upload` for bytes in memory and `downloadAlloc` for whole objects,
+  checksummed both ways. An upload goes out as one `multipart/related`
+  request whose metadata part carries the data's CRC-32C, so the server
+  refuses a corrupted body before the object exists, and the data
+  travels as a segment, never copied into the framing. A download
+  streams into memory up to the caller's `max_bytes`, anything larger
+  failing with `error.ObjectTooLarge` without being held, and the bytes
+  are checked against `x-goog-hash`; an object decompressed in transit
+  has nothing to check against and reports `checksum_verified = false`.
+  Uploads, like deletes without a `generation`, are not retried unless
+  `retry_unconditional_writes` opts in; downloads restart from scratch
+  on transient failures, and partial bytes never leak into the result. Object names travel strictly
   percent-encoded, so names with slashes, spaces, `%` or non-ASCII address
   exactly the object they name. The codec reads the API's quirks: `size`
   and generations as string integers (numbers too, for emulators),

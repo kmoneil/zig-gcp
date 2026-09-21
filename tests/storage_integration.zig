@@ -2,10 +2,8 @@
 //! `fake-gcs-server`: set STORAGE_EMULATOR_HOST (and optionally
 //! STORAGE_PROJECT_ID, default "test"). With it unset, every test skips.
 //!
-//! The library cannot upload yet, so tests that need objects create them
-//! the way curl would: one raw media-upload request straight through the
-//! transport. Each test creates a uniquely named bucket (prefix `zigps-`)
-//! and deletes it and everything in it, even when the test fails.
+//! Each test creates a uniquely named bucket (prefix `zigps-`) and deletes
+//! it and everything in it, even when the test fails.
 
 const std = @import("std");
 const core = @import("core");
@@ -61,26 +59,11 @@ const Fixture = struct {
         return f.client.bucket(&f.bucket_name);
     }
 
-    /// What `curl -X POST --data-binary` would do: one raw media-upload
-    /// request, bypassing the library's (not yet written) upload path.
-    fn uploadRaw(f: *Fixture, name: []const u8, data: []const u8) !void {
-        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-        defer arena.deinit();
-        var url: std.Io.Writer.Allocating = .init(arena.allocator());
-        try url.writer.print("{s}/upload/storage/v1/b/{s}/o?uploadType=media&name=", .{
-            f.client.base_url, &f.bucket_name,
-        });
-        try core.query.writeValue(&url.writer, name);
-        const res = try f.client.transport.sendStream(.{
-            .method = .POST,
-            .url = url.written(),
-            .content_type = "text/plain",
-            .body = .{ .segments = &.{data} },
-        }, arena.allocator());
-        if (res.status != 200) {
-            std.debug.print("raw upload of {s} answered {d}: {s}\n", .{ name, res.status, res.body });
-            return error.TestUploadFailed;
-        }
+    /// Uploads and forgets the metadata, for tests that only need the
+    /// object to exist.
+    fn upload(f: *Fixture, name: []const u8, data: []const u8) !void {
+        var info = try f.bucket().object(name).upload(data, .{ .content_type = "text/plain" });
+        info.deinit();
     }
 };
 
@@ -131,7 +114,7 @@ test "objects: listing with a prefix, a delimiter, and paging" {
         "reports/2026/archive/old.txt",
         "reports/intro.txt",
         "top.txt",
-    }) |name| try f.uploadRaw(name, "hello world\n");
+    }) |name| try f.upload(name, "hello world\n");
 
     // A prefix narrows the listing.
     var under_reports = try f.bucket().listObjects(.{ .prefix = "reports/" });
@@ -184,7 +167,7 @@ test "objects: names with slashes, spaces and percent round-trip through get" {
         "q?.txt#1",
         "caf\xc3\xa9/menu.txt",
     }) |name| {
-        try f.uploadRaw(name, "hello world\n");
+        try f.upload(name, "hello world\n");
         var info = try f.bucket().object(name).get(.{});
         defer info.deinit();
         try testing.expectEqualStrings(name, info.value.name);
@@ -201,7 +184,7 @@ test "objects: delete, then NotFound from get and delete" {
     created.deinit();
 
     const obj = f.bucket().object("reports/2026/q3.txt");
-    try f.uploadRaw("reports/2026/q3.txt", "hello world\n");
+    try f.upload("reports/2026/q3.txt", "hello world\n");
     try testing.expect(try obj.exists());
 
     var info = try obj.get(.{});
@@ -214,4 +197,132 @@ test "objects: delete, then NotFound from get and delete" {
     try testing.expectError(error.NotFound, obj.get(.{}));
     try testing.expectError(error.NotFound, obj.delete(.{}));
     try testing.expectEqual(404, f.diag.http_status);
+}
+
+test "round trip: upload, metadata, download, checksum" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const data = "hello world\n";
+    const obj = f.bucket().object("reports/2026/q3.txt");
+
+    var uploaded = try obj.upload(data, .{ .content_type = "text/plain" });
+    defer uploaded.deinit();
+    try testing.expectEqualStrings("reports/2026/q3.txt", uploaded.value.name);
+    try testing.expectEqual(data.len, uploaded.value.size);
+    if (uploaded.value.crc32c) |crc| try testing.expectEqual(core.crc32c.hash(data), crc);
+
+    var got = try obj.get(.{});
+    defer got.deinit();
+    try testing.expectEqual(data.len, got.value.size);
+    try testing.expectEqualStrings("text/plain", got.value.content_type);
+
+    var downloaded = try obj.downloadAlloc(1024, .{});
+    defer downloaded.deinit();
+    try testing.expectEqualStrings(data, downloaded.value.data);
+    try testing.expectEqual(data.len, downloaded.value.result.bytes_written);
+    try testing.expectEqual(core.crc32c.hash(data), core.crc32c.hash(downloaded.value.data));
+    // The emulator may omit the checksum header; when it sends one, the
+    // library must have verified against it.
+    if (!downloaded.value.result.checksum_verified) {
+        std.debug.print("note: the emulator sent no crc32c to verify\n", .{});
+    }
+
+    // A cap below the object's size refuses without holding the object.
+    try testing.expectError(error.ObjectTooLarge, obj.downloadAlloc(data.len - 1, .{}));
+}
+
+test "round trip: all 256 byte values survive" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+
+    var data: [256]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @intCast(i);
+    const obj = f.bucket().object("binary.bin");
+    var uploaded = try obj.upload(&data, .{ .crc32c = core.crc32c.hash(&data) });
+    uploaded.deinit();
+
+    var downloaded = try obj.downloadAlloc(1024, .{});
+    defer downloaded.deinit();
+    try testing.expectEqualSlices(u8, &data, downloaded.value.data);
+}
+
+test "round trip: a zero-byte object" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const obj = f.bucket().object("empty");
+
+    var uploaded = try obj.upload("", .{});
+    defer uploaded.deinit();
+    try testing.expectEqual(0, uploaded.value.size);
+
+    var downloaded = try obj.downloadAlloc(1024, .{});
+    defer downloaded.deinit();
+    try testing.expectEqual(0, downloaded.value.data.len);
+    // Zero fits under any cap, even zero.
+    var under_zero_cap = try obj.downloadAlloc(0, .{});
+    under_zero_cap.deinit();
+}
+
+test "round trip: odd names through upload, list, get, download and delete" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+
+    for ([_][]const u8{
+        "a b.txt",
+        "100%.txt",
+        "q?.txt#1",
+        "plus+sign.txt",
+        "caf\xc3\xa9/menu.txt",
+    }) |name| {
+        try f.upload(name, "hello world\n");
+        var listed = try f.bucket().listObjects(.{ .prefix = name });
+        defer listed.deinit();
+        try testing.expectEqual(1, listed.value.objects.len);
+        try testing.expectEqualStrings(name, listed.value.objects[0].name);
+
+        var downloaded = try f.bucket().object(name).downloadAlloc(1024, .{});
+        defer downloaded.deinit();
+        try testing.expectEqualStrings("hello world\n", downloaded.value.data);
+
+        try f.bucket().object(name).delete(.{});
+        try testing.expect(!try f.bucket().object(name).exists());
+    }
+}
+
+test "round trip: custom metadata, content type and cache control" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const obj = f.bucket().object("with-metadata.txt");
+
+    var uploaded = try obj.upload("hello world\n", .{
+        .content_type = "text/plain; charset=utf-8",
+        .cache_control = "no-store",
+        .metadata = &.{
+            .{ .key = "origin", .value = "zig" },
+            .{ .key = "empty", .value = "" },
+        },
+    });
+    uploaded.deinit();
+
+    var got = try obj.get(.{});
+    defer got.deinit();
+    try testing.expectEqualStrings("text/plain; charset=utf-8", got.value.content_type);
+    try testing.expectEqualStrings("zig", got.value.metadataValue("origin").?);
+    try testing.expectEqualStrings("", got.value.metadataValue("empty").?);
+    try testing.expectEqual(null, got.value.metadataValue("missing"));
 }
