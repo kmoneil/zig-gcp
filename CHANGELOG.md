@@ -18,7 +18,10 @@ including the ones that did not change.
   default; at a cap `publish` waits for room, or refuses with
   `error.PublisherFull` under `when_full = .fail`. `flush` sends
   everything at once and waits for what came before it. `run` sends until
-  `stop`, which sends what is left first.
+  `stop`, which sends what is left first. With `enable_message_ordering`,
+  a message may carry an ordering key: no request mixes keys, a key has
+  one request in flight at a time, and a key whose batch fails for good
+  pauses, failing what was queued behind it, until `resumePublish`.
 - pubsub: `Topic.publish` now also retries ABORTED, CANCELLED and UNKNOWN,
   the statuses Google's own clients retry for Publish beyond the four it
   already did. UNKNOWN is retried only when the server answered with a 5xx:
