@@ -4,6 +4,25 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.14.0 (unreleased)
+
+- storage: new module, stability `experimental`. A client for the Cloud
+  Storage JSON API, starting with buckets and object metadata: buckets
+  create, get, list and delete; objects get, exists, delete, and listing
+  with prefixes, delimiters and paging. Object names travel strictly
+  percent-encoded, so names with slashes, spaces, `%` or non-ASCII address
+  exactly the object they name. The codec reads the API's quirks: `size`
+  and generations as string integers (numbers too, for emulators),
+  checksums in big-endian base64, `md5Hash` missing for composite objects.
+  A delete without a `generation` is not retried unless
+  `retry_unconditional_writes` opts in, because a blind repeat could
+  remove someone else's newer object; every other call here retries
+  safely. Against `fake-gcs-server` no credentials are needed:
+  `Endpoint.fromEnv` honors `STORAGE_EMULATOR_HOST` in the three forms
+  community tools write it. Uploads and downloads, with checksums
+  verified in both directions, are next.
+- core, pubsub, auth, secret_manager: unchanged.
+
 ## 0.13.1 (2026-09-21)
 
 Version 0.13.0 was skipped: its tag landed one commit early, before the
