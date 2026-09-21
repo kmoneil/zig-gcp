@@ -4,6 +4,17 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.10.1 (unreleased)
+
+- pubsub: fixed: `Subscriber.run` could hang for good after `stop()`.
+  When the teardown's cancel reached the janitor while it was sending
+  acknowledgements, the request noticed the cancel and the janitor then
+  swallowed it, so it went on ticking and `run` waited for it forever.
+  CI's integration suite met this about once in twenty runs. The
+  acknowledgements that were in flight are now kept and sent by the
+  final flush, so those messages are not redelivered either.
+- core, auth, secret_manager: unchanged.
+
 ## 0.10.0 (2026-09-21)
 
 - secret_manager: new module, stability `experimental`. A client for
