@@ -307,7 +307,9 @@ pub fn run(self: *Subscriber, handler: Handler) Error!void {
     workers.await(io) catch {};
     discard(janitor_task.cancel(io));
     janitor_running = false;
-    self.flush(period);
+    // What this cannot send stays listed, and deinit frees it; the server
+    // redelivers those messages, which at-least-once allows.
+    self.flush(period) catch {};
 
     self.mutex.lockUncancelable(io);
     defer self.mutex.unlock(io);
@@ -526,14 +528,19 @@ fn janitorLoop(self: *Subscriber, period_s: u32) std.Io.Cancelable!void {
     const tick_ms = self.tick_override_ms orelse @max(500, @as(i64, period_s) * 500);
     while (true) {
         try io.sleep(.fromMilliseconds(tick_ms), .awake);
-        self.flush(period_s);
+        // A cancel that lands during a flush has to end the loop here. The
+        // request that noticed it has acknowledged it, and std delivers a
+        // cancel once: the sleep above would never see it again, and run()
+        // would wait for this task forever.
+        try self.flush(period_s);
     }
 }
 
 /// Sends the pending acknowledgements and releases, then extends the lease
 /// of everything still in flight. Transient failures put the ids back for
-/// the next flush; fatal ones stop the subscriber.
-fn flush(self: *Subscriber, period_s: u32) void {
+/// the next flush; fatal ones stop the subscriber. `error.Canceled` is
+/// returned, never swallowed, with whatever was not sent put back.
+fn flush(self: *Subscriber, period_s: u32) std.Io.Cancelable!void {
     const io = self.io;
     const subscription = self.janitor.subscription(self.subscription_id);
 
@@ -559,14 +566,22 @@ fn flush(self: *Subscriber, period_s: u32) void {
         }
     }
 
-    self.sendIds(subscription, &acks, .ack) catch |err| return self.recordFatal(err, &self.janitor_diag);
-    self.sendIds(subscription, &nacks, .nack) catch |err| return self.recordFatal(err, &self.janitor_diag);
+    self.sendIds(subscription, &acks, .ack) catch |err| {
+        // The releases taken for this flush go back whatever happened.
+        self.keep(&nacks, .nack);
+        if (err == error.Canceled) return error.Canceled;
+        return self.recordFatal(err, &self.janitor_diag);
+    };
+    self.sendIds(subscription, &nacks, .nack) catch |err| {
+        if (err == error.Canceled) return error.Canceled;
+        return self.recordFatal(err, &self.janitor_diag);
+    };
 
     var sent: usize = 0;
     while (sent < extend_count) {
         const chunk = self.extend_buffer[sent..@min(sent + validate.max_ack_ids_per_request, extend_count)];
         subscription.modifyAckDeadline(chunk, period_s) catch |err| {
-            if (err == error.Canceled) return;
+            if (err == error.Canceled) return error.Canceled;
             if (!core.isRetryable(err)) return self.recordFatal(err, &self.janitor_diag);
             // The leases still stand until the deadline; the next tick
             // tries again.
@@ -583,10 +598,13 @@ fn flush(self: *Subscriber, period_s: u32) void {
     }
 }
 
+const IdKind = enum { ack, nack };
+
 /// Sends `list` as acknowledgements or releases, freeing what was sent.
-/// A transient failure puts the rest back for the next flush.
-fn sendIds(self: *Subscriber, subscription: Subscription, list: *std.ArrayList([]u8), what: enum { ack, nack }) Error!void {
-    const io = self.io;
+/// A transient failure puts the rest back for the next flush, and so does
+/// a cancel, which is then returned: the flush `run` makes on its way out
+/// sends what is left.
+fn sendIds(self: *Subscriber, subscription: Subscription, list: *std.ArrayList([]u8), what: IdKind) Error!void {
     const gpa = self.gpa;
     while (list.items.len > 0) {
         const chunk_len = @min(validate.max_ack_ids_per_request, list.items.len);
@@ -596,28 +614,38 @@ fn sendIds(self: *Subscriber, subscription: Subscription, list: *std.ArrayList([
             .nack => subscription.nack(chunk),
         };
         outcome catch |err| {
-            if (err != error.Canceled and core.isRetryable(err)) {
+            if (err == error.Canceled) {
+                self.keep(list, what);
+                return error.Canceled;
+            }
+            if (core.isRetryable(err)) {
                 logging.warn("{t} of {d} messages failed with {t}; keeping them for the next flush", .{ what, chunk.len, err });
-                self.mutex.lockUncancelable(io);
-                defer self.mutex.unlock(io);
-                const back = switch (what) {
-                    .ack => &self.to_ack,
-                    .nack => &self.to_nack,
-                };
-                back.appendSlice(gpa, list.items) catch for (list.items) |id| gpa.free(id);
-                list.deinit(gpa);
-                list.* = .empty;
+                self.keep(list, what);
                 return;
             }
             for (list.items) |id| gpa.free(id);
             list.deinit(gpa);
             list.* = .empty;
-            if (err == error.Canceled) return;
             return err;
         };
         for (chunk) |id| gpa.free(id);
         list.shrinkRetainingCapacity(list.items.len - chunk_len);
     }
+    list.deinit(gpa);
+    list.* = .empty;
+}
+
+/// Puts ids taken for a flush back on their list, for the next flush.
+fn keep(self: *Subscriber, list: *std.ArrayList([]u8), what: IdKind) void {
+    const io = self.io;
+    const gpa = self.gpa;
+    self.mutex.lockUncancelable(io);
+    defer self.mutex.unlock(io);
+    const back = switch (what) {
+        .ack => &self.to_ack,
+        .nack => &self.to_nack,
+    };
+    back.appendSlice(gpa, list.items) catch for (list.items) |id| gpa.free(id);
     list.deinit(gpa);
     list.* = .empty;
 }
@@ -674,6 +702,11 @@ const FakePubSub = struct {
     /// Fail this many acknowledge requests with `fail_status`.
     fail_acks: usize = 0,
     fail_status: u16 = 503,
+    /// Hold this many acknowledge requests open until they are canceled, as
+    /// a server that stopped answering would. Later ones answer normally.
+    hold_acks: usize = 0,
+    /// Acknowledge requests being held right now.
+    held_acks: usize = 0,
 
     const Msg = struct { data: []u8, ack_id: []u8 };
     const Modack = struct { ack_id: []u8, seconds: u32 };
@@ -738,6 +771,12 @@ const FakePubSub = struct {
             if (m.seconds != 0) n += 1;
         }
         return n;
+    }
+
+    fn heldAcks(f: *FakePubSub) usize {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        return f.held_acks;
     }
 
     fn ackedCount(f: *FakePubSub) usize {
@@ -829,6 +868,13 @@ const FakePubSub = struct {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
         f.ack_calls += 1;
+        if (f.hold_acks > 0) {
+            f.hold_acks -= 1;
+            f.held_acks += 1;
+            defer f.held_acks -= 1;
+            // Nothing answers this request; only canceling it ends the wait.
+            while (true) f.cond.wait(f.io, &f.mutex) catch return error.Canceled;
+        }
         if (f.fail_acks > 0) {
             f.fail_acks -= 1;
             return f.failure(arena);
@@ -1252,4 +1298,51 @@ test "fuzz Subscriber: random loads, failures and limits never lose a message" {
             "\x0c\x02\x00\x01\x00\x04",
         },
     });
+}
+
+test "Subscriber: stop returns when the janitor is canceled in the middle of a flush" {
+    // Regression. A request that noticed the janitor's cancel acknowledged
+    // it and returned error.Canceled, and flush swallowed that, so the
+    // janitor went back to its tick with the cancel already spent: std
+    // delivers a cancel once. run() then waited for it forever. CI met this
+    // about once in twenty runs, as an integration step that hung until
+    // the job's time ran out.
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.init(.{ .tick_ms = 10 });
+    defer h.deinit();
+    // The janitor's first acknowledgement is held until canceled.
+    h.fake.hold_acks = 1;
+    try h.fake.publish("held");
+
+    const Runner = struct {
+        fn run(s: *Subscriber, handler: Handler, returned: *std.atomic.Value(bool)) Error!void {
+            defer returned.store(true, .release);
+            return s.run(handler);
+        }
+        fn hasReturned(returned: *std.atomic.Value(bool)) bool {
+            return returned.load(.acquire);
+        }
+        fn ackHeld(fake: *FakePubSub) bool {
+            return fake.heldAcks() > 0;
+        }
+    };
+    var returned: std.atomic.Value(bool) = .init(false);
+    var running = try io.concurrent(Runner.run, .{ &h.subscriber, h.handler.handler(), &returned });
+
+    // Handled, resolved, and now the janitor is stuck sending the ack.
+    try testing.expect(try waitUntil(5_000, &h.fake, Runner.ackHeld));
+    h.subscriber.stop();
+
+    // The teardown cancels the janitor inside that request. It has to end
+    // the janitor's loop rather than be swallowed by it.
+    if (!try waitUntil(5_000, &returned, Runner.hasReturned)) {
+        @panic("Subscriber.run never returned: the janitor lost its cancel mid-flush");
+    }
+    try running.await(io);
+
+    // The ack the janitor never finished was kept, and the flush run makes
+    // on its way out delivered it, so the message is not redelivered.
+    try testing.expectEqual(1, h.fake.ackedCount());
+    try testing.expectEqual(1, h.subscriber.stats().acked);
 }
