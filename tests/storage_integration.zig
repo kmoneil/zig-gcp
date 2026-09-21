@@ -326,3 +326,78 @@ test "round trip: custom metadata, content type and cache control" {
     try testing.expectEqualStrings("", got.value.metadataValue("empty").?);
     try testing.expectEqual(null, got.value.metadataValue("missing"));
 }
+
+test "download streams into a writer with the checksum verified" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const data = "hello world\n";
+    try f.upload("streamed.txt", data);
+
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    const result = try f.bucket().object("streamed.txt").download(&out, .{});
+    try testing.expectEqualStrings(data, out.buffered());
+    try testing.expectEqual(data.len, result.bytes_written);
+    try testing.expect(result.generation != 0);
+    if (!result.checksum_verified) std.debug.print("note: the emulator sent no crc32c to verify\n", .{});
+
+    // Pinned to its generation, the same bytes come back.
+    out = .fixed(&buf);
+    const pinned = try f.bucket().object("streamed.txt").download(&out, .{ .generation = result.generation });
+    try testing.expectEqual(data.len, pinned.bytes_written);
+}
+
+test "range downloads: the first bytes, the last bytes, and past the end" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    var data: [100]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+    try f.upload("ranged.bin", &data);
+    const obj = f.bucket().object("ranged.bin");
+
+    var buf: [128]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    const first = try obj.download(&out, .{ .range = .{ .offset = 0, .length = 10 } });
+    try testing.expectEqualSlices(u8, data[0..10], out.buffered());
+    try testing.expectEqual(10, first.bytes_written);
+    // The whole-object checksum cannot cover ten bytes of it.
+    try testing.expect(!first.checksum_verified);
+
+    out = .fixed(&buf);
+    const last = try obj.download(&out, .{ .range = .{ .offset = 90, .length = 10 } });
+    try testing.expectEqualSlices(u8, data[90..], out.buffered());
+    try testing.expectEqual(10, last.bytes_written);
+
+    out = .fixed(&buf);
+    const tail = try obj.download(&out, .{ .range = .{ .offset = 95 } });
+    try testing.expectEqualSlices(u8, data[95..], out.buffered());
+    try testing.expectEqual(5, tail.bytes_written);
+
+    out = .fixed(&buf);
+    try testing.expectError(error.OutOfRange, obj.download(&out, .{ .range = .{ .offset = 1000 } }));
+
+    // downloadAlloc takes the same ranges.
+    var ten = try obj.downloadAlloc(1024, .{ .range = .{ .offset = 10, .length = 10 } });
+    defer ten.deinit();
+    try testing.expectEqualSlices(u8, data[10..20], ten.value.data);
+}
+
+test "a range on an empty object is zero bytes, not an error" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    try f.upload("empty.bin", "");
+
+    var buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    const result = try f.bucket().object("empty.bin").download(&out, .{ .range = .{ .offset = 0 } });
+    try testing.expectEqual(0, result.bytes_written);
+}

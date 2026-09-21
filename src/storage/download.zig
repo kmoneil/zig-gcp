@@ -60,6 +60,36 @@ pub const CappedAllocating = struct {
     }
 };
 
+/// The `Range` header for bytes `start` through `end` inclusive, or
+/// everything from `start` when `end` is null.
+pub fn formatRange(buf: []u8, start: u64, end: ?u64) []const u8 {
+    return if (end) |e|
+        std.fmt.bufPrint(buf, "bytes={d}-{d}", .{ start, e }) catch unreachable
+    else
+        std.fmt.bufPrint(buf, "bytes={d}-", .{start}) catch unreachable;
+}
+
+/// The first byte offset a `Content-Range` header claims, from
+/// `bytes {start}-{end}/{total}`, or null when it cannot be read.
+pub fn contentRangeStart(value: []const u8) ?u64 {
+    const rest = std.mem.trimStart(u8, value, " \t");
+    if (!std.ascii.startsWithIgnoreCase(rest, "bytes")) return null;
+    const numbers = std.mem.trimStart(u8, rest["bytes".len..], " \t");
+    const dash = std.mem.indexOfScalar(u8, numbers, '-') orelse return null;
+    return std.fmt.parseInt(u64, numbers[0..dash], 10) catch null;
+}
+
+/// Whether the body was decompressed on its way here. The stored checksum
+/// covers the compressed bytes, so there is nothing to verify against, and
+/// byte offsets mean nothing to the server, so there is no resuming either.
+/// `headed` is anything with a `header(name) ?[]const u8`.
+pub fn isTranscoded(headed: anytype) bool {
+    const stored = headed.header("x-goog-stored-content-encoding") orelse return false;
+    if (!std.ascii.eqlIgnoreCase(stored, "gzip")) return false;
+    const sent = headed.header("content-encoding") orelse "identity";
+    return std.ascii.eqlIgnoreCase(sent, "identity");
+}
+
 /// The crc32c value inside an `x-goog-hash` header, whose value is a
 /// comma-separated list such as `crc32c=8P9ykg==,md5=...`, in either order.
 /// Null when the list has no readable crc32c entry.
@@ -103,6 +133,42 @@ test "CappedAllocating reports the allocator failing as such" {
     try testing.expectError(error.WriteFailed, sink.writer.writeAll("data"));
     try testing.expect(sink.out_of_memory);
     try testing.expect(!sink.over);
+}
+
+test "formatRange writes both forms" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("bytes=0-9", formatRange(&buf, 0, 9));
+    try testing.expectEqualStrings("bytes=5-", formatRange(&buf, 5, null));
+    try testing.expectEqualStrings("bytes=18446744073709551615-", formatRange(&buf, std.math.maxInt(u64), null));
+}
+
+test "contentRangeStart reads what servers send" {
+    try testing.expectEqual(5, contentRangeStart("bytes 5-14/100").?);
+    try testing.expectEqual(0, contentRangeStart("bytes 0-0/1").?);
+    try testing.expectEqual(7, contentRangeStart(" bytes  7-11/12").?);
+    try testing.expectEqual(null, contentRangeStart(""));
+    try testing.expectEqual(null, contentRangeStart("bytes */100"));
+    try testing.expectEqual(null, contentRangeStart("items 5-14/100"));
+    try testing.expectEqual(null, contentRangeStart("bytes x-14/100"));
+}
+
+const FakeHeaders = struct {
+    stored: ?[]const u8 = null,
+    sent: ?[]const u8 = null,
+    fn header(self: FakeHeaders, name: []const u8) ?[]const u8 {
+        if (std.ascii.eqlIgnoreCase(name, "x-goog-stored-content-encoding")) return self.stored;
+        if (std.ascii.eqlIgnoreCase(name, "content-encoding")) return self.sent;
+        return null;
+    }
+};
+
+test "isTranscoded: only a gzip-stored object arriving plain" {
+    try testing.expect(isTranscoded(FakeHeaders{ .stored = "gzip" }));
+    try testing.expect(isTranscoded(FakeHeaders{ .stored = "GZIP", .sent = "identity" }));
+    // Sent compressed as stored: the checksum covers exactly what arrived.
+    try testing.expect(!isTranscoded(FakeHeaders{ .stored = "gzip", .sent = "gzip" }));
+    try testing.expect(!isTranscoded(FakeHeaders{ .stored = "identity" }));
+    try testing.expect(!isTranscoded(FakeHeaders{}));
 }
 
 test "crc32cFromHashHeader reads production's forms" {

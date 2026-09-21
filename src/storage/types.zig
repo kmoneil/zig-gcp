@@ -76,9 +76,19 @@ pub const UploadOptions = struct {
     crc32c: ?u32 = null,
 };
 
+/// A byte range of an object: `length` bytes from `offset`, or everything
+/// from `offset` when `length` is null.
+pub const Range = struct {
+    offset: u64,
+    length: ?u64 = null,
+};
+
 pub const DownloadOptions = struct {
     /// Download one specific generation instead of the live one.
     generation: ?u64 = null,
+    /// Download part of the object. The checksum covers the whole object,
+    /// so a range read reports `checksum_verified = false`.
+    range: ?Range = null,
 };
 
 pub const DownloadResult = struct {

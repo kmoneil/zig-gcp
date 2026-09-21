@@ -231,6 +231,12 @@ pub const FakeTransport = struct {
             .fail => |err| return err,
             .respond => |canned| canned,
         };
+        // The head is visible before any body byte, as the real transport
+        // delivers it, so a cut mid-body still leaves the headers readable.
+        if (req.head_out) |out| out.* = .{
+            .status = canned.status,
+            .headers = try copyHeaders(arena, canned.headers),
+        };
         if (canned.status < 300) if (req.sink == .writer) {
             const w = req.sink.writer;
             if (canned.cut_after) |cut| {
@@ -993,6 +999,42 @@ test "fuzz FakeTransport: segment splits never change the recorded body" {
         "\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x05hello\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x06world!",
         "\x00\x00\x00\x00\x00\x00\x00\x00",
     } });
+}
+
+test "FakeTransport delivers the head before the body, cut or not" {
+    var fake: FakeTransport = .init(std.testing.allocator, &.{
+        .{ .respond = .{
+            .status = 200,
+            .body = "hello world\n",
+            .headers = &.{.{ .name = "x-goog-generation", .value = "7" }},
+            .cut_after = 5,
+        } },
+        .{ .fail = error.ConnectionRefused },
+    });
+    defer fake.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var head: ?StreamRequest.Head = null;
+    _ = fake.transport().sendStream(.{
+        .method = .GET,
+        .url = "http://x/o",
+        .sink = .{ .writer = &out },
+        .head_out = &head,
+    }, arena.allocator()) catch {};
+    try std.testing.expectEqual(200, head.?.status);
+    try std.testing.expectEqualStrings("7", head.?.header("x-goog-generation").?);
+    try std.testing.expectEqualStrings("hello", out.buffered());
+
+    // A transport failure leaves it null.
+    var none: ?StreamRequest.Head = null;
+    _ = fake.transport().sendStream(.{
+        .method = .GET,
+        .url = "http://x/o",
+        .head_out = &none,
+    }, arena.allocator()) catch {};
+    try std.testing.expectEqual(null, none);
 }
 
 test "FakeTransport: a short reader is EndOfStream, and a spent script fails loudly" {
