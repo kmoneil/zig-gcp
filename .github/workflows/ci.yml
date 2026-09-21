@@ -51,12 +51,17 @@ jobs:
           docker logs pubsub
           exit 1
 
+      # About a minute normally. A suite that hangs fails here in ten rather
+      # than using up the job's thirty, and the build streams each test's
+      # name as it starts, so the log's last line names the one that hung.
       - name: Integration tests
+        timeout-minutes: 10
         env:
           PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
         run: zig build test-integration --summary all
 
       - name: Examples
+        timeout-minutes: 10
         env:
           PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
         run: |
