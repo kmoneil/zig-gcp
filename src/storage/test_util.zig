@@ -32,6 +32,8 @@ pub const Harness = struct {
         retry: RetryPolicy = .{},
         retry_unconditional_writes: bool = false,
         verify_checksums: bool = true,
+        chunk_size: usize = 8 * 1024 * 1024,
+        single_request_limit: usize = 8 * 1024 * 1024,
         quota_project: ?[]const u8 = null,
     };
 
@@ -50,6 +52,8 @@ pub const Harness = struct {
             .retry = options.retry,
             .retry_unconditional_writes = options.retry_unconditional_writes,
             .verify_checksums = options.verify_checksums,
+            .chunk_size = options.chunk_size,
+            .single_request_limit = options.single_request_limit,
             .diagnostics = &h.diag,
             .transport = h.fake.transport(),
         });

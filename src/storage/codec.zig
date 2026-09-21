@@ -19,6 +19,56 @@ pub const DecodeError = error{ InvalidResponse, OutOfMemory };
 
 // Requests
 
+/// The object metadata an upload declares: the multipart metadata part and
+/// the resumable session's opening body are this same JSON. `crc32c` is
+/// the checksum's base64 form, or null to claim none.
+pub fn encodeUploadMetadata(
+    arena: Allocator,
+    object_name: []const u8,
+    options: types.UploadOptions,
+    crc32c: ?[8]u8,
+) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeUploadMetadata(&jw, object_name, options, crc32c) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeUploadMetadata(
+    jw: *Stringify,
+    object_name: []const u8,
+    options: types.UploadOptions,
+    crc32c: ?[8]u8,
+) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(object_name);
+    try jw.objectField("contentType");
+    try jw.write(options.content_type);
+    if (options.cache_control) |value| {
+        try jw.objectField("cacheControl");
+        try jw.write(value);
+    }
+    if (options.content_encoding) |value| {
+        try jw.objectField("contentEncoding");
+        try jw.write(value);
+    }
+    if (options.metadata.len > 0) {
+        try jw.objectField("metadata");
+        try jw.beginObject();
+        for (options.metadata) |entry| {
+            try jw.objectField(entry.key);
+            try jw.write(entry.value);
+        }
+        try jw.endObject();
+    }
+    if (crc32c) |checksum| {
+        try jw.objectField("crc32c");
+        try jw.write(&checksum);
+    }
+    try jw.endObject();
+}
+
 /// The `buckets.insert` body.
 pub fn encodeBucket(arena: Allocator, name: []const u8, config: types.BucketConfig) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);

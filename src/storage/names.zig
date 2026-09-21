@@ -68,6 +68,20 @@ fn writeUpload(w: *Writer, bucket: []const u8) Writer.Error!void {
     try w.writeAll("/o?uploadType=multipart");
 }
 
+/// `/upload/storage/v1/b/{bucket}/o?uploadType=resumable`, which opens a
+/// session. The object name travels in the metadata body.
+pub fn uploadResumablePath(arena: Allocator, bucket: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeResumable(&out.writer, bucket) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeResumable(w: *Writer, bucket: []const u8) Writer.Error!void {
+    try w.writeAll("/upload/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/o?uploadType=resumable");
+}
+
 const Parts = struct {
     bucket: ?[]const u8 = null,
     object: ?[]const u8 = null,
