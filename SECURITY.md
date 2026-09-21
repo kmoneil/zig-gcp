@@ -103,6 +103,15 @@ code in `src/`.
 - **Redirects are never followed,** so a server cannot send the request, and
   its Authorization header, to another host. `HttpTransport does not follow
   redirects`.
+- **An impersonation file cannot redirect the token it spends.** Only the
+  service account's email is read from its URL, and only if it is a plain
+  account name; the request goes to Google's IAM Credentials endpoint, as
+  Google's own libraries do, so a crafted file cannot send a user's token to
+  another host. `ImpersonatedServiceAccount: the file's URL names the
+  account, never the host`, `fuzz principalFromUrl: only a plain account
+  name ever comes out`. Its nested source credentials are read with a flat
+  type, so they cannot nest objects to any depth: `adc_file: what an
+  impersonated file must have`.
 - **Nothing sensitive reaches the log:** no tokens, message data, attribute
   keys or values, ordering keys or page tokens. Tokens stay out of
   `Diagnostics` too. `log hygiene: no token, payload or attribute value ever
@@ -110,7 +119,10 @@ code in `src/`.
   provider's token reaches the request intact or not at all`, `Cache: a
   failed early refresh returns the cached token, warns, and retries 10 s
   later`, `AuthorizedUser: secrets reach neither the log nor Diagnostics`,
-  `MetadataServer: the token reaches neither the log nor Diagnostics`.
+  `MetadataServer: the token reaches neither the log nor Diagnostics`,
+  `ImpersonatedServiceAccount: secrets reach neither the log nor
+  Diagnostics`, and every block it frees is wiped first:
+  `ImpersonatedServiceAccount: every block it frees is wiped first`.
 
 ## Secret bytes
 

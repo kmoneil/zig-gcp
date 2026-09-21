@@ -1,8 +1,10 @@
 //! Credentials for the other modules: turns "where am I running?" into a
 //! bearer token. `MetadataServer` for a workload on Google Cloud,
 //! `AuthorizedUser` for the login `gcloud` saves, `ServiceAccount` for a
-//! service account key file, `StaticToken` for a token from somewhere
-//! else, and `Cache`, which the providers share.
+//! service account key file, `ExternalAccount` for workload identity
+//! federation, `ImpersonatedServiceAccount` for a login that acts as a
+//! service account, `StaticToken` for a token from somewhere else, and
+//! `Cache`, which the providers share.
 
 const core = @import("core");
 
@@ -14,6 +16,7 @@ pub const Cache = @import("Cache.zig");
 pub const AuthorizedUser = @import("AuthorizedUser.zig");
 pub const ServiceAccount = @import("ServiceAccount.zig");
 pub const ExternalAccount = @import("ExternalAccount.zig");
+pub const ImpersonatedServiceAccount = @import("ImpersonatedServiceAccount.zig");
 pub const MetadataServer = @import("MetadataServer.zig");
 pub const Lookup = @import("Lookup.zig");
 pub const Credentials = @import("Credentials.zig");
@@ -27,6 +30,7 @@ test {
     _ = @import("AuthorizedUser.zig");
     _ = @import("ServiceAccount.zig");
     _ = @import("ExternalAccount.zig");
+    _ = @import("ImpersonatedServiceAccount.zig");
     _ = @import("MetadataServer.zig");
     _ = @import("rsa.zig");
     _ = @import("Lookup.zig");
@@ -34,6 +38,7 @@ test {
     _ = @import("Cache.zig");
     _ = @import("adc_file.zig");
     _ = @import("form.zig");
+    _ = @import("iam_credentials.zig");
     _ = @import("logging.zig");
     _ = @import("token_response.zig");
 }

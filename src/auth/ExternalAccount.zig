@@ -28,6 +28,7 @@ const Transport = core.transport.Transport;
 const Cache = @import("Cache.zig");
 const adc_file = @import("adc_file.zig");
 const form = @import("form.zig");
+const iam_credentials = @import("iam_credentials.zig");
 const logging = @import("logging.zig");
 const token_response = @import("token_response.zig");
 
@@ -159,6 +160,10 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
         },
         .service_account => {
             if (diag) |d| d.print("the credentials file is a service account key; use ServiceAccount, or findDefault", .{});
+            return error.UnsupportedCredentialType;
+        },
+        .impersonated_service_account => {
+            if (diag) |d| d.print("the credentials file impersonates a service account; use ImpersonatedServiceAccount, or findDefault", .{});
             return error.UnsupportedCredentialType;
         },
     };
@@ -498,71 +503,21 @@ fn stsExchange(self: *ExternalAccount, arena: Allocator, subject: []const u8) Re
 
 /// Trades the STS token for one that acts as the service account.
 fn impersonate(self: *ExternalAccount, io: std.Io, arena: Allocator, sts_token: []const u8) Result {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    {
-        var json: std.json.Stringify = .{ .writer = &out.writer };
-        const write = struct {
-            fn f(j: *std.json.Stringify, self_: *ExternalAccount) !void {
-                try j.beginObject();
-                try j.objectField("scope");
-                try j.beginArray();
-                var scopes = std.mem.splitScalar(u8, self_.scopes.joined.?, ' ');
-                while (scopes.next()) |scope| try j.write(scope);
-                try j.endArray();
-                try j.objectField("lifetime");
-                var buf: [16]u8 = undefined;
-                try j.write(std.fmt.bufPrint(&buf, "{d}s", .{self_.impersonation_lifetime_s}) catch unreachable);
-                try j.endObject();
-            }
-        }.f;
-        write(&json, self) catch return .{ .fail = error.OutOfMemory };
-    }
-
-    const res = self.transport.send(.{
-        .method = .POST,
+    const outcome = iam_credentials.generateAccessToken(self.transport, io, arena, .{
         .url = self.impersonation_url.?,
         .bearer = sts_token,
-        .body = out.written(),
-        .content_type = .json,
+        .scopes = self.scopes.joined.?,
+        .lifetime_s = self.impersonation_lifetime_s,
         .timeout_ms = self.request_timeout_ms,
-    }, arena) catch |err| {
-        if (self.diagnostics) |d| d.print("the IAM Credentials endpoint could not be reached: {t}", .{err});
-        return if (core.isRetryable(err)) .{ .retry = err } else .{ .fail = err };
+    }, self.diagnostics, "impersonation was refused: grant roles/iam.workloadIdentityUser on the service account to the pool identity");
+    return switch (outcome) {
+        .token => |fetched| .{ .token = fetched },
+        .retry => |err| .{ .retry = err },
+        // The STS token was minted a moment ago for this call, so a refusal
+        // is not one a fresher token would fix.
+        .unauthorized => .{ .fail = error.TokenEndpointRejected },
+        .fail => |err| .{ .fail = err },
     };
-    if (res.status != 200) {
-        const body = core.errors.decodeErrorBody(arena, res.body) catch |err| return .{ .fail = err };
-        if (self.diagnostics) |d| {
-            const status = if (body) |b| b.status else "";
-            if (res.status == 403) {
-                d.set(res.status, status, "impersonation was refused: grant roles/iam.workloadIdentityUser on the service account to the pool identity");
-            } else {
-                d.set(res.status, status, if (body) |b| b.message else res.body);
-            }
-        }
-        if (res.status == 429 or res.status >= 500) return .{ .retry = error.TokenUnavailable };
-        return .{ .fail = error.TokenEndpointRejected };
-    }
-
-    const Wire = struct {
-        accessToken: ?[]const u8 = null,
-        expireTime: ?[]const u8 = null,
-    };
-    const wire = std.json.parseFromSliceLeaky(Wire, arena, res.body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-        error.OutOfMemory => return .{ .fail = error.OutOfMemory },
-        else => return invalidImpersonation(self),
-    };
-    const token = wire.accessToken orelse return invalidImpersonation(self);
-    const expire_text = wire.expireTime orelse return invalidImpersonation(self);
-    const expires_at = core.timestamp.parse(expire_text) catch return invalidImpersonation(self);
-    const now = std.Io.Clock.real.now(io);
-    const expires_in = @divFloor(expires_at.nanoseconds - now.nanoseconds, std.time.ns_per_s);
-    if (expires_in <= 0) return invalidImpersonation(self);
-    return .{ .token = .{ .token = token, .expires_in = @intCast(@min(expires_in, std.math.maxInt(i64))) } };
-}
-
-fn invalidImpersonation(self: *ExternalAccount) Result {
-    if (self.diagnostics) |d| d.print("the IAM Credentials answer has no usable accessToken and expireTime", .{});
-    return .{ .fail = error.InvalidTokenResponse };
 }
 
 fn entropy(io: std.Io) u64 {
