@@ -75,6 +75,8 @@ pub fn fromHttpStatus(http_status: u16) ApiError {
         404 => error.NotFound,
         408, 504 => error.DeadlineExceeded,
         409 => error.AlreadyExists,
+        412 => error.FailedPrecondition,
+        416 => error.OutOfRange,
         429 => error.ResourceExhausted,
         499 => error.ServerCancelled,
         500 => error.Internal,
@@ -96,6 +98,11 @@ const WireErrorBody = struct {
     @"error": ?struct {
         status: ?[]const u8 = null,
         message: ?[]const u8 = null,
+        // The older shape, which Cloud Storage still uses: no status, and
+        // a list of errors whose `reason` is a camelCase word.
+        errors: ?[]const struct {
+            reason: ?[]const u8 = null,
+        } = null,
     } = null,
 };
 
@@ -105,6 +112,11 @@ const WireErrorBody = struct {
 /// memory is an error, not a body that failed to decode: the fallback could
 /// report the wrong error, since statuses share HTTP codes. The strings may
 /// point into `body`.
+///
+/// Cloud Storage sends an older shape with no `status`; there the first
+/// error's `reason`, such as "notFound", stands in as the status. No reason
+/// is a canonical status name, so mapping still falls back to the HTTP code
+/// while diagnostics keep the server's word.
 pub fn decodeErrorBody(arena: Allocator, body: []const u8) Allocator.Error!?ErrorBody {
     const wire = std.json.parseFromSliceLeaky(WireErrorBody, arena, body, .{
         .ignore_unknown_fields = true,
@@ -116,7 +128,11 @@ pub fn decodeErrorBody(arena: Allocator, body: []const u8) Allocator.Error!?Erro
         else => return null,
     };
     const e = wire.@"error" orelse return null;
-    return .{ .status = e.status orelse "", .message = e.message orelse "" };
+    const reason: ?[]const u8 = if (e.errors) |list|
+        if (list.len > 0) list[0].reason else null
+    else
+        null;
+    return .{ .status = e.status orelse reason orelse "", .message = e.message orelse "" };
 }
 
 /// Details of the most recent failed call. Zig errors carry no payload, so
@@ -227,6 +243,39 @@ test "error mapping: status wins over HTTP code; unknown status falls back" {
     try testing.expectEqual(error.Unknown, fromResponse(302, ""));
     try testing.expectEqual(error.DeadlineExceeded, fromHttpStatus(408));
     try testing.expectEqual(error.InvalidArgument, fromHttpStatus(413));
+    // The statuses Cloud Storage's preconditions and ranges answer with.
+    try testing.expectEqual(error.FailedPrecondition, fromHttpStatus(412));
+    try testing.expectEqual(error.OutOfRange, fromHttpStatus(416));
+}
+
+test "decode the older error shape Cloud Storage sends" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // No `status` string; the first error's `reason` stands in.
+    const e = (try decodeErrorBody(a,
+        \\{"error":{"code":404,"message":"No such object: my-bucket/missing.txt",
+        \\"errors":[{"message":"No such object: my-bucket/missing.txt","domain":"global","reason":"notFound"}]}}
+    )).?;
+    try testing.expectEqualStrings("notFound", e.status);
+    try testing.expectEqualStrings("No such object: my-bucket/missing.txt", e.message);
+    // A camelCase reason is not a canonical status: the HTTP code decides.
+    try testing.expectEqual(error.NotFound, fromResponse(404, e.status));
+    try testing.expectEqual(error.FailedPrecondition, fromResponse(412, "conditionNotMet"));
+
+    // A `status` string still wins over a reason.
+    const both = (try decodeErrorBody(a,
+        \\{"error":{"status":"NOT_FOUND","errors":[{"reason":"somethingElse"}]}}
+    )).?;
+    try testing.expectEqualStrings("NOT_FOUND", both.status);
+
+    // An empty error list, and a reason-less entry.
+    const empty = (try decodeErrorBody(a, "{\"error\":{\"code\":500,\"errors\":[]}}")).?;
+    try testing.expectEqualStrings("", empty.status);
+    const bare = (try decodeErrorBody(a, "{\"error\":{\"code\":500,\"errors\":[{\"domain\":\"global\"}]}}")).?;
+    try testing.expectEqualStrings("", bare.status);
+    // `errors` that is not a list makes the body unreadable, not a crash.
+    try testing.expectEqual(null, try decodeErrorBody(a, "{\"error\":{\"errors\":42}}"));
 }
 
 test "Diagnostics.set copies and truncates" {
