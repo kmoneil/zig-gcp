@@ -4,6 +4,36 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.13.0 (unreleased)
+
+- core: the transport can stream, groundwork for the coming Cloud Storage
+  module. `Transport` has a second, optional vtable entry, `sendStream`:
+  a `StreamRequest` sends its body from back-to-back segments or from a
+  `std.Io.Reader` with an exact Content-Length, and its 2xx response body
+  either buffered as before or streamed into a `std.Io.Writer`, unbounded,
+  with error bodies always buffered. Response headers, chunked framing,
+  gzip and deflate, and the truncation checks all work as they do for
+  `send`, which is now the same code path with the body as one segment.
+  `accept_encoding` picks between plain bytes, for downloads that must
+  match a checksum, and compressed JSON. Redirects are still never
+  followed, so a resumable upload's 308 comes back untouched. Existing
+  `Transport` implementations keep working: the new entry defaults to
+  null, and only streaming callers need it.
+- core: `crc32c.toBase64` and `crc32c.fromBase64`, the big-endian base64
+  form Cloud Storage uses for checksums. `query.writeStrictSegment`
+  percent-encodes a path segment with only unreserved bytes literal, the
+  form an object name needs. `CountingWriter` counts bytes on their way
+  to another writer. `errors.decodeErrorBody` now also reads the older
+  error-body shape, taking the first error's `reason` as the status when
+  there is no `status` string, and HTTP 412 and 416 map to
+  `error.FailedPrecondition` and `error.OutOfRange`.
+- core: `testing.FakeTransport` scripts streaming requests too: it
+  records each body's prefix, length and CRC-32C however it was sent,
+  writes canned success bodies into a sink writer, and can cut a
+  streamed body short to play a dropped connection.
+- pubsub, auth, secret_manager: unchanged in behavior; every request now
+  goes through the streaming code path.
+
 ## 0.12.0 (2026-09-21)
 
 - pubsub: `Publisher`, new: publishing from many tasks without a round
