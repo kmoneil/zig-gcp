@@ -45,7 +45,11 @@ including the ones that did not change.
   `error.UploadSessionLost` and the caller reopens the source. A 308's
   `Range` header is believed, not assumed: sending resumes at what the
   server kept, a failed chunk leads to a status query first, and the
-  attempt counter resets whenever bytes land. With `options.crc32c` the
+  attempt counter resets whenever bytes land. The final answer is
+  checked too: a server that calls the upload finished short of every
+  byte, or before the stream has ended, has finished a truncated object,
+  so the upload fails with `error.InvalidResponse` and the object is
+  deleted again, pinned to its generation. With `options.crc32c` the
   server verifies the upload; without it `uploadFrom` hashes the stream
   and compares with the finished object, deleting it again, pinned to
   the generation just created, on a mismatch. A declared `options.size`
