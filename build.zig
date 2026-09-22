@@ -176,10 +176,16 @@ pub fn build(b: *std.Build) void {
     const run_auth_integration = streamed(b, auth_integration_tests);
     integration_step.dependOn(&run_auth_integration.step);
 
-    // Secret Manager against a real project: there is no emulator, so these
-    // need GCP_TEST_PROJECT and GCP_TEST_TOKEN, and skip without them. They
-    // are a step of their own, never part of `test-integration`, because
-    // they need cloud credentials that CI does not have.
+    // Against real Google Cloud, with credentials CI does not have, so a
+    // step of their own, never part of `test-integration`. Each suite skips
+    // without its variables. `zig build test` compiles them, as it does the
+    // examples, so they cannot rot between runs.
+    const gcp_step = b.step(
+        "test-integration-gcp",
+        "Run the Secret Manager and Cloud Storage tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET",
+    );
+    // Secret Manager has no emulator, so its tests need GCP_TEST_PROJECT
+    // and GCP_TEST_TOKEN.
     const gcp_tests = b.addTest(.{
         .name = "secret-manager-integration",
         .root_module = b.createModule(.{
@@ -190,11 +196,25 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = test_filters,
     });
-    const run_gcp = streamed(b, gcp_tests);
-    b.step(
-        "test-integration-gcp",
-        "Run Secret Manager tests against the project GCP_TEST_PROJECT names",
-    ).dependOn(&run_gcp.step);
+    gcp_step.dependOn(&streamed(b, gcp_tests).step);
+    test_step.dependOn(&gcp_tests.step);
+    // Cloud Storage against a real bucket, for what fake-gcs-server cannot
+    // show: GCP_TEST_BUCKET and GCP_TEST_TOKEN.
+    const storage_gcp_tests = b.addTest(.{
+        .name = "storage-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "storage", .module = storage },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+    });
+    gcp_step.dependOn(&streamed(b, storage_gcp_tests).step);
+    test_step.dependOn(&storage_gcp_tests.step);
 
     // Fault injection: the full stack against the emulator, through a proxy
     // that drops, cuts, delays and rewrites responses. Skips without
