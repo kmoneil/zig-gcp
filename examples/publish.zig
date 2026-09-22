@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     const count = if (args.len > 2) try std.fmt.parseInt(u32, args[2], 10) else 3;
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     const out = &stdout.interface;
 
     var token: pubsub.StaticToken = .{

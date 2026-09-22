@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     if (tasks == 0) return error.NeedAtLeastOneTask;
 
     var stdout_buffer: [1024]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const out = &stdout.interface;
 
     var token: pubsub.StaticToken = .{
