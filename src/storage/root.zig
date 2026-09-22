@@ -51,8 +51,9 @@ pub const BucketBound = @import("types.zig").BucketBound;
 pub const QueryParam = @import("types.zig").QueryParam;
 pub const Header = @import("types.zig").Header;
 
-/// What signs a signed URL as a service account, such as
-/// `auth.ServiceAccount.signer()` for a key file.
+/// What signs a signed URL as a service account: `auth.Credentials.signer()`
+/// for whatever the environment has, `auth.ServiceAccount.signer()` for a key
+/// file, or `auth.IamSigner` for any account a token may sign as.
 pub const Signer = core.Signer;
 
 /// Parses a `time_created` (RFC 3339) to nanoseconds since the Unix epoch.

@@ -9,11 +9,11 @@ modules it imports.
 | `pubsub` | Pub/Sub v1: publish, one call at a time or batched from many tasks, pull, a worker loop, acknowledge, and topic and subscription management | beta |
 | `secret_manager` | Secret Manager v1: read a secret's bytes, add versions, and manage secrets and their versions, global or regional | experimental |
 | `storage` | Cloud Storage JSON API: buckets, object metadata and listings, uploads from memory or any reader and downloads into any writer, streamed in constant memory, resumed after failures and checksummed both ways, preconditions, server-side copies, and signed URLs | experimental |
-| `auth` | Credentials for the service modules: `findDefault` picks between the metadata server on Google Cloud, the login `gcloud auth application-default login` saves (impersonating a service account or not), and a file the environment names. | experimental |
+| `auth` | Credentials for the service modules: `findDefault` picks between the metadata server on Google Cloud, the login `gcloud auth application-default login` saves (impersonating a service account or not), and a file the environment names. They sign signed URLs too, on this machine or through IAM. | experimental |
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` and `Signer` seams, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 724 unit, property and fuzz tests, Google's 29 V4 signing
+- Tested with 749 unit, property and fuzz tests, Google's 29 V4 signing
   vectors among them; 28 Pub/Sub integration tests that pass against both
   the emulator and production, and 20 more through a proxy that drops,
   cuts and stalls the connection; 18 Cloud Storage tests against
@@ -688,8 +688,8 @@ and compare checksums. An `if_generation_not_match` or
 | `.signedUrl(signer, options)`, `bucket.signedUrl(signer, options)` | A V4 signed URL, which lets whoever holds it make one request without credentials until it expires |
 
 The default OAuth scope is `devstorage.read_write`; `Options.scope` picks
-`.read_only` or `.cloud_platform` instead. Not in this version: signing
-through IAM, metadata updates after upload (`patch`), compose, resumable
+`.read_only` or `.cloud_platform` instead. Not in this version: metadata
+updates after upload (`patch`), compose, POST policy documents, resumable
 sessions that outlive the process, parallel downloads, requester pays,
 customer-supplied encryption keys, listing old versions or soft-deleted
 objects, and gRPC.

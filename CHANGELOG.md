@@ -25,9 +25,18 @@ including the ones that did not change.
   object name with a `.` or `..` segment, which browsers rewrite before
   sending. Breaking, for an exhaustive `switch` over `storage.Error`: it
   gains `InvalidSignedUrlOptions`, `SigningRejected` and `SigningFailed`.
-- auth: `ServiceAccount.signer()` signs with a key file's private key, on
-  this machine. Signing through IAM, for workloads without a key file, is
-  next.
+- auth: signers, for signed URLs. `ServiceAccount.signer()` signs with a
+  key file's private key, on this machine. `IamSigner` signs through the
+  IAM Credentials API's `signBlob` as any service account whose Token
+  Creator role the token's principal holds, with delegates, retries, and
+  one fresh token after a 401; Google rotates the keys it signs with and
+  promises each for 12 hours, so a URL signed through IAM is refused
+  beyond that. `ImpersonatedServiceAccount.signer()` signs as the target
+  with the source credentials, as Google's Python, Node.js and Java
+  libraries do, and `MetadataServer.signer()` as the attached account,
+  whose email the new `MetadataServer.email()` reads. `Credentials.signer()`
+  picks the right one for what `findDefault` found, or null for a user's
+  own login or a workload identity federation file.
 - core: `Signer`, the seam signing goes through, beside `TokenProvider`,
   and `testing.FakeSigner`.
 - pubsub, secret_manager: unchanged.
