@@ -187,13 +187,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `--fuzz=N` runs every matching property N times, so a job takes N
+        # times the sum of its properties' costs per run. Each count aims at
+        # about 90 of the job's 180 minutes, from costs measured on
+        # 2026-09-22, where a local run and CI kept pace: core 2.9 ms,
+        # slow-auth 88 ms, pubsub 5.5 ms, the Subscriber property 31 ms,
+        # storage 0.28 ms.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 2M }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
-          - { job: slow-auth, module: auth, filter: slow property, iterations: 100K }
-          - { job: pubsub, module: pubsub, filter: fuzz, iterations: 2M }
-          - { job: slow-pubsub, module: pubsub, filter: slow property, iterations: 1M }
+          - { job: slow-auth, module: auth, filter: slow property, iterations: 50K }
+          - { job: pubsub, module: pubsub, filter: fuzz, iterations: 750K }
+          - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1M }
+          - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 150K }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
+          - { job: storage, module: storage, filter: fuzz, iterations: 8M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
