@@ -13,7 +13,7 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` seam, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 690 unit, property and fuzz tests; 28 Pub/Sub integration
+- Tested with 692 unit, property and fuzz tests; 28 Pub/Sub integration
   tests that pass against both the emulator and production, and 20 more
   through a proxy that drops, cuts and stalls the connection; 16 Cloud
   Storage tests against fake-gcs-server and 9 against a real bucket,
@@ -27,7 +27,7 @@ modules it imports.
 ## Install
 
 ```
-zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.14.0
+zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.14.1
 ```
 
 ```zig

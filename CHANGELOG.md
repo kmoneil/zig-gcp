@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.14.1 (unreleased)
+## 0.14.1 (2026-09-22)
 
 - pubsub: fixed: a `Subscriber` could keep a pulled batch's memory
   forever when handlers on different tasks finished messages of the same
