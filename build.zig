@@ -206,7 +206,7 @@ pub fn build(b: *std.Build) void {
     // examples, so they cannot rot between runs.
     const gcp_step = b.step(
         "test-integration-gcp",
-        "Run the Secret Manager and Cloud Storage tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET",
+        "Run the Secret Manager, Cloud Storage and signed URL tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET",
     );
     // Secret Manager has no emulator, so its tests need GCP_TEST_PROJECT
     // and GCP_TEST_TOKEN.
@@ -239,6 +239,25 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, storage_gcp_tests).step);
     test_step.dependOn(&storage_gcp_tests.step);
+    // Signed URLs against a real bucket, which is the only place a
+    // signature is checked: GCP_TEST_BUCKET, GCP_TEST_TOKEN, and a signer,
+    // GCP_TEST_SIGNER_KEY or GCP_TEST_SIGNER_EMAIL.
+    const signed_url_gcp_tests = b.addTest(.{
+        .name = "signed-url-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/signed_url_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "storage", .module = storage },
+                .{ .name = "auth", .module = auth },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+    });
+    gcp_step.dependOn(&streamed(b, signed_url_gcp_tests).step);
+    test_step.dependOn(&signed_url_gcp_tests.step);
 
     // Fault injection: the full stack against the emulator, through a proxy
     // that drops, cuts, delays and rewrites responses. Skips without
