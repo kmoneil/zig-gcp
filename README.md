@@ -27,7 +27,7 @@ modules it imports.
 ## Install
 
 ```
-zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.13.1
+zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.14.0
 ```
 
 ```zig

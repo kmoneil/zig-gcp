@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.14.0 (unreleased)
+## 0.14.0 (2026-09-22)
 
 - storage: new module, stability `experimental`. A client for the Cloud
   Storage JSON API: buckets create, get, list and delete; objects get,
