@@ -23,12 +23,17 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//! Zig 0.16.0's test runner (lib/compiler/test_runner.zig), unchanged except
-//! for one line: its fuzz path passes an error return trace to
-//! `std.debug.writeStackTrace`, which does not compile, so `zig build test
-//! --fuzz` fails for every project. The fix calls `writeErrorReturnTrace`.
+//! Zig 0.16.0's test runner (lib/compiler/test_runner.zig), with two fixes to
+//! its fuzz path:
+//! - It passes an error return trace to `std.debug.writeStackTrace`, which
+//!   does not compile, so `zig build test --fuzz` fails for every project.
+//!   The fix calls `writeErrorReturnTrace`.
+//! - It never initializes `std.testing.io` or `std.testing.environ`, which
+//!   the normal path sets up for every test, so a fuzz test that uses them
+//!   reads an uninitialized `Io.Threaded` and segfaults at its first
+//!   allocation. Each fuzz run now gets its own, as every test does.
 //! Used only with `zig build test -Dfuzz-runner --fuzz`. Delete this file
-//! once the Zig release in use ships the fix.
+//! once the Zig release in use ships both fixes.
 //! Default test runner for unit tests.
 const builtin = @import("builtin");
 
@@ -239,7 +244,12 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                     .gpa = gpa,
                     .io = io,
                     .input_poller = undefined,
+                    .test_io_options = .{
+                        .argv0 = .init(init.args),
+                        .environ = init.environ,
+                    },
                 };
+                testing.environ = init.environ;
 
                 {
                     var large_name_buf: std.ArrayList(u8) = .empty;
@@ -449,6 +459,8 @@ var fuzz_runner: if (builtin.fuzz) struct {
     gpa: std.mem.Allocator,
     io: Io,
     input_poller: Io.Future(Io.Cancelable!void),
+    /// What `std.testing.io` is built with for each run, as `run_test` does.
+    test_io_options: Io.Threaded.InitOptions,
 
     comptime {
         assert(builtin.fuzz); // `fuzz_runner` was analyzed in non-fuzzing compilation
@@ -463,6 +475,12 @@ var fuzz_runner: if (builtin.fuzz) struct {
 
         testing.allocator_instance = .{};
         defer if (testing.allocator_instance.deinit() == .leak) std.process.exit(1);
+        // Every input of this run happens inside this call. The Io lives on
+        // the runner's allocator, not `testing.allocator`, whose state the
+        // fuzz loop replaces for each input: an Io that outlives an input
+        // must not have its allocator swapped under it.
+        testing.io_instance = .init(fuzz_runner.gpa, fuzz_runner.test_io_options);
+        defer testing.io_instance.deinit();
         is_fuzz_test = false;
 
         builtin.test_functions[fuzz_runner.indexes[i]].func() catch |err| switch (err) {
