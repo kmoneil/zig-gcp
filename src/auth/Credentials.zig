@@ -148,6 +148,22 @@ pub fn provider(self: Credentials) TokenProvider {
     return self.held.provider();
 }
 
+/// A signer for these credentials, as a signed URL needs, or null when
+/// they cannot sign as a service account. A key file signs on this
+/// machine; a login that impersonates an account signs as it through IAM,
+/// with the source credentials; and a workload on Google Cloud signs as its
+/// attached account through IAM. A user's own login and a workload identity
+/// federation file give null: `IamSigner` names the account and the token
+/// to sign with. Points into the heap, like `provider()`.
+pub fn signer(self: Credentials) ?core.Signer {
+    return switch (self.held.impl) {
+        .service_account => |*account| account.signer(),
+        .impersonated => |*impersonated| impersonated.signer(),
+        .metadata => |*metadata| metadata.signer(),
+        .user, .external_account => null,
+    };
+}
+
 /// The project to charge for quota: `GOOGLE_CLOUD_QUOTA_PROJECT` if it was
 /// set, otherwise whatever the credentials name.
 pub fn quotaProjectId(self: Credentials) ?[]const u8 {
@@ -560,6 +576,79 @@ test "findDefault: a workload identity federation file works from the environmen
     const sent = try fake.request(0);
     try testing.expectEqualStrings("https://sts.googleapis.com/v1/token", sent.url);
     try testing.expect(std.mem.indexOf(u8, sent.body.?, "subject_token=external-subject-token") != null);
+}
+
+test "Credentials.signer: a key file signs here, impersonation and the metadata server through IAM, a user login not at all" {
+    var config: TmpConfig = undefined;
+    try config.init();
+    defer config.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var none: test_util.FakeTransport = .init(testing.allocator, &.{});
+    defer none.deinit();
+
+    // A key file signs on this machine, as its client_email, for as long
+    // as the key lasts.
+    var sa_buf: [160]u8 = undefined;
+    const sa_path = try config.write(&sa_buf, "sa.json", try serviceAccountJson(a));
+    var key = try find(testing.allocator, testing.io, .{ .credentials_path = sa_path }, .{ .transport = none.transport() });
+    defer key.deinit();
+    const key_signer = key.signer().?;
+    try testing.expectEqualStrings("robot@sa-project.iam.gserviceaccount.com", try key_signer.email(testing.io, a));
+    try testing.expectEqual(128, (try key_signer.sign(testing.io, a, "string to sign")).len);
+    try testing.expectEqual(null, key_signer.lifetimeS());
+
+    // A login that impersonates an account signs as it, through IAM.
+    var impersonated_buf: [160]u8 = undefined;
+    const impersonated_path = try config.write(&impersonated_buf, "impersonated.json",
+        \\{"type": "impersonated_service_account",
+        \\ "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken",
+        \\ "source_credentials": {"type": "authorized_user", "client_id": "c", "client_secret": "SECRET", "refresh_token": "SECRET-refresh"}}
+    );
+    var impersonated = try find(testing.allocator, testing.io, .{ .credentials_path = impersonated_path }, .{ .transport = none.transport() });
+    defer impersonated.deinit();
+    const impersonated_signer = impersonated.signer().?;
+    try testing.expectEqualStrings("sa@p.iam.gserviceaccount.com", try impersonated_signer.email(testing.io, a));
+    try testing.expectEqual(43_200, impersonated_signer.lifetimeS());
+
+    // A user's own login is no service account.
+    var user_buf: [160]u8 = undefined;
+    const user_path = try config.write(&user_buf, "user.json", gcloud_json);
+    var user = try find(testing.allocator, testing.io, .{ .credentials_path = user_path }, .{ .transport = none.transport() });
+    defer user.deinit();
+    try testing.expectEqual(null, user.signer());
+
+    // Nor is a workload identity federation file, as Google's Python and
+    // Java libraries have it.
+    var subject_buf: [160]u8 = undefined;
+    _ = try config.write(&subject_buf, "subject", "external-subject-token");
+    var external_buf: [160]u8 = undefined;
+    const external_path = try config.write(&external_buf, "external.json", try std.fmt.allocPrint(a,
+        \\{{"type": "external_account",
+        \\ "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/x",
+        \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        \\ "token_url": "https://sts.googleapis.com/v1/token",
+        \\ "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken",
+        \\ "credential_source": {{"file": "{s}/subject"}}}}
+    , .{config.dir}));
+    var external = try find(testing.allocator, testing.io, .{ .credentials_path = external_path }, .{ .transport = none.transport() });
+    defer external.deinit();
+    try testing.expectEqual(null, external.signer());
+    try testing.expectEqual(0, none.requests.items.len);
+
+    // A workload on Google Cloud signs as its attached account, whose email
+    // the metadata server gives.
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        metadata_listing,
+        .{ .respond = .{ .body = "worker@my-project.iam.gserviceaccount.com\n", .headers = flavor } },
+    });
+    defer fake.deinit();
+    var metadata = try find(testing.allocator, testing.io, .{ .gcloud_config_dir = config.dir }, .{ .transport = fake.transport() });
+    defer metadata.deinit();
+    const metadata_signer = metadata.signer().?;
+    try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try metadata_signer.email(testing.io, a));
+    try testing.expectEqual(43_200, metadata_signer.lifetimeS());
 }
 
 test "findDefault: gcloud's login file is next, and its token comes from it" {

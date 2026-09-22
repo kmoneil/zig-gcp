@@ -43,6 +43,8 @@ target: []u8,
 delegates: [][]u8,
 /// The `...:generateAccessToken` URL on `Options.iam_endpoint`. Owned.
 url: []u8,
+/// The `...:signBlob` URL on `Options.iam_endpoint`. Owned.
+sign_url: []u8,
 /// What a refusal says, naming the account and the role. Owned.
 refused: []u8,
 lifetime_s: u32,
@@ -222,6 +224,8 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
     errdefer wipeFree(gpa, target);
     const url = try iam_credentials.url(gpa, options.iam_endpoint, file.target);
     errdefer wipeFree(gpa, url);
+    const sign_url = try iam_credentials.signBlobUrl(gpa, options.iam_endpoint, file.target);
+    errdefer wipeFree(gpa, sign_url);
     const refused_format = "impersonation was refused: the source credentials need roles/iam.serviceAccountTokenCreator on {s}";
     const refused = try gpa.alloc(u8, std.fmt.count(refused_format, .{file.target}));
     _ = std.fmt.bufPrint(refused, refused_format, .{file.target}) catch unreachable;
@@ -237,6 +241,7 @@ pub fn initFromJson(gpa: Allocator, io: std.Io, json: []const u8, options: Optio
         .target = target,
         .delegates = delegates,
         .url = url,
+        .sign_url = sign_url,
         .refused = refused,
         .lifetime_s = options.lifetime_s,
         .quota_project_id = quota,
@@ -264,6 +269,7 @@ pub fn deinit(self: *ImpersonatedServiceAccount) void {
     freeAll(self.gpa, self.delegates);
     wipeFree(self.gpa, self.target);
     wipeFree(self.gpa, self.url);
+    wipeFree(self.gpa, self.sign_url);
     wipeFree(self.gpa, self.refused);
     if (self.quota_project_id) |q| wipeFree(self.gpa, q);
     wipeFree(self.gpa, self.user_agent);
@@ -290,8 +296,46 @@ pub fn targetPrincipal(self: *const ImpersonatedServiceAccount) []const u8 {
     return self.target;
 }
 
+/// Signs as the target account through IAM `signBlob`, with the source
+/// credentials and the file's delegates, as Google's Python, Node.js and
+/// Java libraries do: the source already holds Token Creator on the
+/// target, which impersonation needs anyway, while the target would need
+/// that role on itself. Points at this struct, which must not move while
+/// the signer is in use.
+pub fn signer(self: *ImpersonatedServiceAccount) core.Signer {
+    return .{ .ptr = self, .vtable = &.{
+        .email = signerEmail,
+        .sign = sign,
+        .lifetime_s = signerLifetime,
+    } };
+}
+
 fn fromPtr(ptr: *anyopaque) *ImpersonatedServiceAccount {
     return @ptrCast(@alignCast(ptr));
+}
+
+fn signerEmail(ptr: *anyopaque, io: std.Io, arena: Allocator) core.Signer.Error![]const u8 {
+    _ = io;
+    return arena.dupe(u8, fromPtr(ptr).target);
+}
+
+fn sign(ptr: *anyopaque, io: std.Io, arena: Allocator, message: []const u8) core.Signer.Error![]const u8 {
+    const self = fromPtr(ptr);
+    return iam_credentials.sign(self.transport, io, arena, .{
+        .provider = self.source.provider(),
+        .url = self.sign_url,
+        .payload = message,
+        .delegates = self.delegates,
+        .retry = self.retry,
+        .timeout_ms = self.request_timeout_ms,
+        .diagnostics = self.diagnostics,
+        .refused = try std.fmt.allocPrint(arena, "signing was refused: the source credentials need roles/iam.serviceAccountTokenCreator on {s}", .{self.target}),
+    });
+}
+
+fn signerLifetime(ptr: *anyopaque) ?u32 {
+    _ = ptr;
+    return iam_credentials.signature_lifetime_s;
 }
 
 fn getToken(ptr: *anyopaque, io: std.Io, arena: Allocator, scopes: []const []const u8) TokenProvider.Error![]const u8 {
@@ -465,6 +509,48 @@ const Harness = struct {
         return h.account.provider().getToken(testing.io, h.arena.allocator(), test_scopes);
     }
 };
+
+/// 256 bytes of 0x5a in base64: what IAM answers for a 2048-bit key.
+const signature_base64 = "Wlpa" ** 85 ++ "Wg==";
+const signed: Reply = .{ .respond = .{ .body = "{\"keyId\":\"k1\",\"signedBlob\":\"" ++ signature_base64 ++ "\"}" } };
+const test_sign_url = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/" ++ test_target ++ ":signBlob";
+
+test "ImpersonatedServiceAccount: the signer signs as the target, with the source token and the delegates" {
+    var h: Harness = undefined;
+    try h.init(&.{ source_ok, signed }, fileJson(google_url, user_source, ", \"delegates\": [\"projects/-/serviceAccounts/middle@p.iam.gserviceaccount.com\"]"));
+    defer h.deinit();
+    const s = h.account.signer();
+    try testing.expectEqualStrings(test_target, try s.email(testing.io, h.arena.allocator()));
+    const signature = try s.sign(testing.io, h.arena.allocator(), "string to sign");
+    try testing.expectEqual(256, signature.len);
+    // The source's own refresh first, then signBlob with its token: the
+    // impersonated token is never fetched.
+    try testing.expectEqual(2, h.fake.requests.items.len);
+    const call = try h.fake.request(1);
+    try testing.expectEqualStrings(test_sign_url, call.url);
+    try testing.expectEqualStrings("ya29.SOURCE-SECRET", call.bearer.?);
+    try testing.expectEqualStrings(
+        "{\"delegates\":[\"projects/-/serviceAccounts/middle@p.iam.gserviceaccount.com\"],\"payload\":\"c3RyaW5nIHRvIHNpZ24=\"}",
+        call.body.?,
+    );
+    try testing.expectEqual(43_200, s.lifetimeS());
+}
+
+test "ImpersonatedServiceAccount: a signature refused with 401 gets one fresh source token" {
+    var h: Harness = undefined;
+    try h.init(&.{ source_ok, iam_unauthorized, source_ok_again, signed }, user_file);
+    defer h.deinit();
+    _ = try h.account.signer().sign(testing.io, h.arena.allocator(), "x");
+    try testing.expectEqualStrings("ya29.SOURCE-SECRET-2", (try h.fake.request(3)).bearer.?);
+}
+
+test "ImpersonatedServiceAccount: a refused signature names the target and the role" {
+    var h: Harness = undefined;
+    try h.init(&.{ source_ok, iam_denied }, user_file);
+    defer h.deinit();
+    try testing.expectError(error.SigningRejected, h.account.signer().sign(testing.io, h.arena.allocator(), "x"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "the source credentials need roles/iam.serviceAccountTokenCreator on " ++ test_target) != null);
+}
 
 test "ImpersonatedServiceAccount: a user login acts as the service account" {
     var h: Harness = undefined;
