@@ -4,11 +4,14 @@
 //! service account key file, `ExternalAccount` for workload identity
 //! federation, `ImpersonatedServiceAccount` for a login that acts as a
 //! service account, `StaticToken` for a token from somewhere else, and
-//! `Cache`, which the providers share.
+//! `Cache`, which the providers share. For signed URLs, a key file, an
+//! impersonating login and the metadata server can also sign, and
+//! `IamSigner` signs through IAM with any token allowed to.
 
 const core = @import("core");
 
 pub const TokenProvider = core.TokenProvider;
+pub const Signer = core.Signer;
 pub const StaticToken = core.StaticToken;
 pub const Diagnostics = core.Diagnostics;
 pub const RetryPolicy = core.RetryPolicy;
@@ -17,6 +20,7 @@ pub const AuthorizedUser = @import("AuthorizedUser.zig");
 pub const ServiceAccount = @import("ServiceAccount.zig");
 pub const ExternalAccount = @import("ExternalAccount.zig");
 pub const ImpersonatedServiceAccount = @import("ImpersonatedServiceAccount.zig");
+pub const IamSigner = @import("IamSigner.zig");
 pub const MetadataServer = @import("MetadataServer.zig");
 pub const Lookup = @import("Lookup.zig");
 pub const Credentials = @import("Credentials.zig");
@@ -31,6 +35,7 @@ test {
     _ = @import("ServiceAccount.zig");
     _ = @import("ExternalAccount.zig");
     _ = @import("ImpersonatedServiceAccount.zig");
+    _ = @import("IamSigner.zig");
     _ = @import("MetadataServer.zig");
     _ = @import("rsa.zig");
     _ = @import("Lookup.zig");
