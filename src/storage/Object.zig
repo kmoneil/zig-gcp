@@ -343,6 +343,11 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
 
     var generation: ?u64 = options.generation;
     var transcoded: ?bool = null;
+    // The checksum named by the response the writer's bytes began with. A
+    // resume is a range read, and production names no checksum on a range
+    // that starts past byte 0, so a resumed download is checked against
+    // this. A request from byte 0 starts the bytes over, and replaces it.
+    var whole_crc: ?u32 = null;
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         const delivered = counting.count;
@@ -376,10 +381,13 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
                 generation = std.fmt.parseInt(u64, text, 10) catch null;
             };
             if (transcoded == null) transcoded = dl.isTranscoded(h);
+            if (!wants_partial) {
+                whole_crc = if (h.header("x-goog-hash")) |value| dl.crc32cFromHashHeader(value) else null;
+            }
         };
 
         const err: Error = if (outcome) |res| {
-            return self.finishStream(res, options, wants_partial, start, generation, transcoded orelse false, &counting, &hashing);
+            return self.finishStream(res, options, wants_partial, start, generation, transcoded orelse false, whole_crc, &counting, &hashing);
         } else |err| switch (err) {
             // The caller's writer failed; whatever it holds is theirs to
             // discard.
@@ -417,7 +425,10 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
 }
 
 /// The end of a streamed body: confirm the server sent what was asked for,
-/// then verify the checksum where one can apply.
+/// then verify the checksum where one can apply. `whole_crc` is what the
+/// response the bytes began with named, which a resumed download meets:
+/// the generation is pinned, so it describes every byte, and the last
+/// response, a range past byte 0, names none.
 fn finishStream(
     self: Object,
     res: core.transport.StreamResponse,
@@ -426,6 +437,7 @@ fn finishStream(
     start: u64,
     generation: ?u64,
     transcoded: bool,
+    whole_crc: ?u32,
     counting: *const core.CountingWriter,
     hashing: *std.Io.Writer.Hashed(core.crc32c.Hasher),
 ) Error!types.DownloadResult {
@@ -446,18 +458,17 @@ fn finishStream(
 
     var verified = false;
     if (self.client.verify_checksums and options.range == null and !transcoded) {
-        if (res.header("x-goog-hash")) |value| {
-            if (dl.crc32cFromHashHeader(value)) |expected| {
-                const got = hashing.hasher.final();
-                if (got != expected) {
-                    if (self.client.diagnostics) |d| d.print(
-                        "checksum mismatch: {d} bytes hash to {d}, the server said {d}; discard what the writer holds",
-                        .{ counting.count, got, expected },
-                    );
-                    return error.ChecksumMismatch;
-                }
-                verified = true;
+        const named: ?u32 = if (res.header("x-goog-hash")) |value| dl.crc32cFromHashHeader(value) else null;
+        if (whole_crc orelse named) |expected| {
+            const got = hashing.hasher.final();
+            if (got != expected) {
+                if (self.client.diagnostics) |d| d.print(
+                    "checksum mismatch: {d} bytes hash to {d}, the server said {d}; discard what the writer holds",
+                    .{ counting.count, got, expected },
+                );
+                return error.ChecksumMismatch;
             }
+            verified = true;
         }
         if (!verified) logging.warn("download of {s} carried no crc32c to verify against", .{self.name});
     }
@@ -773,21 +784,20 @@ test "downloadAlloc resumes after a cut connection and rides out a 503" {
         // The resume request runs into a 503, which touches no bytes.
         .{ .respond = .{ .status = 503, .body = "{}" } },
         // The retried resume delivers the rest, pinned to the generation.
+        // Like production, it names no checksum: Cloud Storage sends
+        // x-goog-hash on a range only when the range starts at byte 0.
         .{ .respond = .{
             .status = 206,
             .body = " world\n",
-            .headers = &.{
-                .{ .name = "Content-Range", .value = "bytes 5-11/12" },
-                .{ .name = "x-goog-hash", .value = "crc32c=8P9ykg==" },
-            },
+            .headers = &.{.{ .name = "Content-Range", .value = "bytes 5-11/12" }},
         } },
     }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
     defer h.deinit();
 
     var got = try h.client.bucket("b").object("a").downloadAlloc(1024, .{});
     defer got.deinit();
-    // The two halves joined without duplication, and the checksum still
-    // covers the whole object.
+    // The two halves joined without duplication, and the first response's
+    // checksum still covers the whole object.
     try testing.expectEqualStrings("hello world\n", got.value.data);
     try testing.expect(got.value.result.checksum_verified);
     try testing.expectEqual(12, got.value.result.bytes_written);
@@ -808,6 +818,89 @@ test "downloadAlloc resumes after a cut connection and rides out a 503" {
         );
         try testing.expectEqualStrings("bytes=5-", resume_req.header("Range").?);
     }
+}
+
+test "a resumed download is held to the first response's checksum" {
+    // The first response names the whole object's checksum and is cut; the
+    // resume names none, as production's never does. Bytes that do not
+    // match the first response's checksum are caught all the same.
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{
+            .body = "hello world\n",
+            .headers = &.{
+                .{ .name = "x-goog-generation", .value = "7" },
+                .{ .name = "x-goog-hash", .value = "crc32c=AAAAAQ==,md5=b1kCrCNwJL3QwXbLkwY9xA==" },
+            },
+            .cut_after = 5,
+        } },
+        .{ .respond = .{
+            .status = 206,
+            .body = " world\n",
+            .headers = &.{.{ .name = "Content-Range", .value = "bytes 5-11/12" }},
+        } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    defer h.deinit();
+
+    try testing.expectError(error.ChecksumMismatch, h.client.bucket("b").object("a").downloadAlloc(1024, .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "checksum mismatch") != null);
+    try testing.expectEqual(2, h.fake.stream_requests.items.len);
+}
+
+test "a download that starts over is held to the checksum it started over with" {
+    // Cut before any byte arrived, with no generation named to pin a
+    // retry to: the retry reads whatever is live from byte 0, here a newer
+    // object, and its own checksum is the one that describes the bytes.
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{
+            .body = "old contents",
+            .headers = &.{.{ .name = "x-goog-hash", .value = "crc32c=AAAAAQ==" }},
+            .cut_after = 0,
+        } },
+        .{ .respond = .{
+            .body = "hello world\n",
+            .headers = &.{.{ .name = "x-goog-hash", .value = "crc32c=8P9ykg==" }},
+        } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    defer h.deinit();
+
+    var got = try h.client.bucket("b").object("a").downloadAlloc(1024, .{});
+    defer got.deinit();
+    try testing.expectEqualStrings("hello world\n", got.value.data);
+    try testing.expect(got.value.result.checksum_verified);
+    // The retry asked for everything again, not for a range.
+    try testing.expectEqual(null, (try h.fake.streamRequest(1)).header("Range"));
+}
+
+test "a resume that names the checksum again is checked against the first" {
+    // An edge cache answers a range with the whole object's checksum; the
+    // first response's still decides, and here they agree.
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{
+            .body = "hello world\n",
+            .headers = &.{
+                .{ .name = "x-goog-generation", .value = "7" },
+                .{ .name = "x-goog-hash", .value = "crc32c=8P9ykg==" },
+            },
+            .cut_after = 5,
+        } },
+        .{ .respond = .{
+            .status = 206,
+            .body = " world\n",
+            .headers = &.{
+                .{ .name = "Content-Range", .value = "bytes 5-11/12" },
+                .{ .name = "x-goog-hash", .value = "crc32c=8P9ykg==,md5=b1kCrCNwJL3QwXbLkwY9xA==" },
+            },
+        } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    defer h.deinit();
+
+    var got = try h.client.bucket("b").object("a").downloadAlloc(1024, .{});
+    defer got.deinit();
+    try testing.expectEqualStrings("hello world\n", got.value.data);
+    try testing.expect(got.value.result.checksum_verified);
 }
 
 test "download streams into the caller's writer and verifies" {
