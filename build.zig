@@ -278,13 +278,13 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp" }) |name| {
-        // whoami, secret and gcs_cp pick their own credentials.
+    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign" }) |name| {
+        // whoami, secret, gcs_cp and gcs_sign pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
             &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "gcs_cp"))
+        else if (std.mem.eql(u8, name, "gcs_cp") or std.mem.eql(u8, name, "gcs_sign"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } }
         else
             &.{.{ .name = "pubsub", .module = mod }};
