@@ -215,7 +215,7 @@ fn encodeMessage(msg: []const u8, em: []u8) []const u8 {
 // (`openssl dgst -sha256 -sign`) over `test_message`, so these tests
 // check against an independent implementation.
 
-const test_message = "sign me, exactly these bytes";
+pub const test_message = "sign me, exactly these bytes";
 
 /// A 1024-bit test key: the smallest accepted, and much faster to sign
 /// with in Debug, so heavier test loops use it.
@@ -238,7 +238,7 @@ pub const test_key_1024 =
     \\-----END PRIVATE KEY-----
 ;
 
-const test_sig_1024_hex = "58b79695ef8b5af573d01eb3ab4694c8c75744f1b624d49b0726346d11b08aa2" ++
+pub const test_sig_1024_hex = "58b79695ef8b5af573d01eb3ab4694c8c75744f1b624d49b0726346d11b08aa2" ++
     "4260ec91ace15c7b3fedeed9c83167d6dd9eddec082ae6724e1ea73d157be4be" ++
     "45a85b007cceed1e05fd7d446dc52feecb1bbc765c559eba408cb6653814cba0" ++
     "2d555263fe4a83a9a3935f397738e96280eccec1762f5b8a98eb915f72fa5003";
