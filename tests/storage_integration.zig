@@ -552,3 +552,102 @@ test "does_not_exist uploads succeed once, then fail their precondition" {
     try obj.delete(.{ .preconditions = .{ .if_generation_match = generation } });
     try testing.expect(!try obj.exists());
 }
+
+/// Uses a URL the way a browser would: no credentials, and only the
+/// headers it was signed with. Returns the status; the body lands in
+/// `body`.
+fn useUrl(
+    method: std.http.Method,
+    url: []const u8,
+    headers: []const std.http.Header,
+    payload: ?[]const u8,
+    body: *std.Io.Writer.Allocating,
+) !std.http.Status {
+    var http: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer http.deinit();
+    const result = try http.fetch(.{
+        .location = .{ .url = url },
+        .method = method,
+        .payload = payload,
+        .extra_headers = headers,
+        .response_writer = &body.writer,
+        .keep_alive = false,
+    });
+    return result.status;
+}
+
+// fake-gcs-server does not check signatures, so a fake signer is enough:
+// these prove that a signed URL reaches the right object, through the XML
+// API's paths, with no credentials. Whether Cloud Storage accepts the
+// signature is Google's conformance vectors' business, and the real-bucket
+// suite's. The emulator serves the XML API only when started with
+// `-public-host` naming the host in STORAGE_EMULATOR_HOST, as CI does.
+
+test "signed URLs: PUT, GET, HEAD and DELETE an object, with no credentials" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    var signer: core.testing.FakeSigner = .{};
+    const data = "hello, signed\n";
+
+    for ([_][]const u8{ "photos/cat.txt", "a b/c+d%e/caf\xc3\xa9 (1).txt" }) |name| {
+        errdefer std.debug.print("object: {s}\n", .{name});
+        const obj = f.bucket().object(name);
+        var body: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer body.deinit();
+
+        const content_type: std.http.Header = .{ .name = "content-type", .value = "text/plain" };
+        var put = try obj.signedUrl(signer.signer(), .{ .method = .PUT, .expires_in_s = 600, .headers = &.{content_type} });
+        defer put.deinit();
+        try testing.expect(std.mem.startsWith(u8, put.value, f.client.base_url));
+        try testing.expectEqual(.ok, try useUrl(.PUT, put.value, &.{content_type}, data, &body));
+        var info = try obj.get(.{});
+        try testing.expectEqual(data.len, info.value.size);
+        try testing.expectEqualStrings("text/plain", info.value.content_type);
+        info.deinit();
+
+        var get = try obj.signedUrl(signer.signer(), .{ .expires_in_s = 600 });
+        defer get.deinit();
+        body.clearRetainingCapacity();
+        try testing.expectEqual(.ok, try useUrl(.GET, get.value, &.{}, null, &body));
+        try testing.expectEqualStrings(data, body.written());
+
+        var head = try obj.signedUrl(signer.signer(), .{ .method = .HEAD, .expires_in_s = 600 });
+        defer head.deinit();
+        body.clearRetainingCapacity();
+        try testing.expectEqual(.ok, try useUrl(.HEAD, head.value, &.{}, null, &body));
+        try testing.expectEqual(0, body.written().len);
+
+        // Cloud Storage answers a DELETE 204; fake-gcs-server says 200.
+        var delete = try obj.signedUrl(signer.signer(), .{ .method = .DELETE, .expires_in_s = 600 });
+        defer delete.deinit();
+        body.clearRetainingCapacity();
+        const status = try useUrl(.DELETE, delete.value, &.{}, null, &body);
+        try testing.expect(status == .ok or status == .no_content);
+        try testing.expect(!try obj.exists());
+    }
+}
+
+test "signed URLs: a bucket-level GET lists the bucket through the XML API" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    try f.upload("cats/tom.txt", "meow\n");
+    try f.upload("dogs/rex.txt", "woof\n");
+    var signer: core.testing.FakeSigner = .{};
+
+    var list = try f.bucket().signedUrl(signer.signer(), .{
+        .expires_in_s = 60,
+        .query = &.{.{ .name = "prefix", .value = "cats/" }},
+    });
+    defer list.deinit();
+    var body: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer body.deinit();
+    try testing.expectEqual(.ok, try useUrl(.GET, list.value, &.{}, null, &body));
+    try testing.expect(std.mem.indexOf(u8, body.written(), "<Key>cats/tom.txt</Key>") != null);
+    try testing.expect(std.mem.indexOf(u8, body.written(), "dogs/rex.txt") == null);
+}
