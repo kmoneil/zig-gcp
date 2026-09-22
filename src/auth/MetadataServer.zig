@@ -8,6 +8,9 @@
 //! carries `Metadata-Flavor: Google`, which a browser cannot be tricked into
 //! sending, and every answer must carry the same header back. Redirects are
 //! refused rather than followed.
+//!
+//! `signer()` signs as the attached account through IAM `signBlob`, since
+//! the account has no key this code could hold.
 
 const MetadataServer = @This();
 
@@ -21,6 +24,7 @@ const HttpTransport = core.transport.HttpTransport;
 const Transport = core.transport.Transport;
 const Response = core.transport.Response;
 const Cache = @import("Cache.zig");
+const iam_credentials = @import("iam_credentials.zig");
 const logging = @import("logging.zig");
 const token_response = @import("token_response.zig");
 
@@ -28,6 +32,7 @@ gpa: Allocator,
 /// All built once from the options, all owned.
 token_url: []u8,
 project_url: []u8,
+email_url: []u8,
 root_url: []u8,
 user_agent: []u8,
 probe_timeout_ms: u32,
@@ -38,6 +43,10 @@ cache: Cache,
 transport: Transport,
 /// The built-in transport, when `Options.transport` was null.
 http: ?*HttpTransport,
+/// The attached account's email, which the signer asks for once and keeps.
+/// Owned.
+signer_email: ?[]u8 = null,
+signer_mutex: std.Io.Mutex = .init,
 
 pub const Options = struct {
     /// The metadata host, with an optional `:port`. `GCE_METADATA_HOST`
@@ -134,6 +143,10 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) InitError!MetadataServ
     errdefer wipeFree(gpa, token_url);
     const project_url = try allocUrl(gpa, "http://{s}/computeMetadata/v1/project/project-id", .{options.host});
     errdefer wipeFree(gpa, project_url);
+    const email_url = try allocUrl(gpa, "http://{s}/computeMetadata/v1/instance/service-accounts/{s}/email", .{
+        options.host, options.service_account,
+    });
+    errdefer wipeFree(gpa, email_url);
     const root_url = try allocUrl(gpa, "http://{s}/", .{options.host});
     errdefer wipeFree(gpa, root_url);
     const user_agent = try gpa.dupe(u8, options.user_agent);
@@ -151,6 +164,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) InitError!MetadataServ
         .gpa = gpa,
         .token_url = token_url,
         .project_url = project_url,
+        .email_url = email_url,
         .root_url = root_url,
         .user_agent = user_agent,
         .probe_timeout_ms = options.probe_timeout_ms,
@@ -172,7 +186,9 @@ pub fn deinit(self: *MetadataServer) void {
     }
     wipeFree(self.gpa, self.token_url);
     wipeFree(self.gpa, self.project_url);
+    wipeFree(self.gpa, self.email_url);
     wipeFree(self.gpa, self.root_url);
+    if (self.signer_email) |address| wipeFree(self.gpa, address);
     wipeFree(self.gpa, self.user_agent);
     self.* = undefined;
 }
@@ -237,8 +253,75 @@ pub fn projectId(self: *MetadataServer, io: std.Io, arena: Allocator) ProjectIdE
     return arena.dupe(u8, id);
 }
 
+/// What `email` can fail with: no metadata server this code can use.
+pub const EmailError = ProjectIdError;
+
+/// The email of the service account this workload runs as: the one
+/// `Options.service_account` names, `default` unless set. Copied into
+/// `arena`.
+pub fn email(self: *MetadataServer, io: std.Io, arena: Allocator) EmailError![]const u8 {
+    const res = self.getRetrying(io, arena, self.email_url) catch |err| switch (err) {
+        // Any refusal means no metadata server this code can use.
+        error.TokenUnavailable, error.TokenEndpointRejected => return error.MetadataUnavailable,
+        else => |e| return e,
+    };
+    const address = std.mem.trim(u8, res.body, " \t\r\n");
+    if (!iam_credentials.isEmail(address)) {
+        if (self.diagnostics) |d| d.set(res.status, "", "the metadata server's service account email is not one");
+        return error.MetadataUnavailable;
+    }
+    logging.debug("metadata server: service account {s}", .{address});
+    return arena.dupe(u8, address);
+}
+
+/// Signs as the attached account through IAM `signBlob`, with this
+/// server's own tokens. Google's rules, not this library's: the account
+/// needs Token Creator on itself, granted on the account or its project;
+/// the project needs the IAM Service Account Credentials API; and on
+/// Compute Engine the VM's access scopes must include `cloud-platform`.
+/// The email is asked for once and kept. Points at this struct, which must
+/// not move while the signer is in use.
+pub fn signer(self: *MetadataServer) core.Signer {
+    return .{ .ptr = self, .vtable = &.{
+        .email = signerEmail,
+        .sign = sign,
+        .lifetime_s = signerLifetime,
+    } };
+}
+
 fn fromPtr(ptr: *anyopaque) *MetadataServer {
     return @ptrCast(@alignCast(ptr));
+}
+
+fn signerEmail(ptr: *anyopaque, io: std.Io, arena: Allocator) core.Signer.Error![]const u8 {
+    const self = fromPtr(ptr);
+    try self.signer_mutex.lock(io);
+    defer self.signer_mutex.unlock(io);
+    if (self.signer_email == null) {
+        var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+        defer scratch.deinit();
+        self.signer_email = try self.gpa.dupe(u8, try self.email(io, scratch.allocator()));
+    }
+    return arena.dupe(u8, self.signer_email.?);
+}
+
+fn sign(ptr: *anyopaque, io: std.Io, arena: Allocator, message: []const u8) core.Signer.Error![]const u8 {
+    const self = fromPtr(ptr);
+    const account = try signerEmail(ptr, io, arena);
+    return iam_credentials.sign(self.transport, io, arena, .{
+        .provider = self.provider(),
+        .url = try iam_credentials.signBlobUrl(arena, iam_credentials.default_endpoint, account),
+        .payload = message,
+        .retry = self.retry,
+        .timeout_ms = self.request_timeout_ms,
+        .diagnostics = self.diagnostics,
+        .refused = try std.fmt.allocPrint(arena, "signing was refused: {s} needs roles/iam.serviceAccountTokenCreator on itself, the IAM Service Account Credentials API must be enabled, and on Compute Engine the VM's access scopes must include cloud-platform", .{account}),
+    });
+}
+
+fn signerLifetime(ptr: *anyopaque) ?u32 {
+    _ = ptr;
+    return iam_credentials.signature_lifetime_s;
 }
 
 fn getToken(ptr: *anyopaque, io: std.Io, arena: Allocator, scopes: []const []const u8) TokenProvider.Error![]const u8 {
@@ -650,6 +733,66 @@ test "MetadataServer: projectId reads the project id, and refuses what is not on
     try testing.expectError(error.MetadataUnavailable, h.metadata.projectId(io, a));
     // Even a refusal is only ever "no metadata server to read this from".
     try testing.expectError(error.MetadataUnavailable, h.metadata.projectId(io, a));
+}
+
+const email_ok: Reply = .{ .respond = .{ .body = "worker@my-project.iam.gserviceaccount.com\n", .headers = flavor } };
+/// 256 bytes of 0x5a in base64: what IAM answers for a 2048-bit key.
+const signature_base64 = "Wlpa" ** 85 ++ "Wg==";
+const signed: Reply = .{ .respond = .{ .body = "{\"keyId\":\"k1\",\"signedBlob\":\"" ++ signature_base64 ++ "\"}" } };
+
+test "MetadataServer: email reads the attached account, and refuses what is not one" {
+    var h: Harness = undefined;
+    try h.init(&.{ email_ok, .{ .respond = .{ .body = "not an email", .headers = flavor } } });
+    defer h.deinit();
+    try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try h.metadata.email(h.clock.io(), h.arena.allocator()));
+    const req = try h.fake.request(0);
+    try testing.expectEqualStrings("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email", req.url);
+    try testing.expectEqualStrings("Google", req.header("Metadata-Flavor").?);
+    try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "email is not one") != null);
+}
+
+test "MetadataServer: the signer asks for its email once, then signs through IAM with the server's token" {
+    var h: Harness = undefined;
+    try h.init(&.{ email_ok, token_ok, signed, signed });
+    defer h.deinit();
+    const s = h.metadata.signer();
+    const arena = h.arena.allocator();
+    try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try s.email(h.clock.io(), arena));
+    const first = try s.sign(h.clock.io(), arena, "string to sign");
+    try testing.expectEqual(256, first.len);
+    try testing.expect(std.mem.allEqual(u8, first, 0x5a));
+    _ = try s.sign(h.clock.io(), arena, "another");
+    // The email once, the token once, then one signBlob call a signature.
+    try testing.expectEqual(4, h.fake.requests.items.len);
+    const iam = try h.fake.request(2);
+    try testing.expectEqual(.POST, iam.method);
+    try testing.expectEqualStrings("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/worker@my-project.iam.gserviceaccount.com:signBlob", iam.url);
+    try testing.expectEqualStrings("ya29.SECRET-metadata", iam.bearer.?);
+    try testing.expectEqualStrings("{\"payload\":\"c3RyaW5nIHRvIHNpZ24=\"}", iam.body.?);
+    try testing.expectEqual(null, iam.header("Metadata-Flavor"));
+    try testing.expectEqual(43_200, s.lifetimeS());
+}
+
+test "MetadataServer: a refused signature names the role and the VM's scopes" {
+    var h: Harness = undefined;
+    try h.init(&.{ email_ok, token_ok, .{ .respond = .{
+        .status = 403,
+        .body = "{\"error\":{\"status\":\"PERMISSION_DENIED\",\"message\":\"Request had insufficient authentication scopes.\"}}",
+    } } });
+    defer h.deinit();
+    try testing.expectError(error.SigningRejected, h.metadata.signer().sign(h.clock.io(), h.arena.allocator(), "x"));
+    const says = h.diag.message();
+    try testing.expect(std.mem.indexOf(u8, says, "worker@my-project.iam.gserviceaccount.com needs roles/iam.serviceAccountTokenCreator on itself") != null);
+    try testing.expect(std.mem.indexOf(u8, says, "access scopes must include cloud-platform") != null);
+}
+
+test "MetadataServer: a signer with no metadata server fails like the provider does" {
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .status = 404, .body = "Not Found", .headers = flavor } }});
+    defer h.deinit();
+    try testing.expectError(error.MetadataUnavailable, h.metadata.signer().sign(h.clock.io(), h.arena.allocator(), "x"));
+    try testing.expectEqual(1, h.fake.requests.items.len);
 }
 
 test "MetadataServer: probe answers only for a metadata server" {
