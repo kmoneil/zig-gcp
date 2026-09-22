@@ -650,6 +650,7 @@ const Harness = struct {
 };
 
 const Endpoint = @import("Endpoint.zig");
+const max_object_name_len = @import("validate.zig").max_object_name_len;
 
 /// A signed URL and its string to sign, computed outside this code: by
 /// Google's google-cloud-storage 3.14.1 where it agrees with the
@@ -1070,8 +1071,10 @@ fn isUpperHex(c: u8) bool {
     return (c >= '0' and c <= '9') or (c >= 'A' and c <= 'F');
 }
 
-fn pathProperty(_: void, input: []const u8) !void {
-    var buffer: [3 * test_util.max_fuzz_input]u8 = undefined;
+fn pathProperty(_: void, bytes: []const u8) !void {
+    // No object name is longer, and the fuzzer's longer inputs only cost time.
+    const input = bytes[0..@min(bytes.len, max_object_name_len)];
+    var buffer: [3 * max_object_name_len]u8 = undefined;
     var w: Writer = .fixed(&buffer);
     try writePath(&w, input);
     const encoded = w.buffered();
@@ -1088,7 +1091,7 @@ fn pathProperty(_: void, input: []const u8) !void {
         try testing.expect(c == '/' or std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_' or c == '~');
     }
     // And it decodes back to the name, byte for byte.
-    var decoded: [3 * test_util.max_fuzz_input]u8 = undefined;
+    var decoded: [3 * max_object_name_len]u8 = undefined;
     @memcpy(decoded[0..encoded.len], encoded);
     try testing.expectEqualSlices(u8, input, std.Uri.percentDecodeInPlace(decoded[0..encoded.len]));
 }
@@ -1104,9 +1107,12 @@ test "fuzz signing: a path keeps / and the unreserved set, and decodes back to t
     } });
 }
 
-fn headerValueProperty(_: void, input: []const u8) !void {
-    const once = try canonicalValue(testing.allocator, input);
-    defer testing.allocator.free(once.ptr[0..input.len]);
+fn headerValueProperty(_: void, bytes: []const u8) !void {
+    // Header values are short; 512 bytes exercise every rule.
+    const input = bytes[0..@min(bytes.len, 512)];
+    var buffer: [1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buffer);
+    const once = try canonicalValue(fba.allocator(), input);
     // No tab, no space at either end, no two spaces in a row.
     try testing.expect(std.mem.indexOfScalar(u8, once, '\t') == null);
     try testing.expect(!std.mem.startsWith(u8, once, " ") and !std.mem.endsWith(u8, once, " "));
@@ -1117,9 +1123,7 @@ fn headerValueProperty(_: void, input: []const u8) !void {
     while (original.next()) |word| try testing.expectEqualStrings(word, canonical.next() orelse return error.TestWordLost);
     try testing.expectEqual(null, canonical.next());
     // And canonicalizing again changes nothing.
-    const twice = try canonicalValue(testing.allocator, once);
-    defer testing.allocator.free(twice.ptr[0..once.len]);
-    try testing.expectEqualStrings(once, twice);
+    try testing.expectEqualStrings(once, try canonicalValue(fba.allocator(), once));
 }
 
 test "fuzz signing: header values canonicalize to their words, one space apart" {
@@ -1366,7 +1370,10 @@ fn modelProperty(_: void, input: []const u8) !void {
     try testing.expect(std.mem.endsWith(u8, prepared.unsigned_url, try std.fmt.allocPrint(a, "{s}?{s}", .{ path_line, query_line })));
 }
 
-test "fuzz signing: the canonical request matches a model written from the rules" {
+// Building whole requests costs about a third of a millisecond a run under
+// the fuzzer, so these two are slow properties, with a nightly job of their
+// own, and the storage job keeps its count.
+test "slow property signing: the canonical request matches a model written from the rules" {
     try test_util.fuzzBytes({}, modelProperty, .{ .random_runs = 500, .max_len = 1024 });
 }
 
@@ -1480,6 +1487,6 @@ fn urlProperty(_: void, input: []const u8) !void {
     try testing.expect(std.mem.indexOf(u8, query, expires) != null);
 }
 
-test "fuzz signing: a signed URL parses, and decodes back to what was signed" {
+test "slow property signing: a signed URL parses, and decodes back to what was signed" {
     try test_util.fuzzBytes({}, urlProperty, .{ .random_runs = 300, .max_len = 1024 });
 }
