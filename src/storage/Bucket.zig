@@ -12,6 +12,7 @@ const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
+const signing = @import("signing.zig");
 const types = @import("types.zig");
 const Error = errors.Error;
 
@@ -71,6 +72,15 @@ pub fn delete(self: Bucket) Error!void {
 /// borrows the client and both names, and must not outlive them.
 pub fn object(self: Bucket, name: []const u8) Object {
     return .{ .client = self.client, .bucket = self.name, .name = name };
+}
+
+/// A V4 signed URL for the bucket itself, through the XML API: a GET lists
+/// its objects as XML, with `prefix` and `delimiter` as signed query
+/// parameters. Everything else is as `Object.signedUrl` says.
+pub fn signedUrl(self: Bucket, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return signing.signUrl(self.client, signer, self.name, null, options);
 }
 
 /// One page of the bucket's objects, filtered and grouped by the options.

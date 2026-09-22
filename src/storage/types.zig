@@ -1,9 +1,11 @@
 //! Public data types: object and bucket metadata, listing options and
-//! pages. Results come wrapped in core's `Owned`, re-exported here.
+//! pages, and what a signed URL allows. Results come wrapped in core's
+//! `Owned`, re-exported here.
 
 const std = @import("std");
+const core = @import("core");
 
-pub const Owned = @import("core").Owned;
+pub const Owned = core.Owned;
 
 /// One entry of an object's custom metadata, a flat map of string to string.
 pub const Metadata = struct {
@@ -189,6 +191,61 @@ pub const BucketPage = struct {
     buckets: []const BucketInfo,
     /// Pass as `page_token` to get the next page. Null on the last page.
     next_page_token: ?[]const u8,
+};
+
+/// The request a signed URL allows. A signed POST can only start a
+/// resumable upload, with the header `x-goog-resumable: start`; the
+/// session URI it answers with then takes the bytes with no signature.
+pub const SignedMethod = enum { GET, HEAD, PUT, POST, DELETE };
+
+/// A header signed into a URL, which its holder must send with this
+/// value. The same shape as the transport's.
+pub const Header = core.transport.Header;
+
+/// A query parameter signed into a URL.
+pub const QueryParam = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Where a signed URL puts the bucket's name.
+pub const UrlStyle = union(enum) {
+    /// `{endpoint}/{bucket}/{object}`. Works for every bucket.
+    path,
+    /// `{scheme}://{bucket}.{endpoint host}/{object}`, so a browser sees
+    /// the bucket as an origin of its own. Needs a bucket name that is a
+    /// host label, and over https one without dots, unless it is
+    /// `PROJECT.appspot.com`: the certificate covers one label.
+    virtual_hosted,
+    /// `{scheme}://{host}/{object}`: a domain that serves one bucket. A
+    /// CNAME to `c.storage.googleapis.com` serves only plain HTTP, for a
+    /// bucket named like the domain, and Google's load balancer does not
+    /// pass signed URLs through.
+    bucket_bound: BucketBound,
+};
+
+pub const BucketBound = struct {
+    /// A host, with an optional port, and nothing else: `media.example.com`.
+    host: []const u8,
+    scheme: core.endpoint.Scheme = .https,
+};
+
+pub const SignedUrlOptions = struct {
+    method: SignedMethod = .GET,
+    /// How long the URL works, counted from now: 1 to 604,800 seconds
+    /// (seven days), and at most what the signer's keys are sure to last,
+    /// 43,200 through IAM. No default: a lifetime is a decision.
+    expires_in_s: u32,
+    /// Headers the holder must send with these values: a `content-type`
+    /// on a PUT, `x-goog-content-length-range` to cap its size,
+    /// `x-goog-if-generation-match: 0` to make it create-only. Names are
+    /// case-insensitive; `host` is always signed and must not appear.
+    headers: []const Header = &.{},
+    /// Query parameters signed into the URL, such as
+    /// `response-content-disposition` or `generation`. The holder cannot
+    /// add others: Cloud Storage refuses any it finds unsigned.
+    query: []const QueryParam = &.{},
+    style: UrlStyle = .path,
 };
 
 const testing = std.testing;
