@@ -25,6 +25,13 @@ including the ones that did not change.
   object name with a `.` or `..` segment, which browsers rewrite before
   sending. Breaking, for an exhaustive `switch` over `storage.Error`: it
   gains `InvalidSignedUrlOptions`, `SigningRejected` and `SigningFailed`.
+  `examples/gcs_sign.zig` prints a URL and the `curl` line that uses it.
+  Against a real bucket, both ways of signing were held to what Google
+  answers: an expired URL is 400 `ExpiredToken`, one dated more than 15
+  minutes ahead is 403 `AccessDenied`, a changed signature is 403
+  `SignatureDoesNotMatch` whose body carries Google's own canonical
+  request, and a signed `x-goog-content-sha256` must be sent as signed but
+  is never checked against the body.
 - auth: signers, for signed URLs. `ServiceAccount.signer()` signs with a
   key file's private key, on this machine. `IamSigner` signs through the
   IAM Credentials API's `signBlob` as any service account whose Token
