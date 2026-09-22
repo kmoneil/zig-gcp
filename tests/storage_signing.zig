@@ -331,3 +331,59 @@ test "400 cases Google's Python library signed, byte for byte" {
         try testing.expectEqualStrings(want, signer.lastMessage());
     }
 }
+
+test "through IAM: Google's first vector, with IAM answering its signature" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const file = try std.json.parseFromSliceLeaky(VectorFile, arena, vectors_json, .{ .ignore_unknown_fields = true });
+    const v = file.signingV4Tests[0];
+    try testing.expectEqualStrings("Simple GET", v.description);
+
+    // IAM answers with the signature Google's vector expects.
+    const marker = "&X-Goog-Signature=";
+    const signature_hex = v.expectedUrl[std.mem.lastIndexOf(u8, v.expectedUrl, marker).? + marker.len ..];
+    var signature: [256]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&signature, signature_hex);
+    var encoded: [std.base64.standard.Encoder.calcSize(256)]u8 = undefined;
+    const answer = try std.mem.concat(arena, u8, &.{
+        "{\"keyId\":\"k1\",\"signedBlob\":\"", std.base64.standard.Encoder.encode(&encoded, &signature), "\"}",
+    });
+    var iam_fake: core.testing.FakeTransport = .init(gpa, &.{ .{ .respond = .{ .body = answer } }, .{ .respond = .{ .body = answer } } });
+    defer iam_fake.deinit();
+    var token: core.testing.FakeTokenProvider = .{ .token = "ya29.CALLER" };
+    var clock: core.testing.FakeClock = .{ .now_ns = (try storage.parseTimestamp(v.timestamp)).nanoseconds };
+    var iam: auth.IamSigner = try .init(gpa, clock.io(), .{
+        .service_account = key_email,
+        .token_provider = token.provider(),
+        .transport = iam_fake.transport(),
+    });
+    defer iam.deinit();
+
+    var storage_fake: core.testing.FakeTransport = .init(gpa, &.{});
+    defer storage_fake.deinit();
+    var client: storage.Client = try .init(gpa, clock.io(), .{ .token_provider = token.provider(), .transport = storage_fake.transport() });
+    defer client.deinit();
+    var url = try client.bucket(v.bucket).object(v.object.?).signedUrl(iam.signer(), .{ .expires_in_s = v.expiration });
+    defer url.deinit();
+    try testing.expectEqualStrings(v.expectedUrl, url.value);
+
+    // What went to IAM is exactly the vector's string to sign, in base64.
+    const body = (try iam_fake.request(0)).body.?;
+    const prefix = "{\"payload\":\"";
+    try testing.expect(std.mem.startsWith(u8, body, prefix) and std.mem.endsWith(u8, body, "\"}"));
+    const payload = body[prefix.len .. body.len - 2];
+    const decoded = try arena.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(payload));
+    try std.base64.standard.Decoder.decode(decoded, payload);
+    try testing.expectEqualStrings(v.expectedStringToSign, decoded);
+    try testing.expectEqual(0, storage_fake.requests.items.len);
+
+    // And through IAM, a URL may not outlast the 12 hours Google promises
+    // its key for: refused before IAM is asked.
+    try testing.expectError(error.InvalidSignedUrlOptions, client.bucket(v.bucket).object(v.object.?).signedUrl(iam.signer(), .{ .expires_in_s = 43_201 }));
+    try testing.expectEqual(1, iam_fake.requests.items.len);
+    var longest = try client.bucket(v.bucket).object(v.object.?).signedUrl(iam.signer(), .{ .expires_in_s = 43_200 });
+    longest.deinit();
+    try testing.expectEqual(2, iam_fake.requests.items.len);
+}
