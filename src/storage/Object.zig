@@ -345,7 +345,7 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
     var transcoded: ?bool = null;
     // The checksum named by the response the writer's bytes began with. A
     // resume is a range read, and production names no checksum on a range
-    // that starts past byte 0, so a resumed download is checked against
+    // short of the whole object, so a resumed download is checked against
     // this. A request from byte 0 starts the bytes over, and replaces it.
     var whole_crc: ?u32 = null;
     var attempt: u32 = 1;
@@ -428,7 +428,7 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
 /// then verify the checksum where one can apply. `whole_crc` is what the
 /// response the bytes began with named, which a resumed download meets:
 /// the generation is pinned, so it describes every byte, and the last
-/// response, a range past byte 0, names none.
+/// response, a range short of the whole object, names none.
 fn finishStream(
     self: Object,
     res: core.transport.StreamResponse,
@@ -785,7 +785,7 @@ test "downloadAlloc resumes after a cut connection and rides out a 503" {
         .{ .respond = .{ .status = 503, .body = "{}" } },
         // The retried resume delivers the rest, pinned to the generation.
         // Like production, it names no checksum: Cloud Storage sends
-        // x-goog-hash on a range only when the range starts at byte 0.
+        // x-goog-hash on a range only when the range spans the whole object.
         .{ .respond = .{
             .status = 206,
             .body = " world\n",

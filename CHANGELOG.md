@@ -27,7 +27,7 @@ including the ones that did not change.
   fails cleanly instead of splicing two objects; the attempt counter
   resets whenever a request delivers bytes. A resumed download is held
   to the checksum its first response named, because Cloud Storage names
-  none on a range that starts past byte 0. A range read, and an object
+  none on a range short of the whole object. A range read, and an object
   decompressed in transit, report `checksum_verified = false`, the
   latter because the stored checksum covers bytes that did not arrive,
   and it cannot resume either. A range past the end is

@@ -487,17 +487,22 @@ test "3. downloads carry x-goog-hash and x-goog-generation, and verify against t
     const generation_text = try std.fmt.bufPrint(&generation_buf, "{d}", .{info.value.generation});
     try testing.expectEqualStrings(generation_text, exchange.responseHeader("x-goog-generation").?);
 
-    // A range from byte 0 still names the whole object's checksum; a range
-    // from anywhere later names none. That is why a resumed download is
-    // held to its first response's checksum.
-    const from_zero = f.faults.exchanges.items.len;
+    // A range names the object's checksum only when it spans the whole
+    // object; any shorter range, from byte 0 or later, names none. That is
+    // why a resumed download is held to the checksum of the response its
+    // bytes began with.
+    const ranges = f.faults.exchanges.items.len;
     var head = obj.downloadAlloc(16, .{ .range = .{ .offset = 0, .length = 10 } }) catch |err| return f.report(err);
     head.deinit();
     var tail = obj.downloadAlloc(16, .{ .range = .{ .offset = 1000, .length = 10 } }) catch |err| return f.report(err);
     tail.deinit();
-    try testing.expectEqual(206, f.faults.exchanges.items[from_zero].status.?);
-    try testing.expect(f.faults.exchanges.items[from_zero].responseHeader("x-goog-hash") != null);
-    try testing.expectEqual(null, f.faults.exchanges.items[from_zero + 1].responseHeader("x-goog-hash"));
+    var all = obj.downloadAlloc(data.len, .{ .range = .{ .offset = 0 } }) catch |err| return f.report(err);
+    all.deinit();
+    for (f.faults.exchanges.items[ranges..][0..3]) |e| try testing.expectEqual(206, e.status.?);
+    try testing.expectEqual(null, f.faults.exchanges.items[ranges].responseHeader("x-goog-hash"));
+    try testing.expectEqual(null, f.faults.exchanges.items[ranges + 1].responseHeader("x-goog-hash"));
+    const whole_range_hash = f.faults.exchanges.items[ranges + 2].responseHeader("x-goog-hash") orelse return error.TestExpectedHashHeader;
+    try testing.expect(std.mem.indexOf(u8, whole_range_hash, &crc_text) != null);
 
     // A zero-byte object verifies against the empty checksum.
     const empty = try f.object("empty.bin");
