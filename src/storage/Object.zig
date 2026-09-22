@@ -18,6 +18,7 @@ const multipart = @import("multipart.zig");
 const names = @import("names.zig");
 const resumable = @import("resumable.zig");
 const rpc = @import("rpc.zig");
+const signing = @import("signing.zig");
 const types = @import("types.zig");
 const Error = errors.Error;
 
@@ -43,6 +44,22 @@ pub fn get(self: Object, options: types.GetOptions) Error!types.Owned(types.Obje
     result.value = codec.decodeObject(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(self.client, err, "object");
     return result;
+}
+
+/// A V4 signed URL: whoever holds it can make the one request it describes
+/// on this object until it expires, with no credentials of their own, as a
+/// browser downloading a private file or uploading straight into the
+/// bucket does. `signer` signs as a service account, which must itself be
+/// allowed to make the request. Nothing is sent to Cloud Storage; a signer
+/// that signs through IAM makes one call there.
+///
+/// The URL points at the client's endpoint, or at `options.style`'s host.
+/// It is a bearer credential until it expires, so it is never logged.
+pub fn signedUrl(self: Object, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    return signing.signUrl(self.client, signer, self.bucket, self.name, options);
 }
 
 /// Sugar over `get`: whether a live object has this name. `NotFound`

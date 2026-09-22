@@ -10,8 +10,9 @@
 
 const core = @import("core");
 
-/// Every error a client call can return.
-pub const Error = core.rpc.Error || error{
+/// Every error a client call can return. `core.Signer.Error` adds
+/// `SigningRejected` and `SigningFailed`, which only `signedUrl` returns.
+pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// Upload or download bytes do not match the checksum beside them. On
     /// upload nothing was sent; on download the data is discarded.
     ChecksumMismatch,
@@ -49,4 +50,9 @@ pub const Error = core.rpc.Error || error{
     InvalidResponse,
     /// `Client.Options` holds an invalid retry policy or user agent.
     InvalidOptions,
+    /// A signed URL's options break a rule: an expiry out of range, a
+    /// header or query parameter that cannot be signed, a style the bucket
+    /// or endpoint cannot use, or an object name a browser would rewrite.
+    /// `Diagnostics` says which. Nothing was signed.
+    InvalidSignedUrlOptions,
 };

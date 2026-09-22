@@ -2,9 +2,9 @@
 //!
 //! `Client` holds the configuration and the connection pool; `Bucket` and
 //! `Object` are cheap handles on it: buckets and object metadata, uploads
-//! from memory, and downloads that stream into any writer with checksums
-//! verified, ranges, and mid-body resume pinned to one generation.
-//! Uploads from a reader arrive with the resumable-upload milestone.
+//! from memory or any reader, downloads that stream into any writer with
+//! checksums verified, ranges, and mid-body resume pinned to one
+//! generation, and signed URLs for clients that have no credentials.
 //!
 //! Against the `fake-gcs-server` emulator no credentials are needed: pass
 //! `Endpoint.fromEnv(environ)` to honor `STORAGE_EMULATOR_HOST`.
@@ -44,6 +44,16 @@ pub const PageOptions = @import("types.zig").PageOptions;
 pub const Preconditions = @import("types.zig").Preconditions;
 pub const Range = @import("types.zig").Range;
 pub const UploadOptions = @import("types.zig").UploadOptions;
+pub const SignedUrlOptions = @import("types.zig").SignedUrlOptions;
+pub const SignedMethod = @import("types.zig").SignedMethod;
+pub const UrlStyle = @import("types.zig").UrlStyle;
+pub const BucketBound = @import("types.zig").BucketBound;
+pub const QueryParam = @import("types.zig").QueryParam;
+pub const Header = @import("types.zig").Header;
+
+/// What signs a signed URL as a service account, such as
+/// `auth.ServiceAccount.signer()` for a key file.
+pub const Signer = core.Signer;
 
 /// Parses a `time_created` (RFC 3339) to nanoseconds since the Unix epoch.
 pub const parseTimestamp = core.timestamp.parse;
@@ -69,6 +79,7 @@ test {
     _ = @import("names.zig");
     _ = @import("resumable.zig");
     _ = @import("rpc.zig");
+    _ = @import("signing.zig");
     _ = @import("test_util.zig");
     _ = @import("types.zig");
     _ = @import("validate.zig");
