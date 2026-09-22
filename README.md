@@ -634,6 +634,20 @@ AUTH_TEST_CREDENTIALS=$HOME/.config/gcloud/application_default_credentials.json 
 # regional tests.
 GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
     zig build test-integration-gcp
+
+# Cloud Storage against fake-gcs-server. Every test creates a zigps-*
+# bucket and deletes it.
+docker run -d -p 4443:4443 fsouza/fake-gcs-server -scheme http -port 4443
+STORAGE_EMULATOR_HOST=http://127.0.0.1:4443 zig build test-integration
+
+# And against a real bucket, for what an emulator cannot show: every
+# precondition enforced, checksums checked by the server, gzip transcoding,
+# and uploads and downloads cut mid-body that resume against Google itself.
+# Objects live under zig-gcp-test/ and are deleted. The token needs Storage
+# Object Admin on the bucket, which must not have object versioning on. It
+# moves about 230 MiB over the wire, 100 MiB of it in one object each way.
+GCP_TEST_BUCKET=my-bucket GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
+    zig build test-integration-gcp
 ```
 
 The emulator binds to IPv6 localhost unless given `--host-port`.
