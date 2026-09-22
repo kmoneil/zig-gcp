@@ -4,6 +4,34 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.15.0 (unreleased)
+
+- storage: signed URLs. `Object.signedUrl(signer, options)` and
+  `Bucket.signedUrl` make V4 signed URLs (`GOOG4-RSA-SHA256`): whoever
+  holds one can make the one request it describes until it expires, with
+  no credentials of their own, as a browser downloading a private object
+  or uploading straight into a bucket does. GET, HEAD, PUT, DELETE, and a
+  POST that starts a resumable upload. Signed headers pin what the holder
+  must send, such as a content type, `x-goog-content-length-range` or
+  `x-goog-if-generation-match: 0`; signed query parameters such as
+  `response-content-disposition` too. Path-style, virtual-hosted and
+  bucket-bound-hostname URLs, on the client's endpoint, so a client on the
+  emulator makes URLs for it. Held byte for byte to Google's 29
+  conformance vectors, signatures included, and to 400 cases Google's
+  Python library signed. Stricter than Google's libraries, which merge,
+  drop or sign what this refuses with `error.InvalidSignedUrlOptions`: an
+  expiry outside 1 second to 7 days, a repeated header, a query parameter
+  named like the signature's own, a newline in a header value, and an
+  object name with a `.` or `..` segment, which browsers rewrite before
+  sending. Breaking, for an exhaustive `switch` over `storage.Error`: it
+  gains `InvalidSignedUrlOptions`, `SigningRejected` and `SigningFailed`.
+- auth: `ServiceAccount.signer()` signs with a key file's private key, on
+  this machine. Signing through IAM, for workloads without a key file, is
+  next.
+- core: `Signer`, the seam signing goes through, beside `TokenProvider`,
+  and `testing.FakeSigner`.
+- pubsub, secret_manager: unchanged.
+
 ## 0.14.1 (2026-09-22)
 
 - pubsub: fixed: a `Subscriber` could keep a pulled batch's memory
