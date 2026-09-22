@@ -144,6 +144,25 @@ const Machine = struct {
                     // response arena may go.
                     result.value = codec.decodeObject(result.arena.allocator(), res.body) catch |err|
                         return rpc.decodeFailed(self.client, err, "object");
+                    // A finished upload holds every byte, and cannot finish
+                    // before the source has. A server that says done short
+                    // of that has finished a truncated object, as an
+                    // emulator does when it takes a status query for a
+                    // finalize: no success, and the object goes again.
+                    const named = codec.decodeObjectSize(response.allocator(), res.body) catch null;
+                    const complete = if (self.total) |total| (named orelse total) == total else false;
+                    if (!complete) {
+                        const deleted = self.discard(bucket_name, object_name, result.value.generation);
+                        // After the delete, whose success cleared them.
+                        if (self.client.diagnostics) |d| {
+                            const fate = if (deleted) "; the truncated object was deleted again" else "";
+                            if (self.total) |total| d.print(
+                                "the server finished the upload holding {d} of its {d} bytes{s}",
+                                .{ named.?, total, fate },
+                            ) else d.print("the server finished the upload before the stream ended{s}", .{fate});
+                        }
+                        return error.InvalidResponse;
+                    }
                     if (self.client.diagnostics) |d| d.clear();
                     return result;
                 },
@@ -384,6 +403,21 @@ const Machine = struct {
         return if (core.isRetryable(err)) .{ .transient = err } else .{ .fatal = err };
     }
 
+    /// Best-effort delete of an object the upload must not leave behind,
+    /// pinned to its generation, so nothing newer can go with it. Without a
+    /// generation nothing is deleted. Returns whether the object went.
+    fn discard(self: *Machine, bucket_name: []const u8, object_name: []const u8, generation: u64) bool {
+        if (generation == 0) return false;
+        var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
+        defer scratch.deinit();
+        const path = names.objectPath(scratch.allocator(), bucket_name, object_name, generation, .{}) catch return false;
+        rpc.executeDiscard(self.client, .{ .method = .DELETE, .path = path }) catch |err| {
+            logging.warn("deleting the truncated upload of {s} failed with {t}", .{ object_name, err });
+            return false;
+        };
+        return true;
+    }
+
     /// Best-effort DELETE of the session, so the server can drop its state.
     fn cancel(self: *Machine, response: *std.heap.ArenaAllocator, session_uri: []const u8) void {
         _ = response.reset(.retain_capacity);
@@ -466,10 +500,16 @@ fn kept(comptime last: u64) Reply {
     } };
 }
 
-const finished: Reply = .{ .respond = .{
-    .status = 200,
-    .body = "{\"name\":\"backup.tar\",\"bucket\":\"b\",\"size\":\"614400\",\"generation\":\"55\"}",
-} };
+/// The final answer for an object of `size` bytes.
+fn finishedAt(comptime size: u64) Reply {
+    return .{ .respond = .{
+        .status = 200,
+        .body = std.fmt.comptimePrint("{{\"name\":\"backup.tar\",\"bucket\":\"b\",\"size\":\"{d}\",\"generation\":\"55\"}}", .{size}),
+    } };
+}
+
+/// The final answer for the 600 KiB most tests upload.
+const finished = finishedAt(600 * 1024);
 
 fn testData(gpa: Allocator, n: usize) ![]u8 {
     const data = try gpa.alloc(u8, n);
@@ -575,6 +615,76 @@ test "a status query can reveal the upload already completed" {
     try testing.expectEqual(3, h.fake.stream_requests.items.len);
 }
 
+test "a status query answered as a finalize is a truncated object, not a success" {
+    // fake-gcs-server takes the empty PUT of a status query for a finalize
+    // and finishes the object with what it holds: here the first chunk.
+    var h: Harness = undefined;
+    try h.init(&.{
+        opened,
+        kept(chunk_size - 1),
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .status = 200, .body = "{\"name\":\"backup.tar\",\"size\":\"262144\",\"generation\":\"61\"}" } },
+        // The cleanup delete.
+        .{ .respond = .{ .status = 204, .body = "" } },
+    }, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+
+    try testing.expectError(error.InvalidResponse, h.client.bucket("b").object("backup.tar").upload(data, .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "holding 262144 of its 614400 bytes; the truncated object was deleted again") != null);
+    // The truncated object went again, pinned to the generation it got.
+    const cleanup = try h.fake.request(0);
+    try testing.expectEqual(.DELETE, cleanup.method);
+    try testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/b/o/backup.tar?generation=61", cleanup.url);
+}
+
+test "a finish before the stream has ended is not believed either" {
+    // A reader of unknown size is still mid-stream when the server says
+    // done, with a declared checksum, so no verification afterwards would
+    // have caught it. The answer names no generation: nothing is safe to
+    // delete, and nothing is.
+    var h: Harness = undefined;
+    try h.init(&.{
+        opened,
+        kept(chunk_size - 1),
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .status = 200, .body = "{\"name\":\"backup.tar\"}" } },
+    }, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+    var reader: std.Io.Reader = .fixed(data);
+
+    try testing.expectError(
+        error.InvalidResponse,
+        h.client.bucket("b").object("backup.tar").uploadFrom(&reader, .{ .crc32c = core.crc32c.hash(data) }),
+    );
+    try testing.expectEqualStrings("the server finished the upload before the stream ended", h.diag.message());
+    try h.expectRequestCount(0);
+    // The query that got the premature answer named no total.
+    try testing.expectEqualStrings("bytes */*", (try h.fake.streamRequest(3)).header("Content-Range").?);
+}
+
+test "a finished object whose answer names no size is taken as whole" {
+    // Emulators may leave fields out; a missing size is no evidence of a
+    // truncated object, and a sound upload must not be deleted for it.
+    var h: Harness = undefined;
+    try h.init(&.{
+        opened,
+        kept(chunk_size - 1),
+        kept(2 * chunk_size - 1),
+        .{ .respond = .{ .status = 200, .body = "{\"name\":\"backup.tar\",\"generation\":\"62\"}" } },
+    }, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+    var info = try h.client.bucket("b").object("backup.tar").upload(data, .{});
+    defer info.deinit();
+    try testing.expectEqual(62, info.value.generation);
+    try h.expectRequestCount(0);
+}
+
 test "a dead session restarts an in-memory upload from its bytes" {
     var h: Harness = undefined;
     try h.init(&.{
@@ -610,7 +720,7 @@ test "a dead session fails a reader, whose bytes are gone" {
 
 test "unknown size: chunks say /*, and a boundary end finishes with an empty PUT" {
     var h: Harness = undefined;
-    try h.init(&.{ opened, kept(chunk_size - 1), finished }, resumableOptions());
+    try h.init(&.{ opened, kept(chunk_size - 1), finishedAt(chunk_size) }, resumableOptions());
     defer h.deinit();
     const data = try testData(testing.allocator, chunk_size);
     defer testing.allocator.free(data);
@@ -630,7 +740,7 @@ test "unknown size: chunks say /*, and a boundary end finishes with an empty PUT
 
 test "an empty stream finishes with bytes */0" {
     var h: Harness = undefined;
-    try h.init(&.{ opened, finished }, resumableOptions());
+    try h.init(&.{ opened, finishedAt(0) }, resumableOptions());
     defer h.deinit();
     var reader: std.Io.Reader = .fixed("");
     var info = try h.client.bucket("b").object("empty").uploadFrom(&reader, .{});
@@ -763,7 +873,7 @@ test "uploadFrom holds one chunk buffer and little else" {
         kept(chunk_size - 1),
         kept(2 * chunk_size - 1),
         kept(3 * chunk_size - 1),
-        finished,
+        finishedAt(768 * 1024),
     });
     defer fake.deinit();
     var clock: test_util.FakeClock = .{};

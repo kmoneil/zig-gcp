@@ -95,6 +95,13 @@ pub fn decodeObject(arena: Allocator, body: []const u8) DecodeError!types.Object
     return objectFromWire(arena, try parseWire(WireObject, arena, body));
 }
 
+/// The `size` an Object resource names, or null when it names none, which
+/// `ObjectInfo` cannot tell from an empty object.
+pub fn decodeObjectSize(arena: Allocator, body: []const u8) DecodeError!?u64 {
+    const wire = try parseWire(struct { size: ?std.json.Value = null }, arena, body);
+    return if (wire.size == null) null else try u64FromValue(wire.size);
+}
+
 /// One page of `objects.list`.
 pub fn decodeObjectPage(arena: Allocator, body: []const u8) DecodeError!types.ObjectPage {
     const wire = try parseWire(WireObjectPage, arena, body);
@@ -344,6 +351,19 @@ test "string integers: string, number, above 32 bits, negative, garbage" {
     }) |body| {
         try testing.expectError(error.InvalidResponse, decodeObject(a, body));
     }
+}
+
+test "decodeObjectSize tells an absent size from an empty object" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqual(12, (try decodeObjectSize(a, "{\"name\":\"x\",\"size\":\"12\"}")).?);
+    try testing.expectEqual(0, (try decodeObjectSize(a, "{\"size\":\"0\"}")).?);
+    try testing.expectEqual(7, (try decodeObjectSize(a, "{\"size\": 7}")).?);
+    try testing.expectEqual(null, try decodeObjectSize(a, "{\"name\":\"x\"}"));
+    try testing.expectEqual(null, try decodeObjectSize(a, "{\"size\": null}"));
+    try testing.expectError(error.InvalidResponse, decodeObjectSize(a, "{\"size\":\"-1\"}"));
+    try testing.expectError(error.InvalidResponse, decodeObjectSize(a, "not json"));
 }
 
 test "checksums: malformed base64 is InvalidResponse, not a wrong value" {
