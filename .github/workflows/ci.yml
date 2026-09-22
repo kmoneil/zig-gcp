@@ -216,10 +216,19 @@ jobs:
           ITERATIONS: ${{ inputs.fuzz_iterations || matrix.iterations }}
           MODULE: ${{ matrix.module }}
           FILTER: ${{ matrix.filter }}
+          JOB: ${{ matrix.job }}
         run: |
+          set -o pipefail
           # A failing input saved by an earlier run is not this run's.
           rm -f .zig-cache/f/crash
-          zig build test -Dfuzz-runner "-Dmodule=$MODULE" "-Dtest-filter=$FILTER" "--fuzz=$ITERATIONS"
+          zig build test -Dfuzz-runner "-Dmodule=$MODULE" "-Dtest-filter=$FILTER" "--fuzz=$ITERATIONS" 2>&1 | tee "$RUNNER_TEMP/fuzz.log"
+          # A test that fails or crashes while being fuzzed does not fail
+          # zig build, which still exits 0: the input it saves, and the line
+          # that reports it, are the only signs. Either one fails the job.
+          if [ -e .zig-cache/f/crash ] || grep -q "input saved to" "$RUNNER_TEMP/fuzz.log"; then
+            echo "::error::a fuzz test failed while being fuzzed; its input is attached as fuzz-failure-$JOB"
+            exit 1
+          fi
 
       - name: Save the fuzz corpus
         if: always()

@@ -81,7 +81,10 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   saves it as `.zig-cache/f/crash`, and the nightly CI run attaches it as
   the `fuzz-failure-<job>` artifact: a 4-byte little-endian length, then
   the input. `zig build test -Dfuzz-runner -Dmodule=<module>
-  -Dtest-filter=fuzz --fuzz` fuzzes one module the way its job does.
+  -Dtest-filter=fuzz --fuzz` fuzzes one module the way its job does. A
+  test that fails while being fuzzed does not fail `zig build`, which
+  exits 0 all the same; the saved input and the `input saved to` line
+  are the signs, and the nightly job fails on either.
 - Name a property test `fuzz <what>: <what it holds>`, and the nightly job
   fuzzes it. A property that costs more than a few milliseconds a run,
   such as one that signs with RSA every time, is named `slow property
