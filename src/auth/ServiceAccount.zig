@@ -2,7 +2,8 @@
 //! service-accounts keys create` (or the console) hands out. Each fetch
 //! signs a short-lived JWT with the file's RSA key and trades it at
 //! Google's token endpoint for an access token, which the cache keeps
-//! until shortly before it expires.
+//! until shortly before it expires. `signer()` signs with the same key,
+//! on this machine, for signed URLs.
 //!
 //! The private key and every access token are secrets: they are never
 //! logged or put in `Diagnostics`, the JWT goes only to the token
@@ -225,6 +226,18 @@ pub fn provider(self: *ServiceAccount) TokenProvider {
     } };
 }
 
+/// Signs as `client_email` with the key file's private key, on this
+/// machine: RSASSA-PKCS1-v1_5 with SHA-256, what a V4 signed URL needs.
+/// Nothing is sent anywhere. Points at this struct, which must not move
+/// while the signer is in use.
+pub fn signer(self: *ServiceAccount) core.Signer {
+    return .{ .ptr = self, .vtable = &.{
+        .email = signerEmail,
+        .sign = sign,
+        .lifetime_s = keyLifetime,
+    } };
+}
+
 /// The project the key file names for quota, if any. A service account
 /// usually bills its own project and names none.
 pub fn quotaProjectId(self: *const ServiceAccount) ?[]const u8 {
@@ -254,42 +267,28 @@ fn quotaProject(ptr: *anyopaque) ?[]const u8 {
     return fromPtr(ptr).quota_project_id;
 }
 
-/// Fixes the scopes on the first call, and refuses different ones later:
-/// the cached token was minted for the first set, and handing it out for
-/// another would give a caller more or less than it asked for.
-fn bindScopes(self: *ServiceAccount, io: std.Io, scopes: []const []const u8) TokenProvider.Error!void {
-    try self.scopes_mutex.lock(io);
-    defer self.scopes_mutex.unlock(io);
-    if (self.scopes) |bound| {
-        if (scopesMatch(bound, scopes)) return;
-        if (self.diagnostics) |d| d.print("this provider's tokens are scoped to what its first call asked for; use a second ServiceAccount for a second scope set", .{});
-        return error.TokenUnavailable;
-    }
-    if (scopes.len == 0) {
-        if (self.diagnostics) |d| d.print("no scopes requested; a service account token is minted for particular scopes", .{});
-        return error.TokenUnavailable;
-    }
-    // Each scope travels inside the JWT's space-joined `scope` claim.
-    for (scopes) |scope| if (!TokenProvider.isValidToken(scope)) {
-        if (self.diagnostics) |d| d.print("invalid scope: scopes are visible ASCII without spaces", .{});
-        return error.TokenUnavailable;
-    };
-    self.scopes = try std.mem.join(self.gpa, " ", scopes);
+fn signerEmail(ptr: *anyopaque, io: std.Io, arena: Allocator) core.Signer.Error![]const u8 {
+    _ = io;
+    return arena.dupe(u8, fromPtr(ptr).client_email);
 }
 
-/// Whether `scopes` joined with spaces is exactly `joined`, without
-/// allocating.
-fn scopesMatch(joined: []const u8, scopes: []const []const u8) bool {
-    var rest = joined;
-    for (scopes, 0..) |scope, i| {
-        if (i > 0) {
-            if (!std.mem.startsWith(u8, rest, " ")) return false;
-            rest = rest[1..];
-        }
-        if (!std.mem.startsWith(u8, rest, scope)) return false;
-        rest = rest[scope.len..];
-    }
-    return rest.len == 0;
+/// `rsa.PrivateKey.sign` only reads the key, so tasks can sign at once.
+fn sign(ptr: *anyopaque, io: std.Io, arena: Allocator, message: []const u8) core.Signer.Error![]const u8 {
+    _ = io;
+    const self = fromPtr(ptr);
+    const out = try arena.alloc(u8, self.key.len);
+    return self.key.sign(message, out) catch {
+        // The key is corrupt in a way parsing could not see; signing again
+        // would fail the same way.
+        if (self.diagnostics) |d| d.print("signing failed: the private key does not verify against itself", .{});
+        return error.SigningFailed;
+    };
+}
+
+/// A key file's key works until its owner deletes it.
+fn keyLifetime(ptr: *anyopaque) ?u32 {
+    _ = ptr;
+    return null;
 }
 
 /// Signs a JWT and trades it for an access token. `arena` is the cache's
@@ -772,6 +771,35 @@ test "ServiceAccount: the file's projects are reported" {
     try testing.expectEqualStrings("my-project", h.account.projectId().?);
     try testing.expectEqual(null, h.account.quotaProjectId());
     try testing.expectEqual(null, h.account.provider().quotaProject());
+}
+
+test "ServiceAccount: the signer signs as client_email, on this machine, as OpenSSL does" {
+    var h: Harness = undefined;
+    try h.init(&.{});
+    defer h.deinit();
+    const s = h.account.signer();
+    const arena = h.arena.allocator();
+    try testing.expectEqualStrings("robot@my-project.iam.gserviceaccount.com", try s.email(h.clock.io(), arena));
+    var expected: [rsa.max_modulus_bytes]u8 = undefined;
+    const want = try std.fmt.hexToBytes(&expected, rsa.test_sig_1024_hex);
+    try testing.expectEqualSlices(u8, want, try s.sign(h.clock.io(), arena, rsa.test_message));
+    // A key file's signatures last as long as the key, and nothing is sent.
+    try testing.expectEqual(null, s.lifetimeS());
+    try testing.expectEqual(0, h.fake.requests.items.len);
+}
+
+fn signOnce(gpa: Allocator, s: core.Signer, io: std.Io) !void {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    _ = try s.email(io, arena.allocator());
+    _ = try s.sign(io, arena.allocator(), rsa.test_message);
+}
+
+test "ServiceAccount: every allocation failure while signing is OutOfMemory" {
+    var h: Harness = undefined;
+    try h.init(&.{});
+    defer h.deinit();
+    try testing.checkAllAllocationFailures(testing.allocator, signOnce, .{ h.account.signer(), h.clock.io() });
 }
 
 test "ServiceAccount: secrets reach neither the log nor Diagnostics" {
