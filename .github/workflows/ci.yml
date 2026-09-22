@@ -53,8 +53,10 @@ jobs:
 
       - name: Start fake-gcs-server
         run: |
+          # -public-host: the emulator serves the XML API's paths, which
+          # signed URLs use, only to requests for this host.
           docker run -d --name fake-gcs -p 4443:4443 \
-            fsouza/fake-gcs-server -scheme http -port 4443
+            fsouza/fake-gcs-server -scheme http -port 4443 -public-host 127.0.0.1:4443
           for _ in $(seq 1 30); do
             curl -sf "http://127.0.0.1:4443/storage/v1/b?project=test" >/dev/null && exit 0
             sleep 2
