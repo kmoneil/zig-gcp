@@ -4,6 +4,20 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.14.1 (unreleased)
+
+- pubsub: fixed: a `Subscriber` could keep a pulled batch's memory
+  forever when handlers on different tasks finished messages of the same
+  batch at the same moment. The count of messages still using a batch was
+  a plain integer, decremented outside any lock, and a lost decrement
+  meant the batch was never freed; it is atomic now. Also fixed: a
+  `Subscriber` stopped just as it handed a batch to its workers could
+  release one message twice and free the batch while earlier messages
+  still pointed into it. Both date from the Subscriber's first release,
+  0.7.0. The nightly fuzzing found the first once it could run the
+  Subscriber at all, and tracing it found the second.
+- core, auth, secret_manager, storage: unchanged.
+
 ## 0.14.0 (2026-09-22)
 
 - storage: new module, stability `experimental`. A client for the Cloud

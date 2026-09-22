@@ -349,11 +349,17 @@ const Tracked = struct {
 /// messages' fields point into it.
 const Batch = struct {
     result: types.Owned(types.PullResult),
-    live: usize,
+    /// Messages still pointing into `result`. Workers release theirs at
+    /// once and outside any lock, so the count is atomic: a lost decrement
+    /// would keep the batch forever, a doubled one free it twice.
+    live: std.atomic.Value(usize),
 
     fn release(batch: *Batch, gpa: Allocator) void {
-        batch.live -= 1;
-        if (batch.live > 0) return;
+        // The last release frees. acq_rel orders every holder's reads of
+        // the result before the free.
+        const before = batch.live.fetchSub(1, .acq_rel);
+        std.debug.assert(before > 0);
+        if (before > 1) return;
         batch.result.deinit();
         gpa.destroy(batch);
     }
@@ -416,7 +422,7 @@ fn dispatch(self: *Subscriber, pulled: types.Owned(types.PullResult)) !void {
         result.deinit();
         return err;
     };
-    batch.* = .{ .result = result, .live = messages.len };
+    batch.* = .{ .result = result, .live = .init(messages.len) };
     const now = std.Io.Timestamp.now(io, .boot);
 
     for (messages, 0..) |message, i| {
@@ -449,9 +455,14 @@ fn dispatch(self: *Subscriber, pulled: types.Owned(types.PullResult)) !void {
             self.queue.putOne(io, tracked) catch |err| switch (err) {
                 // Stopping: release what the workers will never take.
                 error.Closed => self.resolve(tracked, .released),
+                // Canceled at the hand-off, which locks the queue: this
+                // message is released as a closed queue's would be, and
+                // only the ones after it never dispatch. Releasing it again
+                // with them freed the batch under the messages before it.
                 error.Canceled => {
                     self.resolve(tracked, .released);
-                    break :fail error.Canceled;
+                    for (i + 1..messages.len) |_| batch.release(gpa);
+                    return error.Canceled;
                 },
             };
             break :fail null;
@@ -1393,4 +1404,68 @@ test "Subscriber: stop returns when the janitor is canceled in the middle of a f
     // on its way out delivered it, so the message is not redelivered.
     try testing.expectEqual(1, h.fake.ackedCount());
     try testing.expectEqual(1, h.subscriber.stats().acked);
+}
+
+test "a batch released from many tasks at once is freed exactly once" {
+    // Regression: the count was a plain integer, decremented outside any
+    // lock by workers resolving messages of one batch at once. A lost
+    // decrement kept the batch forever, which the Subscriber's fuzz job
+    // found as a leak about once in a few thousand runs.
+    const io = testing.io;
+    const tasks = 4;
+    const per_task = 25_000;
+    const batch = try testing.allocator.create(Batch);
+    batch.* = .{ .result = try .init(testing.allocator), .live = .init(tasks * per_task) };
+    batch.result.value = .{ .messages = &.{} };
+    const Releaser = struct {
+        fn run(b: *Batch) void {
+            for (0..per_task) |_| b.release(testing.allocator);
+        }
+    };
+    var group: std.Io.Group = .init;
+    for (0..tasks) |_| try group.concurrent(io, Releaser.run, .{batch});
+    try group.await(io);
+    // The last release freed it; std.testing.allocator reports anything
+    // left behind, and a second free would have panicked.
+}
+
+fn dispatchForTest(s: *Subscriber, pulled: types.Owned(types.PullResult)) anyerror!void {
+    return s.dispatch(pulled);
+}
+
+test "a dispatch canceled at a hand-off releases each message once" {
+    // Regression: a cancel observed by the queue hand-off of one message,
+    // which locks the queue and so is a cancelation point, released that
+    // message twice: once through resolve, again with the rest of the
+    // batch. The batch was freed under the messages before it. Here the
+    // queue holds one message, so the second hand-off waits for room, and
+    // the cancel lands exactly there.
+    var h: Harness = undefined;
+    try h.init(.{ .max_outstanding = 1 });
+    defer h.deinit();
+    const io = testing.io;
+    for ([_][]const u8{ "first", "second", "third" }) |data| try h.fake.publish(data);
+    const pulled = try h.subscriber.puller.subscription("worker").pull(.{ .max_messages = 3 });
+    try testing.expectEqual(3, pulled.value.messages.len);
+
+    var dispatching = try io.concurrent(dispatchForTest, .{ &h.subscriber, pulled });
+    // Until the second message is registered and its hand-off is waiting.
+    var waited_ms: u32 = 0;
+    while (true) : (waited_ms += 5) {
+        h.subscriber.mutex.lockUncancelable(io);
+        const registered = h.subscriber.inflight.items.len;
+        h.subscriber.mutex.unlock(io);
+        if (registered == 2) break;
+        if (waited_ms > 5000) @panic("the dispatch never reached its second hand-off");
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try testing.expectError(error.Canceled, dispatching.cancel(io));
+
+    // The first message still reads from a live batch.
+    const first = try h.subscriber.queue.getOne(io);
+    try testing.expectEqualStrings("first", first.message.data);
+    h.subscriber.resolve(first, .released);
+    // The second went back unhandled, and the third was never registered.
+    try testing.expectEqual(0, h.subscriber.inflight.items.len);
+    try testing.expectEqual(2, h.subscriber.to_nack.items.len);
 }
