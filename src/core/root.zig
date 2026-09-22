@@ -1,6 +1,7 @@
 //! What the Google Cloud modules share: the HTTP transport, the retry
 //! policy, Google API errors and `Diagnostics`, `Owned` results, the
-//! `TokenProvider` seam, and test helpers for code that uses them.
+//! `TokenProvider` and `Signer` seams, and test helpers for code that uses
+//! them.
 //! Applications rarely import this module directly; each service module
 //! re-exports what its callers need.
 
@@ -39,6 +40,10 @@ pub const Owned = @import("owned.zig").Owned;
 pub const TokenProvider = @import("TokenProvider.zig");
 pub const StaticToken = @import("StaticToken.zig");
 
+/// The seam through which a service module signs as a service account,
+/// as a signed URL needs.
+pub const Signer = @import("Signer.zig");
+
 /// An allocator that wipes memory before freeing it, for secrets.
 pub const WipingAllocator = @import("WipingAllocator.zig");
 
@@ -63,6 +68,7 @@ pub const testing = @import("testing.zig");
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("CountingWriter.zig");
+    _ = @import("Signer.zig");
     _ = @import("StaticToken.zig");
     _ = @import("TokenProvider.zig");
     _ = @import("WipingAllocator.zig");

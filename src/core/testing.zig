@@ -18,6 +18,7 @@ const StreamError = @import("transport.zig").StreamError;
 const ContentType = @import("transport.zig").ContentType;
 const Header = @import("transport.zig").Header;
 const TokenProvider = @import("TokenProvider.zig");
+const Signer = @import("Signer.zig");
 const Crc32c = @import("crc32c.zig").Hasher;
 
 /// A `TokenProvider` that returns one token, or fails with one error, and
@@ -80,6 +81,62 @@ pub const FakeTokenProvider = struct {
 
     fn quotaProject(ptr: *anyopaque) ?[]const u8 {
         return fromPtr(ptr).quota_project;
+    }
+};
+
+/// A `Signer` that answers with one email and one signature, or fails with
+/// one error, and keeps the last message it was asked to sign.
+pub const FakeSigner = struct {
+    /// Returned by `email`, copied into the caller's arena.
+    account: []const u8 = "signer@test-project.iam.gserviceaccount.com",
+    /// Returned by `sign`, copied into the caller's arena, whatever the
+    /// message.
+    signature: []const u8 = "\x5a\xa5\x00\xff",
+    /// When set, `email` and `sign` both fail with it.
+    fail: ?Signer.Error = null,
+    /// What `lifetimeS` returns.
+    lifetime_s: ?u32 = null,
+    /// `sign` calls so far, failed ones included.
+    calls: usize = 0,
+    message_buffer: [1024]u8 = undefined,
+    message_len: usize = 0,
+
+    pub fn signer(self: *FakeSigner) Signer {
+        return .{ .ptr = self, .vtable = &.{
+            .email = email,
+            .sign = sign,
+            .lifetime_s = lifetime,
+        } };
+    }
+
+    /// The message of the latest `sign` call, truncated to 1,024 bytes.
+    pub fn lastMessage(self: *const FakeSigner) []const u8 {
+        return self.message_buffer[0..self.message_len];
+    }
+
+    fn fromPtr(ptr: *anyopaque) *FakeSigner {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn email(ptr: *anyopaque, io: std.Io, arena: Allocator) Signer.Error![]const u8 {
+        _ = io;
+        const self = fromPtr(ptr);
+        if (self.fail) |err| return err;
+        return arena.dupe(u8, self.account);
+    }
+
+    fn sign(ptr: *anyopaque, io: std.Io, arena: Allocator, message: []const u8) Signer.Error![]const u8 {
+        _ = io;
+        const self = fromPtr(ptr);
+        self.calls += 1;
+        self.message_len = @min(message.len, self.message_buffer.len);
+        @memcpy(self.message_buffer[0..self.message_len], message[0..self.message_len]);
+        if (self.fail) |err| return err;
+        return arena.dupe(u8, self.signature);
+    }
+
+    fn lifetime(ptr: *anyopaque) ?u32 {
+        return fromPtr(ptr).lifetime_s;
     }
 };
 
