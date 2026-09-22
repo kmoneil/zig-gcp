@@ -93,6 +93,30 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
     }
 
+    // Signed URLs held to outside answers: Google's conformance vectors,
+    // with real RSA signatures, and cases Google's Python library signed.
+    // The files live in tests/testdata, outside the package, so these run
+    // beside the storage module's unit tests rather than among them.
+    const signing_tests = b.addTest(.{
+        .name = "storage-signing",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage_signing.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "storage", .module = storage },
+                .{ .name = "auth", .module = auth },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = if (fuzz_runner) .{ .path = b.path("tools/test_runner.zig"), .mode = .server } else null,
+        .use_llvm = if (fuzz_runner) true else null,
+    });
+    if (only_module == null or std.mem.eql(u8, only_module.?, "storage")) {
+        test_step.dependOn(&b.addRunArtifact(signing_tests).step);
+    }
+
     // Line coverage of the unit tests, measured by kcov, which must be on
     // PATH. Each module's tests run under kcov, and the merged report is
     // installed to zig-out/coverage: index.html, plus coverage.json and
