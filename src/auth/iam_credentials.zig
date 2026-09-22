@@ -1,7 +1,8 @@
-//! The IAM Credentials API's `generateAccessToken`: trades a token that is
-//! allowed to act as a service account for one that acts as it. Workload
+//! The IAM Credentials API. `generateAccessToken` trades a token that is
+//! allowed to act as a service account for one that acts as it: workload
 //! identity federation calls it after the STS exchange, and impersonated
-//! service account credentials after the source login.
+//! service account credentials after the source login. `signBlob` has
+//! Google sign bytes with the account's own key, for signed URLs.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -9,6 +10,7 @@ const core = @import("core");
 const TokenProvider = core.TokenProvider;
 const Transport = core.transport.Transport;
 const Cache = @import("Cache.zig");
+const logging = @import("logging.zig");
 
 /// Google's endpoint: scheme and host.
 pub const default_endpoint = "https://iamcredentials.googleapis.com";
@@ -69,20 +71,25 @@ pub fn generateAccessToken(
         return if (core.isRetryable(err)) .{ .retry = err } else .{ .fail = err };
     };
     if (res.status != 200) {
-        const error_body = core.errors.decodeErrorBody(arena, res.body) catch |err| return .{ .fail = err };
-        if (diag) |d| {
-            const status = if (error_body) |b| b.status else "";
-            if (res.status == 403) {
-                d.set(res.status, status, refused);
-            } else {
-                d.set(res.status, status, if (error_body) |b| b.message else res.body);
-            }
-        }
+        describeFailure(arena, res, diag, refused) catch |err| return .{ .fail = err };
         if (res.status == 401) return .unauthorized;
         if (res.status == 429 or res.status >= 500) return .{ .retry = error.TokenUnavailable };
         return .{ .fail = error.TokenEndpointRejected };
     }
     return decodeToken(io, arena, res.body, diag);
+}
+
+/// Puts a refusal in `diag`: `refused` for a 403, which should name the
+/// missing role, and the server's own words for anything else.
+fn describeFailure(arena: Allocator, res: core.transport.Response, diag: ?*core.Diagnostics, refused: []const u8) Allocator.Error!void {
+    const error_body = try core.errors.decodeErrorBody(arena, res.body);
+    const d = diag orelse return;
+    const status = if (error_body) |b| b.status else "";
+    if (res.status == 403) {
+        d.set(res.status, status, refused);
+    } else {
+        d.set(res.status, status, if (error_body) |b| b.message else res.body);
+    }
 }
 
 /// `{"delegates":[...],"scope":[...],"lifetime":"3600s"}`, with `delegates`
@@ -136,13 +143,210 @@ fn invalid(diag: ?*core.Diagnostics) Outcome {
 }
 
 /// `{endpoint}/v1/projects/-/serviceAccounts/{principal}:generateAccessToken`.
+pub fn url(gpa: Allocator, endpoint: []const u8, principal: []const u8) Allocator.Error![]u8 {
+    return methodUrl(gpa, endpoint, principal, "generateAccessToken");
+}
+
+/// `{endpoint}/v1/projects/-/serviceAccounts/{principal}:{method}`.
 /// `principal` has passed `isPrincipal`, so it needs no encoding. Sized
 /// exactly and allocated once, so no half-built copy is ever freed.
-pub fn url(gpa: Allocator, endpoint: []const u8, principal: []const u8) Allocator.Error![]u8 {
-    const format = "{s}/v1/projects/-/serviceAccounts/{s}:generateAccessToken";
+fn methodUrl(gpa: Allocator, endpoint: []const u8, principal: []const u8, comptime method: []const u8) Allocator.Error![]u8 {
+    const format = "{s}/v1/projects/-/serviceAccounts/{s}:" ++ method;
     const args = .{ std.mem.trimEnd(u8, endpoint, "/"), principal };
     const out = try gpa.alloc(u8, std.fmt.count(format, args));
     return std.fmt.bufPrint(out, format, args) catch unreachable;
+}
+
+/// How long a key IAM signs with is sure to verify: Google rotates them, and
+/// promises each for at least 12 hours.
+pub const signature_lifetime_s: u32 = 12 * 60 * 60;
+
+pub const SignBlobRequest = struct {
+    /// The full `...:signBlob` URL.
+    url: []const u8,
+    /// The caller's token: one allowed to sign as the service account.
+    bearer: []const u8,
+    /// The bytes to sign.
+    payload: []const u8,
+    /// The chain of accounts between the caller and the target, each as
+    /// `projects/-/serviceAccounts/EMAIL`. Usually there are none.
+    delegates: []const []const u8 = &.{},
+    timeout_ms: u32,
+};
+
+pub const SignOutcome = union(enum) {
+    signature: []const u8,
+    /// A transient failure, worth another attempt.
+    retry: core.Signer.Error,
+    /// The bearer token was refused with HTTP 401: a fresh one may do.
+    unauthorized,
+    fail: core.Signer.Error,
+};
+
+/// One `signBlob` call: RSASSA-PKCS1-v1_5 with SHA-256 over `payload`, made
+/// by Google with the account's own key. The signature lands in `arena`.
+/// `refused` is the diagnostics message for HTTP 403, which should name the
+/// missing role.
+pub fn signBlob(
+    transport: Transport,
+    arena: Allocator,
+    request: SignBlobRequest,
+    diag: ?*core.Diagnostics,
+    refused: []const u8,
+) SignOutcome {
+    const body = encodeSignBody(arena, request) catch return .{ .fail = error.OutOfMemory };
+    const res = transport.send(.{
+        .method = .POST,
+        .url = request.url,
+        .bearer = request.bearer,
+        .body = body,
+        .content_type = .json,
+        .timeout_ms = request.timeout_ms,
+    }, arena) catch |err| {
+        if (diag) |d| d.print("the IAM Credentials endpoint could not be reached: {t}", .{err});
+        return if (core.isRetryable(err)) .{ .retry = err } else .{ .fail = err };
+    };
+    if (res.status != 200) {
+        describeFailure(arena, res, diag, refused) catch |err| return .{ .fail = err };
+        if (res.status == 401) return .unauthorized;
+        if (res.status == 429 or res.status >= 500) return .{ .retry = error.SigningFailed };
+        return .{ .fail = error.SigningRejected };
+    }
+    return decodeSignature(arena, res.body, diag);
+}
+
+/// `{"delegates":[...],"payload":"..."}`, the payload in base64, with
+/// `delegates` left out when there are none.
+pub fn encodeSignBody(arena: Allocator, request: SignBlobRequest) Allocator.Error![]u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var json: std.json.Stringify = .{ .writer = &out.writer };
+    writeSignBody(&json, request) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeSignBody(json: *std.json.Stringify, request: SignBlobRequest) std.json.Stringify.Error!void {
+    try json.beginObject();
+    if (request.delegates.len > 0) {
+        try json.objectField("delegates");
+        try json.write(request.delegates);
+    }
+    try json.objectField("payload");
+    try core.base64.writeJsonString(json, request.payload);
+    try json.endObject();
+}
+
+/// The signature from a 200 answer: base64, and as long as an RSA modulus
+/// Google could have used, 1,024 to 4,096 bits.
+fn decodeSignature(arena: Allocator, body: []const u8, diag: ?*core.Diagnostics) SignOutcome {
+    const Wire = struct {
+        keyId: ?[]const u8 = null,
+        signedBlob: ?[]const u8 = null,
+    };
+    const wire = std.json.parseFromSliceLeaky(Wire, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return .{ .fail = error.OutOfMemory },
+        else => return badSignature(diag),
+    };
+    const text = wire.signedBlob orelse return badSignature(diag);
+    const signature = core.base64.decode(arena, text) catch |err| switch (err) {
+        error.OutOfMemory => return .{ .fail = error.OutOfMemory },
+        error.InvalidBase64 => return badSignature(diag),
+    };
+    if (signature.len < 128 or signature.len > 512) return badSignature(diag);
+    return .{ .signature = signature };
+}
+
+fn badSignature(diag: ?*core.Diagnostics) SignOutcome {
+    if (diag) |d| d.print("the IAM Credentials answer has no usable signedBlob", .{});
+    return .{ .fail = error.SigningFailed };
+}
+
+/// One signing, with the retries every IAM call here gets: backoff on
+/// transient failures, and one fresh token after a 401.
+pub const Sign = struct {
+    /// Whose token goes with each call.
+    provider: TokenProvider,
+    /// The full `...:signBlob` URL.
+    url: []const u8,
+    payload: []const u8,
+    delegates: []const []const u8 = &.{},
+    retry: core.RetryPolicy,
+    timeout_ms: u32,
+    diagnostics: ?*core.Diagnostics,
+    /// What a 403 says: it should name the missing role.
+    refused: []const u8,
+};
+
+/// Signs as `call` says. The token and the signature live in `arena`,
+/// which the caller wipes.
+pub fn sign(transport: Transport, io: std.Io, arena: Allocator, signing: Sign) core.Signer.Error![]const u8 {
+    var max_attempts: u32 = signing.retry.max_attempts;
+    var reauthenticated = false;
+    var attempt: u32 = 1;
+    while (true) : (attempt += 1) {
+        // The provider caches its token and did its own retries.
+        const bearer = try signing.provider.getToken(io, arena, &.{scope});
+        const started = std.Io.Clock.awake.now(io);
+        const outcome = signBlob(transport, arena, .{
+            .url = signing.url,
+            .bearer = bearer,
+            .payload = signing.payload,
+            .delegates = signing.delegates,
+            .timeout_ms = signing.timeout_ms,
+        }, signing.diagnostics, signing.refused);
+        const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+        switch (outcome) {
+            .signature => |signature| {
+                logging.debug("POST {s} -> a signature in {d} ms (attempt {d} of {d})", .{ signing.url, elapsed_ms, attempt, max_attempts });
+                return signature;
+            },
+            .unauthorized => {
+                logging.debug("POST {s} -> 401 in {d} ms (attempt {d} of {d})", .{ signing.url, elapsed_ms, attempt, max_attempts });
+                // The token died between its fetch and its use. A fresh one
+                // fixes that, and costs one more try, not a retry.
+                if (reauthenticated) return error.SigningRejected;
+                reauthenticated = true;
+                max_attempts += 1;
+                logging.warn("IAM refused the token as unauthenticated; fetching a fresh one", .{});
+                signing.provider.invalidate();
+            },
+            .fail => |err| {
+                logging.debug("POST {s} -> {t} in {d} ms (attempt {d} of {d})", .{ signing.url, err, elapsed_ms, attempt, max_attempts });
+                return err;
+            },
+            .retry => |err| {
+                logging.debug("POST {s} -> {t} in {d} ms (attempt {d} of {d})", .{ signing.url, err, elapsed_ms, attempt, max_attempts });
+                if (attempt >= max_attempts) return err;
+                const delay_ms = signing.retry.backoffMs(attempt, entropy(io));
+                logging.warn("signing through IAM failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
+                    err, delay_ms, attempt + 1, max_attempts,
+                });
+                try io.sleep(.fromMilliseconds(delay_ms), .awake);
+            },
+        }
+    }
+}
+
+fn entropy(io: std.Io) u64 {
+    var bytes: [8]u8 = undefined;
+    io.random(&bytes);
+    return std.mem.readInt(u64, &bytes, .little);
+}
+
+/// `{endpoint}/v1/projects/-/serviceAccounts/{principal}:signBlob`.
+pub fn signBlobUrl(gpa: Allocator, endpoint: []const u8, principal: []const u8) Allocator.Error![]u8 {
+    return methodUrl(gpa, endpoint, principal, "signBlob");
+}
+
+/// An account's email: a principal with an `@` in it. A numeric unique id
+/// names the account for IAM, but a signed URL has to name its email.
+pub fn isEmail(text: []const u8) bool {
+    return isPrincipal(text) and std.mem.indexOfScalar(u8, text, '@') != null;
+}
+
+/// `projects/-/serviceAccounts/` and a principal.
+pub fn isDelegate(text: []const u8) bool {
+    const prefix = "projects/-/serviceAccounts/";
+    return std.mem.startsWith(u8, text, prefix) and isPrincipal(text[prefix.len..]);
 }
 
 /// The service account a `...:generateAccessToken` URL names, found the way
@@ -312,5 +516,99 @@ test "fuzz principalFromUrl: only a plain account name ever comes out" {
         "a/b:generateAccessToken",
         "/:generateAccessToken",
         "x/sa%40p:generateAccessToken",
+    } });
+}
+
+const signed_body = "{\"keyId\":\"k1\",\"signedBlob\":\"" ++ "Wlpa" ** 85 ++ "Wg==" ++ "\"}";
+
+fn signOnce(fake: *test_util.FakeTransport, arena: Allocator, diag: *core.Diagnostics) SignOutcome {
+    return signBlob(fake.transport(), arena, .{
+        .url = default_endpoint ++ "/v1/projects/-/serviceAccounts/" ++ target ++ ":signBlob",
+        .bearer = "ya29.CALLER",
+        .payload = "string to sign",
+        .timeout_ms = 5_000,
+    }, diag, "refused: grant the role");
+}
+
+test "signBlob: the request, and the signature from its answer" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{.{ .respond = .{ .body = signed_body } }});
+    defer fake.deinit();
+    var diag: core.Diagnostics = .{};
+    const outcome = signOnce(&fake, arena.allocator(), &diag);
+    try testing.expectEqual(256, outcome.signature.len);
+    try testing.expect(std.mem.allEqual(u8, outcome.signature, 0x5a));
+    const sent = try fake.request(0);
+    try testing.expectEqual(.POST, sent.method);
+    try testing.expectEqualStrings("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/" ++ target ++ ":signBlob", sent.url);
+    try testing.expectEqualStrings("ya29.CALLER", sent.bearer.?);
+    try testing.expectEqual(.json, sent.content_type);
+    try testing.expectEqualStrings("{\"payload\":\"c3RyaW5nIHRvIHNpZ24=\"}", sent.body.?);
+    // Delegates come first when there are any, as generateAccessToken's do.
+    try testing.expectEqualStrings(
+        "{\"delegates\":[\"projects/-/serviceAccounts/m@p.iam.gserviceaccount.com\"],\"payload\":\"\"}",
+        try encodeSignBody(arena.allocator(), .{ .url = "", .bearer = "", .payload = "", .delegates = &.{"projects/-/serviceAccounts/m@p.iam.gserviceaccount.com"}, .timeout_ms = 0 }),
+    );
+}
+
+test "signBlob: each answer says what to do next" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var diag: core.Diagnostics = .{};
+    const cases = [_]struct { Reply, std.meta.Tag(SignOutcome) }{
+        .{ .{ .respond = .{ .body = signed_body } }, .signature },
+        .{ .{ .respond = .{ .status = 401, .body = "{\"error\":{\"status\":\"UNAUTHENTICATED\",\"message\":\"expired\"}}" } }, .unauthorized },
+        .{ .{ .respond = .{ .status = 403, .body = "{\"error\":{\"status\":\"PERMISSION_DENIED\",\"message\":\"denied\"}}" } }, .fail },
+        .{ .{ .respond = .{ .status = 404, .body = "{\"error\":{\"status\":\"NOT_FOUND\",\"message\":\"no such account\"}}" } }, .fail },
+        .{ .{ .respond = .{ .status = 429, .body = "{}" } }, .retry },
+        .{ .{ .respond = .{ .status = 500, .body = "oops" } }, .retry },
+        .{ .{ .fail = error.ConnectionResetByPeer }, .retry },
+        .{ .{ .fail = error.Canceled }, .fail },
+        .{ .{ .respond = .{ .body = "{\"keyId\":\"k1\"}" } }, .fail },
+        .{ .{ .respond = .{ .body = "{\"signedBlob\":\"not base64!\"}" } }, .fail },
+        .{ .{ .respond = .{ .body = "<html>" } }, .fail },
+    };
+    for (cases) |case| {
+        var fake: test_util.FakeTransport = .init(testing.allocator, &.{case[0]});
+        defer fake.deinit();
+        const outcome = signOnce(&fake, arena.allocator(), &diag);
+        try testing.expectEqual(case[1], std.meta.activeTag(outcome));
+    }
+}
+
+test "isEmail and isDelegate" {
+    try testing.expect(isEmail(target));
+    try testing.expect(!isEmail("123456789012345678901"));
+    try testing.expect(!isEmail("sa@p/x"));
+    try testing.expect(!isEmail(""));
+    try testing.expect(isDelegate("projects/-/serviceAccounts/" ++ target));
+    try testing.expect(isDelegate("projects/-/serviceAccounts/123456789"));
+    try testing.expect(!isDelegate(target));
+    try testing.expect(!isDelegate("projects/-/serviceAccounts/"));
+    try testing.expect(!isDelegate("projects/p/serviceAccounts/" ++ target));
+}
+
+fn signatureAnswerProperty(_: void, input: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var diag: core.Diagnostics = .{};
+    switch (decodeSignature(arena.allocator(), input, &diag)) {
+        // Whatever the answer, a signature that comes out is one an RSA key
+        // could have made, and anything else is SigningFailed.
+        .signature => |signature| try testing.expect(signature.len >= 128 and signature.len <= 512),
+        .fail => |err| try testing.expectEqual(error.SigningFailed, err),
+        .retry, .unauthorized => return error.TestUnexpectedOutcome,
+    }
+}
+
+test "fuzz signBlob answers: a plausible signature or SigningFailed, never a crash" {
+    try test_util.fuzzBytes({}, signatureAnswerProperty, .{ .corpus = &.{
+        signed_body,
+        "{}",
+        "{\"signedBlob\":\"AAAA\"}",
+        "{\"signedBlob\":\"" ++ "AAAA" ** 128 ++ "\"}",
+        "{\"signedBlob\":null,\"keyId\":7}",
+        "",
     } });
 }
