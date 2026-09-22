@@ -181,8 +181,9 @@ jobs:
   # auth job skips it, and it gets a job of its own at a count it can
   # finish. pubsub's Publisher property plays a whole script against a
   # publisher and costs about 1.4 ms a run, more than the rest of pubsub's
-  # together, so it is a slow property too. A manual run's fuzz_iterations
-  # overrides every count.
+  # together, so it is a slow property too, and so are the two signed URL
+  # properties in storage that build whole requests. A manual run's
+  # fuzz_iterations overrides every count.
   fuzz:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.fuzz_iterations != '')
     name: fuzz (${{ matrix.job }})
@@ -194,7 +195,8 @@ jobs:
         # about 90 of the job's 180 minutes, from costs measured on
         # 2026-09-22, where a local run and CI kept pace: core 2.9 ms,
         # slow-auth 88 ms, pubsub 5.5 ms, the Subscriber property 31 ms,
-        # storage 0.28 ms.
+        # storage 0.71 ms with its signed URL properties, slow-storage
+        # 0.71 ms.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 2M }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
@@ -203,7 +205,8 @@ jobs:
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1M }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 150K }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
-          - { job: storage, module: storage, filter: fuzz, iterations: 8M }
+          - { job: storage, module: storage, filter: fuzz, iterations: 7M }
+          - { job: slow-storage, module: storage, filter: slow property, iterations: 7M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
