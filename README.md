@@ -674,6 +674,83 @@ and compare checksums. An `if_generation_not_match` or
 `if_metageneration_not_match` met by the current object is
 `error.NotModified`, an answer rather than a failure.
 
+### Signed URLs
+
+A signed URL lets someone with no credentials make one request on one
+object until it expires: a browser downloading a private file, or
+uploading straight into a bucket without the bytes passing through the
+application.
+
+```zig
+var creds = try auth.findDefault(gpa, io, lookup, .{});
+defer creds.deinit();
+const signer = creds.signer() orelse return error.CannotSign;
+
+var url = try gcs.bucket("photos").object("cats/tom.jpg").signedUrl(signer, .{
+    .expires_in_s = 15 * 60,
+    .query = &.{.{ .name = "response-content-disposition", .value = "attachment; filename=\"tom.jpg\"" }},
+});
+defer url.deinit();
+```
+
+An upload URL can pin what the holder may send:
+
+```zig
+var put = try object.signedUrl(signer, .{
+    .method = .PUT,
+    .expires_in_s = 10 * 60,
+    .headers = &.{
+        .{ .name = "content-type", .value = "image/png" },
+        .{ .name = "x-goog-content-length-range", .value = "0,5242880" },
+        .{ .name = "x-goog-if-generation-match", .value = "0" },
+    },
+});
+```
+
+The holder must send every signed header with the same value, and cannot
+add a query parameter of their own: Cloud Storage refuses the request
+otherwise. They must also send no `Authorization` header, even an empty
+one, which would turn the request into an ordinary authenticated one.
+
+Who can sign, as `Credentials.signer()` decides:
+
+| Credentials | Signs | What it needs |
+| --- | --- | --- |
+| A service account key file | on this machine | nothing else |
+| A login impersonating a service account | through IAM, as the target | the Token Creator role impersonation already needs |
+| A workload on Google Cloud | through IAM, as its attached account | Token Creator on itself, and the `cloud-platform` access scope |
+| A user's own login, or workload identity federation | nothing: `signer()` is null | name an account through `auth.IamSigner` |
+
+Google rotates the key IAM signs with and promises each for 12 hours, so
+a URL signed through IAM may last no longer, and `signedUrl` refuses a
+longer one before asking IAM. A key file's URL may last the seven days
+Cloud Storage allows.
+
+The URL points at the client's endpoint, so a client on the emulator
+makes emulator URLs. `.style` chooses `.path` (the default),
+`.virtual_hosted` for `bucket.storage.googleapis.com`, or a
+`.bucket_bound` domain that serves one bucket.
+
+Treat the URL as a password: it is a bearer credential until it expires.
+The library never logs it or puts it in `Diagnostics`, and wipes the
+memory its signature passed through. `examples/gcs_sign.zig` prints one,
+with the `curl` line that uses it:
+
+```
+zig build example-gcs_sign -- gs://my-bucket/reports/q3.txt
+```
+
+What Cloud Storage answers, measured against a real bucket on 2026-09-22:
+
+| The request | The answer |
+| --- | --- |
+| A URL past its expiry | 400 `ExpiredToken` |
+| A URL dated more than 15 minutes ahead | 403 `AccessDenied` |
+| A changed signature, header or parameter | 403 `SignatureDoesNotMatch`, carrying the canonical request Google computed |
+| A signed DELETE | 204 |
+| A signed POST with `x-goog-resumable: start` | 201, and a session URI that takes the bytes with no signature |
+| A body that does not match a signed `x-goog-content-sha256` | stored: the header is signed, but the body is not hashed against it |
+
 ### What it covers
 
 | Call | What it does |
@@ -700,6 +777,10 @@ The integration suite runs against `fake-gcs-server`, and a second suite
 against a real bucket covers what the emulator cannot be trusted on. The
 differences it found:
 
+- It serves the XML API's paths, which signed URLs use, only when started
+  with `-public-host` naming the host those URLs carry, and it never checks
+  a signature. Its signed DELETE answers 200 where Cloud Storage answers
+  204, and its resumable start drops the object name from the path.
 - The emulator enforces preconditions on uploads, but not on deletes, and
   never answers 304.
 - It takes a resumable upload's status query for the final request, and
