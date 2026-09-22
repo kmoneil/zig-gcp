@@ -896,6 +896,19 @@ STORAGE_EMULATOR_HOST=http://127.0.0.1:4443 zig build test-integration
 # moves about 230 MiB over the wire, 100 MiB of it in one object each way.
 GCP_TEST_BUCKET=my-bucket GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
     zig build test-integration-gcp
+
+# Signed URLs against a real bucket, the only place a signature is ever
+# checked. Name a key file, an account the token may sign as through IAM,
+# or both: each test runs once per signer. That account needs Storage
+# Object Admin on the bucket, since a URL grants what its signer may do.
+GCP_TEST_BUCKET=my-bucket GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
+    GCP_TEST_SIGNER_KEY=key.json GCP_TEST_SIGNER_EMAIL=signer@my-project.iam.gserviceaccount.com \
+    zig build test-integration-gcp
+
+# The emulator serves the paths signed URLs use only for the host they
+# name, so those tests need -public-host, as CI passes it.
+docker run -d -p 4443:4443 fsouza/fake-gcs-server -scheme http -port 4443 \
+    -public-host 127.0.0.1:4443
 ```
 
 The emulator binds to IPv6 localhost unless given `--host-port`.
