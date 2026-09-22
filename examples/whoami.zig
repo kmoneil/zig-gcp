@@ -24,7 +24,7 @@ pub const std_options: std.Options = .{
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     const out = &stdout.interface;
     var diag: pubsub.Diagnostics = .{};
 

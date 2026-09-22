@@ -100,6 +100,12 @@ including the ones that did not change.
   `Endpoint.fromEnv` honors `STORAGE_EMULATOR_HOST` in the three forms
   community tools write it. Uploads and downloads, with checksums
   verified in both directions, are next.
+- examples: every example writes its standard output as a stream. Zig
+  0.16's `File.writer` writes at an offset of its own, starting from 0,
+  when standard output is a regular file, so output redirected into a
+  file that something else also writes to landed on top of what came
+  before it; `File.writerStreaming` writes where the file is, as a shell
+  expects.
 - core, pubsub, auth, secret_manager: unchanged.
 
 ## 0.13.1 (2026-09-21)
