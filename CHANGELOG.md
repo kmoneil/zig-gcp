@@ -71,6 +71,15 @@ including the ones that did not change.
   call needs a destination condition to be retried.
 - core: `error.NotModified`, mapped from HTTP 304, for conditional
   reads whose condition was met: there is nothing new to return.
+- core: `testing.FaultTransport`, new: it wraps any `Transport` and
+  breaks the requests a plan names the way a failing network does,
+  cutting a request body or a streamed response body partway, or losing
+  a response after the server acted on it, and it can record every
+  exchange. Each fault reaches the caller as
+  `error.ConnectionResetByPeer`. Around `HttpTransport` the connection
+  really closes with the body unfinished, so a test proves recovery
+  against a real server. A hook runs between the fault and the retry,
+  where a test can change the world under a transfer that will resume.
 - core: a streaming request can ask for the response head as soon as it
   arrives, through `head_out`, so a download that fails mid-body still
   knows the generation it was reading and can resume against it.
