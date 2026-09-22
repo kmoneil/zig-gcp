@@ -76,11 +76,24 @@ jobs:
         timeout-minutes: 10
         env:
           PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
+          STORAGE_EMULATOR_HOST: http://127.0.0.1:4443
         run: |
           zig build example-worker
           zig build example-publish -- orders 3
           zig build example-publisher -- orders 500 4
           zig build example-worker
+          # A file up and back down through gcs_cp, byte for byte, in
+          # chunks, and a refused overwrite.
+          curl -sf -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
+            -H "Content-Type: application/json" -d '{"name":"zigps-examples"}' >/dev/null
+          head -c 20971520 /dev/urandom > "$RUNNER_TEMP/src.bin"
+          zig build example-gcs_cp -- "$RUNNER_TEMP/src.bin" gs://zigps-examples/dir/copy.bin
+          zig build example-gcs_cp -- gs://zigps-examples/dir/copy.bin "$RUNNER_TEMP/back.bin"
+          cmp "$RUNNER_TEMP/src.bin" "$RUNNER_TEMP/back.bin"
+          if zig build example-gcs_cp -- "$RUNNER_TEMP/src.bin" gs://zigps-examples/dir/copy.bin --no-clobber; then
+            echo "--no-clobber replaced an existing object"
+            exit 1
+          fi
 
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
   # read of undefined memory, can pass in Debug and fail here.

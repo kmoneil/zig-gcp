@@ -18,8 +18,17 @@ including the ones that did not change.
   failing with `error.ObjectTooLarge` without being held, and the bytes
   are checked against `x-goog-hash`; an object decompressed in transit
   has nothing to check against and reports `checksum_verified = false`.
-  Uploads, like deletes without a `generation`, are not retried unless
-  `retry_unconditional_writes` opts in. `download` streams an object, or
+  Object names travel strictly percent-encoded, so names with slashes,
+  spaces, `%` or non-ASCII address exactly the object they name, and the
+  codec reads the API's quirks: `size` and generations as string
+  integers (numbers too, for emulators), checksums in big-endian base64,
+  `md5Hash` missing for composite objects. Against `fake-gcs-server` no
+  credentials are needed: `Endpoint.fromEnv` honors
+  `STORAGE_EMULATOR_HOST` in the three forms community tools write it.
+  Uploads without a precondition, like deletes without a `generation`,
+  are not retried unless `retry_unconditional_writes` opts in, because a
+  blind repeat could overwrite or remove someone else's newer object.
+  `download` streams an object, or
   a `range` of it, into any `std.Io.Writer`: the bytes are hashed as
   they pass and checked against `x-goog-hash` at the end, and a
   transient failure mid-body resumes where the bytes stopped, pinned to
@@ -69,8 +78,16 @@ including the ones that did not change.
   `copyTo` copies server-side, looping over rewrite calls until done;
   the caller never sees a rewrite token, and only the tokenless first
   call needs a destination condition to be retried.
+- storage: `examples/gcs_cp.zig` copies a file into Cloud Storage or an
+  object out of it, streaming both ways and checksummed end to end, a
+  download landing in `<file>.part` until its bytes have verified:
+  `zig build example-gcs_cp -- backup.tar gs://my-bucket/backup.tar`. A
+  1 GiB file each way stays under 16 MiB resident.
 - core: `error.NotModified`, mapped from HTTP 304, for conditional
   reads whose condition was met: there is nothing new to return.
+  Breaking for code that switches exhaustively over `pubsub.Error` or
+  `secret_manager.Error`, which include core's API errors: add a prong
+  for it. Neither module returns it.
 - core: `testing.FaultTransport`, new: it wraps any `Transport` and
   breaks the requests a plan names the way a failing network does,
   cutting a request body or a streamed response body partway, or losing
@@ -88,25 +105,15 @@ including the ones that did not change.
   std, because the readers in the chain need a writable destination.
   The transport now forwards the body through a small buffer of its
   own, so any writer works, and the request body writer gained the same
-  protection for reader-backed uploads. Object names travel strictly
-  percent-encoded, so names with slashes, spaces, `%` or non-ASCII address
-  exactly the object they name. The codec reads the API's quirks: `size`
-  and generations as string integers (numbers too, for emulators),
-  checksums in big-endian base64, `md5Hash` missing for composite objects.
-  A delete without a `generation` is not retried unless
-  `retry_unconditional_writes` opts in, because a blind repeat could
-  remove someone else's newer object; every other call here retries
-  safely. Against `fake-gcs-server` no credentials are needed:
-  `Endpoint.fromEnv` honors `STORAGE_EMULATOR_HOST` in the three forms
-  community tools write it. Uploads and downloads, with checksums
-  verified in both directions, are next.
+  protection for reader-backed uploads.
 - examples: every example writes its standard output as a stream. Zig
   0.16's `File.writer` writes at an offset of its own, starting from 0,
   when standard output is a regular file, so output redirected into a
   file that something else also writes to landed on top of what came
   before it; `File.writerStreaming` writes where the file is, as a shell
   expects.
-- core, pubsub, auth, secret_manager: unchanged.
+- auth, pubsub, secret_manager: unchanged, apart from `error.NotModified`
+  joining their error sets through core.
 
 ## 0.13.1 (2026-09-21)
 
