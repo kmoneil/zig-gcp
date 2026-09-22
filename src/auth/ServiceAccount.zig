@@ -890,7 +890,7 @@ fn anyReplyProperty(_: void, input: []const u8) !void {
 }
 
 // Named "slow property", not "fuzz": each run signs a JWT with RSA, about
-// 49 ms, so the nightly fuzz job for auth skips it and a job of its own
+// 90 ms, so the nightly fuzz job for auth skips it and a job of its own
 // fuzzes it fewer times. `zig build test` runs it like any other.
 test "slow property ServiceAccount: any token endpoint reply yields a token or an error" {
     try test_util.fuzzBytes({}, anyReplyProperty, .{

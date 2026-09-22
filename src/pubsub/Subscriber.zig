@@ -1332,7 +1332,10 @@ fn chaosProperty(_: void, input: []const u8) !void {
     try testing.expectEqual(counts.received, counts.acked + counts.nacked);
 }
 
-test "fuzz Subscriber: random loads, failures and limits never lose a message" {
+// Named "slow property", not "fuzz": each run starts real tasks against the
+// clock, about 30 ms, so the nightly fuzz job for pubsub skips it and a job
+// of its own fuzzes it fewer times. `zig build test` runs it like any other.
+test "slow property Subscriber: random loads, failures and limits never lose a message" {
     try test_util.fuzzBytes({}, chaosProperty, .{
         // Real tasks and real time: a few runs, not hundreds.
         .random_runs = 8,
