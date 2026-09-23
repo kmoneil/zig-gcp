@@ -525,6 +525,57 @@ test "copyTo within a bucket and across two buckets" {
     try testing.expectEqualStrings(data, far_round.value.data);
 }
 
+test "copyTo with changes: the new fields, and everything else carried" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const src = f.bucket().object("reports/original.txt");
+    var uploaded = try src.upload("hello world\n", .{
+        .content_type = "text/plain",
+        .cache_control = "no-cache",
+        .metadata = &.{ .{ .key = "reviewer", .value = "kim" }, .{ .key = "stage", .value = "draft" } },
+    });
+    defer uploaded.deinit();
+
+    // A new content type and an edit; the cache control and the key the
+    // edit does not name are carried from the source. fake-gcs-server
+    // would fill those gaps itself, but the resource sent names them, so
+    // this holds on Cloud Storage too, where a gap stays empty.
+    var changed = try src.copyTo(f.bucket().object("copies/changed.txt"), .{
+        .content_type = "application/json",
+        .edit = .{ .change = &.{
+            .{ .key = "stage", .value = null },
+            .{ .key = "origin", .value = "zig" },
+        } },
+    });
+    defer changed.deinit();
+    try testing.expectEqualStrings("application/json", changed.value.content_type);
+    try testing.expectEqualStrings("no-cache", changed.value.cache_control.?);
+    try testing.expectEqualStrings("kim", changed.value.metadataValue("reviewer").?);
+    try testing.expectEqualStrings("zig", changed.value.metadataValue("origin").?);
+    try testing.expectEqual(null, changed.value.metadataValue("stage"));
+    try testing.expectEqual(2, changed.value.metadata.len);
+
+    // Onto itself: a new generation with the same bytes, and a cache
+    // control that replaces the old one. (fake-gcs-server ignores a
+    // storage class in the resource, so this is the change it shows.)
+    var in_place = try src.copyTo(src, .{ .cache_control = "public, max-age=60" });
+    defer in_place.deinit();
+    try testing.expect(in_place.value.generation != uploaded.value.generation);
+    try testing.expectEqualStrings("public, max-age=60", in_place.value.cache_control.?);
+    try testing.expectEqualStrings("text/plain", in_place.value.content_type);
+    try testing.expectEqualStrings("draft", in_place.value.metadataValue("stage").?);
+    var round = try src.downloadAlloc(64, .{});
+    defer round.deinit();
+    try testing.expectEqualStrings("hello world\n", round.value.data);
+
+    // A storage class is accepted and sent; this server does not keep it.
+    var classed = try src.copyTo(f.bucket().object("copies/classed.txt"), .{ .storage_class = "NEARLINE" });
+    classed.deinit();
+}
+
 test "does_not_exist uploads succeed once, then fail their precondition" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;

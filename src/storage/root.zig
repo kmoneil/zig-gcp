@@ -84,6 +84,7 @@ test {
     _ = @import("Object.zig");
     _ = @import("codec.zig");
     _ = @import("compose.zig");
+    _ = @import("copy.zig");
     _ = @import("download.zig");
     _ = @import("errors.zig");
     _ = @import("multipart.zig");

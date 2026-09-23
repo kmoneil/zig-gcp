@@ -102,6 +102,56 @@ pub fn decodeObjectSize(arena: Allocator, body: []const u8) DecodeError!?u64 {
     return if (wire.size == null) null else try u64FromValue(wire.size);
 }
 
+/// What a copy with changes carries from its source: the generation and
+/// metageneration it pins the copy to, and the editable fields as the
+/// server sent them. An empty field reads as absent.
+pub const CopySource = struct {
+    generation: u64,
+    metageneration: u64,
+    content_type: ?[]const u8,
+    cache_control: ?[]const u8,
+    content_disposition: ?[]const u8,
+    content_encoding: ?[]const u8,
+    content_language: ?[]const u8,
+    /// RFC 3339. `ObjectInfo` does not report it, but lifecycle rules read
+    /// it, so a copy must not drop it.
+    custom_time: ?[]const u8,
+    metadata: []const types.Metadata,
+};
+
+/// The source of a copy with changes. A resource that names no generation
+/// or metageneration is `InvalidResponse`: there would be nothing to pin
+/// the copy to.
+pub fn decodeCopySource(arena: Allocator, body: []const u8) DecodeError!CopySource {
+    const wire = try parseWire(WireCopySource, arena, body);
+    const generation = try u64FromValue(wire.generation);
+    const metageneration = try u64FromValue(wire.metageneration);
+    if (generation == 0 or metageneration == 0) return error.InvalidResponse;
+    return .{
+        .generation = generation,
+        .metageneration = metageneration,
+        .content_type = nonEmpty(wire.contentType),
+        .cache_control = nonEmpty(wire.cacheControl),
+        .content_disposition = nonEmpty(wire.contentDisposition),
+        .content_encoding = nonEmpty(wire.contentEncoding),
+        .content_language = nonEmpty(wire.contentLanguage),
+        .custom_time = nonEmpty(wire.customTime),
+        .metadata = try metadataFromWire(arena, wire.metadata),
+    };
+}
+
+const WireCopySource = struct {
+    generation: ?std.json.Value = null,
+    metageneration: ?std.json.Value = null,
+    contentType: ?[]const u8 = null,
+    cacheControl: ?[]const u8 = null,
+    contentDisposition: ?[]const u8 = null,
+    contentEncoding: ?[]const u8 = null,
+    contentLanguage: ?[]const u8 = null,
+    customTime: ?[]const u8 = null,
+    metadata: ?std.json.ArrayHashMap(?[]const u8) = null,
+};
+
 /// One page of `objects.list`.
 pub fn decodeObjectPage(arena: Allocator, body: []const u8) DecodeError!types.ObjectPage {
     const wire = try parseWire(WireObjectPage, arena, body);
@@ -379,6 +429,41 @@ test "decodeObjectSize tells an absent size from an empty object" {
     try testing.expectError(error.InvalidResponse, decodeObjectSize(a, "not json"));
 }
 
+test "decodeCopySource: what a copy carries, and what it pins" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = try decodeCopySource(a,
+        \\{"name":"a","generation":"1758448800123456","metageneration":"3",
+        \\ "contentType":"text/plain","cacheControl":"no-cache","contentDisposition":"",
+        \\ "contentLanguage":"en","customTime":"2026-09-23T00:00:00Z",
+        \\ "storageClass":"NEARLINE","metadata":{"b":"2","a":"1"}}
+    );
+    try testing.expectEqual(1758448800123456, source.generation);
+    try testing.expectEqual(3, source.metageneration);
+    try testing.expectEqualStrings("text/plain", source.content_type.?);
+    try testing.expectEqualStrings("no-cache", source.cache_control.?);
+    // Empty reads as absent, and absent stays absent.
+    try testing.expectEqual(null, source.content_disposition);
+    try testing.expectEqual(null, source.content_encoding);
+    try testing.expectEqualStrings("en", source.content_language.?);
+    try testing.expectEqualStrings("2026-09-23T00:00:00Z", source.custom_time.?);
+    // The server's order, which the copy keeps.
+    try testing.expectEqual(2, source.metadata.len);
+    try testing.expectEqualStrings("b", source.metadata[0].key);
+    try testing.expectEqualStrings("a", source.metadata[1].key);
+
+    // Emulators send plain numbers.
+    const plain = try decodeCopySource(a, "{\"generation\":5,\"metageneration\":1}");
+    try testing.expectEqual(5, plain.generation);
+    try testing.expectEqual(0, plain.metadata.len);
+
+    // Nothing to pin a copy to is not a source a copy can use.
+    try testing.expectError(error.InvalidResponse, decodeCopySource(a, "{\"metageneration\":\"1\"}"));
+    try testing.expectError(error.InvalidResponse, decodeCopySource(a, "{\"generation\":\"5\"}"));
+    try testing.expectError(error.InvalidResponse, decodeCopySource(a, "{\"generation\":\"x\",\"metageneration\":\"1\"}"));
+}
+
 test "checksums: malformed base64 is InvalidResponse, not a wrong value" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -463,6 +548,7 @@ fn decodeArbitrary(_: void, input: []const u8) !void {
     _ = decodeObject(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
     _ = decodeObjectPage(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
     _ = decodeBucketPage(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
+    _ = decodeCopySource(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
 }
 
 test "fuzz decoding: arbitrary bodies never crash" {
