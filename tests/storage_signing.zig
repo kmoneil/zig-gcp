@@ -17,6 +17,7 @@ const rsa = std.crypto.Certificate.rsa;
 
 const vectors_json = @embedFile("testdata/v4_signatures.json");
 const oracle_json = @embedFile("testdata/signed_url_oracle.json");
+const post_oracle_json = @embedFile("testdata/post_policy_oracle.json");
 
 /// The account Google's vectors are signed as, and its key: `private_key`
 /// of storage/v1/test_service_account.not-a-test.json in
@@ -275,13 +276,13 @@ const OracleFile = struct {
     cases: []const OracleCase,
 };
 
-test "400 cases Google's Python library signed, byte for byte" {
+test "800 cases Google's Python library signed, byte for byte" {
     const gpa = testing.allocator;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const file = try std.json.parseFromSliceLeaky(OracleFile, arena, oracle_json, .{ .ignore_unknown_fields = true });
-    try testing.expectEqual(400, file.cases.len);
+    try testing.expectEqual(800, file.cases.len);
 
     var fake: core.testing.FakeTransport = .init(gpa, &.{});
     defer fake.deinit();
@@ -522,4 +523,93 @@ test "Google's V4 POST policy vectors, byte for byte, signatures included" {
         try rsa.PKCS1v1_5Signature.verify(256, signature, recording.message.items, public_key, Sha256);
     }
     try testing.expectEqual(0, fake.requests.items.len);
+}
+
+/// One case of testdata/post_policy_oracle.json.
+const PostOracleCase = struct {
+    bucket: []const u8,
+    object: []const u8,
+    expires: u32,
+    signedAt: i64,
+    style: []const u8,
+    fields: []const [2][]const u8,
+    /// `["starts-with", "$name", prefix]` or
+    /// `["content-length-range", min, max]`.
+    conditions: []const std.json.Value,
+    boundHost: ?[]const u8 = null,
+    boundScheme: ?[]const u8 = null,
+    url: []const u8,
+    /// The base64 document, which is also what the library signed.
+    policy: []const u8,
+};
+
+const PostOracleFile = struct {
+    library: []const u8,
+    email: []const u8,
+    cases: []const PostOracleCase,
+};
+
+test "400 POST policies Google's Python library signed, byte for byte" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const file = try std.json.parseFromSliceLeaky(PostOracleFile, arena, post_oracle_json, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(400, file.cases.len);
+
+    var fake: core.testing.FakeTransport = .init(gpa, &.{});
+    defer fake.deinit();
+    for (file.cases, 0..) |case, i| {
+        errdefer std.debug.print("post policy oracle case {d}: {s}/{s}\n", .{ i, case.bucket, case.object });
+        var clock: core.testing.FakeClock = .{ .now_ns = @as(i96, case.signedAt) * std.time.ns_per_s };
+        var token: core.testing.FakeTokenProvider = .{};
+        var signer: core.testing.FakeSigner = .{ .account = file.email };
+        var client: storage.Client = try .init(gpa, clock.io(), .{
+            .token_provider = token.provider(),
+            .transport = fake.transport(),
+        });
+        defer client.deinit();
+        const fields = try arena.alloc(storage.PostField, case.fields.len);
+        for (case.fields, fields) |pair, *field| field.* = .{ .name = pair[0], .value = pair[1] };
+        const conditions = try arena.alloc(storage.PostCondition, case.conditions.len);
+        for (case.conditions, conditions) |value, *condition| {
+            const items = value.array.items;
+            if (std.mem.eql(u8, items[0].string, "content-length-range")) {
+                condition.* = .{ .content_length_range = .{
+                    .min = @intCast(items[1].integer),
+                    .max = @intCast(items[2].integer),
+                } };
+            } else {
+                // The file carries the field name with its `$`; the API
+                // takes the name, and writes the `$` itself.
+                condition.* = .{ .starts_with = .{ .field = items[1].string[1..], .prefix = items[2].string } };
+            }
+        }
+        const style: storage.UrlStyle = if (std.mem.eql(u8, case.style, "virtual"))
+            .virtual_hosted
+        else if (std.mem.eql(u8, case.style, "bound"))
+            .{ .bucket_bound = .{
+                .host = case.boundHost.?,
+                .scheme = if (std.mem.eql(u8, case.boundScheme.?, "http")) .http else .https,
+            } }
+        else
+            .path;
+        var policy = try client.bucket(case.bucket).object(case.object).postPolicy(signer.signer(), .{
+            .expires_in_s = case.expires,
+            .fields = fields,
+            .conditions = conditions,
+            .style = style,
+        });
+        defer policy.deinit();
+
+        try testing.expectEqualStrings(case.url, policy.value.url);
+        // Compared decoded, so a failure names the byte that differs.
+        try testing.expectEqualStrings(
+            try base64Decode(arena, case.policy),
+            try base64Decode(arena, policy.value.field("policy").?),
+        );
+        try testing.expectEqualStrings(case.policy, policy.value.field("policy").?);
+        // And the document is what the library signed, as it is here.
+        try testing.expectEqualStrings(case.policy, signer.lastMessage());
+    }
 }
