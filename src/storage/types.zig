@@ -35,6 +35,9 @@ pub const ObjectInfo = struct {
     crc32c: ?u32,
     /// Composite objects have none.
     md5: ?[16]u8,
+    /// How many non-composite objects this one is made of, or null when it
+    /// is not a composite. Cloud Storage counts it for nothing else.
+    component_count: ?u32,
     etag: []const u8,
     storage_class: []const u8,
     /// RFC 3339, as sent by the server. `core.timestamp.parse` converts it.
@@ -106,6 +109,36 @@ pub const Preconditions = struct {
     pub fn makesMetadataWriteSafe(self: Preconditions) bool {
         return self.if_metageneration_match != null;
     }
+};
+
+/// One object a compose reads from.
+pub const ComposeSource = struct {
+    /// A name in the destination's bucket. Sources cannot come from
+    /// another bucket, and must share a storage class.
+    name: []const u8,
+    /// Compose one specific generation of it, rather than the live one.
+    generation: ?u64 = null,
+    /// Compose only if that source is at this generation.
+    if_generation_match: ?u64 = null,
+};
+
+/// What `Object.composeFrom` writes, beside the sources it reads.
+pub const ComposeOptions = struct {
+    /// The composite's own metadata: nothing is inherited from the
+    /// sources, so an unset content type becomes the default.
+    content_type: []const u8 = "application/octet-stream",
+    cache_control: ?[]const u8 = null,
+    content_encoding: ?[]const u8 = null,
+    metadata: []const Metadata = &.{},
+    /// Hard-deletes every source once the composite exists, which is what
+    /// Google advises for parallel composite uploads, to keep the parts
+    /// from being billed. Irreversible, and the wrong choice where soft
+    /// delete, object versioning, a retention policy or a hold is in play.
+    /// A compose that deletes its sources is never retried without a
+    /// precondition: the second attempt would find them gone.
+    delete_sources: bool = false,
+    /// `if_generation_match` is what makes this safe to retry.
+    preconditions: Preconditions = .{},
 };
 
 /// What a patch does to an object's custom metadata. Cloud Storage reads
@@ -365,6 +398,7 @@ const testing = std.testing;
 
 test "ObjectInfo.metadataValue finds the first match" {
     const info: ObjectInfo = .{
+        .component_count = null,
         .cache_control = null,
         .content_disposition = null,
         .content_encoding = null,

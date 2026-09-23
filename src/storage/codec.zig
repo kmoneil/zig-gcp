@@ -179,6 +179,7 @@ const WireObject = struct {
     contentLanguage: ?[]const u8 = null,
     crc32c: ?[]const u8 = null,
     md5Hash: ?[]const u8 = null,
+    componentCount: ?std.json.Value = null,
     etag: ?[]const u8 = null,
     storageClass: ?[]const u8 = null,
     timeCreated: ?[]const u8 = null,
@@ -218,6 +219,10 @@ fn objectFromWire(arena: Allocator, wire: WireObject) DecodeError!types.ObjectIn
         .content_language = nonEmpty(wire.contentLanguage),
         .crc32c = try crc32cFromWire(wire.crc32c),
         .md5 = try md5FromWire(wire.md5Hash),
+        .component_count = if (wire.componentCount == null) null else std.math.cast(
+            u32,
+            try u64FromValue(wire.componentCount),
+        ) orelse return error.InvalidResponse,
         .etag = wire.etag orelse "",
         .storage_class = wire.storageClass orelse "",
         .time_created = wire.timeCreated orelse "",
