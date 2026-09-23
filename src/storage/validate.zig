@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const test_util = @import("test_util.zig");
+const types = @import("types.zig");
 
 /// The documented ceiling on an object name's length, in bytes of UTF-8.
 pub const max_object_name_len = 1024;
@@ -30,6 +31,28 @@ pub fn isBucketName(name: []const u8) bool {
         if (c <= ' ' or c == 0x7f) return false;
     }
     return true;
+}
+
+/// What is wrong with a set of custom metadata entries, and where.
+pub const MetadataFault = struct {
+    index: usize,
+    /// True when the key repeats an earlier one, false when it is empty.
+    repeated: bool,
+};
+
+/// The first entry that has no key, or whose key repeats an earlier one,
+/// or null when the set is unambiguous. Cloud Storage stores custom
+/// metadata as one JSON object, so a repeated key makes a body carrying
+/// two entries of one name, which the server resolves however it pleases
+/// and a strict JSON reader refuses outright.
+pub fn metadataFault(entries: []const types.Metadata) ?MetadataFault {
+    for (entries, 0..) |entry, i| {
+        if (entry.key.len == 0) return .{ .index = i, .repeated = false };
+        for (entries[0..i]) |earlier| {
+            if (std.mem.eql(u8, earlier.key, entry.key)) return .{ .index = i, .repeated = true };
+        }
+    }
+    return null;
 }
 
 /// User agents become a header value: printable ASCII.
@@ -100,4 +123,27 @@ test "fuzz name validation is total and safe" {
         "a b",
         "\xff\xfe",
     } });
+}
+
+test "metadataFault finds an empty key and a repeated one" {
+    try std.testing.expectEqual(null, metadataFault(&.{}));
+    try std.testing.expectEqual(null, metadataFault(&.{
+        .{ .key = "a", .value = "1" },
+        .{ .key = "b", .value = "2" },
+    }));
+    // Case matters: Cloud Storage's custom metadata keys are not headers.
+    try std.testing.expectEqual(null, metadataFault(&.{
+        .{ .key = "a", .value = "1" },
+        .{ .key = "A", .value = "2" },
+    }));
+    const empty = metadataFault(&.{.{ .key = "", .value = "1" }}).?;
+    try std.testing.expectEqual(0, empty.index);
+    try std.testing.expectEqual(false, empty.repeated);
+    const repeated = metadataFault(&.{
+        .{ .key = "a", .value = "1" },
+        .{ .key = "b", .value = "2" },
+        .{ .key = "a", .value = "3" },
+    }).?;
+    try std.testing.expectEqual(2, repeated.index);
+    try std.testing.expectEqual(true, repeated.repeated);
 }

@@ -23,6 +23,7 @@ const resumable = @import("resumable.zig");
 const rpc = @import("rpc.zig");
 const signing = @import("signing.zig");
 const types = @import("types.zig");
+const validate = @import("validate.zig");
 const Error = errors.Error;
 
 /// Borrowed; the handle must not outlive it.
@@ -372,10 +373,18 @@ fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void 
         if (client.diagnostics) |d| d.print("invalid content type: expected a header value", .{});
         return error.InvalidArgument;
     }
-    for (options.metadata) |entry| if (entry.key.len == 0) {
-        if (client.diagnostics) |d| d.print("invalid metadata: keys must not be empty", .{});
+    // An empty key was already refused here; a repeated one was not, and
+    // made a body carrying two entries of one name.
+    if (validate.metadataFault(options.metadata)) |fault| {
+        if (client.diagnostics) |d| {
+            if (fault.repeated) {
+                d.print("invalid metadata: key {s} appears twice; one object gives a key one value", .{options.metadata[fault.index].key});
+            } else {
+                d.print("invalid metadata: keys must not be empty", .{});
+            }
+        }
         return error.InvalidArgument;
-    };
+    }
 }
 
 /// Streams the object into `writer`, hashing the bytes as they pass and
@@ -1473,4 +1482,25 @@ test "copyTo refuses a loop that cannot continue" {
     // Done, but no object resource.
     try testing.expectError(error.InvalidResponse, src.copyTo(dest, .{}));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "no object resource") != null);
+}
+
+test "upload: a repeated metadata key is refused before anything is sent" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const obj = h.client.bucket("b").object("a");
+    try testing.expectError(error.InvalidArgument, obj.upload("x", .{
+        .metadata = &.{ .{ .key = "k", .value = "1" }, .{ .key = "k", .value = "2" } },
+    }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "appears twice") != null);
+    // The same rule on the streaming path, which shares the check.
+    var reader: std.Io.Reader = .fixed("x");
+    try testing.expectError(error.InvalidArgument, obj.uploadFrom(&reader, .{
+        .metadata = &.{ .{ .key = "k", .value = "1" }, .{ .key = "k", .value = "2" } },
+    }));
+    // And the empty key that was already refused.
+    try testing.expectError(error.InvalidArgument, obj.upload("x", .{
+        .metadata = &.{.{ .key = "", .value = "1" }},
+    }));
+    try testing.expectEqual(0, h.fake.stream_requests.items.len);
 }
