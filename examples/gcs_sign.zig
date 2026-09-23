@@ -4,6 +4,13 @@
 //!
 //!     zig build example-gcs_sign -- gs://my-bucket/reports/q3.txt
 //!     zig build example-gcs_sign -- gs://my-bucket/uploads/photo.png --put image/png --minutes 10
+//!     zig build example-gcs_sign -- gs://my-bucket/uploads/ --post-policy --put image/png
+//!
+//! `--post-policy` prints an HTML form instead of a URL. A form cannot send
+//! the headers a signed PUT pins, and the person at the browser picks the
+//! file, so its name is not known when the policy is signed; a policy can
+//! allow a whole prefix, which a URL cannot. End the target with `/` for
+//! one: Cloud Storage puts the browser's file name where `${filename}` is.
 //!
 //! A service account key file signs here, on this machine. A workload on
 //! Google Cloud, or a login that impersonates a service account, signs
@@ -27,7 +34,7 @@ pub const std_options: std.Options = .{
     },
 };
 
-const usage = "usage: gcs_sign gs://<bucket>/<object> [--put <content-type>] [--minutes <n>]\n";
+const usage = "usage: gcs_sign gs://<bucket>/<object> [--put <content-type>] [--minutes <n>] [--post-policy]\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -38,6 +45,7 @@ pub fn main(init: std.process.Init) !void {
     var target: ?Remote = null;
     var content_type: ?[]const u8 = null;
     var minutes: u32 = 15;
+    var post_policy = false;
     var bad = false;
     const args = try init.minimal.args.toSlice(arena);
     var i: usize = @min(1, args.len);
@@ -49,6 +57,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--minutes") and i + 1 < args.len) {
             i += 1;
             minutes = std.fmt.parseInt(u32, args[i], 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--post-policy")) {
+            post_policy = true;
         } else if (target == null) {
             target = Remote.parse(arg);
             bad = target == null;
@@ -56,6 +66,8 @@ pub fn main(init: std.process.Init) !void {
             bad = true;
         }
     }
+    // Only a policy can name a prefix instead of one object.
+    if (!bad and target != null and target.?.name.len == 0 and !post_policy) bad = true;
     // Seven days is the longest Cloud Storage accepts.
     if (bad or target == null or minutes == 0 or minutes > 7 * 24 * 60) {
         try out.writeAll(usage);
@@ -79,6 +91,44 @@ pub fn main(init: std.process.Init) !void {
     }) catch |err| return fail(err, &diag);
     defer client.deinit();
 
+    const account = signer.email(init.io, arena) catch |err| return fail(err, &diag);
+    if (post_policy) {
+        const fields: []const storage.PostField = if (content_type) |media_type|
+            &.{.{ .name = "content-type", .value = media_type }}
+        else
+            &.{};
+        const name = target.?.name;
+        // A name ending in `/`, or none at all, is a prefix: the browser
+        // names the object, under it.
+        const exact = name.len != 0 and name[name.len - 1] != '/';
+        const made = if (exact)
+            client.bucket(target.?.bucket).object(name).postPolicy(signer, .{
+                .expires_in_s = minutes * 60,
+                .fields = fields,
+            })
+        else
+            client.bucket(target.?.bucket).postPolicy(signer, .{
+                .expires_in_s = minutes * 60,
+                .key = .{ .starts_with = name },
+                .fields = fields,
+            });
+        var policy = made catch |err| return fail(err, &diag);
+        defer policy.deinit();
+        try out.print("signed as {s}, good for {d} minutes:\n\n", .{ account, minutes });
+        try out.print("<form action=\"{s}\" method=\"post\" enctype=\"multipart/form-data\">\n", .{policy.value.url});
+        for (policy.value.fields) |field| {
+            try out.writeAll("  <input type=\"hidden\" name=\"");
+            try writeHtml(out, field.name);
+            try out.writeAll("\" value=\"");
+            try writeHtml(out, field.value);
+            try out.writeAll("\">\n");
+        }
+        // `file` goes last: Cloud Storage reads the fields before it.
+        try out.writeAll("  <input type=\"file\" name=\"file\">\n");
+        try out.writeAll("  <input type=\"submit\" value=\"Upload\">\n</form>\n");
+        return out.flush();
+    }
+
     const object = client.bucket(target.?.bucket).object(target.?.name);
     const url = if (content_type) |media_type| object.signedUrl(signer, .{
         .method = .PUT,
@@ -90,7 +140,6 @@ pub fn main(init: std.process.Init) !void {
     var signed = url catch |err| return fail(err, &diag);
     defer signed.deinit();
 
-    const account = signer.email(init.io, arena) catch |err| return fail(err, &diag);
     try out.print("signed as {s}, good for {d} minutes:\n", .{ account, minutes });
     if (content_type) |media_type| {
         try out.print("curl -X PUT -H 'content-type: {s}' --data-binary @FILE '{s}'\n", .{ media_type, signed.value });
@@ -109,10 +158,24 @@ const Remote = struct {
     fn parse(text: []const u8) ?Remote {
         const rest = if (std.mem.startsWith(u8, text, "gs://")) text["gs://".len..] else return null;
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
-        if (slash == 0 or slash + 1 == rest.len) return null;
+        if (slash == 0) return null;
+        // An empty name is a policy's "anywhere in the bucket"; the caller
+        // refuses it for anything else.
         return .{ .bucket = rest[0..slash], .name = rest[slash + 1 ..] };
     }
 };
+
+/// The four characters that would end an HTML attribute early, or start
+/// an entity. An object name may hold any of them.
+fn writeHtml(out: *std.Io.Writer, text: []const u8) !void {
+    for (text) |c| switch (c) {
+        '&' => try out.writeAll("&amp;"),
+        '<' => try out.writeAll("&lt;"),
+        '>' => try out.writeAll("&gt;"),
+        '"' => try out.writeAll("&quot;"),
+        else => try out.writeByte(c),
+    };
+}
 
 fn fail(err: anyerror, diag: *const storage.Diagnostics) anyerror {
     std.debug.print("error.{t}", .{err});

@@ -751,6 +751,61 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-22:
 | A signed POST with `x-goog-resumable: start` | 201, and a session URI that takes the bytes with no signature |
 | A body that does not match a signed `x-goog-content-sha256` | stored: the header is signed, but the body is not hashed against it |
 
+### POST policies: uploads from a plain HTML form
+
+A signed URL allows one request. A POST policy allows one kind of
+request, which is what a browser form needs: a form cannot send the
+headers a signed PUT pins, and the person at the browser picks the file,
+so its name is not known when the policy is signed.
+
+```zig
+var policy = try gcs.bucket("photos").postPolicy(signer, .{
+    .expires_in_s = 15 * 60,
+    // Any name under the prefix: the browser chooses the rest.
+    .key = .{ .starts_with = "avatars/" },
+    .fields = &.{.{ .name = "content-type", .value = "image/png" }},
+    .conditions = &.{.{ .content_length_range = .{ .min = 1, .max = 5 << 20 } }},
+});
+defer policy.deinit();
+```
+
+`policy.value.url` is where the form posts, and `policy.value.fields` are
+its hidden inputs. Write them into a `<form method="post"
+enctype="multipart/form-data">` and add `<input type="file" name="file">`
+last: Cloud Storage reads the fields before the bytes. With a prefix key
+the `key` field ends in Google's `${filename}`, which Cloud Storage
+replaces with the name of the file the browser sent.
+
+`Object.postPolicy` names one object exactly instead, and takes no `key`.
+
+A policy is a whitelist. Every field the form sends must be in it, with
+the value it states, or as a `.starts_with` condition for one the browser
+chooses. `content_length_range` bounds the body, which is the one
+condition a signed URL cannot express for a form. Signing is the same as
+for a URL, so the table above applies unchanged: a key file signs here,
+IAM signs for the rest, and the 12-hour limit is the same.
+
+The fields are a bearer credential together, so the library never logs
+the document or the signature. `examples/gcs_sign.zig` prints a ready
+form; end the target with `/` to allow a prefix:
+
+```
+zig build example-gcs_sign -- gs://my-bucket/uploads/ --post-policy --put image/png
+```
+
+What Cloud Storage answers, measured against a real bucket on 2026-09-23:
+
+| The form | The answer |
+| --- | --- |
+| Everything the policy allows | 204, or `success_action_status`'s 200 or 201, whose body names the bucket, key, location and etag |
+| With `success_action_redirect` | 303 to that URL, with what was stored in its query |
+| A field whose value contradicts its condition | 400 `InvalidPolicyDocument`, whose `Details` quotes the condition that failed |
+| A field the policy never mentions | 400 `InvalidPolicyDocument` |
+| A key outside a `starts_with` prefix | 400 `InvalidPolicyDocument` |
+| A body over or under `content_length_range` | 400 `EntityTooLarge` or `EntityTooSmall` |
+| A policy past its expiry | 400 `InvalidPolicyDocument`, where an expired URL is `ExpiredToken` |
+| A changed signature | 403 `SignatureDoesNotMatch`, carrying the policy document Google read |
+
 ### What it covers
 
 | Call | What it does |
@@ -763,13 +818,13 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-22:
 | `.download(writer, options)`, `.downloadAlloc(max_bytes, options)` | Into any writer, or into memory up to a cap |
 | `.copyTo(dest, options)` | A server-side copy, across buckets too |
 | `.signedUrl(signer, options)`, `bucket.signedUrl(signer, options)` | A V4 signed URL, which lets whoever holds it make one request without credentials until it expires |
+| `.postPolicy(signer, options)`, `bucket.postPolicy(signer, options)` | A V4 POST policy, which lets a plain HTML form upload what the policy allows, without credentials, until it expires |
 
 The default OAuth scope is `devstorage.read_write`; `Options.scope` picks
 `.read_only` or `.cloud_platform` instead. Not in this version: metadata
-updates after upload (`patch`), compose, POST policy documents, resumable
-sessions that outlive the process, parallel downloads, requester pays,
-customer-supplied encryption keys, listing old versions or soft-deleted
-objects, and gRPC.
+updates after upload (`patch`), compose, resumable sessions that outlive
+the process, parallel downloads, requester pays, customer-supplied
+encryption keys, listing old versions or soft-deleted objects, and gRPC.
 
 ### The emulator is not production
 
@@ -897,10 +952,12 @@ STORAGE_EMULATOR_HOST=http://127.0.0.1:4443 zig build test-integration
 GCP_TEST_BUCKET=my-bucket GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
     zig build test-integration-gcp
 
-# Signed URLs against a real bucket, the only place a signature is ever
-# checked. Name a key file, an account the token may sign as through IAM,
-# or both: each test runs once per signer. That account needs Storage
-# Object Admin on the bucket, since a URL grants what its signer may do.
+# Signed URLs and POST policies against a real bucket, the only place a
+# signature is ever checked, and the only place Cloud Storage says what it
+# makes of a policy's conditions. Name a key file, an account the token may
+# sign as through IAM, or both: each test runs once per signer. That
+# account needs Storage Object Admin on the bucket, since a URL or a policy
+# grants what its signer may do.
 GCP_TEST_BUCKET=my-bucket GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
     GCP_TEST_SIGNER_KEY=key.json GCP_TEST_SIGNER_EMAIL=signer@my-project.iam.gserviceaccount.com \
     zig build test-integration-gcp
