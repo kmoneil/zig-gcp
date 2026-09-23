@@ -56,6 +56,11 @@ const reserved_fields = [_][]const u8{
 /// Cloud Storage has nothing to compare it with.
 const unconditionable_fields = [_][]const u8{ "file", "policy", "x-goog-signature" };
 
+/// Cloud Storage ignores a field with this prefix, so it can never satisfy
+/// a condition either. Google's library drops such a field silently;
+/// this one refuses it, as it refuses the three above.
+const ignored_prefix = "x-ignore-";
+
 /// Signs a POST policy for `key` in `bucket`. The caller has begun the call
 /// and checked the bucket name.
 pub fn signPolicy(
@@ -189,6 +194,10 @@ pub fn check(
             if (diag) |d| d.print("field {d} is named {s}, which is never a condition, so no policy can allow it", .{ i, never });
             return error.InvalidPostPolicyOptions;
         };
+        if (isIgnored(field.name)) {
+            if (diag) |d| d.print("field {d} starts with {s}, which Cloud Storage ignores, so no policy can allow it", .{ i, ignored_prefix });
+            return error.InvalidPostPolicyOptions;
+        }
         for (options.fields[0..i]) |earlier| if (std.ascii.eqlIgnoreCase(earlier.name, field.name)) {
             if (diag) |d| d.print("field {s} appears twice; a form field has one value", .{field.name});
             return error.InvalidPostPolicyOptions;
@@ -213,6 +222,10 @@ pub fn check(
                 if (diag) |d| d.print("condition {d} is on {s}, which Cloud Storage never compares, so no policy can allow it", .{ i, never });
                 return error.InvalidPostPolicyOptions;
             };
+            if (isIgnored(s.field)) {
+                if (diag) |d| d.print("condition {d} is on a field Cloud Storage ignores, so no policy can allow it", .{i});
+                return error.InvalidPostPolicyOptions;
+            }
         },
         .content_length_range => |r| {
             ranges += 1;
@@ -422,6 +435,12 @@ fn isPolicyText(text: []const u8) bool {
     if (!std.unicode.utf8ValidateSlice(text)) return false;
     for (text) |c| if (c < ' ' or c == 0x7f) return false;
     return true;
+}
+
+/// Whether Cloud Storage ignores a field of this name.
+fn isIgnored(name: []const u8) bool {
+    return name.len >= ignored_prefix.len and
+        std.ascii.eqlIgnoreCase(name[0..ignored_prefix.len], ignored_prefix);
 }
 
 fn isSuccessStatus(value: []const u8) bool {
@@ -694,6 +713,14 @@ test "check: fields the policy sets itself, and fields that are never conditions
         .fields = &.{.{ .name = "file", .value = "v" }},
     }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "never a condition") != null);
+    // Cloud Storage ignores an x-ignore- field, so it can never satisfy a
+    // condition either. Google's library drops one without a word.
+    try testing.expectError(error.InvalidPostPolicyOptions, h.sign("photos", .{
+        .expires_in_s = 600,
+        .key = .{ .exact = "o" },
+        .fields = &.{.{ .name = "X-Ignore-Me", .value = "v" }},
+    }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "Cloud Storage ignores") != null);
     // And a condition on one of those three can never match either.
     try testing.expectError(error.InvalidPostPolicyOptions, h.sign("photos", .{
         .expires_in_s = 600,
@@ -1208,6 +1235,7 @@ fn allowedByRules(d: Drawn) bool {
         if (!isPolicyText(field.name) or !isPolicyText(field.value)) return false;
         for (reserved_fields) |name| if (std.ascii.eqlIgnoreCase(field.name, name)) return false;
         for (unconditionable_fields) |name| if (std.ascii.eqlIgnoreCase(field.name, name)) return false;
+        if (isIgnored(field.name)) return false;
         for (o.fields[0..i]) |earlier| if (std.ascii.eqlIgnoreCase(earlier.name, field.name)) return false;
         if (std.ascii.eqlIgnoreCase(field.name, "success_action_status") and !isSuccessStatus(field.value)) return false;
     }
@@ -1216,6 +1244,7 @@ fn allowedByRules(d: Drawn) bool {
             if (s.field.len == 0) return false;
             if (!isPolicyText(s.field) or !isPolicyText(s.prefix)) return false;
             for (unconditionable_fields) |name| if (std.ascii.eqlIgnoreCase(s.field, name)) return false;
+            if (isIgnored(s.field)) return false;
         },
         .content_length_range => |r| {
             ranges += 1;

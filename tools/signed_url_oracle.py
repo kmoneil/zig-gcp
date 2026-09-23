@@ -10,6 +10,11 @@ query name that is a prefix of another (it sorts whole `name=value`
 strings), an endpoint with a port (it signs the port), and a header value
 outside printable ASCII (it raises).
 
+"A prefix of another" includes the signature's own five parameters, which
+the first guard missed: `X` sorts before `X-Goog-Algorithm` by name, and
+after it by whole string. Extending the draw from 400 to 800 cases on
+2026-09-23 found one, at case 613.
+
 The signatures themselves do not matter, so a throwaway key signs.
 
 Usage: pip install google-cloud-storage, then
@@ -32,6 +37,8 @@ SEED = 20260922
 EMAIL = "oracle@test-project.iam.gserviceaccount.com"
 RESERVED = {"x-goog-algorithm", "x-goog-credential", "x-goog-date", "x-goog-expires",
             "x-goog-signedheaders", "x-goog-signature"}
+SIGNATURE_PARAMS = ["X-Goog-Algorithm", "X-Goog-Credential", "X-Goog-Date", "X-Goog-Expires",
+                    "X-Goog-SignedHeaders", "X-Goog-Signature"]
 # Every printable ASCII character, space included, and some UTF-8 of each length.
 NAME_CHARS = [chr(c) for c in range(0x20, 0x7F)] + ["\u00e9", "\u00df", "\u4e2d", "\u6587", "\U0001F600", "\u200b"]
 HEADER_NAMES = ["content-type", "cache-control", "content-disposition", "x-goog-if-generation-match",
@@ -71,7 +78,10 @@ def draw_query(r):
     for _ in range(r.randint(0, 4)):
         name = "".join(r.choice(NAME_CHARS + ["/", "&", "="]) for _ in range(r.randint(1, 10)))
         encoded = quote(name, safe="~")
-        taken = [quote(k, safe="~") for k in query]
+        # The signature's own five count as taken: a name that is a prefix
+        # of one of them, `X` before `X-Goog-Algorithm`, is the same
+        # departure as a name that is a prefix of another of the caller's.
+        taken = [quote(k, safe="~") for k in query] + SIGNATURE_PARAMS
         if (name.lower() in RESERVED or name.lower().startswith("x-goog-")
                 or any(encoded.startswith(t) or t.startswith(encoded) for t in taken)):
             continue
