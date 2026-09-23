@@ -61,4 +61,8 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// cannot send, or a style the bucket or endpoint cannot use.
     /// `Diagnostics` says which. Nothing was signed.
     InvalidPostPolicyOptions,
+    /// A metadata update breaks a rule: a custom key that is empty or
+    /// repeated, or a value a header cannot carry. `Diagnostics` says
+    /// which. Nothing was sent.
+    InvalidMetadataUpdate,
 };

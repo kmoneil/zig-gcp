@@ -24,6 +24,13 @@ pub const ObjectInfo = struct {
     /// Changes with every metadata update of this generation.
     metageneration: u64,
     content_type: []const u8,
+    /// Null when the object carries none, which is the usual case: Cloud
+    /// Storage stores these only when something set them.
+    cache_control: ?[]const u8,
+    content_disposition: ?[]const u8,
+    /// `gzip` on an object stored compressed; see the download options.
+    content_encoding: ?[]const u8,
+    content_language: ?[]const u8,
     /// Every real object has one; emulators may omit it.
     crc32c: ?u32,
     /// Composite objects have none.
@@ -89,6 +96,51 @@ pub const Preconditions = struct {
     pub fn makesWriteSafe(self: Preconditions) bool {
         return self.if_generation_match != null;
     }
+
+    /// Whether these conditions make a metadata write idempotent, which is
+    /// a different question: a patch that succeeded and lost its response
+    /// has already moved the metageneration, so repeating it under
+    /// `if_metageneration_match` fails rather than applying twice. A
+    /// generation condition says nothing about that, since a patch leaves
+    /// the generation where it was.
+    pub fn makesMetadataWriteSafe(self: Preconditions) bool {
+        return self.if_metageneration_match != null;
+    }
+};
+
+/// What a patch does to an object's custom metadata. Cloud Storage reads
+/// three different requests here, and cannot be asked for two at once,
+/// since a JSON object has one `metadata` value.
+pub const MetadataEdit = union(enum) {
+    /// Send no `metadata` at all: every entry keeps its value.
+    keep,
+    /// Set the entries that carry a value, remove the entries that carry
+    /// none, and leave every key not named here exactly as it was.
+    change: []const MetadataChange,
+    /// Send `"metadata":null`: remove every entry.
+    clear,
+};
+
+/// One custom metadata entry a patch sets or removes.
+pub const MetadataChange = struct {
+    key: []const u8,
+    /// Null removes the key.
+    value: ?[]const u8,
+};
+
+/// What `Object.updateMetadata` changes. A field left null keeps the value
+/// it had; an empty string clears it.
+pub const MetadataUpdate = struct {
+    content_type: ?[]const u8 = null,
+    cache_control: ?[]const u8 = null,
+    content_disposition: ?[]const u8 = null,
+    content_encoding: ?[]const u8 = null,
+    content_language: ?[]const u8 = null,
+    edit: MetadataEdit = .keep,
+    /// Change one older generation's metadata instead of the live one.
+    generation: ?u64 = null,
+    /// `if_metageneration_match` is what makes this safe to retry.
+    preconditions: Preconditions = .{},
 };
 
 pub const UploadOptions = struct {
@@ -313,6 +365,10 @@ const testing = std.testing;
 
 test "ObjectInfo.metadataValue finds the first match" {
     const info: ObjectInfo = .{
+        .cache_control = null,
+        .content_disposition = null,
+        .content_encoding = null,
+        .content_language = null,
         .name = "reports/2026/q3.txt",
         .bucket = "my-bucket",
         .size = 12,

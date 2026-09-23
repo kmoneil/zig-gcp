@@ -14,6 +14,7 @@ const codec = @import("codec.zig");
 const dl = @import("download.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
+const metadata = @import("metadata.zig");
 const multipart = @import("multipart.zig");
 const names = @import("names.zig");
 const post_policy = @import("post_policy.zig");
@@ -83,6 +84,22 @@ pub fn postPolicy(self: Object, signer: core.Signer, options: types.PostPolicyOp
         return error.InvalidPostPolicyOptions;
     }
     return post_policy.signPolicy(self.client, signer, self.bucket, .{ .exact = self.name }, options);
+}
+
+/// Changes what this object says about itself, leaving its bytes and its
+/// generation where they are, and answers the object as it now stands.
+/// Every field the options leave null keeps the value it had, and
+/// `options.edit` says what becomes of the custom metadata: keep it, set
+/// and remove the keys it names, or clear the lot.
+///
+/// A patch bumps the metageneration, so `if_metageneration_match` is what
+/// makes one safe to repeat: a `generation` condition says nothing here,
+/// since the generation does not move.
+pub fn updateMetadata(self: Object, options: types.MetadataUpdate) Error!types.Owned(types.ObjectInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    return metadata.update(self.client, self.bucket, self.name, options);
 }
 
 /// Sugar over `get`: whether a live object has this name. `NotFound`

@@ -44,6 +44,9 @@ pub const PageOptions = @import("types.zig").PageOptions;
 pub const Preconditions = @import("types.zig").Preconditions;
 pub const Range = @import("types.zig").Range;
 pub const UploadOptions = @import("types.zig").UploadOptions;
+pub const MetadataUpdate = @import("types.zig").MetadataUpdate;
+pub const MetadataEdit = @import("types.zig").MetadataEdit;
+pub const MetadataChange = @import("types.zig").MetadataChange;
 pub const SignedUrlOptions = @import("types.zig").SignedUrlOptions;
 pub const PostPolicy = @import("types.zig").PostPolicy;
 pub const PostPolicyOptions = @import("types.zig").PostPolicyOptions;
@@ -82,6 +85,7 @@ test {
     _ = @import("errors.zig");
     _ = @import("multipart.zig");
     _ = @import("logging.zig");
+    _ = @import("metadata.zig");
     _ = @import("names.zig");
     _ = @import("post_policy.zig");
     _ = @import("resumable.zig");
