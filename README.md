@@ -817,14 +817,88 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-23:
 | `.upload(data, options)`, `.uploadFrom(reader, options)` | Bytes in memory, or any reader |
 | `.download(writer, options)`, `.downloadAlloc(max_bytes, options)` | Into any writer, or into memory up to a cap |
 | `.copyTo(dest, options)` | A server-side copy, across buckets too |
+| `.updateMetadata(options)` | Changes what an object says about itself, leaving its bytes alone |
+| `.composeFrom(sources, options)` | Writes this object from up to 32 others in the bucket, server-side |
 | `.signedUrl(signer, options)`, `bucket.signedUrl(signer, options)` | A V4 signed URL, which lets whoever holds it make one request without credentials until it expires |
 | `.postPolicy(signer, options)`, `bucket.postPolicy(signer, options)` | A V4 POST policy, which lets a plain HTML form upload what the policy allows, without credentials, until it expires |
 
 The default OAuth scope is `devstorage.read_write`; `Options.scope` picks
-`.read_only` or `.cloud_platform` instead. Not in this version: metadata
-updates after upload (`patch`), compose, resumable sessions that outlive
-the process, parallel downloads, requester pays, customer-supplied
-encryption keys, listing old versions or soft-deleted objects, and gRPC.
+`.read_only` or `.cloud_platform` instead. Not in this version: `update`
+(PUT, which replaces a whole resource where `patch` merges), parallel
+composite uploads, resumable sessions that outlive the process, parallel
+downloads, requester pays, customer-supplied encryption keys, listing old
+versions or soft-deleted objects, and gRPC.
+
+### Metadata, after the upload
+
+Nothing about an object's bytes has to move to change what it says about
+itself. `updateMetadata` patches: fields left null keep the values they
+had, and the bytes and the generation stand still.
+
+```zig
+var patched = try object.updateMetadata(.{
+    .content_type = "text/markdown",
+    .cache_control = "public, max-age=60",
+    .edit = .{ .change = &.{
+        .{ .key = "reviewer", .value = "sam" },
+        .{ .key = "draft", .value = null },   // null removes the key
+    } },
+});
+defer patched.deinit();
+```
+
+`edit` is the whole of what happens to custom metadata, and Cloud Storage
+reads three different requests there, which cannot be combined because a
+JSON object has one `metadata` value:
+
+| `edit` | What it does |
+| --- | --- |
+| `.keep` (the default) | Every entry keeps its value |
+| `.change` | Sets the entries with a value, removes the entries with none, and leaves every key it does not name |
+| `.clear` | Removes every entry |
+
+A patch moves the metageneration and not the generation, so
+`if_metageneration_match` is what makes one safe to repeat; a generation
+condition says nothing about it. `generation` patches one named
+generation, which needs a versioned bucket to reach a noncurrent one.
+
+Measured against a real bucket on 2026-09-23: a key the patch does not
+name survives it, `.clear` really does remove the lot, a stale
+`if_metageneration_match` is 412 and leaves the object alone, and the
+content stays byte for byte what it was.
+
+### Compose
+
+`composeFrom` writes an object from up to 32 others in the same bucket,
+server-side, with no bytes moving:
+
+```zig
+var joined = try bucket.object("whole.bin").composeFrom(&.{
+    .{ .name = "part-1" },
+    .{ .name = "part-2" },
+}, .{ .content_type = "application/octet-stream" });
+defer joined.deinit();
+```
+
+The destination may be one of its own sources, so an append is a compose
+whose first source is the destination, and a larger join is repeated
+composes. Sources share a bucket and a storage class, may each pin a
+`generation` or carry an `if_generation_match`, and `delete_sources`
+hard-deletes them once the composite exists, which is what Google advises
+for parallel composite uploads and wrong wherever soft delete, versioning,
+a retention policy or a hold is in play.
+
+Nothing is inherited: the composite's metadata is what the call sends. It
+has no MD5, which no composite has, and a CRC32C that Cloud Storage
+derives from its components', so `download` verifies one exactly as it
+verifies anything else. `component_count` says how many objects it is made
+of.
+
+Two rules here are this library's rather than Cloud Storage's: a source
+named twice at the same generation is refused, since concatenating one
+object twice is far more often a loop bug than a request, and a compose
+that deletes its sources is never retried without a precondition, because
+the second attempt would find them gone.
 
 ### The emulator is not production
 

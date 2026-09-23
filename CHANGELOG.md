@@ -4,6 +4,41 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.17.0 (unreleased)
+
+- storage: metadata updates and compose, the next two items of the storage
+  spec's list. `Object.updateMetadata(options)` patches what an object says
+  about itself and leaves its bytes and its generation alone: the fixed
+  fields, and `edit` for the custom metadata, which is `.keep`, `.change`
+  (set the entries with a value, remove the entries with none, leave every
+  key it does not name) or `.clear`. Those three are what Cloud Storage
+  reads, and a JSON object has one `metadata` value, so `MetadataEdit` is a
+  union rather than a set of fields that could ask for two at once.
+  `MetadataChange.value` is optional, because the null that means "remove"
+  has nowhere to live in `Metadata`. Nothing could change an object's
+  metadata before this: `copyTo` sends `{}` as the destination resource,
+  which is how a rewrite says "inherit", so even a copy carried the
+  source's metadata exactly. `Object.composeFrom(sources, options)` writes
+  an object from 1 to 32 others in the same bucket, server-side, with no
+  bytes moving; the destination may be one of its own sources, so an append
+  is a compose, and a larger join is repeated composes. `ObjectInfo` gains
+  `cache_control`, `content_disposition`, `content_encoding` and
+  `content_language`, which v1 could set on upload and never read back, and
+  `component_count`, which only a composite carries. `Preconditions` gains
+  `makesMetadataWriteSafe`: a patch never moves the generation, so
+  `if_generation_match` says nothing about repeating one, while a patch
+  that lost its answer has already moved the metageneration. A repeated
+  custom metadata key is now refused on `upload` too, where it used to make
+  a body carrying two entries of one name. Breaking, for an exhaustive
+  `switch` over `storage.Error`: it gains `InvalidMetadataUpdate` and
+  `InvalidComposeSources`. Held to Google's own answers against a real
+  bucket, including three things no documentation states: a key a patch
+  does not name survives it, `.clear` removes the lot, and a composite's
+  component-derived CRC32C is the CRC32C of the whole, so a download
+  verifies one through the path it already had.
+- core: `transport.Method` gains `PATCH`.
+- auth, pubsub, secret_manager: unchanged.
+
 ## 0.16.0 (2026-09-23)
 
 - storage: POST policy documents, for uploads from a plain HTML form.

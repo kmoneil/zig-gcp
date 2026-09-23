@@ -852,6 +852,205 @@ const Overwrite = struct {
     }
 };
 
+test "9. patch: the fields come back, and only the keys it names change" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const obj = try f.object("patched.txt");
+    var first = obj.upload("hello\n", .{
+        .content_type = "text/plain",
+        .metadata = &.{ .{ .key = "reviewer", .value = "kim" }, .{ .key = "draft", .value = "yes" } },
+    }) catch |err| return f.report(err);
+    defer first.deinit();
+
+    // A patch sets what it names and leaves the rest, which no
+    // documentation states: measured here.
+    var patched = obj.updateMetadata(.{
+        .content_type = "text/markdown",
+        .cache_control = "public, max-age=60",
+        .edit = .{ .change = &.{.{ .key = "reviewer", .value = "sam" }} },
+    }) catch |err| return f.report(err);
+    defer patched.deinit();
+    try testing.expectEqualStrings("text/markdown", patched.value.content_type);
+    try testing.expectEqualStrings("public, max-age=60", patched.value.cache_control.?);
+    try testing.expectEqualStrings("sam", patched.value.metadataValue("reviewer").?);
+    try testing.expectEqualStrings("yes", patched.value.metadataValue("draft").?);
+
+    // A patch writes metadata, not data: the generation stands still and
+    // the metageneration moves.
+    try testing.expectEqual(first.value.generation, patched.value.generation);
+    try testing.expect(patched.value.metageneration > first.value.metageneration);
+    try f.expectContent(obj, "hello\n");
+
+    // A null value removes that key and only that key.
+    var removed = obj.updateMetadata(.{
+        .edit = .{ .change = &.{.{ .key = "draft", .value = null }} },
+    }) catch |err| return f.report(err);
+    defer removed.deinit();
+    try testing.expectEqual(null, removed.value.metadataValue("draft"));
+    try testing.expectEqualStrings("sam", removed.value.metadataValue("reviewer").?);
+
+    // And clear removes the lot, which no documentation states either.
+    var cleared = obj.updateMetadata(.{ .edit = .clear }) catch |err| return f.report(err);
+    defer cleared.deinit();
+    try testing.expectEqual(0, cleared.value.metadata.len);
+    // The fixed fields are untouched by a metadata clear.
+    try testing.expectEqualStrings("text/markdown", cleared.value.content_type);
+}
+
+test "10. patch: a stale metageneration is refused, and one generation is patched without the live one" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const obj = try f.object("generations.txt");
+    var first = obj.upload("one\n", .{ .content_type = "text/plain" }) catch |err| return f.report(err);
+    defer first.deinit();
+    const old_generation = first.value.generation;
+
+    // A stale metageneration is refused, and the object is untouched.
+    try testing.expectError(error.FailedPrecondition, obj.updateMetadata(.{
+        .content_type = "text/x-nope",
+        .preconditions = .{ .if_metageneration_match = first.value.metageneration + 7 },
+    }));
+    try testing.expectEqual(412, f.diag.http_status);
+    var unchanged = obj.get(.{}) catch |err| return f.report(err);
+    defer unchanged.deinit();
+    try testing.expectEqualStrings("text/plain", unchanged.value.content_type);
+
+    // The current one is accepted.
+    var conditional = obj.updateMetadata(.{
+        .cache_control = "no-store",
+        .preconditions = .{ .if_metageneration_match = first.value.metageneration },
+    }) catch |err| return f.report(err);
+    defer conditional.deinit();
+    try testing.expectEqualStrings("no-store", conditional.value.cache_control.?);
+
+    // `generation` addresses one generation rather than whatever is live.
+    // Naming the current one works; naming the one an overwrite replaced
+    // is a clean NotFound, because this bucket keeps no noncurrent
+    // versions, as the suite's header requires. Patching a noncurrent
+    // generation needs a versioned bucket, which is why it is not here.
+    var second = obj.upload("two\n", .{ .content_type = "text/plain" }) catch |err| return f.report(err);
+    defer second.deinit();
+    try testing.expect(second.value.generation != old_generation);
+    var named = obj.updateMetadata(.{
+        .generation = second.value.generation,
+        .edit = .{ .change = &.{.{ .key = "era", .value = "second" }} },
+    }) catch |err| return f.report(err);
+    defer named.deinit();
+    try testing.expectEqual(second.value.generation, named.value.generation);
+    try testing.expectEqualStrings("second", named.value.metadataValue("era").?);
+    try testing.expectError(error.NotFound, obj.updateMetadata(.{
+        .generation = old_generation,
+        .edit = .{ .change = &.{.{ .key = "era", .value = "first" }} },
+    }));
+}
+
+test "11. compose: three parts join, the composite has no md5, and its crc32c verifies" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const parts = [_][]const u8{ "alpha\n", "beta\n", "gamma\n" };
+    var sources: [3]storage.ComposeSource = undefined;
+    for (parts, &sources, 0..) |data, *source, i| {
+        const name = try std.fmt.allocPrint(f.arena.allocator(), "part-{d}", .{i});
+        const part = try f.object(name);
+        var info = part.upload(data, .{ .content_type = "text/plain" }) catch |err| return f.report(err);
+        defer info.deinit();
+        source.* = .{ .name = part.name, .generation = info.value.generation };
+    }
+
+    const joined = try f.object("joined.txt");
+    var composite = joined.composeFrom(&sources, .{
+        .content_type = "text/plain",
+        .metadata = &.{.{ .key = "origin", .value = "compose" }},
+    }) catch |err| return f.report(err);
+    defer composite.deinit();
+
+    // The bytes are the parts in order, and the download verifies the
+    // composite's own crc32c through the path every download uses.
+    try f.expectContent(joined, "alpha\nbeta\ngamma\n");
+    try testing.expectEqual(3, composite.value.component_count.?);
+    try testing.expectEqual(null, composite.value.md5);
+    try testing.expectEqual(patternCrcOf("alpha\nbeta\ngamma\n"), composite.value.crc32c.?);
+    try testing.expectEqualStrings("compose", composite.value.metadataValue("origin").?);
+
+    // The destination as its own first source is an append, and the
+    // component count grows with it.
+    var appended = joined.composeFrom(&.{
+        .{ .name = joined.name },
+        .{ .name = sources[0].name },
+    }, .{ .content_type = "text/plain" }) catch |err| return f.report(err);
+    defer appended.deinit();
+    try f.expectContent(joined, "alpha\nbeta\ngamma\nalpha\n");
+    try testing.expectEqual(4, appended.value.component_count.?);
+
+    // A source pinned to a generation that has moved on is refused.
+    try testing.expectError(error.FailedPrecondition, joined.composeFrom(&.{
+        .{ .name = sources[0].name, .if_generation_match = sources[0].generation.? + 7 },
+    }, .{}));
+}
+
+test "12. compose: deleting the sources leaves the composite and removes the parts" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    var sources: [2]storage.ComposeSource = undefined;
+    for (&sources, 0..) |*source, i| {
+        const name = try std.fmt.allocPrint(f.arena.allocator(), "temp-{d}", .{i});
+        const part = try f.object(name);
+        var info = part.upload("chunk\n", .{ .content_type = "text/plain" }) catch |err| return f.report(err);
+        info.deinit();
+        source.* = .{ .name = part.name };
+    }
+    const joined = try f.object("deleted-sources.txt");
+    var composite = joined.composeFrom(&sources, .{
+        .content_type = "text/plain",
+        .delete_sources = true,
+    }) catch |err| return f.report(err);
+    defer composite.deinit();
+    try f.expectContent(joined, "chunk\nchunk\n");
+    for (sources) |source| {
+        try testing.expectEqual(false, try f.bucket().object(source.name).exists());
+    }
+}
+
+test "13. compose: 32 sources work, and 33 is this library's limit, not a request" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const one = try f.object("unit.txt");
+    var info = one.upload("x", .{ .content_type = "text/plain" }) catch |err| return f.report(err);
+    info.deinit();
+
+    // Thirty-two of the same object at different generations would be
+    // refused by this library's own repeat rule, so each source is pinned
+    // to the one generation and named through a distinct copy.
+    var sources: [33]storage.ComposeSource = undefined;
+    for (&sources, 0..) |*source, i| {
+        const name = try std.fmt.allocPrint(f.arena.allocator(), "unit-{d}.txt", .{i});
+        const copy = try f.object(name);
+        var copied = one.copyTo(copy, .{}) catch |err| return f.report(err);
+        copied.deinit();
+        source.* = .{ .name = copy.name };
+    }
+    const joined = try f.object("thirty-two.txt");
+    var composite = joined.composeFrom(sources[0..32], .{ .content_type = "text/plain" }) catch |err| return f.report(err);
+    defer composite.deinit();
+    try testing.expectEqual(32, composite.value.size);
+    try testing.expectEqual(32, composite.value.component_count.?);
+
+    // Thirty-three never reaches Google: the client's bound matches the
+    // server's documented one.
+    try testing.expectError(error.InvalidComposeSources, joined.composeFrom(&sources, .{}));
+}
+
+/// The CRC-32C of a literal, for the composite whose checksum Cloud
+/// Storage derives from its components' rather than from the bytes.
+fn patternCrcOf(text: []const u8) u32 {
+    return core.crc32c.hash(text);
+}
+
 test "sweep: delete anything a crashed run left under zig-gcp-test/ more than a day ago" {
     var f: Fixture = undefined;
     if (!try f.init(.{})) return error.SkipZigTest;

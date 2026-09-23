@@ -98,15 +98,15 @@ pub fn check(
     // The destination's custom metadata becomes one JSON object, so a
     // repeated key is a body with two entries of one name, which Cloud
     // Storage resolves as it pleases. A property found this one.
-    for (options.metadata, 0..) |entry, i| {
-        if (entry.key.len == 0) {
-            if (diag) |d| d.print("destination metadata {d} has no key", .{i});
-            return error.InvalidComposeSources;
+    if (validate.metadataFault(options.metadata)) |fault| {
+        if (diag) |d| {
+            if (fault.repeated) {
+                d.print("destination metadata key {s} appears twice; one object gives a key one value", .{options.metadata[fault.index].key});
+            } else {
+                d.print("destination metadata {d} has no key", .{fault.index});
+            }
         }
-        for (options.metadata[0..i]) |earlier| if (std.mem.eql(u8, earlier.key, entry.key)) {
-            if (diag) |d| d.print("destination metadata key {s} appears twice; one object gives a key one value", .{entry.key});
-            return error.InvalidComposeSources;
-        };
+        return error.InvalidComposeSources;
     }
 }
 
@@ -522,6 +522,7 @@ test "fuzz compose: the body's sources are the sources, in order" {
 
 /// Section 6's rules, stated again.
 fn allowedByRules(sources: []const types.ComposeSource, options: types.ComposeOptions) bool {
+    if (validate.metadataFault(options.metadata) != null) return false;
     if (sources.len == 0 or sources.len > max_sources) return false;
     for (sources, 0..) |source, i| {
         if (!validate.isObjectName(source.name)) return false;
@@ -531,10 +532,6 @@ fn allowedByRules(sources: []const types.ComposeSource, options: types.ComposeOp
         for (sources[0..i]) |earlier| {
             if (std.mem.eql(u8, earlier.name, source.name) and earlier.generation == source.generation) return false;
         }
-    }
-    for (options.metadata, 0..) |entry, i| {
-        if (entry.key.len == 0) return false;
-        for (options.metadata[0..i]) |earlier| if (std.mem.eql(u8, earlier.key, entry.key)) return false;
     }
     return true;
 }
