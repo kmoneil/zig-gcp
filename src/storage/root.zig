@@ -47,6 +47,8 @@ pub const UploadOptions = @import("types.zig").UploadOptions;
 pub const MetadataUpdate = @import("types.zig").MetadataUpdate;
 pub const MetadataEdit = @import("types.zig").MetadataEdit;
 pub const MetadataChange = @import("types.zig").MetadataChange;
+pub const ComposeSource = @import("types.zig").ComposeSource;
+pub const ComposeOptions = @import("types.zig").ComposeOptions;
 pub const SignedUrlOptions = @import("types.zig").SignedUrlOptions;
 pub const PostPolicy = @import("types.zig").PostPolicy;
 pub const PostPolicyOptions = @import("types.zig").PostPolicyOptions;
@@ -81,6 +83,7 @@ test {
     _ = @import("Endpoint.zig");
     _ = @import("Object.zig");
     _ = @import("codec.zig");
+    _ = @import("compose.zig");
     _ = @import("download.zig");
     _ = @import("errors.zig");
     _ = @import("multipart.zig");

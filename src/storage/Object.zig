@@ -11,6 +11,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const compose_impl = @import("compose.zig");
 const dl = @import("download.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
@@ -84,6 +85,26 @@ pub fn postPolicy(self: Object, signer: core.Signer, options: types.PostPolicyOp
         return error.InvalidPostPolicyOptions;
     }
     return post_policy.signPolicy(self.client, signer, self.bucket, .{ .exact = self.name }, options);
+}
+
+/// Writes this object from `sources`, in order, without moving any bytes:
+/// 1 to 32 objects in this bucket, which may include this one, so an
+/// append is a compose whose first source is the destination. Every source
+/// must share a storage class with the rest.
+///
+/// Nothing is inherited. The composite's metadata is what `options` says,
+/// and an unset content type becomes the default. The result has no MD5,
+/// which no composite has, and a CRC32C that Cloud Storage derives from
+/// its components', so `download` verifies it as it verifies anything.
+pub fn composeFrom(
+    self: Object,
+    sources: []const types.ComposeSource,
+    options: types.ComposeOptions,
+) Error!types.Owned(types.ObjectInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    return compose_impl.compose(self.client, self.bucket, self.name, sources, options);
 }
 
 /// Changes what this object says about itself, leaving its bytes and its

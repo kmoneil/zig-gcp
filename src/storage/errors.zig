@@ -65,4 +65,9 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// repeated, or a value a header cannot carry. `Diagnostics` says
     /// which. Nothing was sent.
     InvalidMetadataUpdate,
+    /// A compose breaks a rule: fewer than 1 or more than 32 sources, a
+    /// name Cloud Storage would refuse, a source named twice at the same
+    /// generation, or a source whose generation and precondition
+    /// contradict each other. `Diagnostics` says which. Nothing was sent.
+    InvalidComposeSources,
 };

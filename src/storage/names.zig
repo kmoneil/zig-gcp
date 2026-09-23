@@ -56,6 +56,25 @@ pub fn objectPath(
     return out.toOwnedSlice();
 }
 
+/// `/storage/v1/b/{bucket}/o/{object}/compose`: writes the destination
+/// from its sources. Compose has no `generation`; it always writes the
+/// live object.
+pub fn composePath(
+    arena: Allocator,
+    bucket: []const u8,
+    object: []const u8,
+    preconditions: types.Preconditions,
+) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{
+        .bucket = bucket,
+        .object = object,
+        .compose = true,
+        .preconditions = preconditions,
+    }) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
 /// `/storage/v1/b/{bucket}/o/{object}?alt=media`: the object's bytes.
 pub fn objectMediaPath(
     arena: Allocator,
@@ -158,6 +177,8 @@ const Parts = struct {
     project: ?[]const u8 = null,
     generation: ?u64 = null,
     preconditions: types.Preconditions = .{},
+    /// Appends `/compose` after the object, before the query.
+    compose: bool = false,
     prefix: ?[]const u8 = null,
     delimiter: ?[]const u8 = null,
     page_size: u32 = 0,
@@ -174,6 +195,7 @@ fn write(w: *Writer, parts: Parts) Writer.Error!void {
     if (parts.object) |object| {
         try w.writeAll("/o/");
         try query.writeStrictSegment(w, object);
+        if (parts.compose) try w.writeAll("/compose");
     }
     var params: query.Params = .init(w);
     if (parts.alt_media) try params.add("alt", "media");
