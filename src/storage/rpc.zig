@@ -114,6 +114,26 @@ pub fn requireProject(client: *Client) Error![]const u8 {
     };
 }
 
+/// A 412 on a call that may have been retried is ambiguous: an earlier
+/// attempt may have landed, and the repeat then failed its own
+/// precondition against the object it just created. The diagnostics say
+/// so, so the caller can `get` the object and compare checksums.
+pub fn ambiguous412(client: *Client, retried: bool) Error {
+    if (retried) replace412(client, "the precondition failed; if this call was a retry, an earlier attempt may have succeeded: get the object and compare checksums");
+    return error.FailedPrecondition;
+}
+
+/// Replaces a 412's message with `message`, keeping the server's status.
+/// `Diagnostics.set` forbids pointers into its own buffer, so the status
+/// is copied out first.
+pub fn replace412(client: *Client, message: []const u8) void {
+    const d = client.diagnostics orelse return;
+    var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
+    const status_text = d.status();
+    @memcpy(status_buf[0..status_text.len], status_text);
+    d.set(412, status_buf[0..status_text.len], message);
+}
+
 /// Reports a 2xx body that did not decode.
 pub fn decodeFailed(client: *Client, err: codec.DecodeError, what: []const u8) Error {
     if (err == error.InvalidResponse) {

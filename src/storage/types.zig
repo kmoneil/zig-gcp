@@ -246,6 +246,24 @@ pub const DeleteOptions = struct {
 pub const CopyOptions = struct {
     /// Copy one specific generation of the source instead of the live one.
     source_generation: ?u64 = null,
+    /// Everything from here to `storage_class` changes the copy's metadata
+    /// on the way. Left null and `.keep`, the copy carries the source's
+    /// metadata as it is. Anything else first reads the source and sends
+    /// its metadata back with the change applied, since Cloud Storage
+    /// takes any metadata a copy sends as the whole of the copy's: a copy
+    /// that sent only a content type would lose the rest. An empty string
+    /// clears a field, except `content_type`, which a changed copy always
+    /// carries.
+    content_type: ?[]const u8 = null,
+    cache_control: ?[]const u8 = null,
+    content_disposition: ?[]const u8 = null,
+    content_encoding: ?[]const u8 = null,
+    content_language: ?[]const u8 = null,
+    edit: MetadataEdit = .keep,
+    /// Such as "NEARLINE". Null leaves the class to Cloud Storage, as a
+    /// copy with no change does. Copying an object onto itself with a new
+    /// class is how a class changes on demand.
+    storage_class: ?[]const u8 = null,
     /// Conditions on the destination. `if_generation_match` makes the
     /// copy safe to retry.
     preconditions: Preconditions = .{},

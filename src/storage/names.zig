@@ -94,20 +94,31 @@ pub fn objectMediaPath(
     return out.toOwnedSlice();
 }
 
+/// What one call of the rewrite loop says beside the two names.
+pub const RewriteParams = struct {
+    /// Which generation of the source to copy.
+    source_generation: ?u64 = null,
+    /// Copy only while the source's metadata is still at this
+    /// metageneration: how a copy that read the source is pinned to it.
+    if_source_metageneration_match: ?u64 = null,
+    /// Conditions on the destination.
+    preconditions: types.Preconditions = .{},
+    /// Continues an earlier call's work.
+    rewrite_token: ?[]const u8 = null,
+};
+
 /// `/storage/v1/b/{src}/o/{srcObj}/rewriteTo/b/{dst}/o/{dstObj}`: one call
-/// of the server-side copy loop. The preconditions apply to the
-/// destination; `rewrite_token` continues an earlier call's work.
+/// of the server-side copy loop.
 pub fn rewritePath(
     arena: Allocator,
     source_bucket: []const u8,
     source_object: []const u8,
     dest_bucket: []const u8,
     dest_object: []const u8,
-    options: types.CopyOptions,
-    rewrite_token: ?[]const u8,
+    params: RewriteParams,
 ) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
-    writeRewrite(&out.writer, source_bucket, source_object, dest_bucket, dest_object, options, rewrite_token) catch
+    writeRewrite(&out.writer, source_bucket, source_object, dest_bucket, dest_object, params) catch
         return error.OutOfMemory;
     return out.toOwnedSlice();
 }
@@ -118,8 +129,7 @@ fn writeRewrite(
     source_object: []const u8,
     dest_bucket: []const u8,
     dest_object: []const u8,
-    options: types.CopyOptions,
-    rewrite_token: ?[]const u8,
+    rewrite: RewriteParams,
 ) Writer.Error!void {
     try w.writeAll("/storage/v1/b/");
     try query.writeStrictSegment(w, source_bucket);
@@ -130,9 +140,10 @@ fn writeRewrite(
     try w.writeAll("/o/");
     try query.writeStrictSegment(w, dest_object);
     var params: query.Params = .init(w);
-    if (options.source_generation) |g| try params.addInt("sourceGeneration", g);
-    try writePreconditions(&params, options.preconditions);
-    try params.addOptional("rewriteToken", rewrite_token);
+    if (rewrite.source_generation) |g| try params.addInt("sourceGeneration", g);
+    if (rewrite.if_source_metageneration_match) |m| try params.addInt("ifSourceMetagenerationMatch", m);
+    try writePreconditions(&params, rewrite.preconditions);
+    try params.addOptional("rewriteToken", rewrite.rewrite_token);
 }
 
 /// `/upload/storage/v1/b/{bucket}/o?uploadType=multipart`. The object name
@@ -313,13 +324,24 @@ test "rewrite paths name both objects and carry the loop's state" {
     const gpa = testing.allocator;
     try expectPath(
         "/storage/v1/b/src-b/o/reports%2Fq3.txt/rewriteTo/b/dst-b/o/copy%2Fq3.txt",
-        try rewritePath(gpa, "src-b", "reports/q3.txt", "dst-b", "copy/q3.txt", .{}, null),
+        try rewritePath(gpa, "src-b", "reports/q3.txt", "dst-b", "copy/q3.txt", .{}),
     );
     try expectPath(
         "/storage/v1/b/s/o/a/rewriteTo/b/d/o/b?sourceGeneration=5&ifGenerationMatch=0&rewriteToken=t%2B1",
         try rewritePath(gpa, "s", "a", "d", "b", .{
             .source_generation = 5,
             .preconditions = .does_not_exist,
-        }, "t+1"),
+            .rewrite_token = "t+1",
+        }),
+    );
+    // A copy that read its source is pinned to what it read: the bytes by
+    // generation, the metadata by metageneration.
+    try expectPath(
+        "/storage/v1/b/s/o/a/rewriteTo/b/d/o/b?sourceGeneration=7&ifSourceMetagenerationMatch=3&ifGenerationMatch=0",
+        try rewritePath(gpa, "s", "a", "d", "b", .{
+            .source_generation = 7,
+            .if_source_metageneration_match = 3,
+            .preconditions = .does_not_exist,
+        }),
     );
 }

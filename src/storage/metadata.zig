@@ -65,29 +65,42 @@ pub fn update(
 }
 
 /// Refuses what Cloud Storage could not store, or could store only
-/// ambiguously, and says why in `diag`. Values never reach it: custom
-/// metadata can hold anything the caller put there.
+/// ambiguously, and says why in `diag`. Keys and values alike come back as
+/// response headers on download, so both are held to what a header holds.
 pub fn check(
     diag: ?*core.Diagnostics,
     options: types.MetadataUpdate,
 ) error{InvalidMetadataUpdate}!void {
-    const fixed = [_]struct { name: []const u8, value: ?[]const u8 }{
-        .{ .name = "content_type", .value = options.content_type },
-        .{ .name = "cache_control", .value = options.cache_control },
-        .{ .name = "content_disposition", .value = options.content_disposition },
-        .{ .name = "content_encoding", .value = options.content_encoding },
-        .{ .name = "content_language", .value = options.content_language },
-    };
-    for (fixed) |field| {
-        const value = field.value orelse continue;
+    try checkFields(diag, .{
+        options.content_type,
+        options.cache_control,
+        options.content_disposition,
+        options.content_encoding,
+        options.content_language,
+    });
+    try checkEdit(diag, options.edit);
+}
+
+/// The five fixed fields, in the order `content_type`, `cache_control`,
+/// `content_disposition`, `content_encoding`, `content_language`. A copy
+/// with changes holds its fields to the same rule.
+pub fn checkFields(diag: ?*core.Diagnostics, values: [5]?[]const u8) error{InvalidMetadataUpdate}!void {
+    const labels = [5][]const u8{ "content_type", "cache_control", "content_disposition", "content_encoding", "content_language" };
+    for (labels, values) |label, maybe| {
+        const value = maybe orelse continue;
         // The empty string clears the field; anything else becomes a
         // response header, so it is what a header value may hold.
         if (value.len != 0 and !isHeaderText(value)) {
-            if (diag) |d| d.print("{s}: a value is printable ASCII and spaces, since it comes back as a header", .{field.name});
+            if (diag) |d| d.print("{s}: a value is printable ASCII and spaces, since it comes back as a header", .{label});
             return error.InvalidMetadataUpdate;
         }
     }
-    const changes = switch (options.edit) {
+}
+
+/// What an edit may set or remove. A copy with changes applies the same
+/// rule to its edit.
+pub fn checkEdit(diag: ?*core.Diagnostics, edit: types.MetadataEdit) error{InvalidMetadataUpdate}!void {
+    const changes = switch (edit) {
         .keep, .clear => return,
         .change => |list| list,
     };
@@ -105,7 +118,7 @@ pub fn check(
             return error.InvalidMetadataUpdate;
         };
         for (changes[0..i]) |earlier| if (std.mem.eql(u8, earlier.key, change.key)) {
-            if (diag) |d| d.print("metadata key {s} appears twice; one patch gives a key one fate", .{change.key});
+            if (diag) |d| d.print("metadata key {s} appears twice; one edit gives a key one fate", .{change.key});
             return error.InvalidMetadataUpdate;
         };
     }

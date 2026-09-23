@@ -12,6 +12,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const compose_impl = @import("compose.zig");
+const copy_impl = @import("copy.zig");
 const dl = @import("download.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
@@ -215,7 +216,8 @@ pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Erro
     }) catch |err| switch (err) {
         // The sink is a buffer; there is no caller writer to fail.
         error.WriteFailed => unreachable,
-        error.FailedPrecondition => return self.ambiguous412(
+        error.FailedPrecondition => return rpc.ambiguous412(
+            self.client,
             options.preconditions.makesWriteSafe() or self.client.retry_unconditional_writes,
         ),
         else => |e| return e,
@@ -277,30 +279,20 @@ pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOpt
     return error.ChecksumMismatch;
 }
 
-/// A 412 on a call that may have been retried is ambiguous: an earlier
-/// attempt may have landed, and the repeat then failed its own
-/// precondition against the object it just created. The diagnostics say
-/// so, so the caller can `get` the object and compare checksums.
-fn ambiguous412(self: Object, retried: bool) Error {
-    if (retried) {
-        if (self.client.diagnostics) |d| {
-            var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
-            const status_text = d.status();
-            @memcpy(status_buf[0..status_text.len], status_text);
-            d.set(
-                412,
-                status_buf[0..status_text.len],
-                "the precondition failed; if this call was a retry, an earlier attempt may have succeeded: get the object and compare checksums",
-            );
-        }
-    }
-    return error.FailedPrecondition;
-}
-
 /// Server-side copy to `dest`, looping over rewrite calls until the
 /// service reports done; the caller never sees a rewrite token. The copy
-/// runs on this object's client, `dest` only naming the destination. The
-/// first call is retried only when the destination carries
+/// runs on this object's client, `dest` only naming the destination.
+///
+/// With no change in `options`, the copy carries the source's metadata as
+/// it is. A change, a storage class included, first reads the source and
+/// sends its metadata back with the change applied, pinned to the
+/// generation and metageneration it read, so a copy never mixes two
+/// versions: Cloud Storage takes any metadata a copy sends as the whole of
+/// the copy's, and a copy that sent only the change would lose everything
+/// else. Copying an object onto itself with a new `storage_class` is how a
+/// class changes on demand. ACLs, holds and retention are never copied.
+///
+/// The first call is retried only when the destination carries
 /// `if_generation_match`, or the client opted into unconditional retries;
 /// follow-up calls hold a rewrite token, which makes them safe anyway.
 pub fn copyTo(self: Object, dest: Object, options: types.CopyOptions) Error!types.Owned(types.ObjectInfo) {
@@ -309,62 +301,7 @@ pub fn copyTo(self: Object, dest: Object, options: types.CopyOptions) Error!type
     try rpc.checkObjectName(self.client, self.name);
     try rpc.checkBucketName(self.client, dest.bucket);
     try rpc.checkObjectName(self.client, dest.name);
-    var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
-    defer scratch.deinit();
-    var response: std.heap.ArenaAllocator = .init(self.client.gpa);
-    defer response.deinit();
-
-    const first_retries = options.preconditions.makesWriteSafe() or self.client.retry_unconditional_writes;
-    var token: ?[]const u8 = null;
-    var rounds: u32 = 0;
-    while (true) {
-        rounds += 1;
-        if (rounds > 100_000) {
-            // Progress is the server's promise; a loop this long has none.
-            if (self.client.diagnostics) |d| d.print("the rewrite loop never reported done", .{});
-            return error.InvalidResponse;
-        }
-        _ = response.reset(.retain_capacity);
-        const path = try names.rewritePath(
-            scratch.allocator(),
-            self.bucket,
-            self.name,
-            dest.bucket,
-            dest.name,
-            options,
-            token,
-        );
-        const body = rpc.execute(self.client, &response, .{
-            .method = .POST,
-            .path = path,
-            .body = "{}",
-            .retry = token != null or first_retries,
-        }) catch |err| switch (err) {
-            error.FailedPrecondition => return self.ambiguous412(first_retries),
-            else => |e| return e,
-        };
-        const rewrite = codec.decodeRewrite(response.allocator(), body) catch |err|
-            return rpc.decodeFailed(self.client, err, "rewrite");
-        if (rewrite.done) {
-            var result: types.Owned(types.ObjectInfo) = try .init(self.client.gpa);
-            errdefer result.deinit();
-            // Decoded again into the result's arena, which outlives this loop.
-            const kept = codec.decodeRewrite(result.arena.allocator(), body) catch |err|
-                return rpc.decodeFailed(self.client, err, "rewrite");
-            result.value = kept.resource orelse {
-                if (self.client.diagnostics) |d| d.print("the final rewrite response carried no object resource", .{});
-                return error.InvalidResponse;
-            };
-            return result;
-        }
-        const next = rewrite.rewrite_token orelse {
-            if (self.client.diagnostics) |d| d.print("the rewrite is not done, but the response carried no token to continue with", .{});
-            return error.InvalidResponse;
-        };
-        // The token must outlive the response arena it was decoded into.
-        token = try scratch.allocator().dupe(u8, next);
-        logging.debug("rewrite of {s}: {d} bytes so far, continuing", .{ self.name, rewrite.total_bytes_rewritten });
-    }
+    return copy_impl.copy(self.client, self.bucket, self.name, dest.bucket, dest.name, options);
 }
 
 fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void {
