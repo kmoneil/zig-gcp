@@ -16,6 +16,7 @@ const errors = @import("errors.zig");
 const logging = @import("logging.zig");
 const multipart = @import("multipart.zig");
 const names = @import("names.zig");
+const post_policy = @import("post_policy.zig");
 const resumable = @import("resumable.zig");
 const rpc = @import("rpc.zig");
 const signing = @import("signing.zig");
@@ -60,6 +61,28 @@ pub fn signedUrl(self: Object, signer: core.Signer, options: types.SignedUrlOpti
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
     return signing.signUrl(self.client, signer, self.bucket, self.name, options);
+}
+
+/// A V4 POST policy that stores this object: what a plain HTML form may
+/// upload, stated in advance and signed, for a browser that cannot send
+/// the headers a signed PUT pins. The policy names this object exactly, so
+/// the form stores that name and no other; `Bucket.postPolicy` is the one
+/// that allows a prefix. Everything else is as `signedUrl` says: `signer`
+/// signs as a service account, which must itself be allowed to write, and
+/// nothing is sent to Cloud Storage.
+///
+/// The returned fields are the form's hidden inputs. The form must also
+/// send `file`, last, holding the bytes. The fields are a bearer
+/// credential together until they expire, so they are never logged.
+pub fn postPolicy(self: Object, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    if (options.key != null) {
+        if (self.client.diagnostics) |d| d.print("this object's name is the policy's key; only Bucket.postPolicy takes one", .{});
+        return error.InvalidPostPolicyOptions;
+    }
+    return post_policy.signPolicy(self.client, signer, self.bucket, .{ .exact = self.name }, options);
 }
 
 /// Sugar over `get`: whether a live object has this name. `NotFound`

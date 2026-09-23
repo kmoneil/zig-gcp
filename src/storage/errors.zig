@@ -55,4 +55,10 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// or endpoint cannot use, or an object name a browser would rewrite.
     /// `Diagnostics` says which. Nothing was signed.
     InvalidSignedUrlOptions,
+    /// A POST policy's options break a rule: an expiry out of range, a
+    /// field the policy sets itself or that is never a condition, a
+    /// repeated field, a size range that cannot hold, a value a form
+    /// cannot send, or a style the bucket or endpoint cannot use.
+    /// `Diagnostics` says which. Nothing was signed.
+    InvalidPostPolicyOptions,
 };

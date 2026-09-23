@@ -200,6 +200,10 @@ jobs:
         # than from a local run, which does not keep pace for every
         # property: the Subscriber property costs 31 ms locally and 52 ms
         # here, which is how its job reached 129 of its 180 minutes.
+        # The two storage counts are under their aim on purpose: the POST
+        # policy properties are new, and local timings of them disagreed
+        # with each other, so they are sized to finish well inside the
+        # timeout and the next nightly measures what they really cost.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 2M }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
@@ -208,8 +212,8 @@ jobs:
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1M }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 105K }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
-          - { job: storage, module: storage, filter: fuzz, iterations: 9M }
-          - { job: slow-storage, module: storage, filter: slow property, iterations: 9M }
+          - { job: storage, module: storage, filter: fuzz, iterations: 5M }
+          - { job: slow-storage, module: storage, filter: slow property, iterations: 6M }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:

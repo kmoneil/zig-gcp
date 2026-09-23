@@ -11,6 +11,7 @@ const Object = @import("Object.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
+const post_policy = @import("post_policy.zig");
 const rpc = @import("rpc.zig");
 const signing = @import("signing.zig");
 const types = @import("types.zig");
@@ -81,6 +82,24 @@ pub fn signedUrl(self: Bucket, signer: core.Signer, options: types.SignedUrlOpti
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return signing.signUrl(self.client, signer, self.name, null, options);
+}
+
+/// A V4 POST policy for this bucket: what a plain HTML form may upload
+/// into it, stated in advance and signed. `options.key` says which names
+/// the form may store, one exactly or any under a prefix, and is required:
+/// `.{ .starts_with = "" }` allows any name in the bucket. Everything else
+/// is as `Object.postPolicy` says.
+pub fn postPolicy(self: Bucket, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    const key = options.key orelse {
+        if (self.client.diagnostics) |d| d.print(
+            "a bucket's POST policy needs a key: one name, or a prefix the browser completes; .{{ .starts_with = \"\" }} allows any name in the bucket",
+            .{},
+        );
+        return error.InvalidPostPolicyOptions;
+    };
+    return post_policy.signPolicy(self.client, signer, self.name, key, options);
 }
 
 /// One page of the bucket's objects, filtered and grouped by the options.

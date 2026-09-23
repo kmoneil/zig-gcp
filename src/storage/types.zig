@@ -230,6 +230,67 @@ pub const BucketBound = struct {
     scheme: core.endpoint.Scheme = .https,
 };
 
+/// One hidden input of a signed form: what the browser sends, and what the
+/// policy pins it to.
+pub const PostField = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// The object name a form may store.
+pub const PostKey = union(enum) {
+    /// One name, pinned exactly. `Object.postPolicy` fills this in.
+    exact: []const u8,
+    /// Any name starting with this, so the browser chooses the rest. The
+    /// form's `key` field becomes `{prefix}${filename}`, and Cloud Storage
+    /// replaces `${filename}` with the name of the file it was sent. An
+    /// empty prefix allows any name in the bucket.
+    starts_with: []const u8,
+};
+
+/// A condition on a field whose value the form chooses. A field in
+/// `PostPolicyOptions.fields` needs none: it is pinned to its value.
+pub const PostCondition = union(enum) {
+    /// `["starts-with", "$field", prefix]`. An empty prefix allows any
+    /// value, which is how a form lets the browser pick a content type.
+    starts_with: struct { field: []const u8, prefix: []const u8 },
+    /// `["content-length-range", min, max]`, in bytes, both inclusive.
+    content_length_range: struct { min: u64, max: u64 },
+};
+
+/// A signed POST policy: where a form posts, and the hidden inputs it
+/// carries. The form must also send `file`, last, holding the bytes; this
+/// library never sees them.
+pub const PostPolicy = struct {
+    url: []const u8,
+    fields: []const PostField,
+
+    /// The value of `name`, or null when the policy has no such field.
+    pub fn field(self: PostPolicy, name: []const u8) ?[]const u8 {
+        for (self.fields) |f| {
+            if (std.ascii.eqlIgnoreCase(f.name, name)) return f.value;
+        }
+        return null;
+    }
+};
+
+pub const PostPolicyOptions = struct {
+    /// How long the policy works, counted from now: 1 to 604,800 seconds
+    /// (seven days), and at most what the signer's keys are sure to last,
+    /// 43,200 through IAM. No default: a lifetime is a decision.
+    expires_in_s: u32,
+    /// The object name the form may store. `Object.postPolicy` names it
+    /// itself and refuses one set here; `Bucket.postPolicy` needs one.
+    key: ?PostKey = null,
+    /// Fields the form must send with these values, each of which becomes
+    /// an exact-match condition: `content-type`, `acl`, `cache-control`,
+    /// `success_action_status`, `x-goog-meta-*`. Sent in this order.
+    fields: []const PostField = &.{},
+    /// Conditions on fields whose value the form chooses.
+    conditions: []const PostCondition = &.{},
+    style: UrlStyle = .path,
+};
+
 pub const SignedUrlOptions = struct {
     method: SignedMethod = .GET,
     /// How long the URL works, counted from now: 1 to 604,800 seconds

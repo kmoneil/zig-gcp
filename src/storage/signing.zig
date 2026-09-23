@@ -158,31 +158,42 @@ pub fn check(
             return error.InvalidSignedUrlOptions;
         };
     }
-    switch (options.style) {
+    checkStyle(diag, base_url, bucket, options.style) catch return error.InvalidSignedUrlOptions;
+}
+
+/// Refuses a style this bucket and this endpoint cannot carry, and says why
+/// in `diag`. Shared with POST policies, whose URL has the same host rules.
+pub fn checkStyle(
+    diag: ?*core.Diagnostics,
+    base_url: []const u8,
+    bucket: []const u8,
+    style: types.UrlStyle,
+) error{InvalidStyle}!void {
+    switch (style) {
         .path => {},
         .virtual_hosted => {
             const endpoint = splitBaseUrl(base_url);
             const endpoint_host = withoutPort(endpoint.authority);
             if (isIpLiteral(endpoint_host)) {
                 if (diag) |d| d.print("virtual-hosted style puts the bucket in front of the endpoint's host name, and this endpoint is an IP address", .{});
-                return error.InvalidSignedUrlOptions;
+                return error.InvalidStyle;
             }
             if (std.mem.eql(u8, endpoint.scheme, "https") and
                 std.mem.indexOfScalar(u8, bucket, '.') != null and !isAppspotBucket(bucket))
             {
                 if (diag) |d| d.print("a bucket name with dots cannot be virtual-hosted over https: the certificate covers one label; use path style", .{});
-                return error.InvalidSignedUrlOptions;
+                return error.InvalidStyle;
             }
             var buffer: [512]u8 = undefined;
             const host = std.fmt.bufPrint(&buffer, "{s}.{s}", .{ bucket, endpoint_host }) catch "";
             if (!core.endpoint.isValidHost(host)) {
                 if (diag) |d| d.print("virtual-hosted style needs a bucket name that is a host label: letters, digits and hyphens", .{});
-                return error.InvalidSignedUrlOptions;
+                return error.InvalidStyle;
             }
         },
         .bucket_bound => |bound| if (!isHostAndPort(bound.host)) {
             if (diag) |d| d.print("a bucket-bound host is a host name, with an optional port, and nothing else", .{});
-            return error.InvalidSignedUrlOptions;
+            return error.InvalidStyle;
         },
     }
 }
@@ -386,8 +397,19 @@ fn canonicalValue(arena: Allocator, value: []const u8) Allocator.Error![]const u
     return out[0..len];
 }
 
-/// `YYYYMMDDTHHMMSSZ` for `now`, or null outside the years 1970 to 9999.
-pub fn timestamp(now: std.Io.Timestamp) ?[16]u8 {
+/// A moment in UTC, to the second.
+pub const Civil = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+};
+
+/// `now` in UTC, or null outside the years 1970 to 9999: a signature can
+/// carry no other year, in either of the two formats that spell one out.
+pub fn civil(now: std.Io.Timestamp) ?Civil {
     const seconds = @divFloor(now.nanoseconds, std.time.ns_per_s);
     if (seconds < 0) return null;
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = std.math.cast(u64, seconds) orelse return null };
@@ -395,14 +417,22 @@ pub fn timestamp(now: std.Io.Timestamp) ?[16]u8 {
     if (year_day.year > 9999) return null;
     const month_day = year_day.calculateMonthDay();
     const day_seconds = epoch.getDaySeconds();
+    return .{
+        .year = year_day.year,
+        .month = month_day.month.numeric(),
+        .day = @as(u8, month_day.day_index) + 1,
+        .hour = day_seconds.getHoursIntoDay(),
+        .minute = day_seconds.getMinutesIntoHour(),
+        .second = day_seconds.getSecondsIntoMinute(),
+    };
+}
+
+/// `YYYYMMDDTHHMMSSZ` for `now`, or null outside the years 1970 to 9999.
+pub fn timestamp(now: std.Io.Timestamp) ?[16]u8 {
+    const c = civil(now) orelse return null;
     var out: [16]u8 = undefined;
     _ = std.fmt.bufPrint(&out, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
-        year_day.year,
-        month_day.month.numeric(),
-        @as(u8, month_day.day_index) + 1,
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-        day_seconds.getSecondsIntoMinute(),
+        c.year, c.month, c.day, c.hour, c.minute, c.second,
     }) catch unreachable;
     return out;
 }
@@ -466,7 +496,7 @@ fn isPort(text: []const u8) bool {
 /// Whether some `/`-separated segment is `.` or `..`. Browsers, curl and
 /// WHATWG URL parsers resolve those before a request leaves, percent-encoded
 /// or not, so the request would name another object.
-fn hasDotSegment(name: []const u8) bool {
+pub fn hasDotSegment(name: []const u8) bool {
     var segments = std.mem.splitScalar(u8, name, '/');
     while (segments.next()) |segment| {
         if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return true;
