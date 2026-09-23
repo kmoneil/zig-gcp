@@ -68,7 +68,7 @@ pub const Options = struct {
     /// takes seconds is already wrong. 0 removes the limit.
     request_timeout_ms: u32 = 10_000,
     /// Printable ASCII.
-    user_agent: []const u8 = "zig-gcp-auth/0.16",
+    user_agent: []const u8 = "zig-gcp-auth/0.17",
     /// Filled with the details of the last failure. Never holds a token.
     diagnostics: ?*Diagnostics = null,
     /// Sends requests through this instead of `std.http.Client`.
