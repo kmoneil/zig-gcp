@@ -4,6 +4,43 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.16.0 (unreleased)
+
+- storage: POST policy documents, for uploads from a plain HTML form.
+  `Object.postPolicy(signer, options)` and `Bucket.postPolicy` sign what a
+  form may upload, stated in advance: the object name exactly, or any name
+  under a prefix the browser completes through Google's `${filename}`;
+  fields the form must send with these values, such as a `content-type`;
+  `starts_with` conditions for fields whose value the browser chooses; and
+  a `content_length_range` that bounds the body, which is the one
+  condition a signed URL cannot express for a form. The result is where
+  the form posts and the hidden inputs it carries; the caller adds `file`,
+  last, holding bytes this library never sees. Path-style, virtual-hosted
+  and bucket-bound-hostname URLs, on the client's endpoint, as for signed
+  URLs, and signed through the same `core.Signer`, so a key file, IAM,
+  impersonation and the metadata server all work with no new setup. Held
+  byte for byte to Google's 11 POST policy conformance vectors, signatures
+  included, and to 400 cases Google's Python library signed. Stricter than
+  that library, which sorts the caller's fields, mutates the condition
+  list it is given, and can print a sub-second expiry: this keeps the
+  caller's order, takes `const` options, and truncates to the second. It
+  refuses with `error.InvalidPostPolicyOptions` what that library would
+  sign into a policy no form can satisfy: a field the policy sets itself,
+  a field Cloud Storage never compares (`file`, `policy`,
+  `x-goog-signature`) or ignores (`x-ignore-*`), a repeated field, two
+  size ranges, a `success_action_status` other than 200, 201 or 204, and a
+  control character anywhere, which a hidden input cannot carry. Breaking,
+  for an exhaustive `switch` over `storage.Error`: it gains
+  `InvalidPostPolicyOptions`. `examples/gcs_sign.zig --post-policy` prints
+  a ready `<form>`. Against a real bucket, both ways of signing were held
+  to what Google answers: a failed condition is 400 `InvalidPolicyDocument`
+  whose `Details` quotes the condition, a body outside the size range is
+  400 `EntityTooLarge` or `EntityTooSmall`, an expired policy is 400
+  `InvalidPolicyDocument` where an expired URL is `ExpiredToken`, and a
+  changed signature is 403 `SignatureDoesNotMatch` whose body carries the
+  policy document Google read, which matched ours.
+- auth, core, pubsub, secret_manager: unchanged.
+
 ## 0.15.0 (2026-09-22)
 
 - storage: signed URLs. `Object.signedUrl(signer, options)` and

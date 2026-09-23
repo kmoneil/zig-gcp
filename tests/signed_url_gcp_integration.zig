@@ -174,6 +174,12 @@ const Answer = struct {
     fn code(a: Answer) []const u8 {
         return xmlElement(a.body, "Code") orelse "";
     }
+
+    /// The `<Details>` of an XML error body, or "". A refused POST policy
+    /// puts the condition that failed here, XML-escaped.
+    fn details(a: Answer) []const u8 {
+        return xmlElement(a.body, "Details") orelse "";
+    }
 };
 
 /// Uses `url` as a browser would: no credentials, nothing but `headers`
@@ -574,4 +580,270 @@ test "signed URLs, real bucket: IAM's signature verifies against the account's p
         verified = true;
     }
     try testing.expect(verified);
+}
+
+// POST policies. A signed URL allows one request; a policy allows one kind
+// of request, and only Cloud Storage can say what it makes of each field.
+
+/// A `multipart/form-data` body, as a browser submitting a form sends one:
+/// every policy field, then `file` last, holding the bytes.
+const Form = struct {
+    /// Fixed, so a failing body is the same every run. Nothing in the
+    /// fields or the file may contain it; the tests' data does not.
+    const boundary = "----zig-gcp-post-policy-boundary";
+    const content_type = "multipart/form-data; boundary=" ++ boundary;
+
+    fn body(
+        arena: Allocator,
+        fields: []const storage.PostField,
+        filename: []const u8,
+        data: []const u8,
+    ) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        for (fields) |field| {
+            try out.print(arena, "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"\r\n\r\n{s}\r\n", .{
+                boundary, field.name, field.value,
+            });
+        }
+        try out.print(arena, "--{s}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{s}\"\r\n\r\n", .{
+            boundary, filename,
+        });
+        try out.appendSlice(arena, data);
+        try out.print(arena, "\r\n--{s}--\r\n", .{boundary});
+        return out.items;
+    }
+};
+
+/// Posts `data` to the policy's URL, as a browser would: no credentials,
+/// and only what the policy said to send.
+fn postForm(
+    arena: Allocator,
+    policy: storage.PostPolicy,
+    filename: []const u8,
+    data: []const u8,
+) !Answer {
+    return useUrl(
+        arena,
+        .POST,
+        policy.url,
+        &.{.{ .name = "content-type", .value = Form.content_type }},
+        try Form.body(arena, policy.fields, filename, data),
+    );
+}
+
+/// The fields with `name` replaced, for the tests that break one on purpose.
+fn withField(
+    arena: Allocator,
+    fields: []const storage.PostField,
+    name: []const u8,
+    value: ?[]const u8,
+) ![]const storage.PostField {
+    var out: std.ArrayList(storage.PostField) = .empty;
+    for (fields) |field| {
+        if (std.ascii.eqlIgnoreCase(field.name, name)) {
+            if (value) |v| try out.append(arena, .{ .name = field.name, .value = v });
+        } else {
+            try out.append(arena, field);
+        }
+    }
+    return out.items;
+}
+
+test "POST policy, real bucket: a form stores the object, and the policy pins its type" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    var buffer: [2]Named = undefined;
+    for (f.signers(&buffer)) |s| {
+        const obj = try f.object(try std.fmt.allocPrint(a, "{s}-form.txt", .{s.name}));
+        var policy = obj.postPolicy(s.signer, .{
+            .expires_in_s = 600,
+            .fields = &.{.{ .name = "content-type", .value = "text/plain" }},
+        }) catch |err| return f.report(err);
+        defer policy.deinit();
+
+        const stored = try postForm(a, policy.value, "anything.txt", hello);
+        try expectStatus(204, stored, s.name);
+        var got = obj.downloadAlloc(hello.len + 1, .{}) catch |err| return f.report(err);
+        defer got.deinit();
+        try testing.expectEqualStrings(hello, got.value.data);
+        var info = obj.get(.{}) catch |err| return f.report(err);
+        defer info.deinit();
+        try testing.expectEqualStrings("text/plain", info.value.content_type);
+
+        // The same policy with another type: the condition no longer holds.
+        // Measured 2026-09-23: this is 400 InvalidPolicyDocument, not the
+        // 403 a bad signature gets, and Details names the condition that
+        // failed, in the document's own words.
+        const wrong = try postForm(a, .{
+            .url = policy.value.url,
+            .fields = try withField(a, policy.value.fields, "content-type", "text/html"),
+        }, "anything.txt", hello);
+        try expectStatus(400, wrong, s.name);
+        try testing.expectEqualStrings("InvalidPolicyDocument", wrong.code());
+        // Details quotes the condition as JSON, with `/` backslash-escaped.
+        const said = try xmlText(a, wrong.details());
+        try testing.expect(std.mem.indexOf(u8, said, "Failed condition") != null);
+        try testing.expect(std.mem.indexOf(u8, said, "\"content-type\":\"text\\/plain\"") != null);
+
+        // And a field the policy never mentions at all: a policy is a
+        // whitelist, so an extra field is refused even though nothing
+        // contradicts it.
+        var extra: std.ArrayList(storage.PostField) = .empty;
+        try extra.appendSlice(a, policy.value.fields);
+        try extra.append(a, .{ .name = "cache-control", .value = "public,max-age=60" });
+        const unlisted = try postForm(a, .{ .url = policy.value.url, .fields = extra.items }, "anything.txt", hello);
+        try expectStatus(400, unlisted, s.name);
+        try testing.expectEqualStrings("InvalidPolicyDocument", unlisted.code());
+    }
+}
+
+test "POST policy, real bucket: success_action_status and success_action_redirect" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    var buffer: [2]Named = undefined;
+    for (f.signers(&buffer)) |s| {
+        const created = try f.object(try std.fmt.allocPrint(a, "{s}-201.txt", .{s.name}));
+        var with_status = created.postPolicy(s.signer, .{
+            .expires_in_s = 600,
+            .fields = &.{.{ .name = "success_action_status", .value = "201" }},
+        }) catch |err| return f.report(err);
+        defer with_status.deinit();
+        const answer = try postForm(a, with_status.value, "x.txt", hello);
+        try expectStatus(201, answer, s.name);
+        // Google documents the body of a 201: bucket, etag, key, location.
+        try testing.expectEqualStrings(f.bucket_name, xmlElement(answer.body, "Bucket") orelse "");
+        try testing.expectEqualStrings(created.name, xmlElement(answer.body, "Key") orelse "");
+        try testing.expect(xmlElement(answer.body, "Location") != null);
+        try testing.expect(xmlElement(answer.body, "ETag") != null);
+
+        const sent = try f.object(try std.fmt.allocPrint(a, "{s}-303.txt", .{s.name}));
+        const back = "https://example.com/thanks";
+        var with_redirect = sent.postPolicy(s.signer, .{
+            .expires_in_s = 600,
+            .fields = &.{.{ .name = "success_action_redirect", .value = back }},
+        }) catch |err| return f.report(err);
+        defer with_redirect.deinit();
+        const redirected = try postForm(a, with_redirect.value, "x.txt", hello);
+        std.debug.print("{s}: success_action_redirect answered {d}\n", .{ s.name, redirected.status });
+        try testing.expect(redirected.status == 303 or redirected.status == 302);
+        const location = redirected.header("location") orelse return error.TestNoLocation;
+        try testing.expect(std.mem.startsWith(u8, location, back));
+        // Google adds what it stored to the redirect's query.
+        try testing.expect(std.mem.indexOf(u8, location, "bucket=") != null);
+    }
+}
+
+test "POST policy, real bucket: a prefix key lets the browser name the object" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    var buffer: [2]Named = undefined;
+    for (f.signers(&buffer)) |s| {
+        const prefix = try std.fmt.allocPrint(a, "{s}uploads-{s}/", .{ &f.prefix, s.name });
+        var policy = f.bucket().postPolicy(s.signer, .{
+            .expires_in_s = 600,
+            .key = .{ .starts_with = prefix },
+        }) catch |err| return f.report(err);
+        defer policy.deinit();
+        // The form's key field is the prefix plus Google's ${filename}.
+        try testing.expectEqualStrings(
+            try std.fmt.allocPrint(a, "{s}${{filename}}", .{prefix}),
+            policy.value.field("key").?,
+        );
+
+        const stored = try postForm(a, policy.value, "report.pdf", hello);
+        try expectStatus(204, stored, s.name);
+        // Cloud Storage put the browser's file name where ${filename} was.
+        const landed = f.bucket().object(try std.fmt.allocPrint(a, "{s}report.pdf", .{prefix}));
+        var info = landed.get(.{}) catch |err| return f.report(err);
+        defer info.deinit();
+        try testing.expectEqual(hello.len, info.value.size);
+
+        // A name outside the prefix is refused, which is the point of it.
+        const outside = try postForm(a, .{
+            .url = policy.value.url,
+            .fields = try withField(a, policy.value.fields, "key", try std.fmt.allocPrint(a, "{s}elsewhere.txt", .{&f.prefix})),
+        }, "elsewhere.txt", hello);
+        try expectStatus(400, outside, s.name);
+        try testing.expectEqualStrings("InvalidPolicyDocument", outside.code());
+        // Details quotes the starts-with condition it could not satisfy.
+        const said = try xmlText(a, outside.details());
+        try testing.expect(std.mem.indexOf(u8, said, "\"starts-with\",\"$key\"") != null);
+    }
+}
+
+test "POST policy, real bucket: content-length-range caps the body at both ends" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    var buffer: [2]Named = undefined;
+    for (f.signers(&buffer)) |s| {
+        const obj = try f.object(try std.fmt.allocPrint(a, "{s}-sized.txt", .{s.name}));
+        var policy = obj.postPolicy(s.signer, .{
+            .expires_in_s = 600,
+            .conditions = &.{.{ .content_length_range = .{ .min = hello.len, .max = hello.len } }},
+        }) catch |err| return f.report(err);
+        defer policy.deinit();
+
+        const exact = try postForm(a, policy.value, "x.txt", hello);
+        try expectStatus(204, exact, s.name);
+
+        // Measured 2026-09-23: a size range has its own two codes, rather
+        // than the InvalidPolicyDocument every other failed condition gets.
+        const over = try postForm(a, policy.value, "x.txt", hello ++ "!");
+        try expectStatus(400, over, s.name);
+        try testing.expectEqualStrings("EntityTooLarge", over.code());
+
+        const under = try postForm(a, policy.value, "x.txt", hello[0 .. hello.len - 1]);
+        try expectStatus(400, under, s.name);
+        try testing.expectEqualStrings("EntityTooSmall", under.code());
+    }
+}
+
+test "POST policy, real bucket: an expired policy and a tampered signature are refused" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    var buffer: [2]Named = undefined;
+    for (f.signers(&buffer)) |s| {
+        const obj = try f.object(try std.fmt.allocPrint(a, "{s}-refused.txt", .{s.name}));
+        var brief = obj.postPolicy(s.signer, .{ .expires_in_s = 1 }) catch |err| return f.report(err);
+        defer brief.deinit();
+        try testing.io.sleep(.fromSeconds(3), .awake);
+        // Measured 2026-09-23: an expired policy is 400
+        // InvalidPolicyDocument, where an expired signed URL is 400
+        // ExpiredToken.
+        const expired = try postForm(a, brief.value, "x.txt", hello);
+        try expectStatus(400, expired, s.name);
+        try testing.expectEqualStrings("InvalidPolicyDocument", expired.code());
+
+        var good = obj.postPolicy(s.signer, .{ .expires_in_s = 600 }) catch |err| return f.report(err);
+        defer good.deinit();
+        const signature = good.value.field("x-goog-signature").?;
+        const tampered = try a.dupe(u8, signature);
+        tampered[tampered.len - 1] = if (tampered[tampered.len - 1] == '0') '1' else '0';
+        const refused = try postForm(a, .{
+            .url = good.value.url,
+            .fields = try withField(a, good.value.fields, "x-goog-signature", tampered),
+        }, "x.txt", hello);
+        try expectStatus(403, refused, s.name);
+        try testing.expectEqualStrings("SignatureDoesNotMatch", refused.code());
+        // A signed URL's refusal echoes the canonical request Google built.
+        // Whether a policy's echoes the document it read is undocumented;
+        // say what came back either way.
+        // Measured 2026-09-23: it does, and it is the base64 document, so
+        // this is the same check the signed URL suite makes against the
+        // canonical request Google computed. Undocumented either way.
+        const echoed = xmlElement(refused.body, "StringToSign") orelse return error.TestNoStringToSign;
+        try testing.expectEqualStrings(good.value.field("policy").?, try xmlText(a, echoed));
+        // The untampered one still works, so the difference is the signature.
+        try expectStatus(204, try postForm(a, good.value, "x.txt", hello), s.name);
+    }
 }
