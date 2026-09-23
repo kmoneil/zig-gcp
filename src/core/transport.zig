@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const http = std.http;
 
-pub const Method = enum { GET, PUT, POST, DELETE };
+pub const Method = enum { GET, PUT, POST, DELETE, PATCH };
 
 pub const Request = struct {
     method: Method,
@@ -286,7 +286,7 @@ pub const HttpTransport = struct {
         const self: *HttpTransport = @ptrCast(@alignCast(ptr));
         const has_body = switch (req.method) {
             .GET, .DELETE => false,
-            .PUT, .POST => true,
+            .PUT, .POST, .PATCH => true,
         };
         const segments = [_][]const u8{req.body orelse ""};
         const res = self.sendStreamNow(.{
@@ -399,6 +399,7 @@ pub const HttpTransport = struct {
             .PUT => .PUT,
             .POST => .POST,
             .DELETE => .DELETE,
+            .PATCH => .PATCH,
         }, uri, .{
             .connection = preconnected,
             .redirect_behavior = .unhandled,
