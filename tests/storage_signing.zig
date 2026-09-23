@@ -1,8 +1,9 @@
-//! Signed URLs held to answers from outside this library, through the
-//! public API and with no network: Google's 29 V4 signing conformance
-//! vectors, byte for byte with real RSA signatures, and 400 cases Google's
-//! Python library signed (testdata/signed_url_oracle.json). testdata/README.md
-//! says where each file comes from.
+//! Signed URLs and POST policies held to answers from outside this
+//! library, through the public API and with no network: Google's 29 V4
+//! signing conformance vectors and its 11 POST policy vectors, byte for
+//! byte with real RSA signatures, and 400 cases Google's Python library
+//! signed (testdata/signed_url_oracle.json). testdata/README.md says where
+//! each file comes from.
 
 const std = @import("std");
 const storage = @import("storage");
@@ -386,4 +387,139 @@ test "through IAM: Google's first vector, with IAM answering its signature" {
     var longest = try client.bucket(v.bucket).object(v.object.?).signedUrl(iam.signer(), .{ .expires_in_s = 43_200 });
     longest.deinit();
     try testing.expectEqual(2, iam_fake.requests.items.len);
+}
+
+/// One of Google's POST policy vectors, as tests.proto describes it.
+const PostVector = struct {
+    description: []const u8,
+    policyInput: PolicyInput,
+    policyOutput: PolicyOutput,
+};
+
+const PolicyInput = struct {
+    scheme: ?[]const u8 = null,
+    bucket: []const u8,
+    object: []const u8,
+    expiration: u32,
+    timestamp: []const u8,
+    urlStyle: ?[]const u8 = null,
+    bucketBoundHostname: ?[]const u8 = null,
+    conditions: ?PolicyConditions = null,
+    fields: ?std.json.ArrayHashMap([]const u8) = null,
+};
+
+const PolicyConditions = struct {
+    /// `["$field", "prefix"]`, the field name with its `$` still on.
+    startsWith: ?[]const []const u8 = null,
+    /// `[min, max]`, in bytes.
+    contentLengthRange: ?[]const u64 = null,
+};
+
+const PolicyOutput = struct {
+    url: []const u8,
+    fields: std.json.ArrayHashMap([]const u8),
+    /// The document with its non-ASCII written out, which is not what was
+    /// signed: this file is JSON, so it cannot hold the `\uXXXX` escapes
+    /// the signed bytes carry. The base64 `policy` field is the truth, and
+    /// the two differ for the two vectors with a `é` in them.
+    expectedDecodedPolicy: []const u8,
+};
+
+const PostVectorFile = struct { postPolicyV4Tests: []const PostVector };
+
+fn postStyleOf(v: PolicyInput) storage.UrlStyle {
+    const style = v.urlStyle orelse return .path;
+    if (std.mem.eql(u8, style, "VIRTUAL_HOSTED_STYLE")) return .virtual_hosted;
+    std.debug.assert(std.mem.eql(u8, style, "BUCKET_BOUND_HOSTNAME"));
+    return .{ .bucket_bound = .{
+        .host = v.bucketBoundHostname.?,
+        .scheme = if (std.mem.eql(u8, v.scheme orelse "https", "http")) .http else .https,
+    } };
+}
+
+fn postFieldsOf(arena: Allocator, map: ?std.json.ArrayHashMap([]const u8)) ![]const storage.PostField {
+    const m = map orelse return &.{};
+    const out = try arena.alloc(storage.PostField, m.map.count());
+    for (m.map.keys(), m.map.values(), out) |name, value, *field| field.* = .{ .name = name, .value = value };
+    return out;
+}
+
+fn postConditionsOf(arena: Allocator, input: ?PolicyConditions) ![]const storage.PostCondition {
+    const c = input orelse return &.{};
+    var out: std.ArrayList(storage.PostCondition) = .empty;
+    if (c.startsWith) |pair| {
+        std.debug.assert(pair.len == 2);
+        std.debug.assert(pair[0][0] == '$');
+        try out.append(arena, .{ .starts_with = .{ .field = pair[0][1..], .prefix = pair[1] } });
+    }
+    if (c.contentLengthRange) |range| {
+        std.debug.assert(range.len == 2);
+        try out.append(arena, .{ .content_length_range = .{ .min = range[0], .max = range[1] } });
+    }
+    return out.items;
+}
+
+fn base64Decode(arena: Allocator, text: []const u8) ![]u8 {
+    const decoder = std.base64.standard.Decoder;
+    const out = try arena.alloc(u8, try decoder.calcSizeForSlice(text));
+    try decoder.decode(out, text);
+    return out;
+}
+
+test "Google's V4 POST policy vectors, byte for byte, signatures included" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const file = try std.json.parseFromSliceLeaky(PostVectorFile, arena, vectors_json, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(11, file.postPolicyV4Tests.len);
+
+    var fake: core.testing.FakeTransport = .init(gpa, &.{});
+    defer fake.deinit();
+    var account = try auth.ServiceAccount.initFromJson(gpa, testing.io, try keyFileJson(arena), .{ .transport = fake.transport() });
+    defer account.deinit();
+    var recording: Recording = .{ .inner = account.signer() };
+    defer recording.message.deinit(gpa);
+    const public_key = try publicKey();
+
+    for (file.postPolicyV4Tests) |v| {
+        errdefer std.debug.print("POST policy vector: {s}\n", .{v.description});
+        const in = v.policyInput;
+        var clock: core.testing.FakeClock = .{ .now_ns = (try storage.parseTimestamp(in.timestamp)).nanoseconds };
+        var token: core.testing.FakeTokenProvider = .{};
+        var client: storage.Client = try .init(gpa, clock.io(), .{
+            .token_provider = token.provider(),
+            .transport = fake.transport(),
+        });
+        defer client.deinit();
+        var policy = try client.bucket(in.bucket).object(in.object).postPolicy(recording.signer(), .{
+            .expires_in_s = in.expiration,
+            .fields = try postFieldsOf(arena, in.fields),
+            .conditions = try postConditionsOf(arena, in.conditions),
+            .style = postStyleOf(in),
+        });
+        defer policy.deinit();
+
+        try testing.expectEqualStrings(v.policyOutput.url, policy.value.url);
+        // The document, compared decoded so a failure is readable.
+        const want = v.policyOutput.fields.map.get("policy").?;
+        const got = policy.value.field("policy").?;
+        try testing.expectEqualStrings(try base64Decode(arena, want), try base64Decode(arena, got));
+        try testing.expectEqualStrings(want, got);
+        // Every field Google expects, with its value, and no others.
+        try testing.expectEqual(v.policyOutput.fields.map.count(), policy.value.fields.len);
+        for (v.policyOutput.fields.map.keys(), v.policyOutput.fields.map.values()) |name, value| {
+            errdefer std.debug.print("field: {s}\n", .{name});
+            try testing.expectEqualStrings(value, policy.value.field(name) orelse return error.TestFieldMissing);
+        }
+        // What was signed is the base64 document itself: no canonical
+        // request, no string to sign.
+        try testing.expectEqualStrings(got, recording.message.items);
+        // std's own RSA code, which shares nothing with auth's, accepts it.
+        var signature: [256]u8 = undefined;
+        const signature_hex = policy.value.field("x-goog-signature").?;
+        try testing.expectEqual(signature.len, (try std.fmt.hexToBytes(&signature, signature_hex)).len);
+        try rsa.PKCS1v1_5Signature.verify(256, signature, recording.message.items, public_key, Sha256);
+    }
+    try testing.expectEqual(0, fake.requests.items.len);
 }
