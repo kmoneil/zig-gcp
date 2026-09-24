@@ -70,4 +70,11 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// generation, or a source whose generation and precondition
     /// contradict each other. `Diagnostics` says which. Nothing was sent.
     InvalidComposeSources,
+    /// A parallel upload's options break a rule: a part size outside 5 MiB
+    /// to 5 GiB, a concurrency outside 1 to 64, a source over 5 TiB, a
+    /// value or custom metadata key a header cannot carry faithfully,
+    /// custom metadata over 8 KiB, or an object name with a `.` or `..`
+    /// segment, which the XML API's paths cannot name. `Diagnostics` says
+    /// which. Nothing was sent.
+    InvalidParallelUploadOptions,
 };

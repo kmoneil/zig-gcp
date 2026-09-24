@@ -49,6 +49,16 @@ transport: Transport,
 http: ?*HttpTransport,
 /// Owned copy of `Options.user_agent`.
 user_agent: []const u8,
+/// Tests only: lowers the multipart upload's 5 MiB part floor, and lets an
+/// emulator endpoint take the multipart path instead of the ordinary
+/// upload `uploadParallel` falls back to there, so a test can send a few
+/// KiB in dozens of parts to a fake that speaks the XML API.
+multipart_test: MultipartTest = .{},
+
+pub const MultipartTest = struct {
+    min_part_size: ?u64 = null,
+    on_emulator: bool = false,
+};
 
 pub const Options = struct {
     /// Needed only to create or list buckets, which address no bucket yet.
