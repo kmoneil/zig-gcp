@@ -914,6 +914,24 @@ test "downloadParallel: a cancel stops the workers and returns Canceled" {
     try testing.expectError(error.Canceled, task.cancel(testing.io));
 }
 
+test "downloadParallel: a worker whose request meets Canceled stops the download, which returns Canceled" {
+    // No cancel reached the task, so the group returns normally: only the
+    // failure the worker recorded keeps unfetched ranges out of the fold.
+    for ([_]bool{ true, false }) |verify| {
+        var rules = [_]Script.Rule{.{ .at = 4096, .fault = .canceled }};
+        var script: Script = .{ .rules = &rules };
+        var s: Setup = undefined;
+        try s.init(testing.io, .{ .verify_checksums = verify });
+        defer s.deinit();
+        s.fake.faults = script.plan();
+        var data: [16 * 1024]u8 = undefined;
+        fill(&data, 17);
+        try s.fake.put("o", &data);
+        var out: [data.len]u8 = undefined;
+        try testing.expectError(error.Canceled, s.object("o").downloadParallel(.{ .buffer = &out }, .{ .part_size = 4096, .concurrency = 2 }));
+    }
+}
+
 test "downloadParallel: a file opened for appending is caught by its length" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var s: Setup = undefined;

@@ -37,6 +37,10 @@ pub const FakeMultipart = struct {
     gate: std.Io.Event = .unset,
     /// How long a `stall` holds its request.
     stall_ms: u32 = 500,
+    /// A move checks its destination's conditions before its source, so a
+    /// move repeated after one that landed answers 412, not 404. Which
+    /// Cloud Storage does, no documentation says.
+    move_checks_destination_first: bool = false,
     counts: Counts = .{},
 
     pub const Counts = struct {
@@ -51,9 +55,10 @@ pub const FakeMultipart = struct {
         /// Body bytes the media reads delivered: half the body for a cut,
         /// none for an answer that was lost.
         media_bytes: u64 = 0,
+        moves: u32 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, read, delete, media };
+    pub const Kind = enum { start, part, finish, abort, read, delete, media, move };
 
     pub const Fault = enum {
         none,
@@ -66,7 +71,8 @@ pub const FakeMultipart = struct {
         /// A part is stored with a byte flipped; a finish stores the object
         /// with a byte flipped. Either way the answer describes what was
         /// stored, as a corrupted transfer would leave it. A media read
-        /// serves its bytes with one flipped, and the object keeps them.
+        /// serves its bytes with one flipped, and the object keeps them. A
+        /// move answers with another object's checksum.
         corrupt,
         /// The upload is gone, and the answer is 404 `NoSuchUpload`. A media
         /// read finds the object overwritten just before it: the generation
@@ -86,6 +92,12 @@ pub const FakeMultipart = struct {
         /// A range read answers 206 with a byte more than was asked for,
         /// where the object has one.
         long,
+        /// A move finds another writer's object put under its destination
+        /// name just before it is served.
+        clobber,
+        /// The request fails with `error.Canceled`, as a canceled task's
+        /// would, though nothing canceled it.
+        canceled,
     };
 
     pub const FaultPlan = struct {
@@ -144,7 +156,8 @@ pub const FakeMultipart = struct {
         return self.uploads.items.len;
     }
 
-    /// Stores an object directly, as another writer would have.
+    /// Stores an object directly, as another writer would have, replacing
+    /// any object of the name.
     pub fn put(self: *FakeMultipart, name: []const u8, bytes: []const u8) Allocator.Error!void {
         const owned_name = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned_name);
@@ -154,7 +167,12 @@ pub const FakeMultipart = struct {
         errdefer self.gpa.free(content_type);
         const metadata = try self.gpa.alloc(Header, 0);
         errdefer self.gpa.free(metadata);
-        try self.objects.append(self.gpa, .{
+        try self.objects.ensureUnusedCapacity(self.gpa, 1);
+        if (self.liveIndex(name)) |i| {
+            var replaced = self.objects.orderedRemove(i);
+            freeStored(self.gpa, &replaced);
+        }
+        self.objects.appendAssumeCapacity(.{
             .name = owned_name,
             .generation = self.next_generation,
             .bytes = owned_bytes,
@@ -253,6 +271,7 @@ pub const FakeMultipart = struct {
             .json => |j| if (method == .GET)
                 (if (j.media) .media else .read)
             else if (method == .DELETE) .delete else return error.HttpProtocolError,
+            .move => if (method == .POST) .move else return error.HttpProtocolError,
             .xml => |x| switch (x.query) {
                 .uploads => .start,
                 .part => .part,
@@ -262,6 +281,7 @@ pub const FakeMultipart = struct {
         const part_number: u32 = switch (target) {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
+            .move => 0,
         };
 
         self.mutex.lockUncancelable(self.io);
@@ -286,6 +306,10 @@ pub const FakeMultipart = struct {
                 self.mutex.unlock(self.io);
                 return error.ConnectionResetByPeer;
             },
+            .canceled => {
+                self.mutex.unlock(self.io);
+                return error.Canceled;
+            },
             else => {},
         }
         defer self.mutex.unlock(self.io);
@@ -293,6 +317,7 @@ pub const FakeMultipart = struct {
         const reply = switch (target) {
             .json => |j| try self.json(kind, j, headers, fault, arena),
             .xml => |x| try self.multipartRequest(kind, x, content_type, headers, body, fault, arena),
+            .move => |m| try self.moveObject(m, fault, arena),
         };
         if (fault == .lose_answer) return error.ConnectionResetByPeer;
         if (kind == .media and reply.status >= 200 and reply.status < 300) {
@@ -310,21 +335,14 @@ pub const FakeMultipart = struct {
             .read => {
                 self.counts.reads += 1;
                 const o = &self.objects.items[index orelse return not_found];
-                var out: std.Io.Writer.Allocating = .init(arena);
-                var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
-                const crc = core.crc32c.toBase64(core.crc32c.hash(o.bytes));
-                jw.write(.{
-                    .name = o.name,
-                    .bucket = target.bucket,
-                    .size = try std.fmt.allocPrint(arena, "{d}", .{o.bytes.len}),
-                    .generation = try std.fmt.allocPrint(arena, "{d}", .{o.generation}),
-                    .metageneration = "1",
-                    .contentType = o.content_type,
-                    .contentEncoding = @as(?[]const u8, if (o.served != null) "gzip" else null),
-                    .crc32c = &crc,
-                    .storageClass = "STANDARD",
-                }) catch return error.OutOfMemory;
-                return .{ .status = 200, .body = out.written() };
+                switch (target.conditions.check(o)) {
+                    .hold => {},
+                    .match_failed => return condition_failed,
+                    // A failing `…NotMatch` condition on a read is a 304,
+                    // as HTTP's If-None-Match is.
+                    .not_match_failed => return .{ .status = 304, .body = "" },
+                }
+                return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false) };
             },
             .media => {
                 self.counts.media += 1;
@@ -346,6 +364,45 @@ pub const FakeMultipart = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// `objects.move`: the source, pinned to its generation, renamed to the
+    /// destination under the destination's conditions, with a new
+    /// generation, atomically. The source goes; an object it replaces goes.
+    fn moveObject(self: *FakeMultipart, target: MoveTarget, fault: Fault, arena: Allocator) Allocator.Error!Reply {
+        self.counts.moves += 1;
+        const not_found: Reply = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
+        if (fault == .clobber) try self.put(target.destination, "another writer's bytes");
+        const destination_holds = if (self.liveIndex(target.destination)) |d|
+            target.conditions.check(&self.objects.items[d]) == .hold
+        else
+            target.conditions.checkAbsent();
+        if (self.move_checks_destination_first and !destination_holds) return condition_failed;
+        const s = self.liveIndex(target.source) orelse return not_found;
+        if (target.if_source_generation_match) |g| if (self.objects.items[s].generation != g) return condition_failed;
+        if (!destination_holds) return condition_failed;
+        if (std.mem.eql(u8, target.source, target.destination)) return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"same name\"}}" };
+
+        // The reply and the new name first: once the objects change,
+        // nothing may fail.
+        const generation = self.next_generation;
+        const reply_body = try objectJson(arena, &self.objects.items[s], target.destination, generation, target.bucket, fault == .corrupt);
+        const name = try self.gpa.dupe(u8, target.destination);
+        self.next_generation += 1;
+        if (self.liveIndex(target.destination)) |d| {
+            var replaced = self.objects.orderedRemove(d);
+            freeStored(self.gpa, &replaced);
+        }
+        const moved = &self.objects.items[self.liveIndex(target.source).?];
+        self.gpa.free(moved.name);
+        moved.name = name;
+        moved.generation = generation;
+        return .{ .status = 200, .body = reply_body };
+    }
+
+    fn liveIndex(self: *const FakeMultipart, name: []const u8) ?usize {
+        for (self.objects.items, 0..) |o, i| if (std.mem.eql(u8, o.name, name)) return i;
+        return null;
     }
 
     /// An object's bytes as the media endpoint serves them: whole, or the one
@@ -466,7 +523,7 @@ pub const FakeMultipart = struct {
                 const index = self.uploadIndex(target.query.upload) orelse return gone;
                 return self.drop(index, .{ .status = 204 });
             },
-            .read, .delete, .media => unreachable,
+            .read, .delete, .media, .move => unreachable,
         }
     }
 
@@ -585,6 +642,74 @@ fn freeUpload(gpa: Allocator, u: *FakeMultipart.Upload) void {
     u.parts.deinit(gpa);
 }
 
+const condition_failed: FakeMultipart.Reply = .{
+    .status = 412,
+    .body = "{\"error\":{\"code\":412,\"message\":\"At least one of the pre-conditions you specified did not hold.\",\"errors\":[{\"reason\":\"conditionNotMet\"}]}}",
+};
+
+/// An object's resource as the JSON API answers it, under `name` and at
+/// `generation`, which a move changes, with the checksum flipped when
+/// `wrong_crc`. Every object here is at metageneration 1.
+fn objectJson(arena: Allocator, o: *const FakeMultipart.Stored, name: []const u8, generation: u64, bucket: []const u8, wrong_crc: bool) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
+    const crc = core.crc32c.toBase64(core.crc32c.hash(o.bytes) ^ @intFromBool(wrong_crc));
+    jw.write(.{
+        .name = name,
+        .bucket = bucket,
+        .size = try std.fmt.allocPrint(arena, "{d}", .{o.bytes.len}),
+        .generation = try std.fmt.allocPrint(arena, "{d}", .{generation}),
+        .metageneration = "1",
+        .contentType = o.content_type,
+        .contentEncoding = @as(?[]const u8, if (o.served != null) "gzip" else null),
+        .crc32c = &crc,
+        .storageClass = "STANDARD",
+    }) catch return error.OutOfMemory;
+    return out.written();
+}
+
+/// The conditions a JSON request carries, on the object it names or, for
+/// a move, on the destination.
+const Conditions = struct {
+    if_generation_match: ?u64 = null,
+    if_generation_not_match: ?u64 = null,
+    if_metageneration_match: ?u64 = null,
+    if_metageneration_not_match: ?u64 = null,
+
+    const Outcome = enum { hold, match_failed, not_match_failed };
+
+    /// Against a live object.
+    fn check(c: Conditions, o: *const FakeMultipart.Stored) Outcome {
+        if (c.if_generation_match) |g| if (g != o.generation) return .match_failed;
+        if (c.if_metageneration_match) |m| if (m != 1) return .match_failed;
+        if (c.if_generation_not_match) |g| if (g == o.generation) return .not_match_failed;
+        if (c.if_metageneration_not_match) |m| if (m == 1) return .not_match_failed;
+        return .hold;
+    }
+
+    /// Against no live object: only "generation 0", meaning none, holds;
+    /// every other condition names something about a live object.
+    fn checkAbsent(c: Conditions) bool {
+        if (c.if_generation_match) |g| if (g != 0) return false;
+        return c.if_generation_not_match == null and c.if_metageneration_match == null and c.if_metageneration_not_match == null;
+    }
+
+    /// Reads one query parameter, if it is a condition.
+    fn take(c: *Conditions, param: []const u8) core.transport.Error!bool {
+        const fields = [_]struct { []const u8, *?u64 }{
+            .{ "ifGenerationMatch=", &c.if_generation_match },
+            .{ "ifGenerationNotMatch=", &c.if_generation_not_match },
+            .{ "ifMetagenerationMatch=", &c.if_metageneration_match },
+            .{ "ifMetagenerationNotMatch=", &c.if_metageneration_not_match },
+        };
+        for (fields) |field| if (std.mem.startsWith(u8, param, field[0])) {
+            field[1].* = std.fmt.parseInt(u64, param[field[0].len..], 10) catch return error.HttpProtocolError;
+            return true;
+        };
+        return false;
+    }
+};
+
 fn freeStored(gpa: Allocator, o: *FakeMultipart.Stored) void {
     gpa.free(o.name);
     gpa.free(o.bytes);
@@ -629,6 +754,16 @@ const JsonTarget = struct {
     generation: ?u64,
     /// `alt=media`: the object's bytes rather than its metadata.
     media: bool = false,
+    conditions: Conditions = .{},
+};
+
+const MoveTarget = struct {
+    bucket: []const u8,
+    source: []const u8,
+    destination: []const u8,
+    if_source_generation_match: ?u64,
+    /// On the destination.
+    conditions: Conditions,
 };
 
 const XmlTarget = struct {
@@ -646,6 +781,7 @@ const XmlTarget = struct {
 const Target = union(enum) {
     json: JsonTarget,
     xml: XmlTarget,
+    move: MoveTarget,
 };
 
 /// What a URL names, decoded. Anything this fake does not serve is
@@ -661,21 +797,38 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
     if (std.mem.startsWith(u8, path, "/storage/v1/b/")) {
         const after = path["/storage/v1/b/".len..];
         const slash = std.mem.indexOf(u8, after, "/o/") orelse return error.HttpProtocolError;
+        const bucket = try decode(arena, after[0..slash]);
+        const object_part = after[slash + 3 ..];
         var generation: ?u64 = null;
+        var source_generation: ?u64 = null;
         var media = false;
+        var conditions: Conditions = .{};
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
+            if (try conditions.take(param)) continue;
             if (std.mem.startsWith(u8, param, "generation=")) {
                 generation = std.fmt.parseInt(u64, param["generation=".len..], 10) catch return error.HttpProtocolError;
+            } else if (std.mem.startsWith(u8, param, "ifSourceGenerationMatch=")) {
+                source_generation = std.fmt.parseInt(u64, param["ifSourceGenerationMatch=".len..], 10) catch return error.HttpProtocolError;
             } else if (std.mem.eql(u8, param, "alt=media")) {
                 media = true;
             }
         }
+        // A name is one strictly encoded segment, so a slash here is the
+        // move's.
+        if (std.mem.indexOf(u8, object_part, "/moveTo/o/")) |at| return .{ .move = .{
+            .bucket = bucket,
+            .source = try decode(arena, object_part[0..at]),
+            .destination = try decode(arena, object_part[at + "/moveTo/o/".len ..]),
+            .if_source_generation_match = source_generation,
+            .conditions = conditions,
+        } };
         return .{ .json = .{
-            .bucket = try decode(arena, after[0..slash]),
-            .name = try decode(arena, after[slash + 3 ..]),
+            .bucket = bucket,
+            .name = try decode(arena, object_part),
             .generation = generation,
             .media = media,
+            .conditions = conditions,
         } };
     }
 

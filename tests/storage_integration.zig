@@ -455,6 +455,23 @@ test "parallel downloads: ranges into memory and into a file, and a gzip-stored 
     try testing.expectEqual(core.crc32c.hash(text), whole.crc32c);
 }
 
+test "parallel uploads with conditions: the ordinary upload an emulator gets carries them" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const obj = f.bucket().object("once.txt");
+
+    var first = try obj.uploadParallel(.{ .data = "created once" }, .{ .preconditions = .does_not_exist });
+    first.deinit();
+    try testing.expectError(error.FailedPrecondition, obj.uploadParallel(.{ .data = "and never again" }, .{ .preconditions = .does_not_exist }));
+
+    var got = try obj.downloadAlloc(1024, .{});
+    defer got.deinit();
+    try testing.expectEqualStrings("created once", got.value.data);
+}
+
 /// A client with the smallest legal chunks, so a modest object forces many
 /// of them.
 fn smallChunkClient(f: *Fixture, diag: *storage.Diagnostics) !storage.Client {

@@ -16,8 +16,16 @@
 //! Cloud Storage has forgotten the upload, which reading the object back
 //! resolves.
 //!
-//! Against an emulator the object goes up as one ordinary upload instead:
-//! fake-gcs-server has no multipart uploads.
+//! The multipart upload takes no preconditions: a finish ignores them. So
+//! an upload with conditions reads the object under them first, which
+//! refuses a condition that already fails before a byte is sent; finishes
+//! under a temporary name; and has `objects.move` rename it into place
+//! only if the conditions still hold. The move is atomic, and pinned to
+//! the temporary object's generation, so a retry never moves twice.
+//!
+//! Against an emulator the object goes up as one ordinary upload instead,
+//! with the conditions applied to it: fake-gcs-server has no multipart
+//! uploads, and no `objects.move`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -49,6 +57,11 @@ const max_etag_len = 128;
 /// What each worker reads a file through.
 const file_buffer_len = 64 * 1024;
 
+/// Where an upload with conditions finishes before it moves into place:
+/// one prefix a lifecycle rule can clean, apart from any name a caller
+/// would choose.
+pub const temp_prefix = "zig-gcp-tmp/";
+
 /// Uploads `source` as `object`. The caller has begun the call and checked
 /// both names.
 pub fn upload(
@@ -67,7 +80,10 @@ pub fn upload(
     if (client.unauthenticated and !client.multipart_test.on_emulator) {
         return fallback(client, bucket, object, source, size, options);
     }
-    return multipart(client, bucket, object, source, size, options);
+    if (std.meta.eql(options.preconditions, types.Preconditions{})) {
+        return multipart(client, bucket, object, source, size, options);
+    }
+    return conditional(client, bucket, object, source, size, options);
 }
 
 /// Refuses what the XML API could not carry faithfully, and what Cloud
@@ -171,6 +187,7 @@ fn fallback(
         .metadata = options.metadata,
         .crc32c = options.crc32c,
         .size = size,
+        .preconditions = options.preconditions,
     };
     switch (source) {
         .data => |data| return target.upload(data, upload_options),
@@ -191,6 +208,32 @@ fn multipart(
     size: u64,
     options: types.ParallelUploadOptions,
 ) Error!types.Owned(types.ObjectInfo) {
+    const joined = try join(client, bucket, object, source, size, options);
+    if (joined.read) |read| return read;
+    return readBack(client, bucket, object, joined.generation, size, joined.whole);
+}
+
+/// What a finished multipart upload left.
+const Joined = struct {
+    /// The object's generation, when the finish's answer named one.
+    generation: ?u64,
+    /// The checksum of what was sent, when checking.
+    whole: ?u32,
+    /// The object read back, when a lost finish answer was resolved that
+    /// way. The caller owns it.
+    read: ?types.Owned(types.ObjectInfo) = null,
+};
+
+/// Sends every part and has Cloud Storage join them as `object`, checked
+/// end to end. Every failure before the join aborts the upload.
+fn join(
+    client: *Client,
+    bucket: []const u8,
+    object: []const u8,
+    source: types.ParallelSource,
+    size: u64,
+    options: types.ParallelUploadOptions,
+) Error!Joined {
     var arena_state: std.heap.ArenaAllocator = .init(client.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -236,15 +279,184 @@ fn multipart(
         return err;
     };
 
+    const checked: ?u32 = if (verify) whole else null;
     const finished = mp.finish(client, bucket, object, upload_id, parts, options.finish_timeout_ms) catch |err| {
         // A repeated finish after one that landed finds no upload.
-        if (mp.uploadIsGone(client, err)) return landedEarlier(client, bucket, object, size, if (verify) whole else null);
+        if (mp.uploadIsGone(client, err)) {
+            const read = try landedEarlier(client, bucket, object, size, checked);
+            return .{ .generation = read.value.generation, .whole = checked, .read = read };
+        }
         return run.giveUp(err);
     };
     if (verify) if (finished.crc32c) |stored| if (stored != whole) {
         return deleteMismatch(client, bucket, object, size, finished, whole);
     };
-    return readBack(client, bucket, object, finished.generation, size, if (verify) whole else null);
+    return .{ .generation = finished.generation, .whole = checked };
+}
+
+/// An upload with conditions: checked before a byte is sent, finished
+/// under a temporary name, and moved into place only if they still hold.
+fn conditional(
+    client: *Client,
+    bucket: []const u8,
+    object: []const u8,
+    source: types.ParallelSource,
+    size: u64,
+    options: types.ParallelUploadOptions,
+) Error!types.Owned(types.ObjectInfo) {
+    try checkEarly(client, bucket, object, options.preconditions);
+    var temp_buf: [temp_prefix.len + 32]u8 = undefined;
+    const temp = tempName(client.io, &temp_buf);
+    logging.debug("{s}: sent as {s}, to be moved into place under its conditions", .{ object, temp });
+    var joined = join(client, bucket, temp, source, size, options) catch |err| {
+        // A finish can land before its answer is lost and every retry
+        // fails, and then the temporary object is there after all.
+        return dropTemp(client, bucket, temp, null, err);
+    };
+    const generation = if (joined.read) |*read| g: {
+        defer read.deinit();
+        break :g read.value.generation;
+    } else joined.generation orelse g: {
+        var read = readBack(client, bucket, temp, null, size, joined.whole) catch |err|
+            return dropTemp(client, bucket, temp, null, err);
+        defer read.deinit();
+        break :g read.value.generation;
+    };
+    return move(client, bucket, temp, object, generation, size, joined.whole, options.preconditions);
+}
+
+/// Reads the object under the caller's conditions before a byte is sent,
+/// so an upload bound to be refused costs one request rather than the
+/// whole transfer. Any other answer goes ahead: the move decides.
+fn checkEarly(client: *Client, bucket: []const u8, object: []const u8, preconditions: types.Preconditions) Error!void {
+    const target: Object = .{ .client = client, .bucket = bucket, .name = object };
+    var info = target.get(.{ .preconditions = preconditions }) catch |err| switch (err) {
+        // A 412, or the 304 a failing `…NotMatch` condition gets on a read.
+        error.FailedPrecondition, error.NotModified => {
+            if (client.diagnostics) |d| d.print("the object's conditions already fail, so nothing was sent", .{});
+            return error.FailedPrecondition;
+        },
+        error.Canceled, error.OutOfMemory => |e| return e,
+        else => {
+            logging.debug("{s}: the early check answered {t}; the move decides", .{ object, err });
+            if (client.diagnostics) |d| d.clear();
+            return;
+        },
+    };
+    info.deinit();
+}
+
+/// `zig-gcp-tmp/` and 32 random hex digits: a name nothing else writes.
+fn tempName(io: std.Io, buf: *[temp_prefix.len + 32]u8) []const u8 {
+    var random: [16]u8 = undefined;
+    io.random(&random);
+    return std.fmt.bufPrint(buf, temp_prefix ++ "{x}", .{&random}) catch unreachable;
+}
+
+/// Renames the temporary object into place under the caller's conditions,
+/// pinned to its generation, and returns what the move made, held to the
+/// size and checksum sent.
+fn move(
+    client: *Client,
+    bucket: []const u8,
+    temp: []const u8,
+    object: []const u8,
+    generation: u64,
+    size: u64,
+    whole: ?u32,
+    preconditions: types.Preconditions,
+) Error!types.Owned(types.ObjectInfo) {
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const path = names.movePath(scratch.allocator(), bucket, temp, object, generation, preconditions) catch |err|
+        return dropTemp(client, bucket, temp, generation, err);
+    var result: types.Owned(types.ObjectInfo) = types.Owned(types.ObjectInfo).init(client.gpa) catch |err|
+        return dropTemp(client, bucket, temp, generation, err);
+    const body = rpc.execute(client, result.arena, .{ .method = .POST, .path = path }) catch |err| {
+        result.deinit();
+        return settle(client, bucket, temp, object, generation, size, whole, err);
+    };
+    errdefer result.deinit();
+    result.value = codec.decodeObject(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(client, err, "move");
+    if (result.value.size != size or (whole != null and result.value.crc32c != whole.?)) {
+        if (client.diagnostics) |d| d.print("the move answered an object of {d} bytes that is not the one sent", .{result.value.size});
+        return error.InvalidResponse;
+    }
+    return result;
+}
+
+/// A move that failed with 404 or 412 may have met its own earlier attempt,
+/// one that landed and lost its answer: the source gone, or the
+/// destination's condition failing against the object the move itself
+/// made. The temporary object says which. Every other failure deletes the
+/// temporary object again.
+fn settle(
+    client: *Client,
+    bucket: []const u8,
+    temp: []const u8,
+    object: []const u8,
+    generation: u64,
+    size: u64,
+    whole: ?u32,
+    err: Error,
+) Error!types.Owned(types.ObjectInfo) {
+    if (err != error.FailedPrecondition and err != error.NotFound) return dropTemp(client, bucket, temp, generation, err);
+    const saved: ?Diagnostics = if (client.diagnostics) |d| d.* else null;
+    const still_there = tempIsThere(client, bucket, temp, generation) catch |read_err|
+        return dropTemp(client, bucket, temp, generation, read_err);
+    if (still_there) {
+        // The move never happened: the conditions failed.
+        if (client.diagnostics) |d| {
+            d.* = saved.?;
+            if (err == error.FailedPrecondition) rpc.replace412(client, "the object's conditions failed at the move; the upload was undone, and nothing was written");
+        }
+        return dropTemp(client, bucket, temp, generation, err);
+    }
+    // The move happened. The object at the name must hold these bytes.
+    return readBack(client, bucket, object, null, size, whole) catch |read_err| switch (read_err) {
+        error.NotFound => {
+            if (client.diagnostics) |d| d.print("the temporary object is gone, and the object does not hold its bytes: it was replaced, or the temporary object was deleted", .{});
+            return error.UploadSessionLost;
+        },
+        else => |e| return e,
+    };
+}
+
+/// Whether the temporary object is still there at `generation`.
+fn tempIsThere(client: *Client, bucket: []const u8, temp: []const u8, generation: u64) Error!bool {
+    const target: Object = .{ .client = client, .bucket = bucket, .name = temp };
+    var info = target.get(.{ .generation = generation }) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => |e| return e,
+    };
+    info.deinit();
+    return true;
+}
+
+/// Deletes the temporary object, when the upload got as far as making one,
+/// and returns `err` with its own diagnostics. Pinned to `generation`, or
+/// to whatever generation the name holds when that is unknown, since
+/// nothing else writes there. A cancel was delivered once already, so this
+/// runs protected from another.
+fn dropTemp(client: *Client, bucket: []const u8, temp: []const u8, generation: ?u64, err: Error) Error {
+    const saved: ?Diagnostics = if (client.diagnostics) |d| d.* else null;
+    defer if (client.diagnostics) |d| {
+        d.* = saved.?;
+    };
+    const protection = client.io.swapCancelProtection(.blocked);
+    defer _ = client.io.swapCancelProtection(protection);
+    const target: Object = .{ .client = client, .bucket = bucket, .name = temp };
+    const pinned = generation orelse found: {
+        var info = target.get(.{}) catch break :found null;
+        defer info.deinit();
+        break :found info.value.generation;
+    } orelse return err;
+    target.delete(.{ .generation = pinned }) catch |delete_err| switch (delete_err) {
+        error.NotFound => {},
+        else => logging.warn("deleting the temporary object {s} failed with {t}: delete it by hand, or let a lifecycle rule", .{ temp, delete_err }),
+    };
+    return err;
 }
 
 /// What one part left behind for the finish.
@@ -382,16 +594,16 @@ const Worker = struct {
         w.client.deinit();
     }
 
-    /// Sends parts until there are none left or one has failed. Returns
-    /// only `Canceled`: every other failure goes to the run, never lost.
+    /// Sends parts until there are none left or one has failed. Every
+    /// failure goes to the run, a cancel included: a group swallows the
+    /// `Canceled` its task returns, and a run that recorded nothing would
+    /// go on to finish an upload missing parts.
     fn main(w: *Worker, run: *Run) error{Canceled}!void {
         while (run.take()) |index| {
-            w.send(run, index) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => {
-                    run.fail(err, &w.diag);
-                    return;
-                },
+            w.send(run, index) catch |err| {
+                run.fail(err, &w.diag);
+                if (err == error.Canceled) return error.Canceled;
+                return;
             };
         }
     }
@@ -657,11 +869,13 @@ test "uploadParallel: the parts in order, checked, joined, and read back" {
     try testing.expectEqual(2, stored.metadata.len);
     try testing.expectEqualStrings("origin", stored.metadata[0].name);
     try testing.expectEqualStrings("zig", stored.metadata[0].value);
-    // Seven parts, one start, one finish, one read back, nothing left open.
+    // Seven parts, one start, one finish, one read back, nothing left open,
+    // and with no conditions, no move.
     try testing.expectEqual(7, s.fake.counts.parts);
     try testing.expectEqual(1, s.fake.counts.starts);
     try testing.expectEqual(1, s.fake.counts.finishes);
     try testing.expectEqual(1, s.fake.counts.reads);
+    try testing.expectEqual(0, s.fake.counts.moves);
     try testing.expectEqual(0, s.fake.openUploads());
 }
 
@@ -870,6 +1084,28 @@ test "uploadParallel: a cancel stops the workers, aborts, and returns Canceled" 
     try testing.expectEqual(null, s.fake.object("o"));
 }
 
+test "uploadParallel: the abort runs to its end under a cancel still pending" {
+    // Every sleep not protected from cancellation reports it: a part's
+    // retry meets it, and the abort, retried after a 503 of its own, must
+    // not, or its parts would stay behind to be billed.
+    var clock: test_util.FakeClock = .{ .cancel_sleep = true };
+    var rules = [_]Script.Rule{
+        .{ .kind = .part, .part = 1, .fault = .unavailable, .times = 99 },
+        .{ .kind = .abort, .fault = .unavailable },
+    };
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(clock.io(), .{ .max_attempts = 3 });
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 32);
+    try testing.expectError(error.Canceled, s.object("o").uploadParallel(.{ .data = &data }, .{ .part_size = 4096 }));
+    try testing.expectEqual(0, rules[1].times);
+    try testing.expectEqual(1, s.fake.counts.aborts);
+    try testing.expectEqual(0, s.fake.openUploads());
+}
+
 test "check: what a parallel upload refuses, before anything is sent" {
     var s: Setup = undefined;
     try s.init(testing.io, .{});
@@ -950,6 +1186,11 @@ fn parallelEverything(gpa: Allocator) !void {
         .metadata = &.{.{ .key = "k", .value = "v" }},
     });
     info.deinit();
+    var created = try client.bucket("b").object("c").uploadParallel(.{ .data = &data }, .{
+        .part_size = 1024,
+        .preconditions = .does_not_exist,
+    });
+    created.deinit();
 }
 
 test "uploadParallel: every allocation failure is OutOfMemory, and nothing leaks" {
@@ -959,11 +1200,16 @@ test "uploadParallel: every allocation failure is OutOfMemory, and nothing leaks
 /// Draws each request's fate from fuzz bytes, under the fake's lock:
 /// mostly nothing, sometimes a fault that kind of request can meet. The
 /// cleanup requests, abort and delete, always go through; their failures
-/// are tested on their own.
+/// are tested on their own. With `clean_reads`, so do metadata reads,
+/// which is how an upload with conditions finds a temporary object to
+/// delete.
 const Chooser = struct {
     bytes: []const u8,
     pos: usize = 0,
     faulted: bool = false,
+    /// Another writer's object appeared before a move.
+    clobbered: bool = false,
+    clean_reads: bool = false,
 
     fn plan(self: *Chooser) FakeMultipart.FaultPlan {
         return .{ .ctx = self, .decide = decide };
@@ -973,6 +1219,7 @@ const Chooser = struct {
         _ = part;
         const self: *Chooser = @ptrCast(@alignCast(ctx.?));
         if (kind == .abort or kind == .delete or self.pos >= self.bytes.len) return .none;
+        if (kind == .read and self.clean_reads) return .none;
         const b = self.bytes[self.pos];
         self.pos += 1;
         const fault: FakeMultipart.Fault = switch (b) {
@@ -982,9 +1229,10 @@ const Chooser = struct {
             230...239 => .lose_answer,
             240...245 => if (kind == .part or kind == .finish) .corrupt else .none,
             246...249 => if (kind == .part or kind == .finish) .gone else .none,
-            else => if (kind == .finish) .error_200 else .none,
+            else => if (kind == .finish) .error_200 else if (kind == .move) .clobber else .none,
         };
         if (fault != .none) self.faulted = true;
+        if (fault == .clobber) self.clobbered = true;
         return fault;
     }
 };
@@ -1312,6 +1560,467 @@ test "uploadParallel: a finish found gone, with another writer's object in its p
     // Read, never touched.
     try testing.expectEqualStrings("another writer's bytes", s.fake.object("o").?.bytes);
     try testing.expectEqual(0, s.fake.counts.deletes);
+}
+
+/// No temporary object left anywhere in the fake.
+fn expectNoTemp(fake: *const FakeMultipart) !void {
+    for (fake.objects.items) |o| {
+        errdefer std.debug.print("left behind: {s}\n", .{o.name});
+        try testing.expect(!std.mem.startsWith(u8, o.name, temp_prefix));
+    }
+}
+
+test "uploadParallel with conditions: checked, sent under a temporary name, and moved into place" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    var data: [20 * 1024 + 3]u8 = undefined;
+    fill(&data, 20);
+    var info = try s.object("dir/o").uploadParallel(.{ .data = &data }, .{
+        .content_type = "application/x-test",
+        .metadata = &.{.{ .key = "origin", .value = "zig" }},
+        .part_size = 4096,
+        .concurrency = 3,
+        .preconditions = .does_not_exist,
+    });
+    defer info.deinit();
+    try testing.expectEqualStrings("dir/o", info.value.name);
+    try testing.expectEqual(data.len, info.value.size);
+    try testing.expectEqual(core.crc32c.hash(&data), info.value.crc32c.?);
+    try testing.expectEqual(1, info.value.metageneration);
+    const stored = s.fake.object("dir/o").?;
+    try testing.expectEqualSlices(u8, &data, stored.bytes);
+    try testing.expectEqual(info.value.generation, stored.generation);
+    try testing.expectEqualStrings("application/x-test", stored.content_type);
+    try testing.expectEqualStrings("zig", stored.metadata[0].value);
+    try expectNoTemp(&s.fake);
+    // The early check, the upload under the temporary name, and the move,
+    // whose answer is the object: no read back.
+    try testing.expectEqual(1, s.fake.counts.reads);
+    try testing.expectEqual(1, s.fake.counts.starts);
+    try testing.expectEqual(6, s.fake.counts.parts);
+    try testing.expectEqual(1, s.fake.counts.finishes);
+    try testing.expectEqual(1, s.fake.counts.moves);
+    try testing.expectEqual(0, s.fake.counts.deletes);
+    try testing.expectEqual(0, s.fake.openUploads());
+
+    // Replacing that very generation, and only it.
+    var replaced = try s.object("dir/o").uploadParallel(.{ .data = "a newer, much shorter object" }, .{
+        .part_size = 4096,
+        .preconditions = .{ .if_generation_match = info.value.generation },
+    });
+    defer replaced.deinit();
+    try testing.expectEqualStrings("a newer, much shorter object", s.fake.object("dir/o").?.bytes);
+    try expectNoTemp(&s.fake);
+}
+
+test "uploadParallel with conditions: one that already fails refuses the upload before a byte is sent" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    try s.fake.put("o", "already here");
+    const generation = s.fake.object("o").?.generation;
+    var data: [9000]u8 = undefined;
+    fill(&data, 21);
+    const refusals = [_]types.Preconditions{
+        .does_not_exist,
+        .{ .if_generation_match = generation + 1 },
+        .{ .if_metageneration_match = 2 },
+        // A read answers a failing `…NotMatch` condition with 304.
+        .{ .if_generation_not_match = generation },
+        .{ .if_metageneration_not_match = 1 },
+    };
+    for (refusals) |conditions| {
+        try testing.expectError(error.FailedPrecondition, s.object("o").uploadParallel(.{ .data = &data }, .{
+            .part_size = 4096,
+            .preconditions = conditions,
+        }));
+        try testing.expect(std.mem.indexOf(u8, s.diag.message(), "already fail, so nothing was sent") != null);
+    }
+    try testing.expectEqual(refusals.len, s.fake.counts.reads);
+    try testing.expectEqual(0, s.fake.counts.starts);
+    try testing.expectEqualStrings("already here", s.fake.object("o").?.bytes);
+}
+
+test "uploadParallel with conditions: an object that appears before the move is kept, and the temporary object goes" {
+    var rules = [_]Script.Rule{.{ .kind = .move, .fault = .clobber }};
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 22);
+    try testing.expectError(error.FailedPrecondition, s.object("o").uploadParallel(.{ .data = &data }, .{
+        .part_size = 4096,
+        .preconditions = .does_not_exist,
+    }));
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "failed at the move; the upload was undone") != null);
+    try testing.expectEqualStrings("another writer's bytes", s.fake.object("o").?.bytes);
+    try expectNoTemp(&s.fake);
+    // The refused move, then a read of the temporary object, still there,
+    // then its deletion.
+    try testing.expectEqual(1, s.fake.counts.moves);
+    try testing.expectEqual(2, s.fake.counts.reads);
+    try testing.expectEqual(1, s.fake.counts.deletes);
+}
+
+test "uploadParallel with conditions: a move whose answer was lost is found by reading, whichever condition its repeat meets" {
+    for ([_]bool{ false, true }) |destination_first| {
+        var rules = [_]Script.Rule{.{ .kind = .move, .fault = .lose_answer }};
+        var script: Script = .{ .rules = &rules };
+        var s: Setup = undefined;
+        try s.init(testing.io, .{});
+        defer s.deinit();
+        s.fake.faults = script.plan();
+        // Its repeat finds the source gone, a 404, or the destination
+        // taken by the object it made itself, a 412.
+        s.fake.move_checks_destination_first = destination_first;
+        var data: [9000]u8 = undefined;
+        fill(&data, 23);
+        var info = try s.object("o").uploadParallel(.{ .data = &data }, .{
+            .part_size = 4096,
+            .preconditions = .does_not_exist,
+        });
+        defer info.deinit();
+        try testing.expectEqualSlices(u8, &data, s.fake.object("o").?.bytes);
+        try testing.expectEqual(core.crc32c.hash(&data), info.value.crc32c.?);
+        try testing.expectEqual(2, s.fake.counts.moves);
+        try testing.expectEqual(0, s.fake.counts.deletes);
+        try expectNoTemp(&s.fake);
+    }
+}
+
+test "uploadParallel with conditions: a lost move answer with another writer's object in its place is UploadSessionLost" {
+    // The move lands and its answer is lost; before the repeat, another
+    // writer replaces the object. The temporary object is gone, and the
+    // object is not this upload's.
+    var rules = [_]Script.Rule{
+        .{ .kind = .move, .fault = .lose_answer },
+        .{ .kind = .move, .fault = .clobber },
+    };
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 24);
+    try testing.expectError(error.UploadSessionLost, s.object("o").uploadParallel(.{ .data = &data }, .{
+        .part_size = 4096,
+        .preconditions = .does_not_exist,
+    }));
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "the object does not hold its bytes") != null);
+    try testing.expectEqualStrings("another writer's bytes", s.fake.object("o").?.bytes);
+    try expectNoTemp(&s.fake);
+}
+
+test "uploadParallel with conditions: a finish whose answer was lost is found by reading back, then moved" {
+    var rules = [_]Script.Rule{.{ .kind = .finish, .fault = .lose_answer }};
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 28);
+    var info = try s.object("o").uploadParallel(.{ .data = &data }, .{ .part_size = 4096, .preconditions = .does_not_exist });
+    defer info.deinit();
+    try testing.expectEqualSlices(u8, &data, s.fake.object("o").?.bytes);
+    // The early check, then the temporary object read back, which named
+    // the generation the move pins.
+    try testing.expectEqual(2, s.fake.counts.finishes);
+    try testing.expectEqual(2, s.fake.counts.reads);
+    try testing.expectEqual(1, s.fake.counts.moves);
+    try expectNoTemp(&s.fake);
+}
+
+test "uploadParallel with conditions: a move that answers with another object is InvalidResponse" {
+    var rules = [_]Script.Rule{.{ .kind = .move, .fault = .corrupt }};
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 29);
+    try testing.expectError(error.InvalidResponse, s.object("o").uploadParallel(.{ .data = &data }, .{
+        .part_size = 4096,
+        .preconditions = .does_not_exist,
+    }));
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "is not the one sent") != null);
+}
+
+test "uploadParallel: a worker that meets Canceled stops the upload, which aborts and returns Canceled" {
+    // No cancel reached the task, so the group returns normally: only the
+    // failure the worker recorded says the upload did not finish.
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 2, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [20 * 1024]u8 = undefined;
+    fill(&data, 30);
+    try testing.expectError(error.Canceled, s.object("o").uploadParallel(.{ .data = &data }, .{ .part_size = 4096, .concurrency = 2 }));
+    try testing.expectEqual(0, s.fake.counts.finishes);
+    try testing.expectEqual(1, s.fake.counts.aborts);
+    try testing.expectEqual(0, s.fake.openUploads());
+    try testing.expectEqual(null, s.fake.object("o"));
+}
+
+test "uploadParallel with conditions: a lost move answer and a same-sized object in its place is told apart by its checksum" {
+    // As above, with this upload exactly as long as the other writer's
+    // bytes: only the checksum says the object is not this upload's.
+    var rules = [_]Script.Rule{
+        .{ .kind = .move, .fault = .lose_answer },
+        .{ .kind = .move, .fault = .clobber },
+    };
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    const data = "this upload's 22 bytes";
+    try testing.expectEqual("another writer's bytes".len, data.len);
+    try testing.expectError(error.UploadSessionLost, s.object("o").uploadParallel(.{ .data = data }, .{
+        .part_size = 4096,
+        .preconditions = .does_not_exist,
+    }));
+    try testing.expectEqualStrings("another writer's bytes", s.fake.object("o").?.bytes);
+}
+
+test "uploadParallel with conditions: the cleanup runs to its end under a cancel still pending" {
+    // Every sleep not protected from cancellation reports it: the move's
+    // retry meets it, and the cleanup's delete, retried after a 503 of its
+    // own, must not.
+    var clock: test_util.FakeClock = .{ .cancel_sleep = true };
+    var rules = [_]Script.Rule{
+        .{ .kind = .move, .fault = .unavailable, .times = 99 },
+        .{ .kind = .delete, .fault = .unavailable },
+    };
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(clock.io(), .{ .max_attempts = 3 });
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 31);
+    try testing.expectError(error.Canceled, s.object("o").uploadParallel(.{ .data = &data }, .{
+        .part_size = 4096,
+        .preconditions = .does_not_exist,
+    }));
+    // The delete met its 503, slept, and was answered on its retry.
+    try testing.expectEqual(0, rules[1].times);
+    try testing.expectEqual(1, s.fake.counts.deletes);
+    try expectNoTemp(&s.fake);
+    try testing.expectEqual(null, s.fake.object("o"));
+}
+
+test "uploadParallel with conditions: a move that fails any other way deletes the temporary object" {
+    var rules = [_]Script.Rule{.{ .kind = .move, .fault = .unavailable, .times = 99 }};
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{ .max_attempts = 2 });
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 25);
+    try testing.expectError(error.Unavailable, s.object("o").uploadParallel(.{ .data = &data }, .{
+        .part_size = 4096,
+        .preconditions = .does_not_exist,
+    }));
+    // The move's own diagnostics, not the cleanup's.
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "try again") != null);
+    try testing.expectEqual(null, s.fake.object("o"));
+    try expectNoTemp(&s.fake);
+    try testing.expectEqual(1, s.fake.counts.deletes);
+}
+
+test "uploadParallel with conditions: a finish that landed before the upload failed leaves no temporary object" {
+    // The finish lands and its answer is lost; every repeat meets a 503.
+    var rules = [_]Script.Rule{
+        .{ .kind = .finish, .fault = .lose_answer },
+        .{ .kind = .finish, .fault = .unavailable, .times = 99 },
+    };
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{ .max_attempts = 2 });
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 26);
+    try testing.expectError(error.Unavailable, s.object("o").uploadParallel(.{ .data = &data }, .{
+        .part_size = 4096,
+        .preconditions = .does_not_exist,
+    }));
+    try testing.expectEqual(null, s.fake.object("o"));
+    try expectNoTemp(&s.fake);
+    try testing.expectEqual(0, s.fake.counts.moves);
+    try testing.expectEqual(1, s.fake.counts.deletes);
+    try testing.expectEqual(0, s.fake.openUploads());
+}
+
+test "uploadParallel with conditions: a cancel at the move deletes the temporary object" {
+    var rules = [_]Script.Rule{.{ .kind = .move, .fault = .wait }};
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 27);
+
+    const Running = struct {
+        fn go(target: Object, bytes: []const u8) Error!void {
+            var info = try target.uploadParallel(.{ .data = bytes }, .{ .part_size = 4096, .preconditions = .does_not_exist });
+            info.deinit();
+        }
+    };
+    var task = try testing.io.concurrent(Running.go, .{ s.object("o"), &data });
+    // The move waits at the gate once the finish is in.
+    const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(10));
+    while (true) {
+        s.fake.mutex.lockUncancelable(testing.io);
+        const finished = s.fake.counts.finishes;
+        s.fake.mutex.unlock(testing.io);
+        if (finished >= 1) break;
+        if (std.Io.Clock.awake.now(testing.io).nanoseconds > deadline.nanoseconds) @panic("the upload never finished its parts");
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.io.sleep(.fromMilliseconds(20), .awake);
+    try testing.expectError(error.Canceled, task.cancel(testing.io));
+    try testing.expectEqual(null, s.fake.object("o"));
+    try expectNoTemp(&s.fake);
+}
+
+test "uploadParallel with conditions: an emulator gets one ordinary upload carrying them" {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        .{ .respond = .{ .body = "{\"name\":\"o\",\"bucket\":\"b\",\"size\":\"5\",\"generation\":\"1\",\"crc32c\":\"mnG7TA==\"}" } },
+    });
+    defer fake.deinit();
+    var client: Client = try .init(testing.allocator, testing.io, .{
+        .endpoint = .{ .url = "http://127.0.0.1:4443", .emulator = true },
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .data = "hello" }, .{ .preconditions = .does_not_exist });
+    defer info.deinit();
+    const sent = try fake.streamRequest(0);
+    try testing.expect(std.mem.indexOf(u8, sent.url, "uploadType=multipart") != null);
+    try testing.expect(std.mem.indexOf(u8, sent.url, "ifGenerationMatch=0") != null);
+    try testing.expectEqual(1, fake.stream_requests.items.len);
+    try testing.expectEqual(0, fake.requests.items.len);
+}
+
+test "tempName: the prefix and 32 hex digits, different every time" {
+    var a_buf: [temp_prefix.len + 32]u8 = undefined;
+    var b_buf: [temp_prefix.len + 32]u8 = undefined;
+    const a = tempName(testing.io, &a_buf);
+    const b = tempName(testing.io, &b_buf);
+    try testing.expectEqual(temp_prefix.len + 32, a.len);
+    try testing.expect(std.mem.startsWith(u8, a, temp_prefix));
+    for (a[temp_prefix.len..]) |c| try testing.expect(std.ascii.isDigit(c) or (c >= 'a' and c <= 'f'));
+    try testing.expect(!std.mem.eql(u8, a, b));
+}
+
+/// One upload with conditions under a drawn fault schedule, held to what
+/// must hold whatever the faults: nothing is ever left under the temporary
+/// prefix, and no part in an open upload; a success stored this upload's
+/// bytes; conditions that cannot hold always fail, before a byte is sent
+/// when the object is there to refuse them, and never touch it; and a run
+/// whose conditions hold and that met no fault never fails.
+fn runConditionalUnderFaults(io: std.Io, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    const size = g.intRange(usize, 0, 24 * 1024);
+    const part_size = g.intRange(u64, 1024, 8 * 1024);
+    const concurrency = g.intRange(u16, 1, 4);
+    const verify = g.intRange(u8, 0, 7) != 0;
+    const existing = g.boolean();
+    const which = g.intRange(u8, 0, 4);
+    const destination_first = g.boolean();
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    fill(data, g.int(u64));
+
+    var s: Setup = undefined;
+    try s.init(io, .{ .verify_checksums = verify });
+    defer s.deinit();
+    s.fake.move_checks_destination_first = destination_first;
+    if (existing) try s.fake.put("o", "an older object");
+    const old_generation: u64 = if (existing) s.fake.object("o").?.generation else 7;
+    const conditions: types.Preconditions, const holds: bool = switch (which) {
+        0 => .{ .does_not_exist, !existing },
+        1 => .{ .{ .if_generation_match = old_generation }, existing },
+        2 => .{ .{ .if_generation_not_match = old_generation + 1 }, existing },
+        3 => .{ .{ .if_metageneration_match = 1 }, existing },
+        else => .{ .{ .if_generation_match = old_generation + 1 }, false },
+    };
+    var chooser: Chooser = .{ .bytes = g.rest(), .clean_reads = true };
+    s.fake.faults = chooser.plan();
+
+    const outcome = s.object("o").uploadParallel(.{ .data = data }, .{
+        .part_size = part_size,
+        .concurrency = concurrency,
+        .preconditions = conditions,
+    });
+    try expectNoTemp(&s.fake);
+    try testing.expectEqual(0, s.fake.openParts());
+    if (outcome) |info_const| {
+        var info = info_const;
+        defer info.deinit();
+        // Another writer's object can make conditions hold that did not:
+        // "not generation 8", say, where there was no object at all.
+        try testing.expect(holds or chooser.clobbered);
+        try testing.expectEqual(size, info.value.size);
+        if (verify) try testing.expectEqualSlices(u8, data, s.fake.object("o").?.bytes);
+    } else |err| {
+        errdefer std.debug.print("{t}: {s}\n", .{ err, s.diag.message() });
+        try testing.expect(chooser.faulted or !holds);
+        if (!holds and !chooser.clobbered) {
+            if (!chooser.faulted) {
+                try testing.expectEqual(error.FailedPrecondition, err);
+                // Refused early when the object is there to refuse them.
+                if (existing) try testing.expectEqual(0, s.fake.counts.starts);
+            }
+            // Never replaced, whatever failed first.
+            if (existing) {
+                try testing.expectEqualStrings("an older object", s.fake.object("o").?.bytes);
+                try testing.expectEqual(old_generation, s.fake.object("o").?.generation);
+            } else try testing.expectEqual(null, s.fake.object("o"));
+        }
+    }
+}
+
+fn conditionalFaultProperty(_: void, input: []const u8) !void {
+    var clock: test_util.FakeClock = .{};
+    try runConditionalUnderFaults(clock.io(), input);
+}
+
+test "fault property parallel conditional: nothing left under the temporary prefix, and nothing replaced against its conditions" {
+    try test_util.fuzzBytes({}, conditionalFaultProperty, .{
+        .random_runs = 300,
+        .max_len = 256,
+        .corpus = &.{
+            "",
+            // 24 KiB, create-only, no faults.
+            "\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x00\x00",
+            // A lost move answer, then another writer's object.
+            "\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xe6\xff",
+        },
+    });
+}
+
+test "uploadParallel with conditions: the same invariants on real threads, under a hundred fault schedules" {
+    var prng: std.Random.DefaultPrng = .init(20260925);
+    var input: [192]u8 = undefined;
+    for (0..100) |_| {
+        prng.random().bytes(&input);
+        runConditionalUnderFaults(testing.io, &input) catch |err| {
+            std.debug.print("input: {x}\n", .{&input});
+            return err;
+        };
+    }
 }
 
 test "Run: parts are handed out once each, and none after a failure; the first failure is kept" {

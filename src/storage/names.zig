@@ -146,6 +146,42 @@ fn writeRewrite(
     try params.addOptional("rewriteToken", rewrite.rewrite_token);
 }
 
+/// `/storage/v1/b/{bucket}/o/{source}/moveTo/o/{destination}`: an atomic
+/// rename within one bucket, pinned to the source's generation, under the
+/// conditions on the destination.
+pub fn movePath(
+    arena: Allocator,
+    bucket: []const u8,
+    source: []const u8,
+    destination: []const u8,
+    source_generation: u64,
+    preconditions: types.Preconditions,
+) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeMove(&out.writer, bucket, source, destination, source_generation, preconditions) catch
+        return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeMove(
+    w: *Writer,
+    bucket: []const u8,
+    source: []const u8,
+    destination: []const u8,
+    source_generation: u64,
+    preconditions: types.Preconditions,
+) Writer.Error!void {
+    try w.writeAll("/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/o/");
+    try query.writeStrictSegment(w, source);
+    try w.writeAll("/moveTo/o/");
+    try query.writeStrictSegment(w, destination);
+    var params: query.Params = .init(w);
+    try params.addInt("ifSourceGenerationMatch", source_generation);
+    try writePreconditions(&params, preconditions);
+}
+
 /// `/upload/storage/v1/b/{bucket}/o?uploadType=multipart`. The object name
 /// travels in the metadata part, not here.
 pub fn uploadMultipartPath(arena: Allocator, bucket: []const u8, preconditions: types.Preconditions) Allocator.Error![]u8 {
@@ -376,6 +412,26 @@ test "XML API paths keep the name's slashes and encode the rest" {
     );
     try expectPath("/b/x?uploadId=id", try xmlPath(gpa, "b", "x", .{ .upload = "id" }));
     try expectPath("/b///?partNumber=10000&uploadId=u", try xmlPath(gpa, "b", "//", .{ .part = .{ .number = 10000, .upload_id = "u" } }));
+}
+
+test "move paths name both objects, pin the source, and carry the destination's conditions" {
+    const gpa = testing.allocator;
+    try expectPath(
+        "/storage/v1/b/my-bucket/o/zig-gcp-tmp%2F0a1b/moveTo/o/backups%2Fdb.tar?ifSourceGenerationMatch=17",
+        try movePath(gpa, "my-bucket", "zig-gcp-tmp/0a1b", "backups/db.tar", 17, .{}),
+    );
+    try expectPath(
+        "/storage/v1/b/b/o/t/moveTo/o/a%20b?ifSourceGenerationMatch=1&ifGenerationMatch=0",
+        try movePath(gpa, "b", "t", "a b", 1, .does_not_exist),
+    );
+    try expectPath(
+        "/storage/v1/b/b/o/t/moveTo/o/d?ifSourceGenerationMatch=2&ifGenerationNotMatch=3&ifMetagenerationMatch=4&ifMetagenerationNotMatch=5",
+        try movePath(gpa, "b", "t", "d", 2, .{
+            .if_generation_not_match = 3,
+            .if_metageneration_match = 4,
+            .if_metageneration_not_match = 5,
+        }),
+    );
 }
 
 test "rewrite paths name both objects and carry the loop's state" {

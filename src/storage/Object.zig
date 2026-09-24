@@ -293,12 +293,22 @@ pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOpt
 /// behind to be billed; a process that dies mid-upload leaves its parts
 /// until the bucket's `AbortIncompleteMultipartUpload` lifecycle rule runs.
 ///
-/// Takes no preconditions, since the multipart upload has none: like an
-/// unconditional upload, it replaces whatever has the name. Retries never
-/// write twice, so it retries as a resumable upload does, always. The
-/// result is read back with one metadata request, which needs
-/// `storage.objects.get`. Against an emulator, which has no multipart
-/// uploads, the object goes up as one ordinary upload.
+/// Without `options.preconditions` it replaces whatever has the name, as
+/// the multipart upload always does, and the result is read back with one
+/// metadata request, which needs `storage.objects.get`. With them, the
+/// object is read under them first, so a condition that already fails
+/// refuses the upload before a byte is sent; the upload finishes under a
+/// temporary name, `zig-gcp-tmp/` and random hex digits; and
+/// `objects.move` renames it into place only if the conditions still
+/// hold, which answers with the result. A refused move, or any failure
+/// after the finish, deletes the temporary object again; a process that
+/// dies in between leaves it for a lifecycle rule on the prefix. The move
+/// needs `storage.objects.move`, which Storage Object User grants and
+/// Storage Object Creator does not.
+///
+/// Retries never write twice, so it retries as a resumable upload does,
+/// always. Against an emulator, which has no multipart uploads, the object
+/// goes up as one ordinary upload, with the conditions applied to it.
 pub fn uploadParallel(self: Object, source: types.ParallelSource, options: types.ParallelUploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
