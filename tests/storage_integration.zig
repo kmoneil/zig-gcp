@@ -402,6 +402,59 @@ test "a range on an empty object is zero bytes, not an error" {
     try testing.expectEqual(0, result.bytes_written);
 }
 
+test "parallel downloads: ranges into memory and into a file, and a gzip-stored object whole" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    // Four ranges at the 1 MiB floor, the last one short.
+    const data = try testing.allocator.alloc(u8, 3 * 1024 * 1024 + 17);
+    defer testing.allocator.free(data);
+    var prng: std.Random.DefaultPrng = .init(20260924);
+    prng.random().bytes(data);
+    var uploaded = try f.bucket().object("dir/big.bin").upload(data, .{});
+    uploaded.deinit();
+    const obj = f.bucket().object("dir/big.bin");
+
+    const out = try testing.allocator.alloc(u8, data.len);
+    defer testing.allocator.free(out);
+    const into_memory = try obj.downloadParallel(.{ .buffer = out }, .{ .part_size = 1024 * 1024, .concurrency = 3 });
+    try testing.expectEqualSlices(u8, data, out);
+    try testing.expectEqual(data.len, into_memory.bytes_written);
+    // The emulator names the whole object's checksum on every range. Each
+    // range is hashed as it arrives instead, and the hashes combined.
+    try testing.expect(into_memory.checksum_verified);
+    try testing.expectEqual(core.crc32c.hash(data), into_memory.crc32c);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "big.bin", .data = "an older, shorter file" });
+    const file = try tmp.dir.openFile(testing.io, "big.bin", .{ .mode = .read_write });
+    defer file.close(testing.io);
+    const into_file = try obj.downloadParallel(.{ .file = file }, .{
+        .part_size = 1024 * 1024,
+        .concurrency = 4,
+        .generation = into_memory.generation,
+    });
+    try testing.expect(into_file.checksum_verified);
+    const got = try tmp.dir.readFileAlloc(testing.io, "big.bin", testing.allocator, .unlimited);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, data, got);
+
+    // Stored gzip-compressed, served decompressed, and a range ignored while
+    // it is: fetched whole in one request.
+    const text = "parallel downloads fetch a gzip-stored object whole\n" ** 20;
+    const gzipped = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\x48\x2c\x4a\xcc\xc9\x49\xcd\x51\x48\xc9\x2f\xcf\xcb\xc9\x4f\x4c\x29\x56\x48\x4b\x2d\x49\xce\x50\x48\x54\x48\xaf\xca\x2c\xd0\x2d\x2e\xc9\x2f\x4a\x4d\x51\xc8\x4f\xca\x4a\x4d\x2e\x51\x28\xcf\xc8\xcf\x49\xe5\x2a\x18\xd5\x33\xaa\x67\x54\xcf\xb0\xd4\x03\x00\xf0\x9e\x3c\x07\x10\x04\x00\x00";
+    var stored = try f.bucket().object("page.txt").upload(gzipped, .{ .content_type = "text/plain", .content_encoding = "gzip" });
+    stored.deinit();
+    var page: [2048]u8 = undefined;
+    const whole = try f.bucket().object("page.txt").downloadParallel(.{ .buffer = &page }, .{ .part_size = 1024 * 1024 });
+    try testing.expectEqualStrings(text, page[0..whole.bytes_written]);
+    try testing.expect(!whole.checksum_verified);
+    try testing.expectEqual(core.crc32c.hash(text), whole.crc32c);
+}
+
 /// A client with the smallest legal chunks, so a modest object forces many
 /// of them.
 fn smallChunkClient(f: *Fixture, diag: *storage.Diagnostics) !storage.Client {

@@ -49,10 +49,11 @@ transport: Transport,
 http: ?*HttpTransport,
 /// Owned copy of `Options.user_agent`.
 user_agent: []const u8,
-/// Tests only: lowers the multipart upload's 5 MiB part floor, and lets an
-/// emulator endpoint take the multipart path instead of the ordinary
-/// upload `uploadParallel` falls back to there, so a test can send a few
-/// KiB in dozens of parts to a fake that speaks the XML API.
+/// Tests only: lowers the multipart upload's 5 MiB part floor and a
+/// parallel download's 1 MiB range floor, and lets an emulator endpoint
+/// take the multipart path instead of the ordinary upload `uploadParallel`
+/// falls back to there, so a test can send a few KiB in dozens of parts to
+/// a fake that speaks the XML API, and read them back in dozens of ranges.
 multipart_test: MultipartTest = .{},
 
 pub const MultipartTest = struct {

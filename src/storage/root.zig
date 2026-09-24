@@ -46,6 +46,8 @@ pub const Range = @import("types.zig").Range;
 pub const UploadOptions = @import("types.zig").UploadOptions;
 pub const ParallelSource = @import("types.zig").ParallelSource;
 pub const ParallelUploadOptions = @import("types.zig").ParallelUploadOptions;
+pub const ParallelDestination = @import("types.zig").ParallelDestination;
+pub const ParallelDownloadOptions = @import("types.zig").ParallelDownloadOptions;
 pub const MetadataUpdate = @import("types.zig").MetadataUpdate;
 pub const MetadataEdit = @import("types.zig").MetadataEdit;
 pub const MetadataChange = @import("types.zig").MetadataChange;
@@ -95,6 +97,7 @@ test {
     _ = @import("metadata.zig");
     _ = @import("names.zig");
     _ = @import("parallel.zig");
+    _ = @import("parallel_download.zig");
     _ = @import("post_policy.zig");
     _ = @import("resumable.zig");
     _ = @import("rpc.zig");

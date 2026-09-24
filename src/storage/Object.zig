@@ -20,6 +20,7 @@ const metadata = @import("metadata.zig");
 const multipart = @import("multipart.zig");
 const names = @import("names.zig");
 const parallel = @import("parallel.zig");
+const parallel_download = @import("parallel_download.zig");
 const post_policy = @import("post_policy.zig");
 const resumable = @import("resumable.zig");
 const rpc = @import("rpc.zig");
@@ -449,7 +450,7 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
         // that is the whole object, not a failure.
         if (err == error.OutOfRange and base_offset == 0 and options.range != null and counting.count == 0) {
             if (self.client.diagnostics) |d| d.clear();
-            return .{ .bytes_written = 0, .generation = generation orelse 0, .checksum_verified = false };
+            return .{ .bytes_written = 0, .generation = generation orelse 0, .checksum_verified = false, .crc32c = hashing.hasher.final() };
         }
 
         // The attempt counter resets on progress: only a link that
@@ -526,7 +527,32 @@ fn finishStream(
         .bytes_written = counting.count,
         .generation = generation orelse 0,
         .checksum_verified = verified,
+        .crc32c = hashing.hasher.final(),
     };
+}
+
+/// Downloads this object in ranges fetched `options.concurrency` at a
+/// time, each on a client and connection of its own. Every range is pinned
+/// to the generation the opening metadata read names and written at its
+/// offset, and the whole is verified by combining the ranges' CRC32Cs with
+/// the object's. For large objects on fast links, where one connection is
+/// the limit.
+///
+/// Each range is fetched with `download`, so it resumes where a dropped
+/// connection or a timeout left it, and an overwrite partway through fails
+/// with `error.NotFound` instead of splicing two objects. An empty object
+/// is not read at all. An object stored gzip-compressed is fetched whole by
+/// one worker, as `download` fetches it: decompressed and unverified, since
+/// Cloud Storage ignores a range while it decompresses.
+///
+/// A file destination is set to exactly the object's length first. On any
+/// failure the destination holds whatever arrived and must be discarded,
+/// so write a file under a temporary name and rename it on success.
+pub fn downloadParallel(self: Object, destination: types.ParallelDestination, options: types.ParallelDownloadOptions) Error!types.DownloadResult {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    return parallel_download.download(self.client, self.bucket, self.name, destination, options);
 }
 
 /// Downloads the whole object, or the `range` of it, into memory: at most
@@ -751,6 +777,7 @@ test "golden: downloadAlloc verifies the checksum and reads the headers" {
     try testing.expectEqual(12, got.value.result.bytes_written);
     try testing.expectEqual(1758448800123456, got.value.result.generation);
     try testing.expect(got.value.result.checksum_verified);
+    try testing.expectEqual(0xf0ff7292, got.value.result.crc32c);
 
     const sent = try h.fake.streamRequest(0);
     try testing.expectEqual(.GET, sent.method);
@@ -798,6 +825,9 @@ test "downloadAlloc: no checksum to check, or checking turned off, is not verifi
     defer transcoded.deinit();
     try testing.expect(!transcoded.value.result.checksum_verified);
     try testing.expectEqualStrings("hello world\n", transcoded.value.data);
+    // Unverifiable, yet the checksum of what arrived is still reported.
+    try testing.expectEqual(0xf0ff7292, transcoded.value.result.crc32c);
+    try testing.expectEqual(0xf0ff7292, bare.value.result.crc32c);
 }
 
 test "downloadAlloc: an object above max_bytes is ObjectTooLarge" {
@@ -852,6 +882,8 @@ test "downloadAlloc resumes after a cut connection and rides out a 503" {
     try testing.expect(got.value.result.checksum_verified);
     try testing.expectEqual(12, got.value.result.bytes_written);
     try testing.expectEqual(7, got.value.result.generation);
+    // Across the resume, the checksum spans both halves.
+    try testing.expectEqual(0xf0ff7292, got.value.result.crc32c);
     try testing.expectEqual(3, h.fake.stream_requests.items.len);
     try testing.expectEqual(2, h.clock.sleep_count);
 
@@ -970,6 +1002,7 @@ test "download streams into the caller's writer and verifies" {
     try testing.expectEqual(12, result.bytes_written);
     try testing.expectEqual(7, result.generation);
     try testing.expect(result.checksum_verified);
+    try testing.expectEqual(core.crc32c.hash("hello world\n"), result.crc32c);
     // Downloads ask for plain bytes, so the checksum can apply.
     try testing.expectEqual(.identity, (try h.fake.streamRequest(0)).accept_encoding);
 }
@@ -1000,6 +1033,8 @@ test "download: a range is asked for exactly and never checksum-verified" {
     try testing.expectEqualStrings(" worl", out.buffered());
     try testing.expectEqual(5, bounded.bytes_written);
     try testing.expect(!bounded.checksum_verified);
+    // The range's own checksum, never the header's whole-object one.
+    try testing.expectEqual(core.crc32c.hash(" worl"), bounded.crc32c);
     try testing.expectEqualStrings("bytes=5-9", (try h.fake.streamRequest(0)).header("Range").?);
 
     out = .fixed(&buf);
@@ -1039,6 +1074,7 @@ test "download: range refusals and lies" {
     const empty = try obj.download(&out, .{ .range = .{ .offset = 0 } });
     try testing.expectEqual(0, empty.bytes_written);
     try testing.expect(!empty.checksum_verified);
+    try testing.expectEqual(0, empty.crc32c);
 
     // A zero-length range never leaves the client.
     try testing.expectError(error.InvalidArgument, obj.download(&out, .{ .range = .{ .offset = 5, .length = 0 } }));
@@ -1088,6 +1124,7 @@ test "download: progress keeps resetting the attempt counter" {
     try testing.expectEqualStrings("abcdefgh", out.buffered());
     try testing.expectEqual(8, result.bytes_written);
     try testing.expect(result.checksum_verified);
+    try testing.expectEqual(core.crc32c.hash("abcdefgh"), result.crc32c);
     try testing.expectEqual(4, h.fake.stream_requests.items.len);
 }
 
@@ -1166,6 +1203,7 @@ test "downloadAlloc: a zero-byte object verifies against the empty checksum" {
     defer got.deinit();
     try testing.expectEqual(0, got.value.data.len);
     try testing.expect(got.value.result.checksum_verified);
+    try testing.expectEqual(0, got.value.result.crc32c);
 }
 
 test "uploadFrom verifies the finished object and deletes a mismatch" {

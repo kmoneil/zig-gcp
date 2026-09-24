@@ -1,8 +1,10 @@
 //! A Cloud Storage that speaks the XML API's multipart upload, and the
-//! little of the JSON API a parallel upload reads back and deletes with,
-//! kept in memory and safe to use from several tasks at once. fake-gcs-
-//! server has no multipart uploads, so this is what `uploadParallel` is
-//! tested against, faults and all. Test code only.
+//! little of the JSON API a parallel transfer needs: metadata reads,
+//! deletes, and media reads of a whole object or one range of it. Kept in
+//! memory and safe to use from several tasks at once. fake-gcs-server has
+//! no multipart uploads and no faults on demand, so this is what
+//! `uploadParallel` and `downloadParallel` are tested against, faults and
+//! all. Test code only.
 //!
 //! It holds uploads to the rules Google documents: part numbers 1 to
 //! 10,000, a part sent again replaces itself, the finish names parts in
@@ -44,9 +46,14 @@ pub const FakeMultipart = struct {
         aborts: u32 = 0,
         reads: u32 = 0,
         deletes: u32 = 0,
+        /// Media reads, of a whole object or a range, answered or not.
+        media: u32 = 0,
+        /// Body bytes the media reads delivered: half the body for a cut,
+        /// none for an answer that was lost.
+        media_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, read, delete };
+    pub const Kind = enum { start, part, finish, abort, read, delete, media };
 
     pub const Fault = enum {
         none,
@@ -58,9 +65,12 @@ pub const FakeMultipart = struct {
         lose_answer,
         /// A part is stored with a byte flipped; a finish stores the object
         /// with a byte flipped. Either way the answer describes what was
-        /// stored, as a corrupted transfer would leave it.
+        /// stored, as a corrupted transfer would leave it. A media read
+        /// serves its bytes with one flipped, and the object keeps them.
         corrupt,
-        /// The upload is gone, and the answer is 404 `NoSuchUpload`.
+        /// The upload is gone, and the answer is 404 `NoSuchUpload`. A media
+        /// read finds the object overwritten just before it: the generation
+        /// moves on, and a read pinned to the old one answers 404.
         gone,
         /// A finish answers 200 with an `<Error>` body, and does nothing.
         error_200,
@@ -69,12 +79,20 @@ pub const FakeMultipart = struct {
         /// The request is held `stall_ms` before it is answered, as a slow
         /// link holds it: long enough for a client's timeout to fire.
         stall,
+        /// A media read sends half its body, then the connection drops.
+        cut,
+        /// A range read answers 206 a byte short of what was asked for.
+        short,
+        /// A range read answers 206 with a byte more than was asked for,
+        /// where the object has one.
+        long,
     };
 
     pub const FaultPlan = struct {
         ctx: ?*anyopaque = null,
         /// Called under the lock, once per request. `part` is the part
-        /// number for a part, else 0.
+        /// number for a part, 1 plus the first byte asked for on a media
+        /// read (1 for a whole object), else 0.
         decide: *const fn (ctx: ?*anyopaque, kind: Kind, part: u32) Fault,
     };
 
@@ -99,6 +117,9 @@ pub const FakeMultipart = struct {
         content_type: []u8,
         /// The `x-goog-meta-` headers the start carried, names lowercased.
         metadata: []Header,
+        /// For an object stored gzip-compressed: what a media read gets
+        /// instead of `bytes`, whole, as Cloud Storage decompresses it.
+        served: ?[]u8 = null,
     };
 
     pub fn init(gpa: Allocator, io: std.Io) FakeMultipart {
@@ -141,6 +162,16 @@ pub const FakeMultipart = struct {
             .metadata = metadata,
         });
         self.next_generation += 1;
+    }
+
+    /// Stores an object as gzip-compressed, as another writer would have:
+    /// `stored` is what Cloud Storage keeps, sizes and hashes, and
+    /// `decompressed` what a media read gets.
+    pub fn putGzip(self: *FakeMultipart, name: []const u8, stored: []const u8, decompressed: []const u8) Allocator.Error!void {
+        const served = try self.gpa.dupe(u8, decompressed);
+        errdefer self.gpa.free(served);
+        try self.put(name, stored);
+        self.objects.items[self.objects.items.len - 1].served = served;
     }
 
     /// Parts held by uploads still open: what is billed until an abort.
@@ -187,6 +218,10 @@ pub const FakeMultipart = struct {
         const res = try self.handle(req.method, req.url, req.content_type, req.headers, body, arena);
         if (req.head_out) |out| out.* = .{ .status = res.status, .headers = res.headers };
         if (req.sink == .writer and res.status >= 200 and res.status < 300) {
+            if (res.cut) {
+                req.sink.writer.writeAll(res.body[0 .. res.body.len / 2]) catch return error.WriteFailed;
+                return error.ConnectionResetByPeer;
+            }
             req.sink.writer.writeAll(res.body) catch return error.WriteFailed;
             return .{ .status = res.status, .headers = res.headers, .bytes_streamed = res.body.len };
         }
@@ -197,6 +232,8 @@ pub const FakeMultipart = struct {
         status: u16,
         headers: []const Header = &.{},
         body: []const u8 = "",
+        /// Send half the body, then drop the connection.
+        cut: bool = false,
     };
 
     /// One request, whichever entry it came through. The URL is parsed
@@ -213,7 +250,9 @@ pub const FakeMultipart = struct {
         const target = try parseTarget(arena, url);
         const kind: Kind = switch (target) {
             // A request this fake does not serve fails the test that sent it.
-            .json => if (method == .GET) .read else if (method == .DELETE) .delete else return error.HttpProtocolError,
+            .json => |j| if (method == .GET)
+                (if (j.media) .media else .read)
+            else if (method == .DELETE) .delete else return error.HttpProtocolError,
             .xml => |x| switch (x.query) {
                 .uploads => .start,
                 .part => .part,
@@ -222,7 +261,7 @@ pub const FakeMultipart = struct {
         };
         const part_number: u32 = switch (target) {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
-            .json => 0,
+            .json => |j| if (j.media) mediaPart(headers) else 0,
         };
 
         self.mutex.lockUncancelable(self.io);
@@ -252,14 +291,17 @@ pub const FakeMultipart = struct {
         defer self.mutex.unlock(self.io);
 
         const reply = switch (target) {
-            .json => |j| try self.json(kind, j, arena),
+            .json => |j| try self.json(kind, j, headers, fault, arena),
             .xml => |x| try self.multipartRequest(kind, x, content_type, headers, body, fault, arena),
         };
         if (fault == .lose_answer) return error.ConnectionResetByPeer;
+        if (kind == .media and reply.status >= 200 and reply.status < 300) {
+            self.counts.media_bytes += if (reply.cut) reply.body.len / 2 else reply.body.len;
+        }
         return reply;
     }
 
-    fn json(self: *FakeMultipart, kind: Kind, target: JsonTarget, arena: Allocator) Allocator.Error!Reply {
+    fn json(self: *FakeMultipart, kind: Kind, target: JsonTarget, headers: []const Header, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         const not_found: Reply = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
         const index = for (self.objects.items, 0..) |o, i| {
             if (std.mem.eql(u8, o.name, target.name) and (target.generation == null or target.generation.? == o.generation)) break i;
@@ -269,7 +311,7 @@ pub const FakeMultipart = struct {
                 self.counts.reads += 1;
                 const o = &self.objects.items[index orelse return not_found];
                 var out: std.Io.Writer.Allocating = .init(arena);
-                var jw: std.json.Stringify = .{ .writer = &out.writer };
+                var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
                 const crc = core.crc32c.toBase64(core.crc32c.hash(o.bytes));
                 jw.write(.{
                     .name = o.name,
@@ -278,10 +320,22 @@ pub const FakeMultipart = struct {
                     .generation = try std.fmt.allocPrint(arena, "{d}", .{o.generation}),
                     .metageneration = "1",
                     .contentType = o.content_type,
+                    .contentEncoding = @as(?[]const u8, if (o.served != null) "gzip" else null),
                     .crc32c = &crc,
                     .storageClass = "STANDARD",
                 }) catch return error.OutOfMemory;
                 return .{ .status = 200, .body = out.written() };
+            },
+            .media => {
+                self.counts.media += 1;
+                if (fault == .gone) {
+                    for (self.objects.items) |*o| if (std.mem.eql(u8, o.name, target.name)) {
+                        o.generation = self.next_generation;
+                        self.next_generation += 1;
+                    };
+                    return not_found;
+                }
+                return media(&self.objects.items[index orelse return not_found], headers, fault, arena);
             },
             .delete => {
                 self.counts.deletes += 1;
@@ -292,6 +346,55 @@ pub const FakeMultipart = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// An object's bytes as the media endpoint serves them: whole, or the one
+    /// range asked for, with the whole object's hash either way, as
+    /// fake-gcs-server sends it. An object stored gzip-compressed is served
+    /// decompressed and whole, the range ignored, as Cloud Storage
+    /// transcodes it.
+    fn media(o: *const Stored, headers: []const Header, fault: Fault, arena: Allocator) Allocator.Error!Reply {
+        const hash = core.crc32c.toBase64(core.crc32c.hash(o.bytes));
+        var reply_headers: std.ArrayList(Header) = .empty;
+        try reply_headers.append(arena, .{ .name = "x-goog-generation", .value = try std.fmt.allocPrint(arena, "{d}", .{o.generation}) });
+        try reply_headers.append(arena, .{ .name = "x-goog-hash", .value = try std.fmt.allocPrint(arena, "crc32c={s}", .{&hash}) });
+        if (o.served) |served| {
+            try reply_headers.append(arena, .{ .name = "x-goog-stored-content-encoding", .value = "gzip" });
+            return .{ .status = 200, .headers = reply_headers.items, .body = served, .cut = fault == .cut };
+        }
+        const size = o.bytes.len;
+        var start: usize = 0;
+        var end: usize = size;
+        var partial = false;
+        if (requestedRange(headers)) |range| {
+            if (range.start >= size) {
+                try reply_headers.append(arena, .{ .name = "Content-Range", .value = try std.fmt.allocPrint(arena, "bytes */{d}", .{size}) });
+                return .{ .status = 416, .headers = reply_headers.items, .body = "<Error><Code>InvalidRange</Code></Error>" };
+            }
+            start = @intCast(range.start);
+            if (range.last) |last| end = @intCast(@min(last + 1, size));
+            partial = true;
+        }
+        switch (fault) {
+            .short => if (end - start > 1) {
+                end -= 1;
+            },
+            .long => if (partial and end < size) {
+                end += 1;
+            },
+            else => {},
+        }
+        var body: []const u8 = o.bytes[start..end];
+        if (fault == .corrupt and body.len > 0) {
+            const flipped = try arena.dupe(u8, body);
+            flipped[flipped.len / 2] ^= 0x01;
+            body = flipped;
+        }
+        if (partial) try reply_headers.append(arena, .{
+            .name = "Content-Range",
+            .value = try std.fmt.allocPrint(arena, "bytes {d}-{d}/{d}", .{ start, end - 1, size }),
+        });
+        return .{ .status = if (partial) 206 else 200, .headers = reply_headers.items, .body = body, .cut = fault == .cut };
     }
 
     fn multipartRequest(
@@ -363,7 +466,7 @@ pub const FakeMultipart = struct {
                 const index = self.uploadIndex(target.query.upload) orelse return gone;
                 return self.drop(index, .{ .status = 204 });
             },
-            .read, .delete => unreachable,
+            .read, .delete, .media => unreachable,
         }
     }
 
@@ -487,12 +590,45 @@ fn freeStored(gpa: Allocator, o: *FakeMultipart.Stored) void {
     gpa.free(o.bytes);
     gpa.free(o.content_type);
     freeHeaders(gpa, o.metadata);
+    if (o.served) |served| gpa.free(served);
+}
+
+/// The one range a `Range: bytes=a-b` or `bytes=a-` header asks for, or
+/// null when there is none, or none this fake reads; fake-gcs-server then
+/// serves the whole object, and so does this.
+const RequestedRange = struct {
+    start: u64,
+    /// The last byte, inclusive, or null for everything from `start`.
+    last: ?u64,
+};
+
+fn requestedRange(headers: []const Header) ?RequestedRange {
+    const value = for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "range")) break h.value;
+    } else return null;
+    if (!std.mem.startsWith(u8, value, "bytes=")) return null;
+    const spec = value["bytes=".len..];
+    const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
+    const start = std.fmt.parseInt(u64, spec[0..dash], 10) catch return null;
+    if (dash + 1 == spec.len) return .{ .start = start, .last = null };
+    const last = std.fmt.parseInt(u64, spec[dash + 1 ..], 10) catch return null;
+    if (last < start) return null;
+    return .{ .start = start, .last = last };
+}
+
+/// What a fault plan sees as a media read's `part`: 1 plus the first byte
+/// asked for, or 1 for a whole object.
+fn mediaPart(headers: []const Header) u32 {
+    const range = requestedRange(headers) orelse return 1;
+    return std.math.cast(u32, range.start +| 1) orelse std.math.maxInt(u32);
 }
 
 const JsonTarget = struct {
     bucket: []const u8,
     name: []const u8,
     generation: ?u64,
+    /// `alt=media`: the object's bytes rather than its metadata.
+    media: bool = false,
 };
 
 const XmlTarget = struct {
@@ -526,16 +662,20 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         const after = path["/storage/v1/b/".len..];
         const slash = std.mem.indexOf(u8, after, "/o/") orelse return error.HttpProtocolError;
         var generation: ?u64 = null;
+        var media = false;
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
             if (std.mem.startsWith(u8, param, "generation=")) {
                 generation = std.fmt.parseInt(u64, param["generation=".len..], 10) catch return error.HttpProtocolError;
+            } else if (std.mem.eql(u8, param, "alt=media")) {
+                media = true;
             }
         }
         return .{ .json = .{
             .bucket = try decode(arena, after[0..slash]),
             .name = try decode(arena, after[slash + 3 ..]),
             .generation = generation,
+            .media = media,
         } };
     }
 
@@ -669,6 +809,12 @@ pub const MultipartServer = struct {
         try w.print("HTTP/1.1 {d} Fake\r\nContent-Length: {d}\r\n", .{ reply.status, reply.body.len });
         for (reply.headers) |h| try w.print("{s}: {s}\r\n", .{ h.name, h.value });
         try w.writeAll("\r\n");
+        if (reply.cut) {
+            // Half the promised body, then the connection drops.
+            try w.writeAll(reply.body[0 .. reply.body.len / 2]);
+            try w.flush();
+            return false;
+        }
         try w.writeAll(reply.body);
         try w.flush();
         return true;
