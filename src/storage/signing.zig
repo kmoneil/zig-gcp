@@ -365,15 +365,8 @@ fn encodeQuery(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
     return out.written();
 }
 
-/// Writes a bucket or object name into a path: `/` and the unreserved
-/// characters stay, every other byte becomes `%XX`.
-fn writePath(w: *Writer, text: []const u8) Writer.Error!void {
-    return std.Uri.Component.percentEncode(w, text, isPathByte);
-}
-
-fn isPathByte(c: u8) bool {
-    return c == '/' or core.query.isUnreserved(c);
-}
+/// Signed URLs name objects the XML API's way.
+const writePath = @import("names.zig").writeXmlPath;
 
 /// Leading and trailing spaces and tabs go, and each run of them inside
 /// becomes one space.

@@ -37,6 +37,66 @@ pub fn fromBase64(text: []const u8) error{InvalidCrc32c}!u32 {
     return std.mem.readInt(u32, &bytes, .big);
 }
 
+/// The CRC-32C of `a ++ b`, from the CRC-32C of each and the length of `b`:
+/// how the checksums of parts hashed apart, on different tasks and in any
+/// order, become the whole's with no second pass over the bytes. The CRC of
+/// nothing is 0, so folding the parts' CRCs into 0, in order, gives the
+/// whole.
+///
+/// zlib's `crc32_combine` on this polynomial, with one difference: zlib's
+/// polynomial comes back to x after 32 squarings, and this one after 31, so
+/// the table below has 31 entries and wraps at 31. With zlib's wrap, every
+/// `len_b` of 512 MiB or more gave a wrong answer.
+pub fn combine(crc_a: u32, crc_b: u32, len_b: u64) u32 {
+    // Appending n bytes multiplies a CRC by x^(8n); x2nModP(n, 3) is that.
+    return multModP(x2nModP(len_b, 3), crc_a) ^ crc_b;
+}
+
+/// The polynomial, reflected: bit 31 is x^0.
+const poly: u32 = 0x82f6_3b78;
+
+/// a(x) times b(x) modulo the polynomial, both reflected (zlib's `multmodp`).
+fn multModP(a: u32, b_start: u32) u32 {
+    var b = b_start;
+    var m: u32 = 1 << 31;
+    var p: u32 = 0;
+    while (true) {
+        if (a & m != 0) {
+            p ^= b;
+            if (a & (m - 1) == 0) break;
+        }
+        m >>= 1;
+        b = if (b & 1 != 0) (b >> 1) ^ poly else b >> 1;
+    }
+    return p;
+}
+
+/// x^(2^k) modulo the polynomial, for k from 0 to 30. Squaring x 31 times
+/// gives x again, so x^(2^k) is x^(2^(k mod 31)) and 31 entries serve every k.
+const x2n_table: [31]u32 = table: {
+    @setEvalBranchQuota(100_000);
+    var table: [31]u32 = undefined;
+    var p: u32 = 1 << 30; // x^1
+    table[0] = p;
+    for (1..31) |k| {
+        p = multModP(p, p);
+        table[k] = p;
+    }
+    break :table table;
+};
+
+/// x^(n * 2^k) modulo the polynomial (zlib's `x2nmodp`), for k below 31.
+fn x2nModP(n_start: u64, k_start: u32) u32 {
+    var n = n_start;
+    var k = k_start;
+    var p: u32 = 1 << 31; // x^0
+    while (n != 0) : (n >>= 1) {
+        if (n & 1 != 0) p = multModP(x2n_table[k], p);
+        k = (k + 1) % 31;
+    }
+    return p;
+}
+
 const testing = std.testing;
 
 /// The definition, one bit at a time, with no table: the reflected form of
@@ -165,4 +225,145 @@ test "fuzz crc32c: the table matches the definition, and splits do not matter" {
         "\x00\x00\x00\x00",
         "\xff\xff\xff\xff\xff\xff\xff\xff",
     } });
+}
+
+/// zlib 1.2.11's `crc32_combine`: a 32 by 32 matrix over GF(2), squared
+/// once per bit of the length. Slower, and it assumes nothing about the
+/// period `combine`'s table relies on, which makes it the oracle for
+/// lengths no test can hash. With `len_b` 0 it returns `crc_a`, which is
+/// `combine`'s answer too whenever `crc_b` is the CRC of nothing, 0.
+fn matrixCombine(crc_a: u32, crc_b: u32, len_b: u64) u32 {
+    const Matrix = [32]u32;
+    const times = struct {
+        fn apply(mat: *const Matrix, vec_start: u32) u32 {
+            var vec = vec_start;
+            var sum: u32 = 0;
+            var i: usize = 0;
+            while (vec != 0) : (i += 1) {
+                if (vec & 1 != 0) sum ^= mat[i];
+                vec >>= 1;
+            }
+            return sum;
+        }
+        fn square(out: *Matrix, mat: *const Matrix) void {
+            for (out, mat) |*row, m| row.* = apply(mat, m);
+        }
+    };
+    if (len_b == 0) return crc_a;
+    var crc = crc_a;
+    var len = len_b;
+    // The operator for one zero bit, then two, then four: squared up to a
+    // byte before the loop starts.
+    var even: Matrix = undefined;
+    var odd: Matrix = undefined;
+    odd[0] = poly;
+    var row: u32 = 1;
+    for (odd[1..]) |*r| {
+        r.* = row;
+        row <<= 1;
+    }
+    times.square(&even, &odd);
+    times.square(&odd, &even);
+    while (true) {
+        times.square(&even, &odd);
+        if (len & 1 != 0) crc = times.apply(&even, crc);
+        len >>= 1;
+        if (len == 0) break;
+        times.square(&odd, &even);
+        if (len & 1 != 0) crc = times.apply(&odd, crc);
+        len >>= 1;
+        if (len == 0) break;
+    }
+    return crc ^ crc_b;
+}
+
+/// The CRC-32C of `n` zero bytes, by doubling from one zero byte with
+/// `combineFn`.
+fn zeroRun(n: u64, combineFn: *const fn (u32, u32, u64) u32) u32 {
+    var result: u32 = 0;
+    var piece = hash(&.{0});
+    var piece_len: u64 = 1;
+    var left = n;
+    while (left != 0) {
+        if (left & 1 != 0) result = combineFn(result, piece, piece_len);
+        left >>= 1;
+        if (left == 0) break;
+        piece = combineFn(piece, piece, piece_len);
+        piece_len *= 2;
+    }
+    return result;
+}
+
+test "combine: every split, and parts folded into nothing" {
+    for ([_][]const u8{ "123456789", "hello world\n", "" }) |data| {
+        for (0..data.len + 1) |split| {
+            try testing.expectEqual(hash(data), combine(hash(data[0..split]), hash(data[split..]), data.len - split));
+        }
+    }
+    // Three parts, folded in order into the CRC of nothing.
+    const data = "the quick brown fox jumps over the lazy dog";
+    var acc: u32 = 0;
+    for ([_][]const u8{ data[0..10], data[10..11], data[11..] }) |part| acc = combine(acc, hash(part), part.len);
+    try testing.expectEqual(hash(data), acc);
+    // Appending nothing, and nothing before.
+    try testing.expectEqual(0xe306_9283, combine(0xe306_9283, 0, 0));
+    try testing.expectEqual(0xe306_9283, combine(0, 0xe306_9283, 9));
+}
+
+test "combine: runs of zeros up to 5 GiB, against std hashing real zeros" {
+    // Each CRC was measured on 2026-09-24 by feeding that many real zero
+    // bytes through std's Crc32Iscsi, which knows nothing of `combine`.
+    // Doubling from one byte reaches every table index and lengths past
+    // 32 bits. With zlib's wrap at 32, every run from 512 MiB was wrong.
+    const runs = [_]struct { len: u64, crc: u32 }{
+        .{ .len = 1 << 28, .crc = 0x02f6_3b78 },
+        .{ .len = 1 << 29, .crc = 0x038d_26c4 },
+        .{ .len = 1 << 30, .crc = 0x036e_6f75 },
+        .{ .len = 1 << 31, .crc = 0x527d_5351 },
+        .{ .len = 1 << 32, .crc = 0xf161_77d2 },
+        .{ .len = 5 << 30, .crc = 0x2cc5_f6d6 },
+    };
+    for (runs) |run| {
+        errdefer std.debug.print("{d} zero bytes\n", .{run.len});
+        try testing.expectEqual(run.crc, zeroRun(run.len, combine));
+        try testing.expectEqual(run.crc, zeroRun(run.len, matrixCombine));
+    }
+    // A run short enough to hash here.
+    const zeros: [5000]u8 = @splat(0);
+    try testing.expectEqual(hash(&zeros), zeroRun(zeros.len, combine));
+}
+
+test "combine: squaring x comes back to x after 31 steps, not zlib's 32" {
+    var p: u32 = 1 << 30; // x
+    for (1..32) |step| {
+        p = multModP(p, p);
+        // Not before the 31st: the table would then be shorter still.
+        try testing.expectEqual(step == 31, p == 1 << 30);
+    }
+}
+
+fn combineProperty(_: void, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    // Against the matrix oracle, at lengths up to 2^64 - 1. The CRC of no
+    // bytes is 0, so only that `crc_b` goes with a zero length.
+    const crc_a = g.int(u32);
+    const len = g.int(u64) >> g.int(u6);
+    const crc_b = if (len == 0) 0 else g.int(u32);
+    try testing.expectEqual(matrixCombine(crc_a, crc_b, len), combine(crc_a, crc_b, len));
+
+    // Against hashing the whole, for the rest of the input split anywhere.
+    const data = g.rest();
+    const split = crc_a % (data.len + 1);
+    try testing.expectEqual(hash(data), combine(hash(data[0..split]), hash(data[split..]), data.len - split));
+}
+
+test "fuzz crc32c combine: splits, and the matrix method, agree" {
+    try test_util.fuzzBytes({}, combineProperty, .{
+        .corpus = &.{
+            "",
+            // A length of 2^29, the first zlib's wrap got wrong.
+            "\x00\x00\x00\x07\x00\x00\x00\x00\x20\x00\x00\x00\x00\x12\x34\x56\x78hello world\n",
+            "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\xde\xad\xbe\xef",
+        },
+    });
 }

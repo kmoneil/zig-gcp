@@ -50,9 +50,8 @@ pub const Call = struct {
 
 /// One streaming request, as a service module describes it: the body from
 /// replayable segments, the response buffered or streamed into a writer,
-/// response headers included in the result. A reader-backed body cannot be
-/// replayed for a retry, so it has no place in this loop; a module that
-/// streams an upload from a reader runs its own.
+/// response headers included in the result. A body read from a stream
+/// cannot be replayed for a retry; `executeStreamBody` sends one once.
 pub const StreamCall = struct {
     method: transport.Method,
     /// Path and query, appended to the base URL.
@@ -74,6 +73,15 @@ pub const StreamCall = struct {
     /// body then fails; see `transport.StreamRequest.head_out`. With
     /// engine-level retries the head is the latest attempt's.
     head_out: ?*?transport.StreamRequest.Head = null,
+    /// How long one attempt may take, instead of the engine's
+    /// `request_timeout_ms`, for a request that is slow by nature, such as
+    /// the one that assembles a multipart upload. 0 removes the limit.
+    timeout_ms: ?u32 = null,
+    /// Reads a failed response's body into a status and message, for a
+    /// service whose errors are not Google's JSON shape, as Cloud Storage's
+    /// XML API's are not. Null reads the JSON shape. Either way a body it
+    /// cannot read becomes the message whole.
+    decode_error: ?*const fn (arena: Allocator, body: []const u8) Allocator.Error!?errors.ErrorBody = null,
 
     pub const Body = union(enum) {
         none,
@@ -82,9 +90,20 @@ pub const StreamCall = struct {
     };
 };
 
+/// A request body read from a stream: exactly `len` bytes from `reader`.
+pub const StreamBody = struct {
+    reader: *std.Io.Reader,
+    len: u64,
+};
+
 /// `Error`, plus the caller's sink writer failing, with the detail wherever
 /// that concrete writer keeps it.
 pub const StreamCallError = Error || error{WriteFailed};
+
+/// `StreamCallError`, plus a streamed body's reader failing
+/// (`ReadFailed`, the detail wherever that reader keeps it) or ending
+/// before its declared length (`EndOfStream`).
+pub const StreamBodyError = StreamCallError || error{ ReadFailed, EndOfStream };
 
 pub fn Engine(comptime log_scope: @EnumLiteral()) type {
     return struct {
@@ -157,7 +176,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                         if (self.diagnostics) |d| d.clear();
                         return res.body;
                     }
-                    break :e self.failure(scratch.allocator(), res);
+                    break :e self.failure(scratch.allocator(), res, null);
                 } else |err| e: {
                     log.debug("{t} {s} -> {t} in {d} ms (attempt {d} of {d})", .{
                         call.method, log_path, err, elapsed_ms, attempt, max_attempts,
@@ -198,13 +217,42 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             response: *std.heap.ArenaAllocator,
             call: StreamCall,
         ) StreamCallError!transport.StreamResponse {
+            return self.stream(response, call, null) catch |err| switch (err) {
+                // Only a streamed body reads.
+                error.ReadFailed, error.EndOfStream => unreachable,
+                else => |e| e,
+            };
+        }
+
+        /// `executeStream` with the body read from `body`, which cannot go
+        /// back: the request is sent once, whatever `call.retry` says, and a
+        /// transient failure comes back for the caller to try again with a
+        /// fresh reader. A 401 drops the cached token, so that next attempt
+        /// gets a new one. `call.body` must be `.none`.
+        pub fn executeStreamBody(
+            self: Self,
+            response: *std.heap.ArenaAllocator,
+            call: StreamCall,
+            body: StreamBody,
+        ) StreamBodyError!transport.StreamResponse {
+            std.debug.assert(call.body == .none);
+            return self.stream(response, call, body);
+        }
+
+        fn stream(
+            self: Self,
+            response: *std.heap.ArenaAllocator,
+            call: StreamCall,
+            streamed: ?StreamBody,
+        ) StreamBodyError!transport.StreamResponse {
             var scratch: std.heap.ArenaAllocator = .init(self.gpa);
             defer scratch.deinit();
             const url = try std.mem.concat(scratch.allocator(), u8, &.{ self.base_url, call.path });
             // Query strings carry page tokens and object names; they stay
             // out of the log.
             const log_path = call.path[0 .. std.mem.indexOfScalar(u8, call.path, '?') orelse call.path.len];
-            var max_attempts: u32 = if (call.retry) self.retry.max_attempts else 1;
+            // A streamed body is spent by its first attempt.
+            var max_attempts: u32 = if (call.retry and streamed == null) self.retry.max_attempts else 1;
 
             // The caller's headers, plus the quota project when there is one.
             var headers = try scratch.allocator().alloc(transport.Header, call.headers.len + 1);
@@ -226,20 +274,20 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                     .bearer = bearer,
                     .content_type = call.content_type,
                     .headers = headers[0..header_count],
-                    .body = switch (call.body) {
+                    .body = if (streamed) |s| .{ .stream = .{ .reader = s.reader, .len = s.len } } else switch (call.body) {
                         .none => .none,
                         .segments => |segments| .{ .segments = segments },
                     },
                     .sink = call.sink,
                     .accept_encoding = call.accept_encoding,
-                    .timeout_ms = self.request_timeout_ms,
+                    .timeout_ms = call.timeout_ms orelse self.request_timeout_ms,
                     .head_out = call.head_out,
                 }, response.allocator());
                 const elapsed_ms = started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
 
                 var http_status: u16 = 0;
                 var mid_body = false;
-                const err: StreamCallError = if (outcome) |res| e: {
+                const err: StreamBodyError = if (outcome) |res| e: {
                     http_status = res.status;
                     log.debug("{t} {s} -> {d} in {d} ms (attempt {d} of {d})", .{
                         call.method, log_path, res.status, elapsed_ms, attempt, max_attempts,
@@ -252,7 +300,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                         .status = res.status,
                         .body = res.body,
                         .headers = res.headers,
-                    });
+                    }, call.decode_error);
                 } else |err| e: {
                     log.debug("{t} {s} -> {t} in {d} ms (attempt {d} of {d})", .{
                         call.method, log_path, err, elapsed_ms, attempt, max_attempts,
@@ -261,8 +309,9 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                     break :e switch (err) {
                         // The caller's sink writer failed; nothing to retry.
                         error.WriteFailed => return error.WriteFailed,
-                        // No reader-backed body ever goes through this loop.
-                        error.ReadFailed, error.EndOfStream => unreachable,
+                        // The caller's body reader failed or ran short. Only
+                        // a streamed body reads, and it is never retried.
+                        error.ReadFailed, error.EndOfStream => |e| if (streamed != null) return e else unreachable,
                         else => |e| b: {
                             // A transport failure may have delivered part of
                             // the body to a writer sink already.
@@ -273,7 +322,13 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                 };
 
                 // A 401 response is buffered whatever the sink, so retrying
-                // it once with a fresh token is safe even there.
+                // it once with a fresh token is safe even there. A streamed
+                // body is spent, so it only gets the token dropped, for the
+                // caller's next attempt.
+                if (err == error.Unauthenticated and streamed != null) {
+                    _ = self.dropCachedToken();
+                    return err;
+                }
                 if (err == error.Unauthenticated and !reauthenticated and self.dropCachedToken()) {
                     reauthenticated = true;
                     max_attempts += 1;
@@ -309,8 +364,14 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
         }
 
         /// Maps a non-2xx response and records its details.
-        fn failure(self: Self, scratch: Allocator, res: Response) Error {
-            const body = errors.decodeErrorBody(scratch, res.body) catch |err| return err;
+        fn failure(
+            self: Self,
+            scratch: Allocator,
+            res: Response,
+            decode_error: ?*const fn (arena: Allocator, body: []const u8) Allocator.Error!?errors.ErrorBody,
+        ) Error {
+            const decode = decode_error orelse errors.decodeErrorBody;
+            const body = decode(scratch, res.body) catch |err| return err;
             const status = if (body) |b| b.status else "";
             // A body that is not the standard error shape, such as a proxy's
             // page, is the best message there is.
@@ -898,6 +959,120 @@ test "executeStream: a 401 is retried once with a fresh token, whatever the sink
     try testing.expectEqual(200, res.status);
     try testing.expectEqual(1, h.token.invalidations);
     try testing.expectEqual(2, h.fake.stream_requests.items.len);
+}
+
+test "executeStreamBody: the reader's bytes go once, with their length" {
+    var h: Harness = undefined;
+    h.init(&.{.{ .respond = .{
+        .status = 200,
+        .body = "",
+        .headers = &.{.{ .name = "ETag", .value = "\"abc\"" }},
+    } }});
+    defer h.deinit();
+    var reader: std.Io.Reader = .fixed("part bytes");
+    const res = try h.engine().executeStreamBody(
+        &h.arena,
+        .{ .method = .PUT, .path = "/b/o?partNumber=1&uploadId=u" },
+        .{ .reader = &reader, .len = 10 },
+    );
+    try testing.expectEqualStrings("\"abc\"", res.header("ETag").?);
+    const sent = try h.fake.streamRequest(0);
+    try testing.expectEqual(.stream, sent.body_tag);
+    try testing.expectEqual(10, sent.body_len);
+    try testing.expectEqualStrings("part bytes", sent.body_prefix);
+}
+
+test "executeStreamBody: a transient failure comes back, since the reader cannot go back" {
+    var h: Harness = undefined;
+    h.init(&.{ unavailable, ok });
+    defer h.deinit();
+    var reader: std.Io.Reader = .fixed("data");
+    try testing.expectError(error.Unavailable, h.engine().executeStreamBody(
+        &h.arena,
+        .{ .method = .PUT, .path = "/b/o" },
+        .{ .reader = &reader, .len = 4 },
+    ));
+    try testing.expectEqual(1, h.fake.stream_requests.items.len);
+    try testing.expectEqual(0, h.clock.sleep_count);
+}
+
+test "executeStreamBody: a 401 drops the token for the caller's next try, and sends nothing again" {
+    var h: Harness = undefined;
+    h.init(&.{ unauthorized, ok });
+    defer h.deinit();
+    var reader: std.Io.Reader = .fixed("data");
+    try testing.expectError(error.Unauthenticated, h.engine().executeStreamBody(
+        &h.arena,
+        .{ .method = .PUT, .path = "/b/o" },
+        .{ .reader = &reader, .len = 4 },
+    ));
+    try testing.expectEqual(1, h.token.invalidations);
+    try testing.expectEqual(1, h.fake.stream_requests.items.len);
+}
+
+test "executeStreamBody: a reader that runs short, or fails" {
+    var h: Harness = undefined;
+    h.init(&.{ ok, ok });
+    defer h.deinit();
+    var short: std.Io.Reader = .fixed("abc");
+    try testing.expectError(error.EndOfStream, h.engine().executeStreamBody(
+        &h.arena,
+        .{ .method = .PUT, .path = "/b/o" },
+        .{ .reader = &short, .len = 10 },
+    ));
+    var failing = std.Io.Reader.failing;
+    try testing.expectError(error.ReadFailed, h.engine().executeStreamBody(
+        &h.arena,
+        .{ .method = .PUT, .path = "/b/o" },
+        .{ .reader = &failing, .len = 10 },
+    ));
+}
+
+test "timeouts: a call's own replaces the engine's, 0 included" {
+    var h: Harness = undefined;
+    h.init(&.{ ok, ok, ok });
+    defer h.deinit();
+    var e = h.engine();
+    e.request_timeout_ms = 30_000;
+    _ = try e.executeStream(&h.arena, .{ .method = .POST, .path = "/b/o?uploadId=u" });
+    _ = try e.executeStream(&h.arena, .{ .method = .POST, .path = "/b/o?uploadId=u", .timeout_ms = 600_000 });
+    _ = try e.executeStream(&h.arena, .{ .method = .POST, .path = "/b/o?uploadId=u", .timeout_ms = 0 });
+    try testing.expectEqual(30_000, (try h.fake.streamRequest(0)).timeout_ms);
+    try testing.expectEqual(600_000, (try h.fake.streamRequest(1)).timeout_ms);
+    try testing.expectEqual(0, (try h.fake.streamRequest(2)).timeout_ms);
+}
+
+/// Reads `<Error><Code>X</Code>...`, the XML API's shape, crudely: enough
+/// to show a call's decoder is the one used.
+fn decodeTestXmlError(arena: Allocator, body: []const u8) Allocator.Error!?errors.ErrorBody {
+    const code_start = (std.mem.indexOf(u8, body, "<Code>") orelse return null) + "<Code>".len;
+    const code_end = std.mem.indexOfPos(u8, body, code_start, "</Code>") orelse return null;
+    return .{ .status = try arena.dupe(u8, body[code_start..code_end]), .message = "decoded by the call's own reader" };
+}
+
+test "a call's own error decoder fills the diagnostics, and its status still maps by HTTP code" {
+    var h: Harness = undefined;
+    h.init(&.{
+        .{ .respond = .{ .status = 404, .body = "<Error><Code>NoSuchUpload</Code><Message>gone</Message></Error>" } },
+        .{ .respond = .{ .status = 404, .body = "not xml at all" } },
+    });
+    defer h.deinit();
+    const e = h.engine();
+    try testing.expectError(error.NotFound, e.executeStream(&h.arena, .{
+        .method = .POST,
+        .path = "/b/o?uploadId=u",
+        .decode_error = decodeTestXmlError,
+    }));
+    try testing.expectEqualStrings("NoSuchUpload", h.diag.status());
+    try testing.expectEqualStrings("decoded by the call's own reader", h.diag.message());
+    // A body the decoder cannot read is the message whole, as for JSON.
+    try testing.expectError(error.NotFound, e.executeStream(&h.arena, .{
+        .method = .POST,
+        .path = "/b/o?uploadId=u",
+        .decode_error = decodeTestXmlError,
+    }));
+    try testing.expectEqualStrings("", h.diag.status());
+    try testing.expectEqualStrings("not xml at all", h.diag.message());
 }
 
 test "executeStream: retry off means one attempt" {

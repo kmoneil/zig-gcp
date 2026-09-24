@@ -82,6 +82,17 @@ pub fn executeStream(
     return engine(client).executeStream(response, call);
 }
 
+/// `executeStream` with the body read once from a stream: a transient
+/// failure comes back for the caller to try again with a fresh reader.
+pub fn executeStreamBody(
+    client: *Client,
+    response: *std.heap.ArenaAllocator,
+    call: StreamCall,
+    body: core.rpc.StreamBody,
+) core.rpc.StreamBodyError!core.transport.StreamResponse {
+    return engine(client).executeStreamBody(response, call, body);
+}
+
 /// The wait before an attempt this module retries itself, such as a
 /// download restarted from scratch. The engine's own retries are its
 /// business.
