@@ -235,6 +235,9 @@ pub const XmlQuery = union(enum) {
     part: struct { number: u32, upload_id: []const u8 },
     /// `?uploadId=ID`: finish or abort an upload.
     upload: []const u8,
+    /// `?uploadId=ID&max-parts=M[&part-number-marker=N]`: one page of the
+    /// parts an upload holds.
+    list: struct { upload_id: []const u8, max_parts: u32, marker: u32 = 0 },
 };
 
 /// `/{bucket}/{object}` and a multipart upload's query, the XML API's path
@@ -259,6 +262,12 @@ fn writeXml(w: *Writer, bucket: []const u8, object: []const u8, xml_query: XmlQu
         .upload => |id| {
             try w.writeAll("?uploadId=");
             try query.writeValue(w, id);
+        },
+        .list => |list| {
+            try w.writeAll("?uploadId=");
+            try query.writeValue(w, list.upload_id);
+            try w.print("&max-parts={d}", .{list.max_parts});
+            if (list.marker > 0) try w.print("&part-number-marker={d}", .{list.marker});
         },
     }
 }

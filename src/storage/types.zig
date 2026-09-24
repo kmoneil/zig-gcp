@@ -245,6 +245,16 @@ pub const ParallelUploadOptions = struct {
     /// needs `storage.objects.move`, which Storage Object User grants and
     /// Storage Object Creator does not.
     preconditions: Preconditions = .{},
+    /// Where an upload from a file keeps what a later process needs to
+    /// carry it on: the upload's id, since which parts the server holds is
+    /// the server's to say. A resumed call re-reads the held parts from
+    /// the file, so the whole is verified across runs and a file changed
+    /// in between is caught, and sends only the rest.
+    /// `storage.CheckpointFile` is the built-in store. A memory source
+    /// refuses one, since only a file outlives the process, and an
+    /// emulator endpoint ignores it, since its one ordinary upload cannot
+    /// resume.
+    checkpoint: ?Checkpoint = null,
 };
 
 /// Where `Object.downloadParallel` writes.

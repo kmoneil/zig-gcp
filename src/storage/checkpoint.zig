@@ -127,6 +127,7 @@ pub const CheckpointFile = struct {
 /// What a transfer saves, by kind. The slices are borrowed.
 pub const State = union(enum) {
     download_parallel: DownloadParallel,
+    upload_parallel: UploadParallel,
 
     pub const DownloadParallel = struct {
         bucket: []const u8,
@@ -143,13 +144,35 @@ pub const State = union(enum) {
         /// limit.
         written: []const u8,
     };
+
+    pub const UploadParallel = struct {
+        bucket: []const u8,
+        /// The name the object is to have; a conditional upload's parts go
+        /// up under `temp` until the move.
+        object: []const u8,
+        /// The source file's size and modification time. A file that
+        /// changed cannot resume: the parts already sent hold other bytes.
+        size: u64,
+        mtime: i128,
+        upload_id: []const u8,
+        /// The plan's own part size, so re-planning reproduces the parts.
+        part_size: u64,
+        /// The temporary name of an upload with conditions, or null. Which
+        /// parts the server holds is the server's to say, through
+        /// ListParts, so nothing more is saved.
+        temp: ?[]const u8,
+        if_generation_match: ?u64,
+        if_generation_not_match: ?u64,
+        if_metageneration_match: ?u64,
+        if_metageneration_not_match: ?u64,
+    };
 };
 
 /// The state's canonical bytes, which are the only bytes `parse` accepts.
 pub fn encodeAlloc(gpa: Allocator, state: State) Allocator.Error![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+    var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
     switch (state) {
         .download_parallel => |s| jw.write(.{
             .version = 1,
@@ -160,6 +183,21 @@ pub fn encodeAlloc(gpa: Allocator, state: State) Allocator.Error![]u8 {
             .generation = s.generation,
             .part_size = s.part_size,
             .written = s.written,
+        }) catch return error.OutOfMemory,
+        .upload_parallel => |s| jw.write(.{
+            .version = 1,
+            .kind = "uploadParallel",
+            .bucket = s.bucket,
+            .object = s.object,
+            .size = s.size,
+            .mtime = s.mtime,
+            .upload_id = s.upload_id,
+            .part_size = s.part_size,
+            .temp = s.temp,
+            .if_generation_match = s.if_generation_match,
+            .if_generation_not_match = s.if_generation_not_match,
+            .if_metageneration_match = s.if_metageneration_match,
+            .if_metageneration_not_match = s.if_metageneration_not_match,
         }) catch return error.OutOfMemory,
     }
     return out.toOwnedSlice();
@@ -176,35 +214,71 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
         bucket: []const u8,
         object: []const u8,
         size: u64,
-        generation: u64,
+        generation: ?u64 = null,
         part_size: u64,
-        written: []const u8,
+        written: ?[]const u8 = null,
+        mtime: ?i128 = null,
+        upload_id: ?[]const u8 = null,
+        temp: ?[]const u8 = null,
+        if_generation_match: ?u64 = null,
+        if_generation_not_match: ?u64 = null,
+        if_metageneration_match: ?u64 = null,
+        if_metageneration_not_match: ?u64 = null,
     };
     const wire = std.json.parseFromSliceLeaky(Wire, arena, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.CheckpointFailed,
     };
     if (wire.version != 1) return error.CheckpointFailed;
-    if (!std.mem.eql(u8, wire.kind, "downloadParallel")) return error.CheckpointFailed;
-    // The plan must reproduce exactly the ranges the earlier run saved:
-    // a part size `plan` would grow named a plan that never was.
-    if (wire.generation == 0 or wire.part_size == 0 or wire.size > mp.max_object_size) return error.CheckpointFailed;
+    // The plan must reproduce exactly the parts the earlier run saved: a
+    // part size `plan` would grow named a plan that never was.
+    if (wire.part_size == 0 or wire.size > mp.max_object_size) return error.CheckpointFailed;
     const plan = mp.plan(wire.size, wire.part_size);
     if (plan.part_size != wire.part_size) return error.CheckpointFailed;
-    // An empty object downloads as no ranges at all, where an upload's
-    // plan would call it one empty part.
-    try checkWritten(wire.written, if (wire.size == 0) 0 else plan.parts);
-    const state: State = .{ .download_parallel = .{
-        .bucket = wire.bucket,
-        .object = wire.object,
-        .size = wire.size,
-        .generation = wire.generation,
-        .part_size = wire.part_size,
-        .written = wire.written,
-    } };
+
+    const state: State = if (std.mem.eql(u8, wire.kind, "downloadParallel")) blk: {
+        const generation = wire.generation orelse return error.CheckpointFailed;
+        const written = wire.written orelse return error.CheckpointFailed;
+        if (generation == 0) return error.CheckpointFailed;
+        // An empty object downloads as no ranges at all, where an upload's
+        // plan would call it one empty part.
+        try checkWritten(written, if (wire.size == 0) 0 else plan.parts);
+        break :blk .{ .download_parallel = .{
+            .bucket = wire.bucket,
+            .object = wire.object,
+            .size = wire.size,
+            .generation = generation,
+            .part_size = wire.part_size,
+            .written = written,
+        } };
+    } else if (std.mem.eql(u8, wire.kind, "uploadParallel")) blk: {
+        const mtime = wire.mtime orelse return error.CheckpointFailed;
+        const upload_id = wire.upload_id orelse return error.CheckpointFailed;
+        if (upload_id.len == 0) return error.CheckpointFailed;
+        if (wire.temp) |temp| if (temp.len == 0) return error.CheckpointFailed;
+        // A temporary name exists exactly when the upload has conditions
+        // to move under.
+        const has_condition = wire.if_generation_match != null or wire.if_generation_not_match != null or
+            wire.if_metageneration_match != null or wire.if_metageneration_not_match != null;
+        if ((wire.temp != null) != has_condition) return error.CheckpointFailed;
+        break :blk .{ .upload_parallel = .{
+            .bucket = wire.bucket,
+            .object = wire.object,
+            .size = wire.size,
+            .mtime = mtime,
+            .upload_id = upload_id,
+            .part_size = wire.part_size,
+            .temp = wire.temp,
+            .if_generation_match = wire.if_generation_match,
+            .if_generation_not_match = wire.if_generation_not_match,
+            .if_metageneration_match = wire.if_metageneration_match,
+            .if_metageneration_not_match = wire.if_metageneration_not_match,
+        } };
+    } else return error.CheckpointFailed;
+
     // Only the canonical encoding is a state. This also refuses what the
     // field checks cannot see: reordered keys, whitespace, escape
-    // variants, numbers written another way.
+    // variants, numbers written another way, fields of the other kind.
     const canonical = try encodeAlloc(arena, state);
     if (!std.mem.eql(u8, canonical, bytes)) return error.CheckpointFailed;
     return state;
@@ -378,6 +452,92 @@ test "state: everything that is not a canonical state is CheckpointFailed" {
     _ = try parse(arena_state.allocator(), good);
 }
 
+test "upload state: the canonical encoding, both shapes, pinned byte for byte" {
+    const plain: State = .{ .upload_parallel = .{
+        .bucket = "b",
+        .object = "dir/o",
+        .size = 5000,
+        .mtime = 1_758_700_000_123_456_789,
+        .upload_id = "VXBs+1=",
+        .part_size = 1024,
+        .temp = null,
+        .if_generation_match = null,
+        .if_generation_not_match = null,
+        .if_metageneration_match = null,
+        .if_metageneration_not_match = null,
+    } };
+    const encoded = try encodeAlloc(testing.allocator, plain);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqualStrings(
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\"," ++
+            "\"size\":5000,\"mtime\":1758700000123456789,\"upload_id\":\"VXBs+1=\",\"part_size\":1024}",
+        encoded,
+    );
+
+    var conditional = plain;
+    conditional.upload_parallel.temp = "zig-gcp-tmp/0011";
+    conditional.upload_parallel.if_generation_match = 0;
+    const with_temp = try encodeAlloc(testing.allocator, conditional);
+    defer testing.allocator.free(with_temp);
+    try testing.expectEqualStrings(
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\"," ++
+            "\"size\":5000,\"mtime\":1758700000123456789,\"upload_id\":\"VXBs+1=\",\"part_size\":1024," ++
+            "\"temp\":\"zig-gcp-tmp/0011\",\"if_generation_match\":0}",
+        with_temp,
+    );
+
+    // Both round-trip, negative mtime included: filesystems can be odd.
+    var negative = conditional;
+    negative.upload_parallel.mtime = -1;
+    negative.upload_parallel.if_generation_match = null;
+    negative.upload_parallel.if_metageneration_not_match = 7;
+    for ([_]State{ plain, conditional, negative }) |state| {
+        var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const bytes = try encodeAlloc(arena, state);
+        const back = try parse(arena, bytes);
+        const want = state.upload_parallel;
+        const got = back.upload_parallel;
+        try testing.expectEqualStrings(want.upload_id, got.upload_id);
+        try testing.expectEqual(want.mtime, got.mtime);
+        try testing.expectEqual(want.size, got.size);
+        try testing.expectEqual(want.if_generation_match, got.if_generation_match);
+        try testing.expectEqual(want.if_metageneration_not_match, got.if_metageneration_not_match);
+        try testing.expectEqual(want.temp == null, got.temp == null);
+        if (want.temp) |temp| try testing.expectEqualStrings(temp, got.temp.?);
+    }
+}
+
+test "upload state: everything that is not a canonical upload state is CheckpointFailed" {
+    const good = "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\"," ++
+        "\"size\":5000,\"mtime\":1758700000123456789,\"upload_id\":\"VXBs+1=\",\"part_size\":1024}";
+    const refused = [_][]const u8{
+        // A download's fields on an upload state, and the other way round.
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"mtime\":1,\"upload_id\":\"u\",\"part_size\":1024,\"written\":\"50\"}",
+        "{\"version\":1,\"kind\":\"downloadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"generation\":42,\"part_size\":1024,\"written\":\"50\",\"mtime\":1}",
+        // Missing what an upload must have.
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"upload_id\":\"u\",\"part_size\":1024}",
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"mtime\":1,\"part_size\":1024}",
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"mtime\":1,\"upload_id\":\"\",\"part_size\":1024}",
+        // A temporary name without conditions, conditions without one, and
+        // an empty one.
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"mtime\":1,\"upload_id\":\"u\",\"part_size\":1024,\"temp\":\"zig-gcp-tmp/aa\"}",
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"mtime\":1,\"upload_id\":\"u\",\"part_size\":1024,\"if_generation_match\":0}",
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"mtime\":1,\"upload_id\":\"u\",\"part_size\":1024,\"temp\":\"\",\"if_generation_match\":0}",
+        // A part size the plan would have grown.
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":50000000,\"mtime\":1,\"upload_id\":\"u\",\"part_size\":1024}",
+    };
+    for (refused) |bytes| {
+        var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena_state.deinit();
+        try testing.expectError(error.CheckpointFailed, parse(arena_state.allocator(), bytes));
+    }
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    _ = try parse(arena_state.allocator(), good);
+}
+
 test "bitmap: bits to hex and back, at every width mod 4" {
     for ([_]u32{ 1, 2, 3, 4, 5, 7, 8, 9, 100 }) |parts| {
         var bits: std.DynamicBitSetUnmanaged = try .initEmpty(testing.allocator, parts);
@@ -419,13 +579,21 @@ fn parseProperty(_: void, input: []const u8) !void {
     // its pieces hold together well enough to resume with.
     const encoded = try encodeAlloc(arena, state);
     try testing.expectEqualSlices(u8, input, encoded);
-    const s = state.download_parallel;
-    const plan = mp.plan(s.size, s.part_size);
-    try testing.expectEqual(s.part_size, plan.part_size);
-    const parts: u32 = if (s.size == 0) 0 else plan.parts;
-    var bits = try bitsFromHex(testing.allocator, s.written, parts);
-    defer bits.deinit(testing.allocator);
-    try testing.expect(bits.count() <= parts);
+    switch (state) {
+        .download_parallel => |s| {
+            const plan = mp.plan(s.size, s.part_size);
+            try testing.expectEqual(s.part_size, plan.part_size);
+            const parts: u32 = if (s.size == 0) 0 else plan.parts;
+            var bits = try bitsFromHex(testing.allocator, s.written, parts);
+            defer bits.deinit(testing.allocator);
+            try testing.expect(bits.count() <= parts);
+        },
+        .upload_parallel => |s| {
+            try testing.expectEqual(s.part_size, mp.plan(s.size, s.part_size).part_size);
+            try testing.expect(s.upload_id.len > 0);
+            if (s.temp) |temp| try testing.expect(temp.len > 0);
+        },
+    }
 }
 
 test "fuzz checkpoint state: every input parses to a state that re-encodes to itself, or fails" {
@@ -434,6 +602,8 @@ test "fuzz checkpoint state: every input parses to a state that re-encodes to it
         "{\"version\":1,\"kind\":\"downloadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"generation\":42,\"part_size\":1024,\"written\":\"50\"}",
         "{\"version\":1,\"kind\":\"downloadParallel\",\"bucket\":\"b\",\"object\":\"empty\",\"size\":0,\"generation\":7,\"part_size\":1048576,\"written\":\"\"}",
         "{\"version\":1,\"kind\":\"downloadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5000,\"generation\":42,\"part_size\":1024,\"written\":\"1f\"}",
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"mtime\":1758700000123456789,\"upload_id\":\"VXBs+1=\",\"part_size\":1024}",
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":-1,\"upload_id\":\"u\",\"part_size\":1024,\"temp\":\"zig-gcp-tmp/00\",\"if_generation_match\":0}",
     } });
 }
 

@@ -33,6 +33,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const Object = @import("Object.zig");
+const checkpoint = @import("checkpoint.zig");
 const codec = @import("codec.zig");
 const logging = @import("logging.zig");
 const mp = @import("xml_multipart.zig");
@@ -72,18 +73,358 @@ pub fn upload(
     options: types.ParallelUploadOptions,
 ) Error!types.Owned(types.ObjectInfo) {
     try check(client, object, options);
+    if (options.checkpoint != null and source != .file) {
+        return refuse(client.diagnostics, "checkpoint: only a file source outlives a process, so memory takes none", .{});
+    }
     const size = try sourceSize(client, source);
     if (size > mp.max_object_size) {
         if (client.diagnostics) |d| d.print("the source is {d} bytes, and an object holds at most 5 TiB", .{size});
         return error.InvalidParallelUploadOptions;
     }
     if (client.unauthenticated and !client.multipart_test.on_emulator) {
+        if (options.checkpoint != null) {
+            logging.warn("{s}: an emulator's one ordinary upload cannot resume, so the checkpoint is ignored", .{object});
+        }
         return fallback(client, bucket, object, source, size, options);
     }
-    if (std.meta.eql(options.preconditions, types.Preconditions{})) {
-        return multipart(client, bucket, object, source, size, options);
+    if (options.checkpoint) |cp| {
+        return persistent(client, bucket, object, source.file, size, options, cp);
     }
-    return conditional(client, bucket, object, source, size, options);
+    if (std.meta.eql(options.preconditions, types.Preconditions{})) {
+        return multipart(client, bucket, object, source, size, options, null);
+    }
+    return conditional(client, bucket, object, source, size, options, null);
+}
+
+/// Everything a checkpointed upload carries between its pieces.
+const Persist = struct {
+    cp: checkpoint.Checkpoint,
+    bucket: []const u8,
+    /// The name the object is to have, whatever name the parts go up
+    /// under.
+    object: []const u8,
+    file: std.Io.File,
+    size: u64,
+    mtime: i128,
+    preconditions: types.Preconditions,
+    /// The temporary name the parts go up under, for an upload with
+    /// conditions; set before `join`.
+    temp: ?[]const u8 = null,
+    /// The state an earlier process saved, until it is spent.
+    resumed: ?checkpoint.State.UploadParallel,
+};
+
+/// With a checkpoint, which failures still abort the upload, drop the
+/// temporary object and clear the state: those a resume could only
+/// repeat. Everything else leaves the parts and the checkpoint for a
+/// later process.
+fn abandons(err: Error) bool {
+    return switch (err) {
+        error.ChecksumMismatch,
+        error.InvalidResponse,
+        error.ReadFailed,
+        error.UnexpectedEndOfStream,
+        error.StreamTooLong,
+        error.FailedPrecondition,
+        error.NotModified,
+        error.UploadSessionLost,
+        => true,
+        else => false,
+    };
+}
+
+fn persistent(
+    client: *Client,
+    bucket: []const u8,
+    object: []const u8,
+    file: std.Io.File,
+    size: u64,
+    options: types.ParallelUploadOptions,
+    cp: checkpoint.Checkpoint,
+) Error!types.Owned(types.ObjectInfo) {
+    const result = resumeOrStart(client, bucket, object, file, size, options, cp);
+    if (result) |_| {
+        cp.clear();
+    } else |err| if (abandons(err)) cp.clear();
+    return result;
+}
+
+/// Picks the upload up where a checkpoint left it, or starts one and
+/// records it. An upload that turns out to be gone either finished in the
+/// dead process, which the object settles, or was aborted, and starts
+/// over, bounded like a retry.
+fn resumeOrStart(
+    client: *Client,
+    bucket: []const u8,
+    object: []const u8,
+    file: std.Io.File,
+    size: u64,
+    options: types.ParallelUploadOptions,
+    cp: checkpoint.Checkpoint,
+) Error!types.Owned(types.ObjectInfo) {
+    var state_arena: std.heap.ArenaAllocator = .init(client.gpa);
+    defer state_arena.deinit();
+    var persist: Persist = .{
+        .cp = cp,
+        .bucket = bucket,
+        .object = object,
+        .file = file,
+        .size = size,
+        .mtime = try statMtime(client, file),
+        .preconditions = options.preconditions,
+        .resumed = try loadUploadState(client, cp, state_arena.allocator(), bucket, object),
+    };
+    if (persist.resumed) |s| {
+        if (s.size != size or s.mtime != persist.mtime) {
+            logging.warn("{s}: the source file changed under the checkpoint; abandoning the old upload and starting over", .{object});
+            abandonResumed(client, bucket, s);
+            persist.resumed = null;
+        } else if (!sameConditions(s, options.preconditions)) {
+            logging.warn("{s}: the conditions changed since the checkpoint; abandoning the old upload and starting over", .{object});
+            abandonResumed(client, bucket, s);
+            persist.resumed = null;
+        }
+    }
+    const with_conditions = !std.meta.eql(options.preconditions, types.Preconditions{});
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        const outcome = if (with_conditions)
+            conditional(client, bucket, object, .{ .file = file }, size, options, &persist)
+        else
+            multipart(client, bucket, object, .{ .file = file }, size, options, &persist);
+        if (outcome) |result| {
+            return result;
+        } else |err| {
+            if (err != error.UploadSessionLost or attempt + 1 >= client.retry.max_attempts) return err;
+            if (persist.resumed != null) {
+                if (try finishedEarlier(client, &persist, options)) |result| return result;
+            }
+            logging.warn("{s}: the upload is gone; starting over", .{object});
+            persist.resumed = null;
+        }
+    }
+}
+
+fn sameConditions(s: checkpoint.State.UploadParallel, preconditions: types.Preconditions) bool {
+    return std.meta.eql(preconditions, types.Preconditions{
+        .if_generation_match = s.if_generation_match,
+        .if_generation_not_match = s.if_generation_not_match,
+        .if_metageneration_match = s.if_metageneration_match,
+        .if_metageneration_not_match = s.if_metageneration_not_match,
+    });
+}
+
+/// What the checkpoint holds for this upload, or null when it holds
+/// nothing yet. A state that cannot be read or parsed, or that belongs to
+/// another transfer, is `error.CheckpointFailed` before anything is sent.
+fn loadUploadState(
+    client: *Client,
+    cp: checkpoint.Checkpoint,
+    arena: Allocator,
+    bucket: []const u8,
+    object: []const u8,
+) Error!?checkpoint.State.UploadParallel {
+    const d = client.diagnostics;
+    const bytes = cp.load(arena) catch |err| switch (err) {
+        error.CheckpointFailed => {
+            if (d) |diag| diag.print("the checkpoint could not be read", .{});
+            return error.CheckpointFailed;
+        },
+        else => |e| return e,
+    } orelse return null;
+    const state = checkpoint.parse(arena, bytes) catch |err| switch (err) {
+        error.CheckpointFailed => {
+            if (d) |diag| diag.print("the checkpoint holds no state this library wrote; nothing was changed", .{});
+            return error.CheckpointFailed;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const s = switch (state) {
+        .upload_parallel => |s| s,
+        else => {
+            if (d) |diag| diag.print("the checkpoint belongs to another transfer, not a parallel upload; give each transfer a checkpoint of its own", .{});
+            return error.CheckpointFailed;
+        },
+    };
+    if (!std.mem.eql(u8, s.bucket, bucket) or !std.mem.eql(u8, s.object, object)) {
+        if (d) |diag| diag.print("the checkpoint belongs to another transfer; overwriting it would orphan that one, so give each transfer a checkpoint of its own", .{});
+        return error.CheckpointFailed;
+    }
+    return s;
+}
+
+/// Encodes and saves the upload's state, once, when the upload starts. A
+/// store that cannot save fails the upload before any data moves.
+fn saveUploadState(client: *Client, p: *const Persist, upload_id: []const u8, part_size: u64) Error!void {
+    const state: checkpoint.State = .{ .upload_parallel = .{
+        .bucket = p.bucket,
+        .object = p.object,
+        .size = p.size,
+        .mtime = p.mtime,
+        .upload_id = upload_id,
+        .part_size = part_size,
+        .temp = p.temp,
+        .if_generation_match = p.preconditions.if_generation_match,
+        .if_generation_not_match = p.preconditions.if_generation_not_match,
+        .if_metageneration_match = p.preconditions.if_metageneration_match,
+        .if_metageneration_not_match = p.preconditions.if_metageneration_not_match,
+    } };
+    const bytes = try checkpoint.encodeAlloc(client.gpa, state);
+    defer client.gpa.free(bytes);
+    p.cp.save(bytes) catch |err| switch (err) {
+        error.CheckpointFailed => {
+            if (client.diagnostics) |d| d.print("the checkpoint refused a save; the upload fails rather than carry on unresumable", .{});
+            return error.CheckpointFailed;
+        },
+        else => |e| return e,
+    };
+}
+
+fn statMtime(client: *Client, file: std.Io.File) Error!i128 {
+    const stat = file.stat(client.io) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => {
+            if (client.diagnostics) |d| d.print("the file's size and time could not be read: {t}", .{err});
+            return error.ReadFailed;
+        },
+    };
+    return stat.mtime.nanoseconds;
+}
+
+/// The CRC32C of `len` bytes of the file from `first`: how a resume
+/// rebuilds what an earlier process sent, taking nothing about the data
+/// from the checkpoint, so a file changed between runs is caught.
+fn hashRange(client: *Client, file: std.Io.File, first: u64, len: u64) Error!u32 {
+    const buf = try client.gpa.alloc(u8, file_buffer_len);
+    defer client.gpa.free(buf);
+    var hasher: core.crc32c.Hasher = .init();
+    var offset = first;
+    var remaining = len;
+    while (remaining > 0) {
+        const want: usize = @intCast(@min(remaining, buf.len));
+        const got = file.readPositionalAll(client.io, buf[0..want], offset) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                if (client.diagnostics) |d| d.print("the file could not be read back at byte {d} to resume: {t}", .{ offset, err });
+                return error.ReadFailed;
+            },
+        };
+        if (got < want) {
+            if (client.diagnostics) |d| d.print("the file ends at byte {d}, before bytes the checkpoint says were sent", .{offset + got});
+            return error.ReadFailed;
+        }
+        hasher.update(buf[0..got]);
+        offset += got;
+        remaining -= got;
+    }
+    return hasher.final();
+}
+
+/// Learns which parts the server holds, through ListParts, and re-reads
+/// each from the file, so its checksum is rebuilt rather than trusted. A
+/// part of another size than the plan's is left out, and sending it again
+/// replaces it. Returns how many parts stand.
+fn prefill(
+    client: *Client,
+    persist: *const Persist,
+    bucket: []const u8,
+    object: []const u8,
+    upload_id: []const u8,
+    plan: mp.Plan,
+    slots: []Slot,
+) Error!u32 {
+    var arena_state: std.heap.ArenaAllocator = .init(client.gpa);
+    defer arena_state.deinit();
+    const listed = mp.listParts(client, arena_state.allocator(), bucket, object, upload_id, mp.list_page_size) catch |err| {
+        if (mp.uploadIsGone(client, err)) return error.UploadSessionLost;
+        return err;
+    };
+    var held: u32 = 0;
+    for (listed) |part| {
+        if (part.number < 1 or part.number > plan.parts) continue;
+        const index: u32 = part.number - 1;
+        if (part.size != plan.len(index)) continue;
+        if (part.etag.len == 0 or part.etag.len > max_etag_len) continue;
+        const slot = &slots[index];
+        if (slot.etag_len != 0) continue;
+        slot.crc32c = if (client.verify_checksums) try hashRange(client, persist.file, plan.offset(index), part.size) else 0;
+        @memcpy(slot.etag_buffer[0..part.etag.len], part.etag);
+        slot.etag_len = @intCast(part.etag.len);
+        held += 1;
+    }
+    logging.debug("multipart upload of {s}: resuming; the server holds {d} of {d} parts", .{ persist.object, held, plan.parts });
+    return held;
+}
+
+/// Drops an upload whose state could not be saved: unrecorded, it would
+/// only linger and be billed. Best effort, protected from a cancel, and
+/// the save failure's diagnostics stay.
+fn abortUnrecorded(client: *Client, bucket: []const u8, object: []const u8, upload_id: []const u8) void {
+    const saved: ?Diagnostics = if (client.diagnostics) |d| d.* else null;
+    defer if (client.diagnostics) |d| {
+        d.* = saved.?;
+    };
+    const protection = client.io.swapCancelProtection(.blocked);
+    defer _ = client.io.swapCancelProtection(protection);
+    mp.abort(client, bucket, object, upload_id) catch |err| {
+        logging.warn("aborting the unrecorded multipart upload of {s} failed with {t}: abort upload id {s} by hand, or let a lifecycle rule", .{ object, err, upload_id });
+    };
+}
+
+/// Drops what a checkpoint's upload left on the server, for a transfer
+/// that cannot resume it: the upload and its parts, and the temporary
+/// object where one got as far as existing. Best effort, protected from a
+/// cancel.
+fn abandonResumed(client: *Client, bucket: []const u8, s: checkpoint.State.UploadParallel) void {
+    const saved: ?Diagnostics = if (client.diagnostics) |d| d.* else null;
+    defer if (client.diagnostics) |d| {
+        d.* = saved.?;
+    };
+    const protection = client.io.swapCancelProtection(.blocked);
+    defer _ = client.io.swapCancelProtection(protection);
+    mp.abort(client, bucket, s.temp orelse s.object, s.upload_id) catch |err| {
+        logging.warn("aborting the old multipart upload of {s} failed with {t}: abort upload id {s} by hand, or let a lifecycle rule", .{ s.object, err, s.upload_id });
+    };
+    const temp = s.temp orelse return;
+    const target: Object = .{ .client = client, .bucket = bucket, .name = temp };
+    const generation: ?u64 = found: {
+        var info = target.get(.{}) catch break :found null;
+        defer info.deinit();
+        break :found info.value.generation;
+    };
+    if (generation) |g| target.delete(.{ .generation = g }) catch |err| switch (err) {
+        error.NotFound => {},
+        else => logging.warn("deleting the old temporary object {s} failed with {t}: delete it by hand, or let a lifecycle rule", .{ temp, err }),
+    };
+}
+
+/// The resumed upload is gone at the server. A finish that landed in the
+/// dead process leaves the object, or the temporary object, holding
+/// exactly the file's bytes, and the transfer carries on from there; null
+/// means it was aborted instead, and starts over.
+fn finishedEarlier(client: *Client, persist: *Persist, options: types.ParallelUploadOptions) Error!?types.Owned(types.ObjectInfo) {
+    const s = persist.resumed.?;
+    const whole: ?u32 = if (client.verify_checksums) try hashRange(client, persist.file, 0, persist.size) else null;
+    if (s.temp) |temp| {
+        found: {
+            var read = readBack(client, persist.bucket, temp, null, persist.size, whole) catch |err| switch (err) {
+                error.NotFound => break :found,
+                else => |e| return e,
+            };
+            defer read.deinit();
+            logging.debug("{s}: the dead process finished the temporary object; the move is still owed", .{persist.object});
+            return try move(client, persist, persist.bucket, temp, persist.object, read.value.generation, persist.size, whole, options.preconditions);
+        }
+        // Or the move itself landed too.
+        return readBack(client, persist.bucket, persist.object, null, persist.size, whole) catch |err| switch (err) {
+            error.NotFound => null,
+            else => |e| return e,
+        };
+    }
+    return readBack(client, persist.bucket, persist.object, null, persist.size, whole) catch |err| switch (err) {
+        error.NotFound => null,
+        else => |e| return e,
+    };
 }
 
 /// Refuses what the XML API could not carry faithfully, and what Cloud
@@ -207,8 +548,9 @@ fn multipart(
     source: types.ParallelSource,
     size: u64,
     options: types.ParallelUploadOptions,
+    persist: ?*Persist,
 ) Error!types.Owned(types.ObjectInfo) {
-    const joined = try join(client, bucket, object, source, size, options);
+    const joined = try join(client, bucket, object, source, size, options, persist);
     if (joined.read) |read| return read;
     return readBack(client, bucket, object, joined.generation, size, joined.whole);
 }
@@ -233,19 +575,31 @@ fn join(
     source: types.ParallelSource,
     size: u64,
     options: types.ParallelUploadOptions,
+    persist: ?*Persist,
 ) Error!Joined {
     var arena_state: std.heap.ArenaAllocator = .init(client.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const plan = mp.plan(size, options.part_size);
-    const upload_id = try mp.start(client, arena, bucket, object, .{
-        .content_type = options.content_type,
-        .cache_control = options.cache_control,
-        .content_disposition = options.content_disposition,
-        .content_encoding = options.content_encoding,
-        .content_language = options.content_language,
-        .metadata = options.metadata,
-    });
+    // The parts already on the server fix a resumed plan, not the options.
+    const resumed: ?checkpoint.State.UploadParallel = if (persist) |p| p.resumed else null;
+    const plan = mp.plan(size, if (resumed) |s| s.part_size else options.part_size);
+    const upload_id = if (resumed) |s| s.upload_id else blk: {
+        const id = try mp.start(client, arena, bucket, object, .{
+            .content_type = options.content_type,
+            .cache_control = options.cache_control,
+            .content_disposition = options.content_disposition,
+            .content_encoding = options.content_encoding,
+            .content_language = options.content_language,
+            .metadata = options.metadata,
+        });
+        if (persist) |p| saveUploadState(client, p, id, plan.part_size) catch |err| {
+            // An upload the checkpoint never recorded would only linger:
+            // drop it again before any data moves.
+            abortUnrecorded(client, bucket, object, id);
+            return err;
+        };
+        break :blk id;
+    };
     logging.debug("multipart upload of {s}: {d} bytes in {d} parts of {d}", .{ object, size, plan.parts, plan.part_size });
 
     const slots = try arena.alloc(Slot, plan.parts);
@@ -259,8 +613,13 @@ fn join(
         .plan = plan,
         .options = options,
         .slots = slots,
+        .persist = persist,
     };
-    run.sendParts() catch |err| return run.giveUp(err);
+    var held: u32 = 0;
+    if (resumed != null) {
+        held = prefill(client, persist.?, bucket, object, upload_id, plan, slots) catch |err| return run.giveUp(err);
+    }
+    if (held < plan.parts) run.sendParts() catch |err| return run.giveUp(err);
 
     // Every part is in. The parts' checksums fold into the whole's.
     const verify = client.verify_checksums;
@@ -303,26 +662,37 @@ fn conditional(
     source: types.ParallelSource,
     size: u64,
     options: types.ParallelUploadOptions,
+    persist: ?*Persist,
 ) Error!types.Owned(types.ObjectInfo) {
-    try checkEarly(client, bucket, object, options.preconditions);
+    checkEarly(client, bucket, object, options.preconditions) catch |err| {
+        // A resumed upload whose conditions now fail can never move into
+        // place: what it left on the server goes too.
+        if (err == error.FailedPrecondition) if (persist) |p| if (p.resumed) |s| abandonResumed(client, bucket, s);
+        return err;
+    };
     var temp_buf: [temp_prefix.len + 32]u8 = undefined;
-    const temp = tempName(client.io, &temp_buf);
+    const temp: []const u8 = if (persist) |p| t: {
+        // The parts already sent live under the dead process's name.
+        if (p.resumed) |s| break :t s.temp.?;
+        break :t tempName(client.io, &temp_buf);
+    } else tempName(client.io, &temp_buf);
+    if (persist) |p| p.temp = temp;
     logging.debug("{s}: sent as {s}, to be moved into place under its conditions", .{ object, temp });
-    var joined = join(client, bucket, temp, source, size, options) catch |err| {
+    var joined = join(client, bucket, temp, source, size, options, persist) catch |err| {
         // A finish can land before its answer is lost and every retry
         // fails, and then the temporary object is there after all.
-        return dropTemp(client, bucket, temp, null, err);
+        return dropTemp(client, persist, bucket, temp, null, err);
     };
     const generation = if (joined.read) |*read| g: {
         defer read.deinit();
         break :g read.value.generation;
     } else joined.generation orelse g: {
         var read = readBack(client, bucket, temp, null, size, joined.whole) catch |err|
-            return dropTemp(client, bucket, temp, null, err);
+            return dropTemp(client, persist, bucket, temp, null, err);
         defer read.deinit();
         break :g read.value.generation;
     };
-    return move(client, bucket, temp, object, generation, size, joined.whole, options.preconditions);
+    return move(client, persist, bucket, temp, object, generation, size, joined.whole, options.preconditions);
 }
 
 /// Reads the object under the caller's conditions before a byte is sent,
@@ -358,6 +728,7 @@ fn tempName(io: std.Io, buf: *[temp_prefix.len + 32]u8) []const u8 {
 /// size and checksum sent.
 fn move(
     client: *Client,
+    persist: ?*Persist,
     bucket: []const u8,
     temp: []const u8,
     object: []const u8,
@@ -369,12 +740,12 @@ fn move(
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
     const path = names.movePath(scratch.allocator(), bucket, temp, object, generation, preconditions) catch |err|
-        return dropTemp(client, bucket, temp, generation, err);
+        return dropTemp(client, persist, bucket, temp, generation, err);
     var result: types.Owned(types.ObjectInfo) = types.Owned(types.ObjectInfo).init(client.gpa) catch |err|
-        return dropTemp(client, bucket, temp, generation, err);
+        return dropTemp(client, persist, bucket, temp, generation, err);
     const body = rpc.execute(client, result.arena, .{ .method = .POST, .path = path }) catch |err| {
         result.deinit();
-        return settle(client, bucket, temp, object, generation, size, whole, err);
+        return settle(client, persist, bucket, temp, object, generation, size, whole, err);
     };
     errdefer result.deinit();
     result.value = codec.decodeObject(result.arena.allocator(), body) catch |err|
@@ -393,6 +764,7 @@ fn move(
 /// temporary object again.
 fn settle(
     client: *Client,
+    persist: ?*Persist,
     bucket: []const u8,
     temp: []const u8,
     object: []const u8,
@@ -401,17 +773,17 @@ fn settle(
     whole: ?u32,
     err: Error,
 ) Error!types.Owned(types.ObjectInfo) {
-    if (err != error.FailedPrecondition and err != error.NotFound) return dropTemp(client, bucket, temp, generation, err);
+    if (err != error.FailedPrecondition and err != error.NotFound) return dropTemp(client, persist, bucket, temp, generation, err);
     const saved: ?Diagnostics = if (client.diagnostics) |d| d.* else null;
     const still_there = tempIsThere(client, bucket, temp, generation) catch |read_err|
-        return dropTemp(client, bucket, temp, generation, read_err);
+        return dropTemp(client, persist, bucket, temp, generation, read_err);
     if (still_there) {
         // The move never happened: the conditions failed.
         if (client.diagnostics) |d| {
             d.* = saved.?;
             if (err == error.FailedPrecondition) rpc.replace412(client, "the object's conditions failed at the move; the upload was undone, and nothing was written");
         }
-        return dropTemp(client, bucket, temp, generation, err);
+        return dropTemp(client, persist, bucket, temp, generation, err);
     }
     // The move happened. The object at the name must hold these bytes.
     return readBack(client, bucket, object, null, size, whole) catch |read_err| switch (read_err) {
@@ -437,9 +809,18 @@ fn tempIsThere(client: *Client, bucket: []const u8, temp: []const u8, generation
 /// Deletes the temporary object, when the upload got as far as making one,
 /// and returns `err` with its own diagnostics. Pinned to `generation`, or
 /// to whatever generation the name holds when that is unknown, since
-/// nothing else writes there. A cancel was delivered once already, so this
-/// runs protected from another.
-fn dropTemp(client: *Client, bucket: []const u8, temp: []const u8, generation: ?u64, err: Error) Error {
+/// nothing else writes there. With a checkpoint, a failure a resume could
+/// get past deletes nothing: the temporary object stays for the move a
+/// later process owes. A cancel was delivered once already, so this runs
+/// protected from another.
+fn dropTemp(client: *Client, persist: ?*const Persist, bucket: []const u8, temp: []const u8, generation: ?u64, err: Error) Error {
+    // A gone upload is kept too: a finish that landed in a dead process
+    // leaves exactly a temporary object and no upload, and the resume
+    // still owes it the move.
+    if (persist != null and (!abandons(err) or err == error.UploadSessionLost)) {
+        logging.warn("the upload of {s} failed with {t} at its temporary object; whatever stands stays for a resume", .{ temp, err });
+        return err;
+    }
     const saved: ?Diagnostics = if (client.diagnostics) |d| d.* else null;
     defer if (client.diagnostics) |d| {
         d.* = saved.?;
@@ -481,6 +862,8 @@ const Run = struct {
     plan: mp.Plan,
     options: types.ParallelUploadOptions,
     slots: []Slot,
+    /// Null when the caller keeps no state between processes.
+    persist: ?*Persist = null,
     mutex: std.Io.Mutex = .init,
     /// The next part to send, from 0.
     next: u32 = 0,
@@ -492,13 +875,17 @@ const Run = struct {
         diag: Diagnostics,
     };
 
-    /// Sends every part: `concurrency` workers, each with a client of its
-    /// own, on tasks of their own, or one on this task when the `std.Io`
-    /// cannot run tasks concurrently.
+    /// Sends every part not already on the server: `concurrency` workers,
+    /// each with a client of its own, on tasks of their own, or one on
+    /// this task when the `std.Io` cannot run tasks concurrently.
     fn sendParts(run: *Run) Error!void {
         const gpa = run.client.gpa;
         const io = run.client.io;
-        const count: usize = @min(run.options.concurrency, run.plan.parts);
+        var held: u32 = 0;
+        for (run.slots) |slot| {
+            if (slot.etag_len != 0) held += 1;
+        }
+        const count: usize = @min(run.options.concurrency, run.plan.parts - held);
         const workers = try gpa.alloc(Worker, count);
         defer gpa.free(workers);
         var made: usize = 0;
@@ -530,12 +917,17 @@ const Run = struct {
         }
     }
 
-    /// The next part to send, or null once there is none or one failed.
+    /// The next part to send, or null once there is none or one failed. A
+    /// part the server already holds is never handed out: its bytes were
+    /// re-read, not trusted, and sending it again would spend the transfer
+    /// a resume is for.
     fn take(run: *Run) ?u32 {
         const io = run.client.io;
         run.mutex.lockUncancelable(io);
         defer run.mutex.unlock(io);
-        if (run.failure != null or run.next == run.plan.parts) return null;
+        if (run.failure != null) return null;
+        while (run.next < run.plan.parts and run.slots[run.next].etag_len != 0) run.next += 1;
+        if (run.next == run.plan.parts) return null;
         defer run.next += 1;
         return run.next;
     }
@@ -550,11 +942,17 @@ const Run = struct {
     }
 
     /// Aborts the upload, keeping the diagnostics of the failure that
-    /// caused it, and returns that failure. A cancel was delivered once
-    /// already, so the abort runs protected from another and is bounded by
-    /// the client's request timeout.
+    /// caused it, and returns that failure. With a checkpoint, a failure a
+    /// resume could get past aborts nothing: the parts and the state stay
+    /// for a later process. A cancel was delivered once already, so the
+    /// abort runs protected from another and is bounded by the client's
+    /// request timeout.
     fn giveUp(run: *Run, err: Error) Error {
         const client = run.client;
+        if (run.persist != null and !abandons(err)) {
+            logging.warn("the multipart upload of {s} failed with {t}; its parts and checkpoint stay for a resume", .{ run.object, err });
+            return err;
+        }
         const saved: ?Diagnostics = if (client.diagnostics) |d| d.* else null;
         const protection = client.io.swapCancelProtection(.blocked);
         defer _ = client.io.swapCancelProtection(protection);
@@ -2056,4 +2454,914 @@ test "Run: parts are handed out once each, and none after a failure; the first f
     clean.next = 0;
     for (0..5) |i| try testing.expectEqual(@as(u32, @intCast(i)), clean.take().?);
     try testing.expectEqual(null, clean.take());
+}
+
+const MemoryCheckpoint = test_util.MemoryCheckpoint;
+
+/// A client of its own on a shared fake, as each process of a resumed
+/// upload has, with the part floor lowered to 1 KiB.
+fn clientOn(fake: *FakeMultipart, token: *core.StaticToken, diag: *Diagnostics, max_attempts: u8) !Client {
+    var client: Client = try .init(testing.allocator, fake.io, .{
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+        .diagnostics = diag,
+        .retry = .{ .max_attempts = max_attempts, .initial_backoff_ms = 1, .max_backoff_ms = 2 },
+    });
+    client.multipart_test = .{ .min_part_size = 1024 };
+    return client;
+}
+
+/// The test's source file, opened to be rewritten between "processes".
+fn sourceOn(tmp: *testing.TmpDir, data: []const u8) !std.Io.File {
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "source.bin", .data = data });
+    return tmp.dir.openFile(testing.io, "source.bin", .{ .mode = .read_write });
+}
+
+test "uploadParallel: a checkpoint on a memory source is refused before anything is sent" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    try testing.expectError(error.InvalidParallelUploadOptions, s.object("o").uploadParallel(.{ .data = "bytes" }, .{
+        .part_size = 1024,
+        .checkpoint = saved.checkpoint(),
+    }));
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "only a file source outlives a process") != null);
+    try testing.expectEqual(0, s.fake.counts.starts);
+    try testing.expectEqual(0, saved.loads);
+}
+
+test "uploadParallel with a checkpoint: saved once at the start, cleared at the end" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    var data: [6 * 1024]u8 = undefined;
+    fill(&data, 40);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var info = try s.object("dir/o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .concurrency = 2,
+        .checkpoint = saved.checkpoint(),
+    });
+    defer info.deinit();
+    try testing.expectEqual(data.len, info.value.size);
+    try testing.expectEqualSlices(u8, &data, s.fake.object("dir/o").?.bytes);
+    // One save when the upload starts: the server says which parts it
+    // holds, so nothing more is recorded. One clear when it is done.
+    try testing.expectEqual(1, saved.saves);
+    try testing.expectEqual(1, saved.clears);
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "uploadParallel: a run that dies partway leaves a checkpoint a second client resumes, sending only what is missing" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [6 * 1024]u8 = undefined;
+    fill(&data, 41);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var store: checkpoint.CheckpointFile = .init(testing.io, tmp.dir, "o.upload");
+    const options: types.ParallelUploadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = store.checkpoint(),
+    };
+
+    // The first process sends two parts, and the third request dies with
+    // it.
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 3, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    {
+        var diag: Diagnostics = .{};
+        var first = try clientOn(&fake, &token, &diag, 4);
+        defer first.deinit();
+        try testing.expectError(error.Canceled, first.bucket("b").object("dir/o").uploadParallel(.{ .file = file }, options));
+    }
+    try testing.expectEqual(2, fake.counts.parts);
+    try testing.expectEqual(0, fake.counts.aborts);
+    try testing.expectEqual(1, fake.openUploads());
+    try testing.expectEqual(2, fake.openParts());
+
+    // The second process asks the server where the upload stands, re-reads
+    // those parts locally, and sends only the other four.
+    fake.faults = null;
+    var diag: Diagnostics = .{};
+    var second = try clientOn(&fake, &token, &diag, 4);
+    defer second.deinit();
+    var info = try second.bucket("b").object("dir/o").uploadParallel(.{ .file = file }, options);
+    defer info.deinit();
+    try testing.expectEqual(data.len, info.value.size);
+    try testing.expectEqual(core.crc32c.hash(&data), info.value.crc32c.?);
+    try testing.expectEqualSlices(u8, &data, fake.object("dir/o").?.bytes);
+    try testing.expectEqual(1, fake.counts.starts);
+    try testing.expectEqual(1, fake.counts.lists);
+    try testing.expectEqual(2 + 4, fake.counts.parts);
+    try testing.expectEqual(1, fake.counts.finishes);
+    try testing.expectEqual(0, fake.openUploads());
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "o.upload", .{}));
+}
+
+test "uploadParallel: a source file that changed abandons the old upload and starts over" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [6 * 1024]u8 = undefined;
+    fill(&data, 42);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const options: types.ParallelUploadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 3, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").uploadParallel(.{ .file = file }, options));
+    fake.faults = null;
+
+    // The file grows a byte: nothing the server holds describes it now.
+    var grown: [6 * 1024 + 1]u8 = undefined;
+    fill(&grown, 43);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "source.bin", .data = &grown });
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, options);
+    defer info.deinit();
+    try testing.expectEqual(grown.len, info.value.size);
+    try testing.expectEqualSlices(u8, &grown, fake.object("o").?.bytes);
+    // The old upload was aborted, a new one started, and all seven parts
+    // of the grown file sent.
+    try testing.expectEqual(1, fake.counts.aborts);
+    try testing.expectEqual(2, fake.counts.starts);
+    try testing.expectEqual(0, fake.counts.lists);
+    try testing.expectEqual(2 + 7, fake.counts.parts);
+    try testing.expectEqual(0, fake.openUploads());
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "uploadParallel: conditions that changed abandon the old upload and start over" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 44);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+
+    // The first process uploads create-only, under a temporary name, and
+    // dies at its second part.
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 2, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .preconditions = .does_not_exist,
+        .checkpoint = saved.checkpoint(),
+    }));
+    try testing.expect(saved.stored != null);
+    fake.faults = null;
+
+    // The second asks for no conditions at all: not the same transfer.
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    });
+    defer info.deinit();
+    try testing.expectEqualSlices(u8, &data, fake.object("o").?.bytes);
+    try testing.expectEqual(1, fake.counts.aborts);
+    try testing.expectEqual(2, fake.counts.starts);
+    try testing.expectEqual(1 + 4, fake.counts.parts);
+    try testing.expectEqual(0, fake.counts.moves);
+    try testing.expectEqual(0, fake.openUploads());
+}
+
+test "uploadParallel: a part of the wrong size is not trusted, and sending again replaces it" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [6 * 1024]u8 = undefined;
+    fill(&data, 45);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 3, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    }));
+    fake.faults = null;
+
+    // A state naming another part size: the two 1 KiB parts the server
+    // holds fit no slot of the 2 KiB plan, so everything goes up fresh
+    // under the same upload.
+    const forged = try checkpoint.encodeAlloc(testing.allocator, .{ .upload_parallel = .{
+        .bucket = "b",
+        .object = "o",
+        .size = data.len,
+        .mtime = (try file.stat(testing.io)).mtime.nanoseconds,
+        .upload_id = fake.uploads.items[0].id,
+        .part_size = 2048,
+        .temp = null,
+        .if_generation_match = null,
+        .if_generation_not_match = null,
+        .if_metageneration_match = null,
+        .if_metageneration_not_match = null,
+    } });
+    testing.allocator.free(saved.stored.?);
+    saved.stored = forged;
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    });
+    defer info.deinit();
+    try testing.expectEqualSlices(u8, &data, fake.object("o").?.bytes);
+    try testing.expectEqual(1, fake.counts.lists);
+    // Two parts before the crash, three of the resumed plan's size.
+    try testing.expectEqual(2 + 3, fake.counts.parts);
+    try testing.expectEqual(1, fake.counts.starts);
+}
+
+test "uploadParallel: a checkpoint of a finished upload finds the object and sends nothing" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 46);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    // The process dies between the finish and the clear.
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator, .keep_on_clear = true };
+    defer saved.deinit();
+    const options: types.ParallelUploadOptions = .{ .part_size = 1024, .checkpoint = saved.checkpoint() };
+    var first = try s.object("o").uploadParallel(.{ .file = file }, options);
+    first.deinit();
+    try testing.expect(saved.stored != null);
+    try testing.expectEqual(4, s.fake.counts.parts);
+
+    saved.keep_on_clear = false;
+    var info = try s.object("o").uploadParallel(.{ .file = file }, options);
+    defer info.deinit();
+    try testing.expectEqual(data.len, info.value.size);
+    try testing.expectEqual(core.crc32c.hash(&data), info.value.crc32c.?);
+    // The upload was gone; the object already held the file's bytes, so
+    // nothing was sent again.
+    try testing.expectEqual(4, s.fake.counts.parts);
+    try testing.expectEqual(1, s.fake.counts.starts);
+    try testing.expectEqual(1, s.fake.counts.finishes);
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "uploadParallel: a checkpoint of an aborted upload starts over" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 47);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const options: types.ParallelUploadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var rules = [_]Script.Rule{
+        .{ .kind = .part, .part = 3, .fault = .canceled },
+        // A lifecycle rule, say, aborted the upload between the runs.
+        .{ .kind = .list, .fault = .gone },
+    };
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").uploadParallel(.{ .file = file }, options));
+
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, options);
+    defer info.deinit();
+    try testing.expectEqualSlices(u8, &data, fake.object("o").?.bytes);
+    // The gone upload was read for its parts, found gone, no object held
+    // the bytes, and everything went up fresh.
+    try testing.expectEqual(1, fake.counts.lists);
+    try testing.expectEqual(2, fake.counts.starts);
+    try testing.expectEqual(2 + 4, fake.counts.parts);
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "uploadParallel with conditions: a crash between the finish and the move is settled by the resume" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 48);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const options: types.ParallelUploadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .preconditions = .does_not_exist,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var rules = [_]Script.Rule{.{ .kind = .move, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").uploadParallel(.{ .file = file }, options));
+    // The finish landed under the temporary name; the move died.
+    try testing.expectEqual(1, fake.counts.finishes);
+    try testing.expect(saved.stored != null);
+    try testing.expect(fake.object("o") == null);
+    fake.faults = null;
+
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, options);
+    defer info.deinit();
+    try testing.expectEqualStrings("o", info.value.name);
+    try testing.expectEqualSlices(u8, &data, fake.object("o").?.bytes);
+    // No part went up again, no new upload, no second finish: only the
+    // move that was owed, after the file was re-read and held to the
+    // temporary object.
+    try testing.expectEqual(4, fake.counts.parts);
+    try testing.expectEqual(1, fake.counts.starts);
+    try testing.expectEqual(1, fake.counts.finishes);
+    try testing.expectEqual(1, fake.counts.moves);
+    try testing.expectEqual(null, saved.stored);
+    // Nothing lingers under the temporary prefix.
+    for (fake.objects.items) |o| try testing.expect(!std.mem.startsWith(u8, o.name, temp_prefix));
+}
+
+test "uploadParallel with conditions: a resume whose conditions now fail abandons everything" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 49);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const options: types.ParallelUploadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .preconditions = .does_not_exist,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 3, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").uploadParallel(.{ .file = file }, options));
+    fake.faults = null;
+
+    // Another writer created the object: create-only can never move into
+    // place, so the parts go too, before any are sent again.
+    try fake.put("o", "another writer's bytes");
+    try testing.expectError(error.FailedPrecondition, client.bucket("b").object("o").uploadParallel(.{ .file = file }, options));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "conditions already fail") != null);
+    try testing.expectEqual(1, fake.counts.aborts);
+    try testing.expectEqual(2, fake.counts.parts);
+    try testing.expectEqual(0, fake.openUploads());
+    try testing.expectEqual(null, saved.stored);
+    try testing.expectEqualStrings("another writer's bytes", fake.object("o").?.bytes);
+}
+
+test "uploadParallel: a save that fails at the start aborts the unrecorded upload; retries run out and everything stays" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [6 * 1024]u8 = undefined;
+    fill(&data, 50);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+
+    // The very first save fails: the upload it would have recorded goes.
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator, .saves_allowed = 0 };
+    defer saved.deinit();
+    const options: types.ParallelUploadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+    try testing.expectError(error.CheckpointFailed, client.bucket("b").object("o").uploadParallel(.{ .file = file }, options));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "refused a save") != null);
+    try testing.expectEqual(1, fake.counts.starts);
+    try testing.expectEqual(1, fake.counts.aborts);
+    try testing.expectEqual(0, fake.counts.parts);
+    try testing.expectEqual(0, fake.openUploads());
+
+    // Retries running out on a part keeps the upload and the state.
+    saved.saves_allowed = null;
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 2, .times = 4, .fault = .unavailable }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    try testing.expectError(error.Unavailable, client.bucket("b").object("o").uploadParallel(.{ .file = file }, options));
+    try testing.expect(saved.stored != null);
+    try testing.expectEqual(1, fake.counts.aborts);
+    try testing.expectEqual(1, fake.openUploads());
+
+    // And the next run finishes from there.
+    fake.faults = null;
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, options);
+    defer info.deinit();
+    try testing.expectEqualSlices(u8, &data, fake.object("o").?.bytes);
+    try testing.expectEqual(0, fake.openUploads());
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "uploadParallel: with a checkpoint, a cancel keeps the parts for the next run" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 2, .fault = .wait }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var data: [6 * 1024]u8 = undefined;
+    fill(&data, 51);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    const options: types.ParallelUploadOptions = .{
+        .part_size = 1024,
+        .concurrency = 2,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    const Running = struct {
+        fn go(target: Object, source: std.Io.File, opts: types.ParallelUploadOptions) Error!void {
+            var info = try target.uploadParallel(.{ .file = source }, opts);
+            info.deinit();
+        }
+    };
+    var task = try testing.io.concurrent(Running.go, .{ client.bucket("b").object("o"), file, options });
+    // One worker holds part 2 at the gate; the other sends the rest.
+    const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(10));
+    while (true) {
+        fake.mutex.lockUncancelable(testing.io);
+        const sent = fake.counts.parts;
+        fake.mutex.unlock(testing.io);
+        if (sent >= 5) break;
+        if (std.Io.Clock.awake.now(testing.io).nanoseconds > deadline.nanoseconds) @panic("the upload never sent the five parts not held back");
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expectError(error.Canceled, task.cancel(testing.io));
+    // The cancel aborted nothing: the parts and the state stay.
+    try testing.expect(saved.stored != null);
+    try testing.expectEqual(0, fake.counts.aborts);
+    try testing.expectEqual(1, fake.openUploads());
+
+    fake.faults = null;
+    fake.gate.set(testing.io);
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, options);
+    defer info.deinit();
+    try testing.expectEqualSlices(u8, &data, fake.object("o").?.bytes);
+    try testing.expectEqual(5 + 1, fake.counts.parts);
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "uploadParallel: a checksum mismatch aborts and clears even with a checkpoint" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 52);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    try testing.expectError(error.ChecksumMismatch, s.object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .crc32c = core.crc32c.hash(&data) ^ 1,
+        .checkpoint = saved.checkpoint(),
+    }));
+    // Resuming would only repeat the mismatch: nothing stays.
+    try testing.expectEqual(1, s.fake.counts.aborts);
+    try testing.expectEqual(0, s.fake.openUploads());
+    try testing.expectEqual(null, saved.stored);
+    try testing.expectEqual(1, saved.clears);
+}
+
+test "the upload checkpoint's state reaches neither the log nor the diagnostics" {
+    logging.capture.reset();
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 53);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    const options: types.ParallelUploadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 2, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").uploadParallel(.{ .file = file }, options));
+    fake.faults = null;
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, options);
+    info.deinit();
+
+    try testing.expect(logging.capture.lines > 0);
+    try testing.expectEqual(null, std.mem.indexOf(u8, logging.capture.text(), "\"kind\""));
+    try testing.expectEqual(null, std.mem.indexOf(u8, logging.capture.text(), "\"upload_id\""));
+    try testing.expectEqual(null, std.mem.indexOf(u8, diag.message(), "\"kind\""));
+}
+
+fn uploadWithCheckpoint(gpa: Allocator) !void {
+    var fake: FakeMultipart = .init(gpa, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var client: Client = try .init(gpa, testing.io, .{
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    client.multipart_test = .{ .min_part_size = 1024 };
+    var data: [3000]u8 = undefined;
+    fill(&data, 54);
+    var saved: MemoryCheckpoint = .{ .gpa = gpa };
+    defer saved.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    // One worker, so the allocation count is the same on every pass.
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    });
+    info.deinit();
+}
+
+test "uploadParallel with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, uploadWithCheckpoint, .{});
+}
+
+/// Lets every request through, recording each part number sent, so a
+/// resume can prove it sent nothing the server already held.
+const PartRecorder = struct {
+    gpa: Allocator,
+    numbers: std.ArrayList(u32) = .empty,
+
+    fn deinit(self: *PartRecorder) void {
+        self.numbers.deinit(self.gpa);
+    }
+
+    fn plan(self: *PartRecorder) FakeMultipart.FaultPlan {
+        return .{ .ctx = self, .decide = decide };
+    }
+
+    fn decide(ctx: ?*anyopaque, kind: FakeMultipart.Kind, part: u32) FakeMultipart.Fault {
+        const self: *PartRecorder = @ptrCast(@alignCast(ctx.?));
+        if (kind == .part) self.numbers.append(self.gpa, part) catch @panic("out of memory recording a part");
+        return .none;
+    }
+};
+
+/// One upload under drawn faults, cut wherever they cut it, then a second
+/// run with the same checkpoint and no faults: the object is exactly the
+/// file, no part the server already held is sent again, and nothing but
+/// an empty upload a lost start answer left behind stays to be billed.
+fn resumeUnderFaults(input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    const size = g.intRange(usize, 0, 40 * 1024);
+    const part_size = g.intRange(u64, 1024, 12 * 1024);
+    const concurrency = g.intRange(u16, 1, 4);
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    fill(data, g.int(u64));
+
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    fake.min_part_size = 1024;
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, data);
+    defer file.close(testing.io);
+    const options: types.ParallelUploadOptions = .{
+        .part_size = part_size,
+        .concurrency = concurrency,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var chooser: Chooser = .{ .bytes = g.rest() };
+    fake.faults = chooser.plan();
+    var first_diag: Diagnostics = .{};
+    var first = try clientOn(&fake, &token, &first_diag, 2);
+    defer first.deinit();
+    if (first.bucket("b").object("o").uploadParallel(.{ .file = file }, options)) |finished| {
+        var owned = finished;
+        owned.deinit();
+    } else |err| {
+        errdefer std.debug.print("first run: {t}: {s}\n", .{ err, first_diag.message() });
+        // Only a fault ends a first run.
+        try testing.expect(chooser.faulted);
+    }
+
+    // What the state records, and which of its parts the server holds.
+    var state_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state_arena.deinit();
+    var held_numbers: std.ArrayList(u32) = .empty;
+    defer held_numbers.deinit(testing.allocator);
+    var resumable_upload = false;
+    if (saved.stored) |bytes| {
+        // Whatever the faults did, the state is one this library wrote.
+        const state = try checkpoint.parse(state_arena.allocator(), bytes);
+        const s = state.upload_parallel;
+        try testing.expectEqualStrings("o", s.object);
+        try testing.expectEqual(data.len, s.size);
+        const plan = mp.plan(s.size, s.part_size);
+        for (fake.uploads.items) |u| {
+            if (!std.mem.eql(u8, u.id, s.upload_id)) continue;
+            resumable_upload = true;
+            for (u.parts.keys(), u.parts.values()) |number, part| {
+                if (number >= 1 and number <= plan.parts and part.bytes.len == plan.len(number - 1)) {
+                    try held_numbers.append(testing.allocator, number);
+                }
+            }
+        }
+    }
+
+    var recorder: PartRecorder = .{ .gpa = testing.allocator };
+    defer recorder.deinit();
+    fake.faults = recorder.plan();
+    var diag: Diagnostics = .{};
+    var second = try clientOn(&fake, &token, &diag, 4);
+    defer second.deinit();
+    var info = second.bucket("b").object("o").uploadParallel(.{ .file = file }, options) catch |err| {
+        std.debug.print("second run: {t}: {s}\n", .{ err, diag.message() });
+        return err;
+    };
+    defer info.deinit();
+
+    try testing.expectEqual(data.len, info.value.size);
+    try testing.expectEqual(core.crc32c.hash(data), info.value.crc32c.?);
+    try testing.expectEqualSlices(u8, data, fake.object("o").?.bytes);
+    try testing.expectEqual(null, saved.stored);
+    // A resume of a live upload sent no part the server already held.
+    if (resumable_upload) {
+        for (recorder.numbers.items) |sent| {
+            for (held_numbers.items) |held| try testing.expect(sent != held);
+        }
+    }
+    // Nothing to be billed stays behind, but for an empty upload a lost
+    // start answer left, whose id never reached the client.
+    try testing.expectEqual(0, fake.openParts());
+}
+
+fn resumeProperty(_: void, input: []const u8) !void {
+    try resumeUnderFaults(input);
+}
+
+// About 9 ms a run in Debug, with two uploads over real threads and a real
+// file: named out of the nightly's "fuzz" and "slow property" filters,
+// like the other parallel fault properties, until a job of its own is
+// sized for them.
+test "fault property parallel upload resume: a second run completes the object, sending nothing the server holds" {
+    try test_util.fuzzBytes({}, resumeProperty, .{
+        .random_runs = 100,
+        .max_len = 256,
+        .corpus = &.{
+            "",
+            // 40 KiB in 1 KiB parts, 4 at once, a reset and a lost answer.
+            "\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x00\x00\x00\x00\x00\xdc\xe6",
+            // A corrupted part, which aborts and clears, then a clean pair
+            // of runs.
+            "\x80\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x02\x01\x00\x00\x00\x00\x00\x00\xf2",
+        },
+    });
+}
+
+test "uploadParallel over real sockets: an upload its connection keeps killing resumes on a second client" {
+    // Four resets exhaust the first client's four attempts on one part:
+    // that process is done, two parts up.
+    var rules = [_]Script.Rule{.{ .kind = .part, .part = 3, .times = 4, .fault = .reset }};
+    var script: Script = .{ .rules = &rules };
+    var s: OverSockets = undefined;
+    try s.init();
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [40 * 1024 + 5]u8 = undefined;
+    fill(&data, 55);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var store: checkpoint.CheckpointFile = .init(testing.io, tmp.dir, "o.upload");
+    const options: types.ParallelUploadOptions = .{
+        .part_size = 8 * 1024,
+        .concurrency = 1,
+        .checkpoint = store.checkpoint(),
+    };
+    try testing.expectError(
+        error.ConnectionResetByPeer,
+        s.client.bucket("b").object("dir/o").uploadParallel(.{ .file = file }, options),
+    );
+    try testing.expectEqual(2, s.fake.counts.parts);
+    try testing.expectEqual(1, s.fake.openUploads());
+
+    // A second client, over connections of its own, finishes the upload.
+    var url_buf: [64]u8 = undefined;
+    var diag: Diagnostics = .{};
+    var second: Client = try .init(testing.allocator, testing.io, .{
+        .endpoint = .{ .url = s.server.url(&url_buf), .emulator = true },
+        .diagnostics = &diag,
+        .retry = .{ .max_attempts = 4, .initial_backoff_ms = 1, .max_backoff_ms = 2 },
+    });
+    defer second.deinit();
+    second.multipart_test = .{ .min_part_size = 1024, .on_emulator = true };
+    var info = try second.bucket("b").object("dir/o").uploadParallel(.{ .file = file }, options);
+    defer info.deinit();
+    try testing.expectEqual(data.len, info.value.size);
+    try testing.expectEqualSlices(u8, &data, s.fake.object("dir/o").?.bytes);
+    // The four missing parts and nothing more, and the state is gone.
+    try testing.expectEqual(2 + 4, s.fake.counts.parts);
+    try testing.expectEqual(1, s.fake.counts.lists);
+    try testing.expectEqual(1, s.fake.counts.starts);
+    try testing.expectEqual(0, s.fake.openUploads());
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "o.upload", .{}));
+}
+
+test "uploadParallel: a checkpoint of another transfer, or one unreadable, is refused before anything is sent and kept" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, "the file's bytes");
+    defer file.close(testing.io);
+
+    // A download's state: not this transfer's, whatever its names say.
+    const download_state = try checkpoint.encodeAlloc(testing.allocator, .{ .download_parallel = .{
+        .bucket = "b",
+        .object = "o",
+        .size = 5000,
+        .generation = 42,
+        .part_size = 1024,
+        .written = "50",
+    } });
+    var wrong_kind: MemoryCheckpoint = .{ .gpa = testing.allocator, .stored = download_state };
+    defer wrong_kind.deinit();
+    try testing.expectError(error.CheckpointFailed, s.object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .checkpoint = wrong_kind.checkpoint(),
+    }));
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "not a parallel upload") != null);
+    try testing.expectEqualStrings(download_state, wrong_kind.stored.?);
+
+    // An upload state for another object.
+    const foreign = try checkpoint.encodeAlloc(testing.allocator, .{ .upload_parallel = .{
+        .bucket = "b",
+        .object = "someone-elses",
+        .size = 5000,
+        .mtime = 1,
+        .upload_id = "u",
+        .part_size = 1024,
+        .temp = null,
+        .if_generation_match = null,
+        .if_generation_not_match = null,
+        .if_metageneration_match = null,
+        .if_metageneration_not_match = null,
+    } });
+    var other: MemoryCheckpoint = .{ .gpa = testing.allocator, .stored = foreign };
+    defer other.deinit();
+    try testing.expectError(error.CheckpointFailed, s.object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .checkpoint = other.checkpoint(),
+    }));
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "belongs to another transfer") != null);
+    try testing.expectEqualStrings(foreign, other.stored.?);
+
+    // Bytes that are no state at all.
+    var garbage: MemoryCheckpoint = .{ .gpa = testing.allocator, .stored = try testing.allocator.dupe(u8, "gsutil tracker?") };
+    defer garbage.deinit();
+    try testing.expectError(error.CheckpointFailed, s.object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .checkpoint = garbage.checkpoint(),
+    }));
+
+    // None of it reached the server, and nothing was aborted.
+    try testing.expectEqual(0, s.fake.counts.starts);
+    try testing.expectEqual(0, s.fake.counts.lists);
+    try testing.expectEqual(0, s.fake.counts.aborts);
+}
+
+test "uploadParallel: an emulator's ordinary upload ignores the checkpoint" {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        // The ordinary upload's resumable session, opened and finished.
+        .{ .respond = .{ .body = "", .headers = &.{.{ .name = "Location", .value = "http://localhost:4443/session/1" }} } },
+        .{ .respond = .{ .body = "{\"name\":\"o\",\"bucket\":\"b\",\"size\":\"16\",\"generation\":\"1\"}" } },
+    });
+    defer fake.deinit();
+    var client: Client = try .init(testing.allocator, testing.io, .{
+        .endpoint = .{ .url = "localhost:4443", .emulator = true },
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, "the file's bytes");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var info = try client.bucket("b").object("o").uploadParallel(.{ .file = file }, .{
+        .checkpoint = saved.checkpoint(),
+    });
+    defer info.deinit();
+    // One ordinary upload, which cannot resume: the checkpoint was never
+    // touched.
+    try testing.expectEqual(0, saved.loads);
+    try testing.expectEqual(0, saved.saves);
+    try testing.expectEqual(0, saved.clears);
 }
