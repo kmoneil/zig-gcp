@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.18.0 (unreleased)
+## 0.18.0 (2026-09-24)
 
 - storage: parallel uploads, and copies that change what they carry: the
   two follow-ups the metadata spec named.
