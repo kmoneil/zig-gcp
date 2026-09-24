@@ -1,6 +1,6 @@
 .{
     .name = .gcp,
-    .version = "0.18.0",
+    .version = "0.19.0",
     // Tied to .name: `zig build` generated it when the package became gcp.
     // Never change it; forks regenerate it.
     .fingerprint = 0xac0c4def50e03e1b,
