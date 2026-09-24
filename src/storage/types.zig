@@ -234,6 +234,14 @@ pub const ParallelUploadOptions = struct {
     /// How long the finish may take: Google says "several minutes". 0
     /// removes the limit.
     finish_timeout_ms: u32 = 600_000,
+    /// Conditions on the object's name. When empty, the upload replaces
+    /// whatever is there, as the multipart upload always does. When set,
+    /// they are checked before a byte is sent, the upload finishes under a
+    /// temporary name, and `objects.move` puts it in place only if they
+    /// still hold. `.does_not_exist` makes the upload create-only. The move
+    /// needs `storage.objects.move`, which Storage Object User grants and
+    /// Storage Object Creator does not.
+    preconditions: Preconditions = .{},
 };
 
 /// Where `Object.downloadParallel` writes.
