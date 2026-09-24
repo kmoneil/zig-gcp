@@ -236,6 +236,35 @@ pub const ParallelUploadOptions = struct {
     finish_timeout_ms: u32 = 600_000,
 };
 
+/// Where `Object.downloadParallel` writes.
+pub const ParallelDestination = union(enum) {
+    /// Memory of at least the object's size. The object fills it from the
+    /// start; `DownloadResult.bytes_written` says how far.
+    buffer: []u8,
+    /// A regular file opened for writing, not appending. Its length becomes
+    /// exactly the object's, and each range is written at its own offset.
+    file: std.Io.File,
+};
+
+pub const ParallelDownloadOptions = struct {
+    /// Download one specific generation instead of the live one.
+    generation: ?u64 = null,
+    /// Conditions on the metadata read that opens the download. Every
+    /// range is then pinned to the generation that read named.
+    preconditions: Preconditions = .{},
+    /// At least 1 MiB, grown when the object would otherwise need more than
+    /// 10,000 ranges. Every range but the last is this size.
+    part_size: u64 = 32 * 1024 * 1024,
+    /// Ranges in flight at once, each on a connection of its own: 1 to 64.
+    concurrency: u16 = 8,
+    /// How long one request for a range may run before it is cut and
+    /// resumed where it stopped, far past `Client.Options.request_timeout_ms`,
+    /// which still bounds the metadata read. A gzip-stored object is fetched
+    /// in one request that cannot resume, so this bounds all of it. 0
+    /// removes the limit.
+    part_timeout_ms: u32 = 300_000,
+};
+
 /// A byte range of an object: `length` bytes from `offset`, or everything
 /// from `offset` when `length` is null.
 pub const Range = struct {
@@ -260,6 +289,9 @@ pub const DownloadResult = struct {
     /// checksum, the object was decompressed in transit, or the client
     /// turned verification off.
     checksum_verified: bool,
+    /// The CRC32C of the bytes written, whether or not there was a checksum
+    /// to verify them against: a range's, or a decompressed object's.
+    crc32c: u32,
 };
 
 /// A whole object in memory, with how the download went.

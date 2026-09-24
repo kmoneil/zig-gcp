@@ -16,7 +16,8 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// Upload or download bytes do not match the checksum beside them. On
     /// upload nothing was sent; on download the data is discarded.
     ChecksumMismatch,
-    /// `downloadAlloc` met an object larger than its `max_bytes`.
+    /// `downloadAlloc` met an object larger than its `max_bytes`, or
+    /// `downloadParallel` one larger than the buffer it was given.
     ObjectTooLarge,
     /// The caller's writer failed during a download, with the detail
     /// wherever that concrete writer keeps it. Whatever it holds by then
@@ -77,4 +78,8 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// segment, which the XML API's paths cannot name. `Diagnostics` says
     /// which. Nothing was sent.
     InvalidParallelUploadOptions,
+    /// A parallel download's options break a rule: a part size under 1 MiB,
+    /// or a concurrency outside 1 to 64. `Diagnostics` says which. Nothing
+    /// was sent.
+    InvalidParallelDownloadOptions,
 };
