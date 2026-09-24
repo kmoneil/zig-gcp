@@ -179,9 +179,11 @@ pub const MetadataUpdate = struct {
 pub const UploadOptions = struct {
     content_type: []const u8 = "application/octet-stream",
     cache_control: ?[]const u8 = null,
+    content_disposition: ?[]const u8 = null,
     /// `gzip` marks the object as stored compressed, which changes how
     /// downloads behave; see the download options.
     content_encoding: ?[]const u8 = null,
+    content_language: ?[]const u8 = null,
     /// Custom metadata. Keys must not be empty.
     metadata: []const Metadata = &.{},
     /// The known checksum of the whole object. Checked against the data
@@ -194,6 +196,44 @@ pub const UploadOptions = struct {
     size: ?u64 = null,
     /// `.does_not_exist` makes an upload create-only and safe to retry.
     preconditions: Preconditions = .{},
+};
+
+/// Where `Object.uploadParallel` reads its parts.
+pub const ParallelSource = union(enum) {
+    /// Bytes in memory. Each part is a slice of them; nothing is copied.
+    data: []const u8,
+    /// A regular file opened for reading. Each part is read at its own
+    /// offset, so the file must allow positional reads, and it must not
+    /// change until the upload returns.
+    file: std.Io.File,
+};
+
+pub const ParallelUploadOptions = struct {
+    content_type: []const u8 = "application/octet-stream",
+    cache_control: ?[]const u8 = null,
+    content_disposition: ?[]const u8 = null,
+    content_encoding: ?[]const u8 = null,
+    content_language: ?[]const u8 = null,
+    /// Sent as `x-goog-meta-` headers, the only way the XML API takes
+    /// custom metadata. So a key is lowercase letters, digits and
+    /// `!#$%&'*+-.^_`|~`, a value printable ASCII without a space at either
+    /// end, which HTTP would trim, and all of it together at most 8 KiB.
+    metadata: []const Metadata = &.{},
+    /// The known checksum of the whole object, checked against the parts'
+    /// before they are joined, so a mismatch writes nothing.
+    crc32c: ?u32 = null,
+    /// 5 MiB to 5 GiB, grown when the object would otherwise need more
+    /// than 10,000 parts. Every part but the last is this size.
+    part_size: u64 = 32 * 1024 * 1024,
+    /// Parts in flight at once, each on a connection of its own: 1 to 64.
+    concurrency: u16 = 8,
+    /// How long one part may take, far past `Client.Options.request_timeout_ms`,
+    /// which still bounds the small requests: at the default a 32 MiB part
+    /// may cross its connection at about 110 KiB/s. 0 removes the limit.
+    part_timeout_ms: u32 = 300_000,
+    /// How long the finish may take: Google says "several minutes". 0
+    /// removes the limit.
+    finish_timeout_ms: u32 = 600_000,
 };
 
 /// A byte range of an object: `length` bytes from `offset`, or everything

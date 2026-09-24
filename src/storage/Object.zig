@@ -19,6 +19,7 @@ const logging = @import("logging.zig");
 const metadata = @import("metadata.zig");
 const multipart = @import("multipart.zig");
 const names = @import("names.zig");
+const parallel = @import("parallel.zig");
 const post_policy = @import("post_policy.zig");
 const resumable = @import("resumable.zig");
 const rpc = @import("rpc.zig");
@@ -277,6 +278,31 @@ pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOpt
         .{ streamed, expected },
     );
     return error.ChecksumMismatch;
+}
+
+/// Uploads `source` as this object in parts sent `options.concurrency` at
+/// a time, each on a client and connection of its own, and has Cloud
+/// Storage join them: the XML API's multipart upload. For large objects on
+/// fast links, where one connection is the limit.
+///
+/// Every part is checked against the checksum Cloud Storage stored for it,
+/// and the parts' checksums combine into the whole object's, which must
+/// match `options.crc32c` before anything is joined, and the joined object
+/// afterwards. On any failure the upload is aborted, so no part is left
+/// behind to be billed; a process that dies mid-upload leaves its parts
+/// until the bucket's `AbortIncompleteMultipartUpload` lifecycle rule runs.
+///
+/// Takes no preconditions, since the multipart upload has none: like an
+/// unconditional upload, it replaces whatever has the name. Retries never
+/// write twice, so it retries as a resumable upload does, always. The
+/// result is read back with one metadata request, which needs
+/// `storage.objects.get`. Against an emulator, which has no multipart
+/// uploads, the object goes up as one ordinary upload.
+pub fn uploadParallel(self: Object, source: types.ParallelSource, options: types.ParallelUploadOptions) Error!types.Owned(types.ObjectInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    return parallel.upload(self.client, self.bucket, self.name, source, options);
 }
 
 /// Server-side copy to `dest`, looping over rewrite calls until the

@@ -913,6 +913,17 @@ pub const ScriptedServer = struct {
     }
 };
 
+test "FakeClock: cancel protection is kept, and a blocked sleep is not canceled" {
+    var clock: FakeClock = .{ .cancel_sleep = true };
+    const io = clock.io();
+    try std.testing.expectError(error.Canceled, io.sleep(.fromMilliseconds(1), .awake));
+    const before = io.swapCancelProtection(.blocked);
+    try std.testing.expectEqual(.unblocked, before);
+    try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(.blocked, io.swapCancelProtection(before));
+    try std.testing.expectError(error.Canceled, io.sleep(.fromMilliseconds(1), .awake));
+}
+
 /// An allocator that counts the blocks that were not all zeros when freed,
 /// to test code that must wipe secrets. Such code should free with `rawFree`
 /// after wiping: `Allocator.free` overwrites memory with a debug pattern in
@@ -965,8 +976,12 @@ pub const FakeClock = struct {
     /// When set, `random` fills every byte with this value instead of the PRNG.
     random_byte: ?u8 = null,
     prng: std.Random.DefaultPrng = .init(0x9e37_79b9_7f4a_7c15),
-    /// When set, `sleep` reports cancellation, as a canceled task would see it.
+    /// When set, `sleep` reports cancellation, as a canceled task would see
+    /// it, unless the task has blocked cancellation.
     cancel_sleep: bool = false,
+    /// What `swapCancelProtection` last set: code that must finish a
+    /// cleanup after a cancel blocks it, and a blocked sleep is not canceled.
+    cancel_protection: std.Io.CancelProtection = .unblocked,
 
     pub fn io(self: *FakeClock) std.Io {
         return .{ .userdata = self, .vtable = &vtable };
@@ -982,6 +997,7 @@ pub const FakeClock = struct {
         v.now = now;
         v.sleep = sleep;
         v.random = random;
+        v.swapCancelProtection = swapCancelProtection;
         break :v v;
     };
 
@@ -996,7 +1012,7 @@ pub const FakeClock = struct {
 
     fn sleep(userdata: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
         const self = fromUserdata(userdata);
-        if (self.cancel_sleep) return error.Canceled;
+        if (self.cancel_sleep and self.cancel_protection == .unblocked) return error.Canceled;
         const ns: i96 = switch (timeout) {
             .none => 0,
             .duration => |d| d.raw.nanoseconds,
@@ -1005,6 +1021,12 @@ pub const FakeClock = struct {
         if (self.sleep_count < self.sleeps.len) self.sleeps[self.sleep_count] = ns;
         self.sleep_count += 1;
         self.now_ns += ns;
+    }
+
+    fn swapCancelProtection(userdata: ?*anyopaque, new: std.Io.CancelProtection) std.Io.CancelProtection {
+        const self = fromUserdata(userdata);
+        defer self.cancel_protection = new;
+        return self.cancel_protection;
     }
 
     fn random(userdata: ?*anyopaque, buffer: []u8) void {

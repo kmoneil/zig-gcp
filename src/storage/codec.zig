@@ -49,8 +49,16 @@ fn writeUploadMetadata(
         try jw.objectField("cacheControl");
         try jw.write(value);
     }
+    if (options.content_disposition) |value| {
+        try jw.objectField("contentDisposition");
+        try jw.write(value);
+    }
     if (options.content_encoding) |value| {
         try jw.objectField("contentEncoding");
+        try jw.write(value);
+    }
+    if (options.content_language) |value| {
+        try jw.objectField("contentLanguage");
         try jw.write(value);
     }
     if (options.metadata.len > 0) {
