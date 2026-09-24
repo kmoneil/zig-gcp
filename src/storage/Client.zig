@@ -170,6 +170,38 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
     };
 }
 
+/// A client with this one's settings and a connection of its own, for a
+/// task that runs beside this one's: a client must not be used from two
+/// tasks at once, and the built-in transport is not safe to share. A custom
+/// `Options.transport` is shared, so it must tolerate use from several
+/// tasks at once, as `pubsub.Publisher` asks of its senders' too. The token
+/// provider is shared; it is asked for tokens from every task. The sibling
+/// reports into `diagnostics`, and is freed with its own `deinit`.
+pub fn sibling(self: *const Client, diagnostics: ?*Diagnostics) Error!Client {
+    const base_url = try self.gpa.dupe(u8, self.base_url);
+    errdefer self.gpa.free(base_url);
+    const project_id = if (self.project_id) |p| try self.gpa.dupe(u8, p) else null;
+    errdefer if (project_id) |p| self.gpa.free(p);
+    const user_agent = try self.gpa.dupe(u8, self.user_agent);
+    errdefer self.gpa.free(user_agent);
+
+    var http: ?*HttpTransport = null;
+    const transport = if (self.http == null) self.transport else t: {
+        const h = try self.gpa.create(HttpTransport);
+        h.* = .init(self.gpa, self.io, user_agent);
+        http = h;
+        break :t h.transport();
+    };
+    var copy = self.*;
+    copy.project_id = project_id;
+    copy.base_url = base_url;
+    copy.user_agent = user_agent;
+    copy.transport = transport;
+    copy.http = http;
+    copy.diagnostics = diagnostics;
+    return copy;
+}
+
 pub fn deinit(self: *Client) void {
     if (self.http) |h| {
         h.deinit();
@@ -336,4 +368,58 @@ test "listBuckets without a project is MissingProject" {
     try testing.expectError(error.MissingProject, h.client.listBuckets(.{}));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "project_id") != null);
     try h.expectRequestCount(0);
+}
+
+test "sibling: the same settings, a connection of its own, and diagnostics of its own" {
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: Diagnostics = .{};
+    var client: Client = try .init(testing.allocator, testing.io, .{
+        .project_id = "extractctl",
+        .token_provider = token.provider(),
+        .retry = .{ .max_attempts = 7 },
+        .request_timeout_ms = 1234,
+        .user_agent = "zig-gcp-test/1",
+        .diagnostics = &diag,
+    });
+    defer client.deinit();
+    var sibling_diag: Diagnostics = .{};
+    var s = try client.sibling(&sibling_diag);
+    defer s.deinit();
+    // A built-in transport is never shared: one per task.
+    try testing.expect(s.http != null and s.http != client.http);
+    try testing.expect(s.transport.ptr != client.transport.ptr);
+    try testing.expectEqual(&sibling_diag, s.diagnostics.?);
+    // Its own copies of the strings, equal to the original's.
+    try testing.expect(s.base_url.ptr != client.base_url.ptr);
+    try testing.expectEqualStrings(client.base_url, s.base_url);
+    try testing.expectEqualStrings("extractctl", s.project_id.?);
+    try testing.expectEqualStrings("zig-gcp-test/1", s.user_agent);
+    try testing.expectEqual(7, s.retry.max_attempts);
+    try testing.expectEqual(1234, s.request_timeout_ms);
+    try testing.expectEqual(client.token_provider.?.ptr, s.token_provider.?.ptr);
+
+    // A custom transport is shared, as documented.
+    var h: test_util.Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    var shared = try h.client.sibling(null);
+    defer shared.deinit();
+    try testing.expectEqual(null, shared.http);
+    try testing.expectEqual(h.client.transport.ptr, shared.transport.ptr);
+    try testing.expectEqual(null, shared.diagnostics);
+}
+
+fn siblingOf(gpa: Allocator) !void {
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var client: Client = try .init(gpa, testing.io, .{
+        .project_id = "extractctl",
+        .token_provider = token.provider(),
+    });
+    defer client.deinit();
+    var s = try client.sibling(null);
+    s.deinit();
+}
+
+test "sibling: every allocation failure is OutOfMemory without leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, siblingOf, .{});
 }

@@ -98,4 +98,6 @@ test {
     _ = @import("test_util.zig");
     _ = @import("types.zig");
     _ = @import("validate.zig");
+    _ = @import("xml.zig");
+    _ = @import("xml_multipart.zig");
 }

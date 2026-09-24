@@ -180,6 +180,53 @@ fn writeResumable(w: *Writer, bucket: []const u8, preconditions: types.Precondit
     try writePreconditions(&params, preconditions);
 }
 
+/// Writes a bucket or object name into an XML API path, as signed URLs and
+/// multipart uploads name objects: `/` and the unreserved characters stay,
+/// every other byte becomes `%XX`.
+pub fn writeXmlPath(w: *Writer, text: []const u8) Writer.Error!void {
+    return std.Uri.Component.percentEncode(w, text, isXmlPathByte);
+}
+
+fn isXmlPathByte(c: u8) bool {
+    return c == '/' or query.isUnreserved(c);
+}
+
+/// What an XML API multipart upload request says after the object.
+pub const XmlQuery = union(enum) {
+    /// `?uploads`: start an upload.
+    uploads,
+    /// `?partNumber=N&uploadId=ID`: send one part.
+    part: struct { number: u32, upload_id: []const u8 },
+    /// `?uploadId=ID`: finish or abort an upload.
+    upload: []const u8,
+};
+
+/// `/{bucket}/{object}` and a multipart upload's query, the XML API's path
+/// style: the object name's slashes kept, the rest percent-encoded.
+pub fn xmlPath(arena: Allocator, bucket: []const u8, object: []const u8, xml_query: XmlQuery) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeXml(&out.writer, bucket, object, xml_query) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeXml(w: *Writer, bucket: []const u8, object: []const u8, xml_query: XmlQuery) Writer.Error!void {
+    try w.writeByte('/');
+    try writeXmlPath(w, bucket);
+    try w.writeByte('/');
+    try writeXmlPath(w, object);
+    switch (xml_query) {
+        .uploads => try w.writeAll("?uploads"),
+        .part => |part| {
+            try w.print("?partNumber={d}&uploadId=", .{part.number});
+            try query.writeValue(w, part.upload_id);
+        },
+        .upload => |id| {
+            try w.writeAll("?uploadId=");
+            try query.writeValue(w, id);
+        },
+    }
+}
+
 const Parts = struct {
     bucket: ?[]const u8 = null,
     object: ?[]const u8 = null,
@@ -318,6 +365,17 @@ test "preconditions become their query parameters, in every position" {
         try uploadResumablePath(gpa, "b", .{ .if_generation_match = 12 }),
     );
     try expectPath("/upload/storage/v1/b/b/o?uploadType=resumable", try uploadResumablePath(gpa, "b", .{}));
+}
+
+test "XML API paths keep the name's slashes and encode the rest" {
+    const gpa = testing.allocator;
+    try expectPath("/my-bucket/backups/2026/db.tar?uploads", try xmlPath(gpa, "my-bucket", "backups/2026/db.tar", .uploads));
+    try expectPath(
+        "/b/a%20b%2Bc%3F%23caf%C3%A9?partNumber=3&uploadId=VXBs%2Bb2Fk%3D",
+        try xmlPath(gpa, "b", "a b+c?#caf\xc3\xa9", .{ .part = .{ .number = 3, .upload_id = "VXBs+b2Fk=" } }),
+    );
+    try expectPath("/b/x?uploadId=id", try xmlPath(gpa, "b", "x", .{ .upload = "id" }));
+    try expectPath("/b///?partNumber=10000&uploadId=u", try xmlPath(gpa, "b", "//", .{ .part = .{ .number = 10000, .upload_id = "u" } }));
 }
 
 test "rewrite paths name both objects and carry the loop's state" {
