@@ -4,6 +4,42 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.19.0 (unreleased)
+
+- storage: parallel downloads, and parallel uploads that can be
+  create-only. `Object.downloadParallel(destination, options)` fetches
+  one object in ranges, `concurrency` at a time (8 by default), each on a
+  client and connection of its own, and writes each at its offset in a
+  file or a caller's buffer: Google's sliced download, which gcloud does
+  by default. One metadata read names the size, generation, CRC32C and
+  content encoding, and every range is pinned to that generation, so an
+  overwrite partway through is `error.NotFound`, never a file spliced
+  from two objects. Each range is fetched with `download`, so it resumes
+  where a dropped connection left it. The ranges' checksums combine into
+  the whole object's, which must match the metadata's. A file is set to
+  exactly the object's length first and held to it afterwards, which is
+  how a file opened for appending shows: Linux puts its writes at its
+  end, whatever the offset. An empty object is not read, and one stored
+  gzip-compressed is fetched whole by one worker, as `download` fetches
+  it, since Cloud Storage ignores a range while it decompresses.
+  `DownloadResult` gains `crc32c`, the checksum of what a download wrote,
+  on every download. `ParallelUploadOptions` gains `preconditions`: the
+  object is read under them first, so a condition that already fails
+  refuses the upload before a byte is sent; the upload finishes under a
+  temporary name, `zig-gcp-tmp/` and random hex digits; and
+  `objects.move` renames it into place only if they still hold. A refused
+  move, or any failure after the finish, deletes the temporary object.
+  Upload workers now record a cancel like any other failure: a
+  `std.Io.Group` swallows the `Canceled` its task returns, and an `Io`
+  that reported one without a cancel request would have let an upload go
+  on to finish with a part missing. Breaking, for an exhaustive `switch`
+  over `storage.Error`: it gains `InvalidParallelDownloadOptions`; and for
+  code that builds a `DownloadResult` itself, which must now give a
+  `crc32c`.
+- examples: `gcs_cp --parallel N` works in both directions, and with
+  `--no-clobber` for uploads.
+- auth, core, pubsub, secret_manager: unchanged.
+
 ## 0.18.0 (2026-09-24)
 
 - storage: parallel uploads, and copies that change what they carry: the

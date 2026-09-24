@@ -14,10 +14,16 @@
 //! overwritten generation stays readable and the pinning test cannot see
 //! the overwrite.
 //!
-//! The largest test moves 100 MiB each way and prints the throughput; the
-//! suite as a whole moves about 230 MiB over the wire, and its copies are
-//! server-side. One copy is stored as NEARLINE, whose 30-day minimum is
-//! billed on delete: about a tenth of a cent.
+//! An upload with conditions finishes under the bucket's `zig-gcp-tmp/`
+//! before it moves into place; the tests check that nothing is left
+//! there, and the sweep clears anything a crashed run left more than a day
+//! ago.
+//!
+//! The largest tests move 1 GiB up twice, and 1 GiB up and twice down,
+//! and print the throughput; the suite as a whole moves about 5.4 GiB over
+//! the wire, and its copies are server-side. One copy is stored as
+//! NEARLINE, whose 30-day minimum is billed on delete: about a tenth of a
+//! cent.
 //!
 //! Faults come from `core.testing.FaultTransport` around the real HTTP
 //! transport: it closes real connections partway through real bodies, so
@@ -1051,7 +1057,7 @@ fn patternCrcOf(text: []const u8) u32 {
     return core.crc32c.hash(text);
 }
 
-test "sweep: delete anything a crashed run left under zig-gcp-test/ more than a day ago" {
+test "sweep: delete anything a crashed run left under zig-gcp-test/ or zig-gcp-tmp/ more than a day ago" {
     var f: Fixture = undefined;
     if (!try f.init(.{})) return error.SkipZigTest;
     defer f.deinit();
@@ -1059,20 +1065,22 @@ test "sweep: delete anything a crashed run left under zig-gcp-test/ more than a 
     const now = std.Io.Clock.real.now(testing.io).nanoseconds;
     const day: i96 = 24 * 60 * 60 * std.time.ns_per_s;
     var deleted: usize = 0;
-    var token: ?[]const u8 = null;
-    for (0..100) |_| {
-        var page = f.bucket().listObjects(.{ .prefix = "zig-gcp-test/", .page_token = token }) catch |err| return f.report(err);
-        defer page.deinit();
-        for (page.value.objects) |info| {
-            // Only this suite's objects, and only old ones: a run going on
-            // right now elsewhere keeps its own.
-            const created = storage.parseTimestamp(info.time_created) catch continue;
-            if (now - created.nanoseconds < day) continue;
-            f.bucket().object(info.name).delete(.{ .generation = info.generation }) catch continue;
-            deleted += 1;
+    for ([_][]const u8{ "zig-gcp-test/", "zig-gcp-tmp/" }) |prefix| {
+        var token: ?[]const u8 = null;
+        for (0..100) |_| {
+            var page = f.bucket().listObjects(.{ .prefix = prefix, .page_token = token }) catch |err| return f.report(err);
+            defer page.deinit();
+            for (page.value.objects) |info| {
+                // Only this suite's objects, and only old ones: a run going
+                // on right now elsewhere keeps its own.
+                const created = storage.parseTimestamp(info.time_created) catch continue;
+                if (now - created.nanoseconds < day) continue;
+                f.bucket().object(info.name).delete(.{ .generation = info.generation }) catch continue;
+                deleted += 1;
+            }
+            const next = page.value.next_page_token orelse break;
+            token = try f.arena.allocator().dupe(u8, next);
         }
-        const next = page.value.next_page_token orelse break;
-        token = try f.arena.allocator().dupe(u8, next);
     }
     if (deleted > 0) std.debug.print("swept {d} leftover test object(s)\n", .{deleted});
 }
@@ -1688,4 +1696,368 @@ test "22. move: whether objects.move works in a bucket without hierarchical name
         try testing.expect(!(try src.exists()));
         try f.expectContent(f.bucket().object(dest_name), "moving\n");
     }
+}
+
+// Parallel downloads and create-only parallel uploads: the parallel
+// downloads spec's section 8, real-bucket cases 1 to 8.
+
+/// Objects under the bucket's `zig-gcp-tmp/`, where an upload with
+/// conditions finishes before it moves into place: anything there was left
+/// behind.
+fn tempObjects(f: *Fixture) !usize {
+    var page = f.bucket().listObjects(.{ .prefix = "zig-gcp-tmp/" }) catch |err| return f.report(err);
+    defer page.deinit();
+    for (page.value.objects) |o| std.debug.print("left under zig-gcp-tmp/: {s}\n", .{o.name});
+    return page.value.objects.len;
+}
+
+/// Multipart uploads still open under `zig-gcp-tmp/`.
+fn openTempUploads(f: *Fixture) !usize {
+    const path = try std.fmt.allocPrint(f.arena.allocator(), "/{s}?uploads&prefix=zig-gcp-tmp/", .{f.bucket_name});
+    const res = try raw(f, .GET, path, &.{}, null, null);
+    try expectStatus(200, res);
+    return std.mem.count(u8, res.body, "<Upload>");
+}
+
+/// The CRC-32C of a file, read back from disk.
+fn fileCrc(file: std.Io.File) !u32 {
+    var buffer: [64 * 1024]u8 = undefined;
+    var reader = file.reader(testing.io, &buffer);
+    var hasher: core.crc32c.Hasher = .init();
+    while (true) {
+        const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        hasher.update(chunk);
+        reader.interface.toss(chunk.len);
+    }
+    return hasher.final();
+}
+
+test "23. parallel download: 1 GiB in 32 MiB ranges, one at a time and eight at a time, timed" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    var pool: PoolTransport = undefined;
+    var client = try pooledClient(&f, &pool);
+    defer pool.deinit();
+    defer client.deinit();
+
+    const size: u64 = 1024 * 1024 * 1024;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const out = try tmp.dir.createFile(testing.io, "gib.bin", .{});
+        defer out.close(testing.io);
+        var buf: [64 * 1024]u8 = undefined;
+        var writer = out.writer(testing.io, &buf);
+        var block: [64 * 1024]u8 = undefined;
+        var i: u64 = 0;
+        while (i < size) : (i += block.len) {
+            for (&block, 0..) |*b, k| b.* = patternByte(23, i + k);
+            try writer.interface.writeAll(&block);
+        }
+        try writer.interface.flush();
+    }
+    const source = try tmp.dir.openFile(testing.io, "gib.bin", .{});
+    defer source.close(testing.io);
+    const expected = patternCrc(23, size);
+    const obj = client.bucket(f.bucket_name).object((try f.object("gib-down.bin")).name);
+    var up = obj.uploadParallel(.{ .file = source }, .{ .part_size = 32 * 1024 * 1024, .crc32c = expected }) catch |err| return f.report(err);
+    defer up.deinit();
+
+    // 1. Down in 32 MiB ranges, one at a time, then eight, into a file.
+    var ms: [2]i64 = undefined;
+    for ([_]u16{ 1, 8 }, 0..) |concurrency, i| {
+        const out = try tmp.dir.createFile(testing.io, "down.bin", .{ .read = true });
+        defer out.close(testing.io);
+        const started = std.Io.Clock.awake.now(testing.io);
+        const result = obj.downloadParallel(.{ .file = out }, .{ .concurrency = concurrency }) catch |err| return f.report(err);
+        ms[i] = msSince(started);
+        try testing.expect(result.checksum_verified);
+        try testing.expectEqual(expected, result.crc32c);
+        try testing.expectEqual(size, try out.length(testing.io));
+        // The ranges' checksum covers the bytes as they arrived; the file
+        // read back says they landed where they belong.
+        try testing.expectEqual(expected, try fileCrc(out));
+        std.debug.print("1 GiB down in 32 MiB ranges, {d} at a time: {d} ms ({d} MiB/s)\n", .{
+            concurrency, ms[i], @divTrunc(1024 * 1000, @max(ms[i], 1)),
+        });
+    }
+    std.debug.print("eight at a time was {d:.2} times as fast as one\n", .{@as(f64, @floatFromInt(ms[0])) / @as(f64, @floatFromInt(@max(ms[1], 1)))});
+}
+
+test "24. parallel download: what a range of a private object carries, and ranges verified anyway" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const size = 3 * 1024 * 1024 + 7;
+    const data = try pattern(testing.allocator, 24, size);
+    defer testing.allocator.free(data);
+    const obj = try f.object("ranges.bin");
+    var up = obj.upload(data, .{}) catch |err| return f.report(err);
+    up.deinit();
+
+    // 2. A range short of the whole object, and one that is all of it.
+    const media = try jsonPath(&f, obj.name, "?alt=media");
+    const whole = try std.fmt.allocPrint(f.arena.allocator(), "bytes=0-{d}", .{size - 1});
+    for ([_][]const u8{ "bytes=0-1048575", whole }) |range| {
+        const res = try raw(&f, .GET, media, &.{.{ .name = "Range", .value = range }}, null, null);
+        try expectStatus(206, res);
+        std.debug.print("{s} of a private object: x-goog-hash {s}\n", .{ range, res.header("x-goog-hash") orelse "(none)" });
+    }
+
+    // Each range hashed as it arrives, the hashes combined: one worker on
+    // the fixture's transport, which is not for sharing between tasks.
+    const out = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(out);
+    const result = obj.downloadParallel(.{ .buffer = out }, .{ .part_size = 1024 * 1024, .concurrency = 1 }) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, data, out);
+    try testing.expect(result.checksum_verified);
+}
+
+test "25. parallel download: an overwrite partway through fails with NotFound, never a spliced file" {
+    const gpa = testing.allocator;
+    const size = 3 * 1024 * 1024;
+    const mib = 1024 * 1024;
+    var plan = [_]FaultTransport.Fault{
+        // The second range, cut partway: between its halves, another
+        // writer replaces the object.
+        .{ .method = .GET, .url_contains = "alt=media", .skip = 1, .action = .{ .cut_response_body = 300_000 } },
+    };
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .plan = &plan, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const original = try pattern(gpa, 251, size);
+    defer gpa.free(original);
+    const replacement = try pattern(gpa, 252, size);
+    defer gpa.free(replacement);
+    const obj = try f.object("overwritten.bin");
+    var first = obj.upload(original, .{}) catch |err| return f.report(err);
+    defer first.deinit();
+
+    var other: storage.Client = try .init(gpa, testing.io, .{
+        .token_provider = f.token.provider(),
+        .user_agent = Fixture.user_agent,
+    });
+    defer other.deinit();
+    var overwrite: Overwrite = .{ .object = other.bucket(f.bucket_name).object(obj.name), .data = replacement };
+    f.faults.after_fault = .{ .context = &overwrite, .run = Overwrite.run };
+
+    // 3.
+    const out = try gpa.alloc(u8, size);
+    defer gpa.free(out);
+    try testing.expectError(error.NotFound, obj.downloadParallel(.{ .buffer = out }, .{ .part_size = mib, .concurrency = 1 }));
+    try testing.expect(plan[0].fired);
+    if (overwrite.err) |err| return err;
+    std.debug.print("a parallel download meeting an overwrite: \"{s}\"\n", .{f.diag.message()});
+    // The first range, and the second's first half, are the original's:
+    // nothing of the replacement was spliced in.
+    try testing.expectEqualSlices(u8, original[0 .. mib + 300_000], out[0 .. mib + 300_000]);
+    // The resume asked for the old generation by number, and got a 404.
+    const resumed = try f.after(try f.faulted(0));
+    var pinned_buf: [48]u8 = undefined;
+    const pinned = try std.fmt.bufPrint(&pinned_buf, "generation={d}", .{first.value.generation});
+    try testing.expect(std.mem.indexOf(u8, resumed.url, pinned) != null);
+    try testing.expectEqual(404, resumed.status.?);
+
+    // A fresh parallel download gets the replacement, verified.
+    f.faults.after_fault = null;
+    const fresh = obj.downloadParallel(.{ .buffer = out }, .{ .part_size = mib, .concurrency = 1 }) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, replacement, out);
+    try testing.expect(fresh.checksum_verified);
+    try testing.expectEqual(overwrite.generation, fresh.generation);
+}
+
+test "26. parallel download: a gzip-stored object is fetched whole, in one request, decompressed" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const gpa = testing.allocator;
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    for (0..2000) |i| try text.writer.print("line {d}: the quick brown fox jumps over the lazy dog\n", .{i});
+    const plain = text.written();
+    const gz = try gzip(gpa, plain);
+    defer gpa.free(gz);
+    const obj = try f.object("transcoded-parallel.txt");
+    var info = obj.upload(gz, .{ .content_type = "text/plain", .content_encoding = "gzip" }) catch |err| return f.report(err);
+    info.deinit();
+
+    // 4.
+    const before = f.faults.exchanges.items.len;
+    const out = try gpa.alloc(u8, plain.len + 100);
+    defer gpa.free(out);
+    const result = obj.downloadParallel(.{ .buffer = out }, .{ .part_size = 1024 * 1024 }) catch |err| return f.report(err);
+    try testing.expectEqualStrings(plain, out[0..result.bytes_written]);
+    try testing.expect(!result.checksum_verified);
+    try testing.expectEqual(core.crc32c.hash(plain), result.crc32c);
+    // The metadata read, then one read of the object, with no range.
+    const exchanges = f.faults.exchanges.items[before..];
+    try testing.expectEqual(2, exchanges.len);
+    try testing.expectEqual(null, exchanges[1].header("Range"));
+    try testing.expectEqualStrings("gzip", exchanges[1].responseHeader("x-goog-stored-content-encoding").?);
+}
+
+test "27. create-only parallel upload: over an existing object, refused before a byte is sent" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const obj = try f.object("exists.bin");
+    var first = obj.upload("already here\n", .{}) catch |err| return f.report(err);
+    defer first.deinit();
+    const data = try pattern(testing.allocator, 27, 6 * 1024 * 1024);
+    defer testing.allocator.free(data);
+
+    // 5. Create-only, and a `…NotMatch` condition that already fails.
+    const refusals = [_]storage.Preconditions{
+        .does_not_exist,
+        .{ .if_generation_not_match = first.value.generation },
+    };
+    for (refusals) |conditions| {
+        const before = f.faults.exchanges.items.len;
+        try testing.expectError(error.FailedPrecondition, obj.uploadParallel(.{ .data = data }, .{
+            .part_size = 5 * 1024 * 1024,
+            .concurrency = 1,
+            .preconditions = conditions,
+        }));
+        // One request, the early check, and no part sent.
+        const exchanges = f.faults.exchanges.items[before..];
+        try testing.expectEqual(1, exchanges.len);
+        std.debug.print("refused before a byte was sent: the early read answered HTTP {?d}\n", .{exchanges[0].status});
+    }
+    try testing.expectEqual(0, try openTempUploads(&f));
+    try testing.expectEqual(0, try tempObjects(&f));
+    try f.expectContent(obj, "already here\n");
+}
+
+/// Puts another writer's object under `name` just before the first move
+/// is sent, on a client of its own.
+const CreateBeforeMove = struct {
+    inner: core.transport.Transport,
+    other: storage.Object,
+    created: bool = false,
+
+    fn transport(self: *CreateBeforeMove) core.transport.Transport {
+        return .{ .ptr = self, .vtable = &.{ .send = send, .sendStream = sendStream } };
+    }
+
+    fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
+        const self: *CreateBeforeMove = @ptrCast(@alignCast(ptr));
+        if (!self.created and req.method == .POST and std.mem.indexOf(u8, req.url, "/moveTo/") != null) {
+            self.created = true;
+            var info = self.other.upload("another writer's bytes\n", .{}) catch return error.NetworkFailure;
+            info.deinit();
+        }
+        return self.inner.send(req, arena);
+    }
+
+    fn sendStream(ptr: *anyopaque, req: core.transport.StreamRequest, arena: Allocator) core.transport.StreamError!core.transport.StreamResponse {
+        const self: *CreateBeforeMove = @ptrCast(@alignCast(ptr));
+        return self.inner.sendStream(req, arena);
+    }
+};
+
+test "28. create-only parallel upload: an object that appears before the move is kept, and the temporary object goes" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const name = (try f.object("raced.bin")).name;
+    var other: storage.Client = try .init(testing.allocator, testing.io, .{
+        .token_provider = f.token.provider(),
+        .user_agent = Fixture.user_agent,
+    });
+    defer other.deinit();
+    var creator: CreateBeforeMove = .{ .inner = f.faults.transport(), .other = other.bucket(f.bucket_name).object(name) };
+    var diag: storage.Diagnostics = .{};
+    var client: storage.Client = try .init(testing.allocator, testing.io, .{
+        .token_provider = f.token.provider(),
+        .transport = creator.transport(),
+        .diagnostics = &diag,
+        .user_agent = Fixture.user_agent,
+    });
+    defer client.deinit();
+    const data = try pattern(testing.allocator, 28, 6 * 1024 * 1024);
+    defer testing.allocator.free(data);
+
+    // 6.
+    try testing.expectError(error.FailedPrecondition, client.bucket(f.bucket_name).object(name).uploadParallel(.{ .data = data }, .{
+        .part_size = 5 * 1024 * 1024,
+        .concurrency = 1,
+        .preconditions = .does_not_exist,
+    }));
+    try testing.expect(creator.created);
+    std.debug.print("the move, refused: HTTP {d} {s}: {s}\n", .{ diag.http_status, diag.status(), diag.message() });
+    try f.expectContent(f.bucket().object(name), "another writer's bytes\n");
+    try testing.expectEqual(0, try tempObjects(&f));
+    try testing.expectEqual(0, try openTempUploads(&f));
+}
+
+test "29. create-only parallel upload: a new name, with its metadata and metageneration 1, and nothing left behind" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const size = 2 * 5 * 1024 * 1024 + 4321;
+    const data = try pattern(testing.allocator, 29, size);
+    defer testing.allocator.free(data);
+    const obj = try f.object("created.bin");
+
+    // 7.
+    const before = f.faults.exchanges.items.len;
+    const started = std.Io.Clock.awake.now(testing.io);
+    var info = obj.uploadParallel(.{ .data = data }, .{
+        .content_type = "application/x-test",
+        .metadata = &.{.{ .key = "origin", .value = "zig" }},
+        .part_size = 5 * 1024 * 1024,
+        .concurrency = 1,
+        .crc32c = core.crc32c.hash(data),
+        .preconditions = .does_not_exist,
+    }) catch |err| return f.report(err);
+    defer info.deinit();
+    const ms = msSince(started);
+    try testing.expectEqualStrings(obj.name, info.value.name);
+    try testing.expectEqual(1, info.value.metageneration);
+    try testing.expectEqual(size, info.value.size);
+    try testing.expectEqual(core.crc32c.hash(data), info.value.crc32c.?);
+    try testing.expectEqualStrings("application/x-test", info.value.content_type);
+    try testing.expectEqualStrings("zig", info.value.metadataValue("origin").?);
+    // The early check, the start, three parts, the finish and the move,
+    // whose answer is the object: no read back.
+    const exchanges = f.faults.exchanges.items[before..];
+    for (exchanges) |e| std.debug.print("  {t} {?d} {s}\n", .{ e.method, e.status, e.url[0..@min(e.url.len, 110)] });
+    try testing.expectEqual(7, exchanges.len);
+    try testing.expect(std.mem.indexOf(u8, exchanges[6].url, "/moveTo/") != null);
+    std.debug.print("create-only, {d} bytes in 3 parts: {d} ms\n", .{ size, ms });
+    try testing.expectEqual(0, try tempObjects(&f));
+    try testing.expectEqual(0, try openTempUploads(&f));
+    try f.expectContent(obj, data);
+}
+
+test "30. create-only parallel upload: a lost move answer is settled by reading, and what the repeat met" {
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .POST, .url_contains = "/moveTo/", .action = .lose_response },
+    };
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .plan = &plan, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const data = try pattern(testing.allocator, 30, 6 * 1024 * 1024);
+    defer testing.allocator.free(data);
+    const obj = try f.object("moved-twice.bin");
+
+    // 8.
+    var info = obj.uploadParallel(.{ .data = data }, .{
+        .part_size = 5 * 1024 * 1024,
+        .concurrency = 1,
+        .preconditions = .does_not_exist,
+    }) catch |err| return f.report(err);
+    defer info.deinit();
+    try testing.expect(plan[0].fired);
+    const repeat = try f.after(try f.faulted(0));
+    std.debug.print("a move repeated after one that landed: HTTP {?d}\n", .{repeat.status});
+    try testing.expect(std.mem.indexOf(u8, repeat.url, "/moveTo/") != null);
+    try testing.expect(repeat.status.? == 404 or repeat.status.? == 412);
+    try testing.expectEqual(core.crc32c.hash(data), info.value.crc32c.?);
+    try f.expectContent(obj, data);
+    try testing.expectEqual(0, try tempObjects(&f));
 }

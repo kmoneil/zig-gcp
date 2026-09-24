@@ -6,16 +6,19 @@
 //!     zig build example-gcs_cp -- gs://my-bucket/backups/backup.tar restored.tar
 //!     ... -- backup.tar gs://my-bucket/backup.tar --no-clobber
 //!     ... -- backup.tar gs://my-bucket/backup.tar --parallel 8
+//!     ... -- gs://my-bucket/backup.tar restored.tar --parallel 8
 //!
 //! Both directions are checksummed end to end. An upload hashes the file as
 //! it streams and compares the result with the finished object; a download
 //! is checked against the checksum Cloud Storage keeps, and goes to
 //! `<file>.part` first, renamed into place only once it has verified.
 //! `--no-clobber` refuses to replace an existing object, with a
-//! precondition the server enforces. `--parallel N` uploads the file in
+//! precondition the server enforces. `--parallel N` moves the file in
 //! parts, N at a time on connections of their own, for a large file on a
-//! fast link; it takes no `--no-clobber`, since a multipart upload has no
-//! preconditions.
+//! fast link: an upload in parts Cloud Storage joins, a download in ranges
+//! written at their offsets. With `--no-clobber` too, a parallel upload
+//! finishes under a temporary name and moves into place only if nothing
+//! took the name meanwhile.
 //!
 //! Credentials come from `auth.findDefault`: the file
 //! `GOOGLE_APPLICATION_CREDENTIALS` names, then the one `gcloud auth
@@ -35,8 +38,8 @@ pub const std_options: std.Options = .{
     },
 };
 
-const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber | --parallel N]\n" ++
-    "       gcs_cp gs://<bucket>/<object> <file>\n";
+const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber] [--parallel N]\n" ++
+    "       gcs_cp gs://<bucket>/<object> <file> [--parallel N]\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -68,10 +71,10 @@ pub fn main(init: std.process.Init) !void {
     }
     const from_remote = if (count == 2) Remote.parse(paths[0]) else null;
     const to_remote = if (count == 2) Remote.parse(paths[1]) else null;
-    // Exactly one side is in Cloud Storage, and only an upload goes in
-    // parts, which cannot be create-only.
+    // Exactly one side is in Cloud Storage, and only an upload can refuse
+    // to replace what is there.
     if (bad or count != 2 or (from_remote == null) == (to_remote == null) or
-        (parallel != null and (to_remote == null or no_clobber)))
+        (no_clobber and to_remote == null))
     {
         try out.writeAll(usage);
         return out.flush();
@@ -99,7 +102,7 @@ pub fn main(init: std.process.Init) !void {
     if (to_remote) |remote| {
         try upload(&client, init.io, paths[0], remote, no_clobber, parallel, out, &diag, started);
     } else {
-        try download(&client, init.io, arena, from_remote.?, paths[1], out, &diag, started);
+        try download(&client, init.io, arena, from_remote.?, paths[1], parallel, out, &diag, started);
     }
     try out.flush();
 }
@@ -131,11 +134,13 @@ fn upload(
 ) !void {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
+    const preconditions: storage.Preconditions = if (no_clobber) .does_not_exist else .{};
     if (parallel) |concurrency| {
         // Each part is read at its own offset, and checked on its own.
         var info = client.bucket(remote.bucket).object(remote.name).uploadParallel(.{ .file = file }, .{
             .concurrency = concurrency,
-        }) catch |err| return fail(err, diag);
+            .preconditions = preconditions,
+        }) catch |err| return refused(err, no_clobber, remote, diag);
         defer info.deinit();
         const ms = elapsedMs(io, started);
         try out.print("{s} -> gs://{s}/{s} through uploadParallel, concurrency {d}: {d} bytes in {d} ms ({d:.1} MiB/s), generation {d}, crc32c {?x:0>8}\n", .{
@@ -151,19 +156,22 @@ fn upload(
 
     var info = client.bucket(remote.bucket).object(remote.name).uploadFrom(&reader.interface, .{
         .size = size,
-        .preconditions = if (no_clobber) .does_not_exist else .{},
-    }) catch |err| switch (err) {
-        error.FailedPrecondition => if (no_clobber) {
-            std.debug.print("gs://{s}/{s} exists, and --no-clobber keeps it\n", .{ remote.bucket, remote.name });
-            return err;
-        } else return fail(err, diag),
-        else => return fail(err, diag),
-    };
+        .preconditions = preconditions,
+    }) catch |err| return refused(err, no_clobber, remote, diag);
     defer info.deinit();
     const ms = elapsedMs(io, started);
     try out.print("{s} -> gs://{s}/{s}: {d} bytes in {d} ms ({d:.1} MiB/s), generation {d}, crc32c {?x:0>8}\n", .{
         path, remote.bucket, remote.name, info.value.size, ms, mibPerSecond(info.value.size, ms), info.value.generation, info.value.crc32c,
     });
+}
+
+/// An upload's failure, told as `--no-clobber`'s refusal where it is one.
+fn refused(err: anyerror, no_clobber: bool, remote: Remote, diag: *const storage.Diagnostics) anyerror {
+    if (err == error.FailedPrecondition and no_clobber) {
+        std.debug.print("gs://{s}/{s} exists, and --no-clobber keeps it\n", .{ remote.bucket, remote.name });
+        return err;
+    }
+    return fail(err, diag);
 }
 
 fn download(
@@ -172,6 +180,7 @@ fn download(
     arena: std.mem.Allocator,
     remote: Remote,
     path: []const u8,
+    parallel: ?u16,
     out: *std.Io.Writer,
     diag: *const storage.Diagnostics,
     started: std.Io.Timestamp,
@@ -186,6 +195,13 @@ fn download(
     const result = r: {
         const file = try cwd.createFile(io, part, .{});
         defer file.close(io);
+        if (parallel) |concurrency| {
+            // Each range is written at its own offset, and the ranges'
+            // checksums combine into the whole object's.
+            break :r client.bucket(remote.bucket).object(remote.name).downloadParallel(.{ .file = file }, .{
+                .concurrency = concurrency,
+            }) catch |err| return fail(err, diag);
+        }
         var buffer: [64 * 1024]u8 = undefined;
         var writer = file.writer(io, &buffer);
         const got = client.bucket(remote.bucket).object(remote.name).download(&writer.interface, .{}) catch |err|
@@ -198,10 +214,11 @@ fn download(
     finished = true;
 
     const ms = elapsedMs(io, started);
-    try out.print("gs://{s}/{s} -> {s}: {d} bytes in {d} ms ({d:.1} MiB/s), generation {d}, checksum {s}\n", .{
+    try out.print("gs://{s}/{s} -> {s}{s}: {d} bytes in {d} ms ({d:.1} MiB/s), generation {d}, checksum {s}\n", .{
         remote.bucket,
         remote.name,
         path,
+        if (parallel != null) " through downloadParallel" else "",
         result.bytes_written,
         ms,
         mibPerSecond(result.bytes_written, ms),
