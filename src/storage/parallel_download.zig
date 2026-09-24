@@ -24,6 +24,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const Object = @import("Object.zig");
+const checkpoint = @import("checkpoint.zig");
 const logging = @import("logging.zig");
 const mp = @import("xml_multipart.zig");
 const types = @import("types.zig");
@@ -49,8 +50,57 @@ pub fn download(
     options: types.ParallelDownloadOptions,
 ) Error!types.DownloadResult {
     try check(client, options);
+    if (options.checkpoint != null and destination != .file) {
+        return refuse(client.diagnostics, "checkpoint: only a file destination outlives a process, so a buffer takes none", .{});
+    }
+    const result = transfer(client, bucket, object, destination, options);
+    if (options.checkpoint) |cp| {
+        if (result) |_| {
+            cp.clear();
+        } else |err| switch (err) {
+            // Resuming these would only repeat them: the destination must
+            // be discarded, or the response can never be used. Everything
+            // else keeps the state for a later run; a foreign checkpoint
+            // especially is another transfer's to clear.
+            error.ChecksumMismatch, error.InvalidResponse => cp.clear(),
+            else => {},
+        }
+    }
+    return result;
+}
+
+fn transfer(
+    client: *Client,
+    bucket: []const u8,
+    object: []const u8,
+    destination: types.ParallelDestination,
+    options: types.ParallelDownloadOptions,
+) Error!types.DownloadResult {
+    // What the checkpoint holds outlives the metadata read that judges it.
+    var resume_arena: std.heap.ArenaAllocator = .init(client.gpa);
+    defer resume_arena.deinit();
+    var saved: ?checkpoint.State.DownloadParallel = null;
+    if (options.checkpoint) |cp| {
+        saved = try loadState(client, cp, resume_arena.allocator(), bucket, object);
+        if (saved) |s| if (options.generation) |wanted| if (wanted != s.generation) {
+            logging.debug("parallel download of {s}: the checkpoint is for generation {d}, not the requested {d}; starting over", .{ object, s.generation, wanted });
+            saved = null;
+        };
+    }
+
     const source: Object = .{ .client = client, .bucket = bucket, .name = object };
-    var info = try source.get(.{ .generation = options.generation, .preconditions = options.preconditions });
+    var info = if (saved) |s|
+        source.get(.{ .generation = s.generation, .preconditions = options.preconditions }) catch |err| blk: {
+            // The checkpoint's generation is gone: the object changed. The
+            // caller who asked for no particular generation gets the live
+            // one, from the start.
+            if (err != error.NotFound or options.generation != null) return err;
+            logging.debug("parallel download of {s}: generation {d} is gone; starting over at the live object", .{ object, s.generation });
+            saved = null;
+            break :blk try source.get(.{ .preconditions = options.preconditions });
+        }
+    else
+        try source.get(.{ .generation = options.generation, .preconditions = options.preconditions });
     defer info.deinit();
     const size = info.value.size;
     const generation = info.value.generation;
@@ -70,26 +120,78 @@ pub fn download(
             if (client.diagnostics) |d| d.print("the object is {d} bytes, and the buffer holds {d}", .{ size, buffer.len });
             return error.ObjectTooLarge;
         },
-        .file => |file| try setLength(client.io, client.diagnostics, file, size),
+        .file => |file| {
+            if (saved) |s| {
+                if (s.size != size) {
+                    // A generation never changes size: this state does not
+                    // describe the object it names.
+                    if (client.diagnostics) |d| d.print("the checkpoint says generation {d} has {d} bytes, and it has {d}; it is not this transfer's", .{ generation, s.size, size });
+                    return error.CheckpointFailed;
+                }
+                // Only a file still shaped by the earlier run resumes.
+                const held_length = file.length(client.io) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => {
+                        if (client.diagnostics) |d| d.print("the file's length could not be read: {t}", .{err});
+                        return error.WriteFailed;
+                    },
+                };
+                if (held_length != size) {
+                    logging.debug("parallel download of {s}: the file is {d} bytes, not {d}; starting over", .{ object, held_length, size });
+                    saved = null;
+                }
+            }
+            if (saved == null) try setLength(client.io, client.diagnostics, file, size);
+        },
     }
     var crc: u32 = 0;
     if (size > 0) {
-        const plan = mp.plan(size, options.part_size);
+        const plan = mp.plan(size, if (saved) |s| s.part_size else options.part_size);
         logging.debug("parallel download of {s}: {d} bytes in {d} ranges of {d}", .{ object, size, plan.parts, plan.part_size });
         const crcs = try client.gpa.alloc(u32, plan.parts);
         defer client.gpa.free(crcs);
+        var written: std.DynamicBitSetUnmanaged = if (saved) |s|
+            try checkpoint.bitsFromHex(client.gpa, s.written, plan.parts)
+        else
+            try .initEmpty(client.gpa, plan.parts);
+        defer written.deinit(client.gpa);
+        const hex = try client.gpa.alloc(u8, checkpoint.digitsFor(plan.parts));
+        defer client.gpa.free(hex);
         var run: Run = .{
             .client = client,
             .bucket = bucket,
             .object = object,
+            .size = size,
             .generation = generation,
             .destination = destination,
             .plan = plan,
             .crcs = crcs,
+            .checkpoint = options.checkpoint,
+            .written = &written,
+            .hex = hex,
         };
-        try run.fetchRanges(options);
+        // The state goes down before any data moves, so a store that
+        // cannot save fails while starting over still costs nothing.
+        if (options.checkpoint != null) try run.save(client.diagnostics);
+        const held = written.count();
+        if (held > 0) {
+            logging.debug("parallel download of {s}: the file already holds {d} of {d} ranges; re-reading them", .{ object, held, plan.parts });
+            try rereadWritten(client, destination.file, plan, &written, crcs);
+        }
+        if (held < plan.parts) try run.fetchRanges(options);
         // Every range is in. Their checksums fold into the whole's.
         for (crcs, 0..) |range_crc, i| crc = core.crc32c.combine(crc, range_crc, plan.len(@intCast(i)));
+    } else if (options.checkpoint) |cp| {
+        // An empty object has no ranges, but the started transfer is still
+        // recorded, as every other is.
+        try saveState(client.gpa, cp, client.diagnostics, .{ .download_parallel = .{
+            .bucket = bucket,
+            .object = object,
+            .size = 0,
+            .generation = generation,
+            .part_size = options.part_size,
+            .written = "",
+        } });
     }
     if (destination == .file) try checkLength(client.io, client.diagnostics, destination.file, size);
 
@@ -122,6 +224,96 @@ pub fn check(client: *const Client, options: types.ParallelDownloadOptions) Erro
 fn refuse(d: ?*Diagnostics, comptime format: []const u8, args: anytype) Error {
     if (d) |diag| diag.print(format, args);
     return error.InvalidParallelDownloadOptions;
+}
+
+/// What the checkpoint holds for this download, or null when it holds
+/// nothing yet. A state that cannot be read or parsed, or that belongs to
+/// another transfer, is `error.CheckpointFailed` before anything is sent.
+fn loadState(
+    client: *Client,
+    cp: checkpoint.Checkpoint,
+    arena: Allocator,
+    bucket: []const u8,
+    object: []const u8,
+) Error!?checkpoint.State.DownloadParallel {
+    const d = client.diagnostics;
+    const bytes = cp.load(arena) catch |err| switch (err) {
+        error.CheckpointFailed => {
+            if (d) |diag| diag.print("the checkpoint could not be read", .{});
+            return error.CheckpointFailed;
+        },
+        else => |e| return e,
+    } orelse return null;
+    const state = checkpoint.parse(arena, bytes) catch |err| switch (err) {
+        error.CheckpointFailed => {
+            if (d) |diag| diag.print("the checkpoint holds no state this library wrote; nothing was changed", .{});
+            return error.CheckpointFailed;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    const s = switch (state) {
+        .download_parallel => |s| s,
+    };
+    if (!std.mem.eql(u8, s.bucket, bucket) or !std.mem.eql(u8, s.object, object)) {
+        if (d) |diag| diag.print("the checkpoint belongs to another transfer; overwriting it would orphan that one, so give each transfer a checkpoint of its own", .{});
+        return error.CheckpointFailed;
+    }
+    return s;
+}
+
+/// Encodes and saves one state, with the failure the caller asked to be
+/// told about: a transfer that cannot record itself must not pretend it
+/// can be resumed.
+fn saveState(gpa: Allocator, cp: checkpoint.Checkpoint, d: ?*Diagnostics, state: checkpoint.State) Error!void {
+    const bytes = try checkpoint.encodeAlloc(gpa, state);
+    defer gpa.free(bytes);
+    cp.save(bytes) catch |err| switch (err) {
+        error.CheckpointFailed => {
+            if (d) |diag| diag.print("the checkpoint refused a save; the download fails rather than carry on unresumable", .{});
+            return error.CheckpointFailed;
+        },
+        else => |e| return e,
+    };
+}
+
+/// Rebuilds each held range's CRC32C by reading the file back: nothing
+/// about the data is taken from the checkpoint, so a destination that
+/// changed between runs fails the whole's checksum instead of standing
+/// unread.
+fn rereadWritten(
+    client: *Client,
+    file: std.Io.File,
+    plan: mp.Plan,
+    written: *const std.DynamicBitSetUnmanaged,
+    crcs: []u32,
+) Error!void {
+    const buf = try client.gpa.alloc(u8, file_buffer_len);
+    defer client.gpa.free(buf);
+    var index: u32 = 0;
+    while (index < plan.parts) : (index += 1) {
+        if (!written.isSet(index)) continue;
+        var hasher: core.crc32c.Hasher = .init();
+        var offset = plan.offset(index);
+        var remaining = plan.len(index);
+        while (remaining > 0) {
+            const want: usize = @intCast(@min(remaining, buf.len));
+            const got = file.readPositionalAll(client.io, buf[0..want], offset) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    if (client.diagnostics) |d| d.print("range {d} could not be read back from the file to resume: {t}", .{ index + 1, err });
+                    return error.ReadFailed;
+                },
+            };
+            if (got < want) {
+                if (client.diagnostics) |d| d.print("the file ends {d} bytes into range {d}, which the checkpoint says it holds", .{ plan.len(index) - remaining + got, index + 1 });
+                return error.ReadFailed;
+            }
+            hasher.update(buf[0..got]);
+            offset += got;
+            remaining -= got;
+        }
+        crcs[index] = hasher.final();
+    }
 }
 
 /// A gzip-stored object, fetched whole by one worker as `download` fetches
@@ -182,11 +374,20 @@ const Run = struct {
     client: *Client,
     bucket: []const u8,
     object: []const u8,
+    size: u64,
     generation: u64,
     destination: types.ParallelDestination,
     plan: mp.Plan,
-    /// Each range's CRC32C, written by the worker that fetched it.
+    /// Each range's CRC32C, written by the worker that fetched it, or
+    /// rebuilt from the file for a range an earlier run fetched.
     crcs: []u32,
+    /// Null when the caller keeps no state between processes.
+    checkpoint: ?checkpoint.Checkpoint,
+    /// Which ranges the destination holds: the resumed ones up front, and
+    /// each fetched range as its save records it.
+    written: *std.DynamicBitSetUnmanaged,
+    /// Scratch for the state's hex form, `digitsFor(parts)` long.
+    hex: []u8,
     mutex: std.Io.Mutex = .init,
     /// The next range to fetch, from 0.
     next: u32 = 0,
@@ -198,13 +399,40 @@ const Run = struct {
         diag: Diagnostics,
     };
 
-    /// Fetches every range: `concurrency` workers, each with a client of
-    /// its own, on tasks of their own, or one on this task when the
-    /// `std.Io` cannot run tasks concurrently.
+    /// Saves the run's state. The caller holds the lock while workers run;
+    /// the first save, before they start, needs none.
+    fn save(run: *Run, d: ?*Diagnostics) Error!void {
+        checkpoint.hexFromBits(run.written, run.plan.parts, run.hex);
+        return saveState(run.client.gpa, run.checkpoint.?, d, .{ .download_parallel = .{
+            .bucket = run.bucket,
+            .object = run.object,
+            .size = run.size,
+            .generation = run.generation,
+            .part_size = run.plan.part_size,
+            .written = run.hex,
+        } });
+    }
+
+    /// Range `index` is in the destination, hashing to `range_crc`: record
+    /// it, and save the checkpoint so no later process fetches it again.
+    fn complete(run: *Run, index: u32, range_crc: u32, d: ?*Diagnostics) Error!void {
+        run.crcs[index] = range_crc;
+        if (run.checkpoint == null) return;
+        const io = run.client.io;
+        run.mutex.lockUncancelable(io);
+        defer run.mutex.unlock(io);
+        run.written.set(index);
+        try run.save(d);
+    }
+
+    /// Fetches every range not already held: `concurrency` workers, each
+    /// with a client of its own, on tasks of their own, or one on this task
+    /// when the `std.Io` cannot run tasks concurrently.
     fn fetchRanges(run: *Run, options: types.ParallelDownloadOptions) Error!void {
         const gpa = run.client.gpa;
         const io = run.client.io;
-        const count: usize = @min(options.concurrency, run.plan.parts);
+        const missing = run.plan.parts - run.written.count();
+        const count: usize = @min(options.concurrency, missing);
         const workers = try gpa.alloc(Worker, count);
         defer gpa.free(workers);
         var made: usize = 0;
@@ -237,11 +465,16 @@ const Run = struct {
     }
 
     /// The next range to fetch, or null once there is none or one failed.
+    /// A range the destination already holds is never handed out: its
+    /// bytes were re-read, not trusted, and re-fetching them would spend
+    /// the transfer a resume is for.
     fn take(run: *Run) ?u32 {
         const io = run.client.io;
         run.mutex.lockUncancelable(io);
         defer run.mutex.unlock(io);
-        if (run.failure != null or run.next == run.plan.parts) return null;
+        if (run.failure != null) return null;
+        while (run.next < run.plan.parts and run.written.isSet(run.next)) run.next += 1;
+        if (run.next == run.plan.parts) return null;
         defer run.next += 1;
         return run.next;
     }
@@ -323,7 +556,7 @@ const Worker = struct {
             w.diag.print("range {d}: {d} bytes from byte {d} were asked for, and {d} arrived", .{ index + 1, len, offset, result.bytes_written });
             return error.InvalidResponse;
         }
-        run.crcs[index] = result.crc32c;
+        try run.complete(index, result.crc32c, &w.diag);
     }
 
     /// A gzip-stored object, whole: into the buffer as far as it goes, or
@@ -1066,6 +1299,556 @@ test "check: what a parallel download refuses, before anything is sent" {
     try check(&s.client, .{ .part_size = std.math.maxInt(u64), .concurrency = 64 });
 }
 
+const MemoryCheckpoint = test_util.MemoryCheckpoint;
+
+/// A client of its own on a shared fake, as each process of a resumed
+/// download has, with the range floor lowered to 1 KiB.
+fn clientOn(fake: *FakeMultipart, token: *core.StaticToken, diag: *Diagnostics, max_attempts: u8) !Client {
+    var client: Client = try .init(testing.allocator, fake.io, .{
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+        .diagnostics = diag,
+        .retry = .{ .max_attempts = max_attempts, .initial_backoff_ms = 1, .max_backoff_ms = 2 },
+    });
+    client.multipart_test = .{ .min_part_size = 1024 };
+    return client;
+}
+
+test "downloadParallel: a checkpoint on a buffer destination is refused before anything is sent" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    try s.fake.put("o", "bytes");
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var out: [16]u8 = undefined;
+    try testing.expectError(
+        error.InvalidParallelDownloadOptions,
+        s.object("o").downloadParallel(.{ .buffer = &out }, .{ .checkpoint = saved.checkpoint() }),
+    );
+    try expectDiag(&s.diag, "only a file destination outlives a process");
+    try testing.expectEqual(0, s.fake.counts.reads);
+    try testing.expectEqual(0, saved.loads);
+}
+
+test "downloadParallel with a checkpoint: saved at the start and after every range, cleared at the end" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    var data: [5 * 1024]u8 = undefined;
+    fill(&data, 20);
+    try s.fake.put("o", &data);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+
+    const result = try s.object("o").downloadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .concurrency = 2,
+        .checkpoint = saved.checkpoint(),
+    });
+    try testing.expect(result.checksum_verified);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &data, got);
+    // One save when the download starts, one per range, one clear.
+    try testing.expectEqual(1 + 5, saved.saves);
+    try testing.expectEqual(1, saved.clears);
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "downloadParallel: a run that dies partway leaves a checkpoint file a second client resumes, fetching only what is missing" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [5 * 1024 + 7]u8 = undefined;
+    fill(&data, 21);
+    try fake.put("dir/o", &data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "an older file");
+    defer file.close(testing.io);
+    var store: checkpoint.CheckpointFile = .init(testing.io, tmp.dir, "o.download");
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = store.checkpoint(),
+    };
+
+    // The first process: two ranges land, the third request dies with the
+    // process, as it were.
+    var rules = [_]Script.Rule{.{ .at = 2 * 1024, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    {
+        var diag: Diagnostics = .{};
+        var first = try clientOn(&fake, &token, &diag, 4);
+        defer first.deinit();
+        try testing.expectError(
+            error.Canceled,
+            first.bucket("b").object("dir/o").downloadParallel(.{ .file = file }, options),
+        );
+    }
+    try testing.expectEqual(2, fake.counts.media);
+    try testing.expectEqual(2 * 1024, fake.counts.media_bytes);
+
+    // The second process fetches the four missing ranges and nothing it
+    // already has, and the whole is verified.
+    fake.faults = null;
+    var diag: Diagnostics = .{};
+    var second = try clientOn(&fake, &token, &diag, 4);
+    defer second.deinit();
+    const result = try second.bucket("b").object("dir/o").downloadParallel(.{ .file = file }, options);
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(data.len, result.bytes_written);
+    try testing.expectEqual(core.crc32c.hash(&data), result.crc32c);
+    try testing.expectEqual(2 + 4, fake.counts.media);
+    try testing.expectEqual(data.len, fake.counts.media_bytes);
+    try testing.expectEqual(2, fake.counts.reads);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &data, got);
+    // The transfer is done: the checkpoint file is gone.
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "o.download", .{}));
+}
+
+test "downloadParallel: a resumed run re-reads the file, so bytes changed on disk fail the checksum and clear the checkpoint" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 22);
+    try fake.put("o", &data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var rules = [_]Script.Rule{.{ .at = 2 * 1024, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").downloadParallel(.{ .file = file }, options));
+    try testing.expect(saved.stored != null);
+
+    // Someone edits the partial file between the runs.
+    try file.writePositionalAll(testing.io, &.{data[100] ^ 0x01}, 100);
+    fake.faults = null;
+    try testing.expectError(error.ChecksumMismatch, client.bucket("b").object("o").downloadParallel(.{ .file = file }, options));
+    try expectDiag(&diag, "discard what the destination holds");
+    // The state was cleared with the bytes discredited, so the next run is
+    // whole, and right.
+    try testing.expectEqual(null, saved.stored);
+    const result = try client.bucket("b").object("o").downloadParallel(.{ .file = file }, options);
+    try testing.expect(result.checksum_verified);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &data, got);
+}
+
+test "downloadParallel: a file no longer the object's length starts over instead of resuming" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 34);
+    try fake.put("o", &data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var rules = [_]Script.Rule{.{ .at = 2 * 1024, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").downloadParallel(.{ .file = file }, options));
+    fake.faults = null;
+
+    // Someone truncated the file: what the checkpoint says it holds is
+    // gone, so nothing of it is trusted.
+    try file.setLength(testing.io, 5);
+    const media_before = fake.counts.media;
+    const result = try client.bucket("b").object("o").downloadParallel(.{ .file = file }, options);
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(4, fake.counts.media - media_before);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &data, got);
+}
+
+test "downloadParallel: a checkpoint of a finished download re-reads everything and fetches nothing" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 23);
+    try s.fake.put("o", &data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    // The process dies between the last range and the clear.
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator, .keep_on_clear = true };
+    defer saved.deinit();
+    const options: types.ParallelDownloadOptions = .{ .part_size = 1024, .checkpoint = saved.checkpoint() };
+    _ = try s.object("o").downloadParallel(.{ .file = file }, options);
+    try testing.expect(saved.stored != null);
+    try testing.expectEqual(4, s.fake.counts.media);
+
+    saved.keep_on_clear = false;
+    const result = try s.object("o").downloadParallel(.{ .file = file }, options);
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(data.len, result.bytes_written);
+    try testing.expectEqual(core.crc32c.hash(&data), result.crc32c);
+    // No range was fetched again; the file alone answered.
+    try testing.expectEqual(4, s.fake.counts.media);
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "downloadParallel: a generation gone starts the checkpoint over at the live object, unless the caller pinned it" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [4 * 1024]u8 = undefined;
+    fill(&data, 24);
+    try fake.put("o", &data);
+    const first_generation = fake.object("o").?.generation;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var rules = [_]Script.Rule{.{ .at = 2 * 1024, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").downloadParallel(.{ .file = file }, options));
+    fake.faults = null;
+
+    // The object is replaced. A caller pinned to the checkpoint's
+    // generation learns it is gone; the state stays theirs to resume
+    // against a versioned bucket.
+    var replacement: [4 * 1024]u8 = undefined;
+    fill(&replacement, 25);
+    try fake.put("o", &replacement);
+    var pinned = options;
+    pinned.generation = first_generation;
+    try testing.expectError(error.NotFound, client.bucket("b").object("o").downloadParallel(.{ .file = file }, pinned));
+    try testing.expect(saved.stored != null);
+
+    // A caller with no generation of their own starts over at the live
+    // object, from the start.
+    const media_before = fake.counts.media;
+    const result = try client.bucket("b").object("o").downloadParallel(.{ .file = file }, options);
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(4, fake.counts.media - media_before);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &replacement, got);
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "downloadParallel: a caller generation different from the checkpoint's starts over at that generation" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [3 * 1024]u8 = undefined;
+    fill(&data, 26);
+    try fake.put("o", &data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var rules = [_]Script.Rule{.{ .at = 1024, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").downloadParallel(.{ .file = file }, options));
+    fake.faults = null;
+
+    var replacement: [3 * 1024]u8 = undefined;
+    fill(&replacement, 27);
+    try fake.put("o", &replacement);
+    var pinned = options;
+    pinned.generation = fake.object("o").?.generation;
+    const media_before = fake.counts.media;
+    const result = try client.bucket("b").object("o").downloadParallel(.{ .file = file }, pinned);
+    try testing.expect(result.checksum_verified);
+    // Everything was fetched: the checkpoint described another generation.
+    try testing.expectEqual(3, fake.counts.media - media_before);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &replacement, got);
+}
+
+test "downloadParallel: a checkpoint of another transfer, or one unreadable, is refused before anything is sent and kept" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    try s.fake.put("o", "bytes of o");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+
+    // A state this library wrote, for another object.
+    const foreign = try checkpoint.encodeAlloc(testing.allocator, .{ .download_parallel = .{
+        .bucket = "b",
+        .object = "someone-elses",
+        .size = 5000,
+        .generation = 42,
+        .part_size = 1024,
+        .written = "50",
+    } });
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator, .stored = foreign };
+    defer saved.deinit();
+    const options: types.ParallelDownloadOptions = .{ .part_size = 1024, .checkpoint = saved.checkpoint() };
+    try testing.expectError(error.CheckpointFailed, s.object("o").downloadParallel(.{ .file = file }, options));
+    try expectDiag(&s.diag, "belongs to another transfer");
+    try testing.expectEqualStrings(foreign, saved.stored.?);
+
+    // Bytes that are no state at all.
+    var garbage: MemoryCheckpoint = .{ .gpa = testing.allocator, .stored = try testing.allocator.dupe(u8, "tracker-v2?") };
+    defer garbage.deinit();
+    try testing.expectError(error.CheckpointFailed, s.object("o").downloadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .checkpoint = garbage.checkpoint(),
+    }));
+    try expectDiag(&s.diag, "no state this library wrote");
+
+    // A load that fails outright.
+    var unreadable: MemoryCheckpoint = .{ .gpa = testing.allocator, .fail_loads = true };
+    defer unreadable.deinit();
+    try testing.expectError(error.CheckpointFailed, s.object("o").downloadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .checkpoint = unreadable.checkpoint(),
+    }));
+    try expectDiag(&s.diag, "could not be read");
+
+    // None of it reached the server.
+    try testing.expectEqual(0, s.fake.counts.reads);
+    try testing.expectEqual(0, s.fake.counts.media);
+}
+
+test "downloadParallel: a save that fails at the start moves no data; one that fails later fails the run and keeps the state" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [6 * 1024]u8 = undefined;
+    fill(&data, 28);
+    try fake.put("o", &data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+
+    // The very first save fails: the metadata was read, no byte moved.
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator, .saves_allowed = 0 };
+    defer saved.deinit();
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+    try testing.expectError(error.CheckpointFailed, client.bucket("b").object("o").downloadParallel(.{ .file = file }, options));
+    try expectDiag(&diag, "refused a save");
+    try testing.expectEqual(0, fake.counts.media);
+
+    // Saves fail after the start and two ranges: the run fails, and what
+    // was recorded resumes.
+    saved.saves_allowed = 3;
+    try testing.expectError(error.CheckpointFailed, client.bucket("b").object("o").downloadParallel(.{ .file = file }, options));
+    try testing.expect(saved.stored != null);
+    saved.saves_allowed = null;
+    const media_before = fake.counts.media;
+    const result = try client.bucket("b").object("o").downloadParallel(.{ .file = file }, options);
+    try testing.expect(result.checksum_verified);
+    // Ranges 1 and 2 were recorded; range 3 landed but its save failed, so
+    // it alone is fetched again beside the three never fetched.
+    try testing.expectEqual(4, fake.counts.media - media_before);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &data, got);
+}
+
+test "downloadParallel: with a checkpoint, a cancel keeps the state for the next run" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var rules = [_]Script.Rule{.{ .at = 1024, .fault = .wait }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var data: [3 * 1024]u8 = undefined;
+    fill(&data, 29);
+    try fake.put("o", &data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = 1024,
+        .concurrency = 2,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    const Running = struct {
+        fn go(target: Object, destination: std.Io.File, opts: types.ParallelDownloadOptions) Error!void {
+            _ = try target.downloadParallel(.{ .file = destination }, opts);
+        }
+    };
+    var task = try testing.io.concurrent(Running.go, .{ client.bucket("b").object("o"), file, options });
+    const deadline = std.Io.Clock.awake.now(testing.io).addDuration(.fromSeconds(10));
+    while (true) {
+        fake.mutex.lockUncancelable(testing.io);
+        const served = fake.counts.media;
+        fake.mutex.unlock(testing.io);
+        if (served >= 2) break;
+        if (std.Io.Clock.awake.now(testing.io).nanoseconds > deadline.nanoseconds) @panic("the download never fetched the two ranges not held back");
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expectError(error.Canceled, task.cancel(testing.io));
+    // The cancel kept the state; the second run finishes the work.
+    try testing.expect(saved.stored != null);
+    try testing.expect(saved.clears == 0);
+    fake.faults = null;
+    fake.gate.set(testing.io);
+    const result = try client.bucket("b").object("o").downloadParallel(.{ .file = file }, options);
+    try testing.expect(result.checksum_verified);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &data, got);
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "downloadParallel: a gzip-stored object with a checkpoint saves nothing and clears at the end" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    const decompressed = "what the object decompresses to";
+    try s.fake.putGzip("page", "stored form", decompressed);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "old");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const result = try s.object("page").downloadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .checkpoint = saved.checkpoint(),
+    });
+    // A whole-object fetch cannot resume, so there is nothing to save, and
+    // a finished one leaves no state behind.
+    try testing.expectEqual(decompressed.len, result.bytes_written);
+    try testing.expectEqual(0, saved.saves);
+    try testing.expectEqual(1, saved.clears);
+}
+
+test "downloadParallel: an empty object with a checkpoint records the transfer and clears it" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    try s.fake.put("empty", "");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "yesterday's bytes");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const result = try s.object("empty").downloadParallel(.{ .file = file }, .{ .checkpoint = saved.checkpoint() });
+    try testing.expectEqual(0, result.bytes_written);
+    try testing.expectEqual(0, try file.length(testing.io));
+    try testing.expectEqual(1, saved.saves);
+    try testing.expectEqual(1, saved.clears);
+    try testing.expectEqual(null, saved.stored);
+}
+
+test "the checkpoint's state reaches neither the log nor the diagnostics" {
+    logging.capture.reset();
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var data: [3 * 1024]u8 = undefined;
+    fill(&data, 30);
+    try fake.put("o", &data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 4);
+    defer client.deinit();
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    // A run that dies and a resume, the paths that touch the state most.
+    var rules = [_]Script.Rule{.{ .at = 1024, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").downloadParallel(.{ .file = file }, options));
+    fake.faults = null;
+    _ = try client.bucket("b").object("o").downloadParallel(.{ .file = file }, options);
+
+    try testing.expect(logging.capture.lines > 0);
+    // The state's own shape never appears: not its keys, not its bitmap.
+    try testing.expectEqual(null, std.mem.indexOf(u8, logging.capture.text(), "\"kind\""));
+    try testing.expectEqual(null, std.mem.indexOf(u8, logging.capture.text(), "\"written\""));
+    try testing.expectEqual(null, std.mem.indexOf(u8, diag.message(), "\"kind\""));
+}
+
 fn checkProperty(_: void, input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
     const floor: u64 = g.pick(u64, &.{ 1024, 1024 * 1024 });
@@ -1260,6 +2043,152 @@ test "downloadParallel: the same invariants on real threads, under a hundred fau
     }
 }
 
+/// Lets every request through, recording each media read's first byte, so
+/// a resume can prove it fetched nothing the file already held.
+const MediaRecorder = struct {
+    gpa: Allocator,
+    starts: std.ArrayList(u64) = .empty,
+
+    fn deinit(self: *MediaRecorder) void {
+        self.starts.deinit(self.gpa);
+    }
+
+    fn plan(self: *MediaRecorder) FakeMultipart.FaultPlan {
+        return .{ .ctx = self, .decide = decide };
+    }
+
+    fn decide(ctx: ?*anyopaque, kind: FakeMultipart.Kind, part: u32) FakeMultipart.Fault {
+        const self: *MediaRecorder = @ptrCast(@alignCast(ctx.?));
+        if (kind == .media) self.starts.append(self.gpa, part - 1) catch @panic("out of memory recording a range");
+        return .none;
+    }
+};
+
+/// One download under drawn faults, cut wherever they cut it, then a
+/// second run with the same checkpoint and no faults: the file ends up
+/// exactly the object, and a resume at the checkpoint's generation fetches
+/// no range the file already holds. The one legitimate second-run failure
+/// is a checksum mismatch over bytes the first run's fault corrupted,
+/// which clears the state, so a third run is whole and right.
+fn resumeUnderFaults(input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    const size = g.intRange(usize, 0, 40 * 1024);
+    const part_size = g.intRange(u64, 1024, 12 * 1024);
+    const concurrency = g.intRange(u16, 1, 4);
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    fill(data, g.int(u64));
+
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    try fake.put("o", data);
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "an older file's bytes");
+    defer file.close(testing.io);
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = part_size,
+        .concurrency = concurrency,
+        .checkpoint = saved.checkpoint(),
+    };
+
+    var chooser: Chooser = .{ .bytes = g.rest() };
+    fake.faults = chooser.plan();
+    var first_diag: Diagnostics = .{};
+    var first = try clientOn(&fake, &token, &first_diag, 2);
+    defer first.deinit();
+    if (first.bucket("b").object("o").downloadParallel(.{ .file = file }, options)) |_| {} else |err| {
+        errdefer std.debug.print("first run: {t}: {s}\n", .{ err, first_diag.message() });
+        // Only a fault ends a first run.
+        try testing.expect(chooser.faulted);
+    }
+
+    // What the state records, before the second run moves it on.
+    var state_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state_arena.deinit();
+    var held_offsets: std.ArrayList(u64) = .empty;
+    defer held_offsets.deinit(testing.allocator);
+    var recorded_generation: ?u64 = null;
+    if (saved.stored) |bytes| {
+        // Whatever the faults did, the state is one this library wrote.
+        const state = try checkpoint.parse(state_arena.allocator(), bytes);
+        const s = state.download_parallel;
+        try testing.expectEqualStrings("o", s.object);
+        try testing.expectEqual(data.len, s.size);
+        const plan = mp.plan(s.size, s.part_size);
+        var bits = try checkpoint.bitsFromHex(testing.allocator, s.written, plan.parts);
+        defer bits.deinit(testing.allocator);
+        var i: u32 = 0;
+        while (i < plan.parts) : (i += 1) {
+            if (bits.isSet(i)) try held_offsets.append(testing.allocator, plan.offset(i));
+        }
+        recorded_generation = s.generation;
+    }
+
+    var recorder: MediaRecorder = .{ .gpa = testing.allocator };
+    defer recorder.deinit();
+    fake.faults = recorder.plan();
+    var diag: Diagnostics = .{};
+    var second = try clientOn(&fake, &token, &diag, 4);
+    defer second.deinit();
+    const target = second.bucket("b").object("o");
+    const result = target.downloadParallel(.{ .file = file }, options) catch |err| {
+        errdefer std.debug.print("second run: {t}: {s}\n", .{ err, diag.message() });
+        try testing.expectEqual(error.ChecksumMismatch, err);
+        try testing.expect(chooser.faulted);
+        try testing.expectEqual(null, saved.stored);
+        const third = try target.downloadParallel(.{ .file = file }, options);
+        try testing.expect(third.checksum_verified);
+        const rewritten = try readBack(&tmp);
+        defer testing.allocator.free(rewritten);
+        try testing.expectEqualSlices(u8, data, rewritten);
+        return;
+    };
+
+    try testing.expectEqual(data.len, result.bytes_written);
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(core.crc32c.hash(data), result.crc32c);
+    try testing.expectEqual(null, saved.stored);
+    const written = try readBack(&tmp);
+    defer testing.allocator.free(written);
+    try testing.expectEqualSlices(u8, data, written);
+
+    // A resume at the recorded generation never fetches a held range. (At
+    // another generation the state was rightly discarded, and everything
+    // is fetched.)
+    if (recorded_generation == fake.object("o").?.generation) {
+        for (recorder.starts.items) |start| {
+            for (held_offsets.items) |held| try testing.expect(start != held);
+        }
+    }
+}
+
+fn resumeProperty(_: void, input: []const u8) !void {
+    try resumeUnderFaults(input);
+}
+
+// About 9 ms a run in Debug, with two or three downloads over real
+// threads and a real file: named out of the nightly's "fuzz" and "slow
+// property" filters, like the other parallel fault properties, until a
+// job of its own is sized for them.
+test "fault property parallel resume: a second run completes the object, fetching nothing the file holds" {
+    try test_util.fuzzBytes({}, resumeProperty, .{
+        .random_runs = 100,
+        .max_len = 256,
+        .corpus = &.{
+            "",
+            // 40 KiB in 1 KiB ranges, 4 at once, a cut and a lost answer.
+            "\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xe0\xd8",
+            // A corrupted range, then a connection cut: the second run
+            // meets the mismatch and the third puts it right.
+            "\x80\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\xeb\xe6\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xe6",
+        },
+    });
+}
+
 /// The fake behind a real HTTP server on the loopback interface, and a
 /// client that reaches it through real connections: its built-in
 /// transport, a new one per worker.
@@ -1393,19 +2322,107 @@ test "downloadParallel over real sockets: a stalled range times out and is fetch
     try testing.expect(elapsed_ms < 1_500);
 }
 
-test "Run: ranges are handed out once each, and none after a failure; the first failure is kept" {
+test "downloadParallel over real sockets: a download its connection keeps killing resumes on a second client" {
+    // Four resets exhaust the first client's four attempts on one range:
+    // that process is done, two ranges down.
+    var rules = [_]Script.Rule{.{ .at = 16 * 1024, .times = 4, .fault = .reset }};
+    var script: Script = .{ .rules = &rules };
+    var s: OverSockets = undefined;
+    try s.init();
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [40 * 1024 + 5]u8 = undefined;
+    fill(&data, 32);
+    try s.fake.put("dir/o", &data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    var store: checkpoint.CheckpointFile = .init(testing.io, tmp.dir, "o.download");
+    const options: types.ParallelDownloadOptions = .{
+        .part_size = 8 * 1024,
+        .concurrency = 1,
+        .checkpoint = store.checkpoint(),
+    };
+    try testing.expectError(
+        error.ConnectionResetByPeer,
+        s.client.bucket("b").object("dir/o").downloadParallel(.{ .file = file }, options),
+    );
+    try testing.expectEqual(2, s.fake.counts.media);
+
+    // A second client, over connections of its own, finishes the object.
+    var url_buf: [64]u8 = undefined;
+    var diag: Diagnostics = .{};
+    var second: Client = try .init(testing.allocator, testing.io, .{
+        .endpoint = .{ .url = s.server.url(&url_buf), .emulator = true },
+        .diagnostics = &diag,
+        .retry = .{ .max_attempts = 4, .initial_backoff_ms = 1, .max_backoff_ms = 2 },
+    });
+    defer second.deinit();
+    second.multipart_test = .{ .min_part_size = 1024 };
+    const result = try second.bucket("b").object("dir/o").downloadParallel(.{ .file = file }, options);
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(core.crc32c.hash(&data), result.crc32c);
+    // The four missing ranges and nothing more, and the state is gone.
+    try testing.expectEqual(2 + 4, s.fake.counts.media);
+    try testing.expectEqual(data.len, s.fake.counts.media_bytes);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &data, got);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "o.download", .{}));
+}
+
+fn downloadWithCheckpoint(gpa: Allocator) !void {
+    var fake: FakeMultipart = .init(gpa, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var client: Client = try .init(gpa, testing.io, .{
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    client.multipart_test = .{ .min_part_size = 1024 };
+    var data: [3000]u8 = undefined;
+    fill(&data, 33);
+    try fake.put("o", &data);
+    var saved: MemoryCheckpoint = .{ .gpa = gpa };
+    defer saved.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    // One worker, so the allocation count is the same on every pass.
+    _ = try client.bucket("b").object("o").downloadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .concurrency = 1,
+        .checkpoint = saved.checkpoint(),
+    });
+}
+
+test "downloadParallel with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, downloadWithCheckpoint, .{});
+}
+
+test "Run: ranges are handed out once each, never a held one, and none after a failure; the first failure is kept" {
     var s: Setup = undefined;
     try s.init(testing.io, .{});
     defer s.deinit();
     var crcs: [5]u32 = undefined;
+    var written: std.DynamicBitSetUnmanaged = try .initEmpty(testing.allocator, 5);
+    defer written.deinit(testing.allocator);
+    var hex: [2]u8 = undefined;
     var run: Run = .{
         .client = &s.client,
         .bucket = "b",
         .object = "o",
+        .size = 5 * 1024,
         .generation = 1,
         .destination = .{ .buffer = &.{} },
         .plan = mp.plan(5 * 1024, 1024),
         .crcs = &crcs,
+        .checkpoint = null,
+        .written = &written,
+        .hex = &hex,
     };
     try testing.expectEqual(0, run.take().?);
     try testing.expectEqual(1, run.take().?);
@@ -1425,4 +2442,16 @@ test "Run: ranges are handed out once each, and none after a failure; the first 
     clean.next = 0;
     for (0..5) |i| try testing.expectEqual(@as(u32, @intCast(i)), clean.take().?);
     try testing.expectEqual(null, clean.take());
+
+    // Ranges the destination holds are stepped over, first, midway and
+    // last.
+    written.set(0);
+    written.set(2);
+    written.set(4);
+    var resumed: Run = run;
+    resumed.failure = null;
+    resumed.next = 0;
+    try testing.expectEqual(1, resumed.take().?);
+    try testing.expectEqual(3, resumed.take().?);
+    try testing.expectEqual(null, resumed.take());
 }

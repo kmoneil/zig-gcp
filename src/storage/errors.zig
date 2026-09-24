@@ -29,7 +29,9 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// still in memory.
     UploadSessionLost,
     /// The caller's reader failed during an upload, with the detail
-    /// wherever that concrete reader keeps it. The session was cancelled.
+    /// wherever that concrete reader keeps it (the session was cancelled),
+    /// or a resumed transfer could not read back what its file already
+    /// held to rebuild the checksums.
     ReadFailed,
     /// `uploadFrom` was given `size`, and the reader ended early.
     UnexpectedEndOfStream,
@@ -79,7 +81,15 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// which. Nothing was sent.
     InvalidParallelUploadOptions,
     /// A parallel download's options break a rule: a part size under 1 MiB,
-    /// or a concurrency outside 1 to 64. `Diagnostics` says which. Nothing
-    /// was sent.
+    /// a concurrency outside 1 to 64, or a checkpoint on a buffer
+    /// destination, which no later process could hold. `Diagnostics` says
+    /// which. Nothing was sent.
     InvalidParallelDownloadOptions,
+    /// A checkpoint could not be read, parsed or saved, or it belongs to
+    /// another transfer: another kind, bucket or object. Whatever it holds
+    /// is kept, so the transfer it does belong to loses nothing; a transfer
+    /// whose own save fails mid-run fails with this rather than carry on
+    /// without what the caller asked to resume by. `Diagnostics` says
+    /// which.
+    CheckpointFailed,
 };

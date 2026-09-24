@@ -7,6 +7,9 @@ const core = @import("core");
 
 pub const Owned = core.Owned;
 
+/// Where a transfer keeps what a later process needs to carry it on.
+pub const Checkpoint = @import("checkpoint.zig").Checkpoint;
+
 /// One entry of an object's custom metadata, a flat map of string to string.
 pub const Metadata = struct {
     key: []const u8,
@@ -271,6 +274,14 @@ pub const ParallelDownloadOptions = struct {
     /// in one request that cannot resume, so this bounds all of it. 0
     /// removes the limit.
     part_timeout_ms: u32 = 300_000,
+    /// Where a download into a file keeps what a later process needs to
+    /// carry it on: which ranges the file holds, at which generation.
+    /// A resumed call re-reads those ranges from the file, so the whole is
+    /// verified across runs and a file changed in between is caught, and
+    /// fetches only the rest. `storage.CheckpointFile` is the built-in
+    /// store. A buffer destination refuses one, since only a file outlives
+    /// the process.
+    checkpoint: ?Checkpoint = null,
 };
 
 /// A byte range of an object: `length` bytes from `offset`, or everything

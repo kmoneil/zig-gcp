@@ -6,6 +6,7 @@ const std = @import("std");
 const core = @import("core");
 
 const Client = @import("Client.zig");
+const Checkpoint = @import("checkpoint.zig").Checkpoint;
 const Method = core.transport.Method;
 const Diagnostics = core.Diagnostics;
 const RetryPolicy = core.RetryPolicy;
@@ -19,6 +20,56 @@ pub const ByteGen = core.testing.ByteGen;
 pub const FuzzOptions = core.testing.FuzzOptions;
 pub const fuzzBytes = core.testing.fuzzBytes;
 pub const max_fuzz_input = core.testing.max_fuzz_input;
+
+/// A checkpoint kept in memory, counting its calls: a "process" is one
+/// call, so a restart is two calls sharing one of these. Failures on
+/// demand, and a `clear` that keeps the state, as a crash between the last
+/// range and the clear would.
+pub const MemoryCheckpoint = struct {
+    gpa: std.mem.Allocator,
+    stored: ?[]u8 = null,
+    loads: u32 = 0,
+    saves: u32 = 0,
+    clears: u32 = 0,
+    /// Fail every save once this many succeeded.
+    saves_allowed: ?u32 = null,
+    fail_loads: bool = false,
+    keep_on_clear: bool = false,
+
+    pub fn deinit(self: *MemoryCheckpoint) void {
+        if (self.stored) |bytes| self.gpa.free(bytes);
+        self.* = undefined;
+    }
+
+    pub fn checkpoint(self: *MemoryCheckpoint) Checkpoint {
+        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .clear = clear } };
+    }
+
+    fn load(ptr: *anyopaque, arena: std.mem.Allocator) Checkpoint.Error!?[]const u8 {
+        const self: *MemoryCheckpoint = @ptrCast(@alignCast(ptr));
+        self.loads += 1;
+        if (self.fail_loads) return error.CheckpointFailed;
+        const bytes = self.stored orelse return null;
+        return try arena.dupe(u8, bytes);
+    }
+
+    fn save(ptr: *anyopaque, state: []const u8) Checkpoint.Error!void {
+        const self: *MemoryCheckpoint = @ptrCast(@alignCast(ptr));
+        if (self.saves_allowed) |allowed| if (self.saves >= allowed) return error.CheckpointFailed;
+        self.saves += 1;
+        const copy = try self.gpa.dupe(u8, state);
+        if (self.stored) |old| self.gpa.free(old);
+        self.stored = copy;
+    }
+
+    fn clear(ptr: *anyopaque) void {
+        const self: *MemoryCheckpoint = @ptrCast(@alignCast(ptr));
+        self.clears += 1;
+        if (self.keep_on_clear) return;
+        if (self.stored) |old| self.gpa.free(old);
+        self.stored = null;
+    }
+};
 
 /// A real `Client` wired to a `FakeTransport` and a `FakeClock`. Initialize
 /// it in place with `init`: the client points into the harness.

@@ -27,6 +27,8 @@ pub const Error = @import("errors.zig").Error;
 pub const ApiError = core.ApiError;
 
 pub const Owned = @import("types.zig").Owned;
+pub const Checkpoint = @import("checkpoint.zig").Checkpoint;
+pub const CheckpointFile = @import("checkpoint.zig").CheckpointFile;
 pub const BucketConfig = @import("types.zig").BucketConfig;
 pub const BucketInfo = @import("types.zig").BucketInfo;
 pub const BucketPage = @import("types.zig").BucketPage;
@@ -86,6 +88,7 @@ test {
     _ = @import("Client.zig");
     _ = @import("Endpoint.zig");
     _ = @import("Object.zig");
+    _ = @import("checkpoint.zig");
     _ = @import("codec.zig");
     _ = @import("compose.zig");
     _ = @import("copy.zig");
