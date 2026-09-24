@@ -4,6 +4,46 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.18.0 (unreleased)
+
+- storage: parallel uploads, and copies that change what they carry: the
+  two follow-ups the metadata spec named.
+  `Object.uploadParallel(source, options)` sends one object in parts,
+  `concurrency` at a time (8 by default), each on a client and connection
+  of its own, through the XML API's multipart upload, and has Cloud
+  Storage join them. That is Google's own advice over parallel composite
+  uploads: the parts are never objects, so there is nothing to list,
+  delete or leave behind. The source is bytes in memory or a file, read at
+  each part's offset. Every part is checked against the CRC32C Cloud
+  Storage stored for it. The parts' checksums combine into the whole
+  object's, which is held to `options.crc32c` before anything is joined,
+  and to the finished object afterwards. Every failure aborts the upload,
+  so no part is left to be billed, and a cancel stops the workers and
+  aborts too. It takes no preconditions, since the multipart upload has
+  none. Against an emulator, which has no multipart uploads, the object
+  goes up as one ordinary upload. From this sandbox, 100 MiB in 8 MiB
+  parts, 8 at a time, went up 3.5 times as fast as one stream.
+  `copyTo` can now change what the copy carries: the fixed fields, a
+  `MetadataEdit`, and `storage_class`. Cloud Storage takes any metadata a
+  copy sends as the whole of the copy's: measured, a rewrite naming only a
+  storage class, the body Google's own samples send, came back with an
+  empty content type and no custom metadata. So a changed copy reads its
+  source first and sends everything back with the change applied, pinned
+  to the generation and metageneration it read. Copying an object onto
+  itself with a new class is how a class changes on demand.
+  `Client.sibling` makes a client with the same settings for another
+  task. `UploadOptions` gains `content_disposition` and
+  `content_language`. Breaking, for an exhaustive `switch` over
+  `storage.Error`: it gains `InvalidParallelUploadOptions`.
+- core: `crc32c.combine` gives the CRC32C of two runs of bytes joined,
+  from the CRC32C of each. zlib's version of it is wrong for CRC32C from
+  512 MiB on, since CRC32C's table wraps at 31 and zlib's at 32. Held to
+  std's own hashing of real zero runs up to 5 GiB. `rpc` gains
+  `executeStreamBody`, a body streamed once and never replayed, and
+  `StreamCall` gains `timeout_ms` and `decode_error`.
+  `testing.FakeClock` keeps a cancel protection state.
+- auth, pubsub, secret_manager: unchanged.
+
 ## 0.17.0 (2026-09-23)
 
 - storage: metadata updates and compose, the next two items of the storage

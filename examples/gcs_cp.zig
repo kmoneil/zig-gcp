@@ -5,13 +5,17 @@
 //!     zig build example-gcs_cp -- backup.tar gs://my-bucket/backups/backup.tar
 //!     zig build example-gcs_cp -- gs://my-bucket/backups/backup.tar restored.tar
 //!     ... -- backup.tar gs://my-bucket/backup.tar --no-clobber
+//!     ... -- backup.tar gs://my-bucket/backup.tar --parallel 8
 //!
 //! Both directions are checksummed end to end. An upload hashes the file as
 //! it streams and compares the result with the finished object; a download
 //! is checked against the checksum Cloud Storage keeps, and goes to
 //! `<file>.part` first, renamed into place only once it has verified.
 //! `--no-clobber` refuses to replace an existing object, with a
-//! precondition the server enforces.
+//! precondition the server enforces. `--parallel N` uploads the file in
+//! parts, N at a time on connections of their own, for a large file on a
+//! fast link; it takes no `--no-clobber`, since a multipart upload has no
+//! preconditions.
 //!
 //! Credentials come from `auth.findDefault`: the file
 //! `GOOGLE_APPLICATION_CREDENTIALS` names, then the one `gcloud auth
@@ -31,7 +35,7 @@ pub const std_options: std.Options = .{
     },
 };
 
-const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber]\n" ++
+const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber | --parallel N]\n" ++
     "       gcs_cp gs://<bucket>/<object> <file>\n";
 
 pub fn main(init: std.process.Init) !void {
@@ -43,10 +47,18 @@ pub fn main(init: std.process.Init) !void {
     var paths: [2][]const u8 = undefined;
     var count: usize = 0;
     var no_clobber = false;
+    var parallel: ?u16 = null;
+    var bad = false;
     const args = try init.minimal.args.toSlice(arena);
-    for (args[@min(1, args.len)..]) |arg| {
+    var i: usize = @min(1, args.len);
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (std.mem.eql(u8, arg, "--no-clobber")) {
             no_clobber = true;
+        } else if (std.mem.eql(u8, arg, "--parallel")) {
+            i += 1;
+            parallel = if (i < args.len) std.fmt.parseInt(u16, args[i], 10) catch null else null;
+            if (parallel == null) bad = true;
         } else if (count < paths.len) {
             paths[count] = arg;
             count += 1;
@@ -56,8 +68,11 @@ pub fn main(init: std.process.Init) !void {
     }
     const from_remote = if (count == 2) Remote.parse(paths[0]) else null;
     const to_remote = if (count == 2) Remote.parse(paths[1]) else null;
-    // Exactly one side is in Cloud Storage.
-    if (count != 2 or (from_remote == null) == (to_remote == null)) {
+    // Exactly one side is in Cloud Storage, and only an upload goes in
+    // parts, which cannot be create-only.
+    if (bad or count != 2 or (from_remote == null) == (to_remote == null) or
+        (parallel != null and (to_remote == null or no_clobber)))
+    {
         try out.writeAll(usage);
         return out.flush();
     }
@@ -82,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
 
     const started = std.Io.Clock.awake.now(init.io);
     if (to_remote) |remote| {
-        try upload(&client, init.io, paths[0], remote, no_clobber, out, &diag, started);
+        try upload(&client, init.io, paths[0], remote, no_clobber, parallel, out, &diag, started);
     } else {
         try download(&client, init.io, arena, from_remote.?, paths[1], out, &diag, started);
     }
@@ -109,12 +124,25 @@ fn upload(
     path: []const u8,
     remote: Remote,
     no_clobber: bool,
+    parallel: ?u16,
     out: *std.Io.Writer,
     diag: *const storage.Diagnostics,
     started: std.Io.Timestamp,
 ) !void {
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
+    if (parallel) |concurrency| {
+        // Each part is read at its own offset, and checked on its own.
+        var info = client.bucket(remote.bucket).object(remote.name).uploadParallel(.{ .file = file }, .{
+            .concurrency = concurrency,
+        }) catch |err| return fail(err, diag);
+        defer info.deinit();
+        const ms = elapsedMs(io, started);
+        try out.print("{s} -> gs://{s}/{s} through uploadParallel, concurrency {d}: {d} bytes in {d} ms ({d:.1} MiB/s), generation {d}, crc32c {?x:0>8}\n", .{
+            path, remote.bucket, remote.name, concurrency, info.value.size, ms, mibPerSecond(info.value.size, ms), info.value.generation, info.value.crc32c,
+        });
+        return;
+    }
     // A declared size lets the server check the upload is whole, and the
     // library that the file neither shrank nor grew while it was read.
     const size = (try file.stat(io)).size;

@@ -1076,3 +1076,616 @@ test "sweep: delete anything a crashed run left under zig-gcp-test/ more than a 
     }
     if (deleted > 0) std.debug.print("swept {d} leftover test object(s)\n", .{deleted});
 }
+
+// Parallel uploads and copies with changes: the parallel-uploads-and-copy
+// spec's section 9, cases 1 to 16, which is where the undocumented parts
+// are settled.
+
+const Header = core.transport.Header;
+
+/// A raw request through the fixture's transport, carrying its token: for
+/// what no call of the library asks. Lives in the fixture's arena.
+fn raw(
+    f: *Fixture,
+    method: core.transport.Method,
+    path: []const u8,
+    headers: []const Header,
+    content_type: ?[]const u8,
+    body: ?[]const u8,
+) !core.transport.StreamResponse {
+    const arena = f.arena.allocator();
+    const url = try std.fmt.allocPrint(arena, "https://storage.googleapis.com{s}", .{path});
+    const segments = [_][]const u8{body orelse ""};
+    return f.faults.transport().sendStream(.{
+        .method = method,
+        .url = url,
+        .bearer = f.token.token,
+        .content_type = content_type,
+        .headers = headers,
+        .body = if (body != null) .{ .segments = &segments } else .none,
+    }, arena);
+}
+
+/// `/storage/v1/b/{bucket}/o/{name}`, the name one strict segment.
+fn jsonPath(f: *Fixture, name: []const u8, suffix: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(f.arena.allocator(), "/storage/v1/b/{s}/o/{s}{s}", .{ f.bucket_name, try segment(f, name), suffix });
+}
+
+/// A name as one strict segment of a JSON API path.
+fn segment(f: *Fixture, name: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(f.arena.allocator());
+    try core.query.writeStrictSegment(&out.writer, name);
+    return out.written();
+}
+
+/// The rewrite call a copy makes, raw, with `resource` as its body.
+fn rewriteRaw(f: *Fixture, source: []const u8, dest: []const u8, resource: []const u8) !core.transport.StreamResponse {
+    const path = try std.fmt.allocPrint(f.arena.allocator(), "{s}/rewriteTo/b/{s}/o/{s}", .{ try jsonPath(f, source, ""), f.bucket_name, try segment(f, dest) });
+    return raw(f, .POST, path, &.{}, "application/json", resource);
+}
+
+/// `/{bucket}/{name}{query}`: the suite's names need no escaping.
+fn xmlPath(f: *Fixture, name: []const u8, query: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(f.arena.allocator(), "/{s}/{s}{s}", .{ f.bucket_name, name, query });
+}
+
+fn expectStatus(expected: u16, res: core.transport.StreamResponse) !void {
+    if (res.status != expected) std.debug.print("HTTP {d}: {s}\n", .{ res.status, res.body });
+    try testing.expectEqual(expected, res.status);
+}
+
+/// The text of the first `<tag>` in `body`, or null.
+fn xmlText(body: []const u8, comptime tag: []const u8) ?[]const u8 {
+    const start = (std.mem.indexOf(u8, body, "<" ++ tag ++ ">") orelse return null) + tag.len + 2;
+    const end = std.mem.indexOfPos(u8, body, start, "</" ++ tag ++ ">") orelse return null;
+    return body[start..end];
+}
+
+/// A field of an object's JSON resource, read raw, for what `ObjectInfo`
+/// does not report.
+fn rawField(f: *Fixture, name: []const u8, field: []const u8) !?[]const u8 {
+    const res = try raw(f, .GET, try jsonPath(f, name, ""), &.{}, null, null);
+    try expectStatus(200, res);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, f.arena.allocator(), res.body, .{});
+    const value = parsed.object.get(field) orelse return null;
+    return switch (value) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Multipart uploads still open for names under the test's prefix.
+fn openUploads(f: *Fixture) !usize {
+    const path = try std.fmt.allocPrint(f.arena.allocator(), "/{s}?uploads&prefix={s}", .{ f.bucket_name, &f.prefix });
+    const res = try raw(f, .GET, path, &.{}, null, null);
+    try expectStatus(200, res);
+    return std.mem.count(u8, res.body, "<Upload>");
+}
+
+/// Several real transports behind one that several tasks may share: each
+/// request takes a transport from the pool and gives it back, so a parallel
+/// upload's workers each get a connection, as the built-in transport gives
+/// them. It also counts stored parts and times finishes.
+const PoolTransport = struct {
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    transports: [16]core.transport.HttpTransport,
+    free: [16]u8,
+    free_count: usize,
+    parts_stored: u32 = 0,
+    finish_ms: [8]i64 = @splat(0),
+    finishes: usize = 0,
+
+    fn init(p: *PoolTransport, gpa: Allocator, io: std.Io) void {
+        p.* = .{ .io = io, .transports = undefined, .free = undefined, .free_count = 16 };
+        for (&p.transports, 0..) |*t, i| {
+            t.* = .init(gpa, io, Fixture.user_agent);
+            p.free[i] = @intCast(i);
+        }
+    }
+
+    fn deinit(p: *PoolTransport) void {
+        for (&p.transports) |*t| t.deinit();
+    }
+
+    fn transport(p: *PoolTransport) core.transport.Transport {
+        return .{ .ptr = p, .vtable = &.{ .send = send, .sendStream = sendStream } };
+    }
+
+    fn take(p: *PoolTransport) *core.transport.HttpTransport {
+        p.mutex.lockUncancelable(p.io);
+        defer p.mutex.unlock(p.io);
+        if (p.free_count == 0) @panic("the transport pool ran dry");
+        p.free_count -= 1;
+        return &p.transports[p.free[p.free_count]];
+    }
+
+    fn give(p: *PoolTransport, t: *core.transport.HttpTransport) void {
+        p.mutex.lockUncancelable(p.io);
+        defer p.mutex.unlock(p.io);
+        p.free[p.free_count] = @intCast(t - &p.transports[0]);
+        p.free_count += 1;
+    }
+
+    fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
+        const p: *PoolTransport = @ptrCast(@alignCast(ptr));
+        const t = p.take();
+        defer p.give(t);
+        return t.transport().send(req, arena);
+    }
+
+    fn sendStream(ptr: *anyopaque, req: core.transport.StreamRequest, arena: Allocator) core.transport.StreamError!core.transport.StreamResponse {
+        const p: *PoolTransport = @ptrCast(@alignCast(ptr));
+        const t = p.take();
+        defer p.give(t);
+        const started = std.Io.Clock.awake.now(p.io);
+        const outcome = t.transport().sendStream(req, arena);
+        const ms = started.durationTo(std.Io.Clock.awake.now(p.io)).toMilliseconds();
+        const ok = if (outcome) |res| res.status >= 200 and res.status < 300 else |_| false;
+        p.mutex.lockUncancelable(p.io);
+        defer p.mutex.unlock(p.io);
+        if (ok and req.method == .PUT and std.mem.indexOf(u8, req.url, "partNumber=") != null) p.parts_stored += 1;
+        if (req.method == .POST and std.mem.indexOf(u8, req.url, "uploadId=") != null and p.finishes < p.finish_ms.len) {
+            p.finish_ms[p.finishes] = ms;
+            p.finishes += 1;
+        }
+        return outcome;
+    }
+};
+
+/// A client on a `PoolTransport`, with the fixture's token.
+fn pooledClient(f: *Fixture, pool: *PoolTransport) !storage.Client {
+    pool.init(testing.allocator, testing.io);
+    return storage.Client.init(testing.allocator, testing.io, .{
+        .token_provider = f.token.provider(),
+        .transport = pool.transport(),
+        .diagnostics = &f.diag,
+        .request_timeout_ms = 120_000,
+        .user_agent = Fixture.user_agent,
+    });
+}
+
+test "14. copy: a rewrite keeps only what it names, so copyTo sends everything back" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const src = try f.object("copy-src.txt");
+    var up = src.upload("hello\n", .{
+        .content_type = "text/plain",
+        .cache_control = "no-cache",
+        .content_language = "en",
+        .metadata = &.{ .{ .key = "reviewer", .value = "kim" }, .{ .key = "stage", .value = "draft" } },
+    }) catch |err| return f.report(err);
+    up.deinit();
+    // customTime can be set only by a raw patch: no call of the library sets it.
+    const custom_time = "2026-09-24T00:00:00Z";
+    try expectStatus(200, try raw(&f, .PATCH, try jsonPath(&f, src.name, ""), &.{}, "application/json", "{\"customTime\":\"" ++ custom_time ++ "\"}"));
+
+    // 1. A rewrite whose resource names only contentType.
+    const only_type = try f.object("only-type.txt");
+    try expectStatus(200, try rewriteRaw(&f, src.name, only_type.name, "{\"contentType\":\"text/csv\"}"));
+    var typed = only_type.get(.{}) catch |err| return f.report(err);
+    defer typed.deinit();
+    std.debug.print("a rewrite naming only contentType: cacheControl {?s}, contentLanguage {?s}, {d} custom keys, customTime {?s}\n", .{
+        typed.value.cache_control, typed.value.content_language, typed.value.metadata.len, try rawField(&f, only_type.name, "customTime"),
+    });
+    try testing.expectEqualStrings("text/csv", typed.value.content_type);
+    try testing.expectEqual(null, typed.value.cache_control);
+    try testing.expectEqual(0, typed.value.metadata.len);
+
+    // 2. One naming only storageClass, which Google's own samples send.
+    const only_class = try f.object("only-class.txt");
+    try expectStatus(200, try rewriteRaw(&f, src.name, only_class.name, "{\"storageClass\":\"NEARLINE\"}"));
+    var classed = only_class.get(.{}) catch |err| return f.report(err);
+    defer classed.deinit();
+    std.debug.print("a rewrite naming only storageClass: contentType \"{s}\", cacheControl {?s}, {d} custom keys, class {s}\n", .{
+        classed.value.content_type, classed.value.cache_control, classed.value.metadata.len, classed.value.storage_class,
+    });
+    try testing.expectEqualStrings("NEARLINE", classed.value.storage_class);
+    try testing.expectEqual(0, classed.value.metadata.len);
+
+    // 3. copyTo with a change keeps every field it did not change.
+    const changed = try f.object("changed.txt");
+    var copied = src.copyTo(changed, .{ .content_type = "text/csv" }) catch |err| return f.report(err);
+    defer copied.deinit();
+    try testing.expectEqualStrings("text/csv", copied.value.content_type);
+    try testing.expectEqualStrings("no-cache", copied.value.cache_control.?);
+    try testing.expectEqualStrings("en", copied.value.content_language.?);
+    try testing.expectEqualStrings("kim", copied.value.metadataValue("reviewer").?);
+    try testing.expectEqualStrings("draft", copied.value.metadataValue("stage").?);
+    const carried = (try rawField(&f, changed.name, "customTime")) orelse return error.TestCustomTimeLost;
+    try testing.expectEqual((try storage.parseTimestamp(custom_time)).nanoseconds, (try storage.parseTimestamp(carried)).nanoseconds);
+    try f.expectContent(changed, "hello\n");
+}
+
+test "15. copy: a class changes in place, and what an empty resource does with one" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const obj = try f.object("class.txt");
+    var up = obj.upload("bytes that stay\n", .{
+        .content_type = "text/plain",
+        .metadata = &.{.{ .key = "reviewer", .value = "kim" }},
+    }) catch |err| return f.report(err);
+    defer up.deinit();
+
+    // 4. Onto itself with a new class: a new generation, the same bytes
+    // and metadata. NEARLINE bills 30 days on delete: a fraction of a cent.
+    var moved = obj.copyTo(obj, .{ .storage_class = "NEARLINE" }) catch |err| return f.report(err);
+    defer moved.deinit();
+    try testing.expectEqualStrings("NEARLINE", moved.value.storage_class);
+    try testing.expect(moved.value.generation != up.value.generation);
+    try testing.expectEqualStrings("text/plain", moved.value.content_type);
+    try testing.expectEqualStrings("kim", moved.value.metadataValue("reviewer").?);
+    try f.expectContent(obj, "bytes that stay\n");
+
+    // What an empty resource does with a class: the source's, or the
+    // bucket's default, STANDARD here. Nothing documents it.
+    const plain = try f.object("plain-copy.txt");
+    var copied = obj.copyTo(plain, .{}) catch |err| return f.report(err);
+    defer copied.deinit();
+    std.debug.print("a copy with an empty resource of a NEARLINE object, in a STANDARD bucket: {s}\n", .{copied.value.storage_class});
+    // And a changed copy that names no class.
+    const changed = try f.object("changed-copy.txt");
+    var changed_copy = obj.copyTo(changed, .{ .cache_control = "no-store" }) catch |err| return f.report(err);
+    defer changed_copy.deinit();
+    std.debug.print("a changed copy naming no class, of the same object: {s}\n", .{changed_copy.value.storage_class});
+}
+
+/// Patches the source's metadata just before the first rewrite call goes
+/// out: the moment between a copy's read and its write.
+const PatchBeforeRewrite = struct {
+    inner: core.transport.Transport,
+    f: *Fixture,
+    source: []const u8,
+    patched: bool = false,
+
+    fn transport(self: *PatchBeforeRewrite) core.transport.Transport {
+        return .{ .ptr = self, .vtable = &.{ .send = send, .sendStream = sendStream } };
+    }
+
+    fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
+        const self: *PatchBeforeRewrite = @ptrCast(@alignCast(ptr));
+        if (!self.patched and req.method == .POST and std.mem.indexOf(u8, req.url, "/rewriteTo/") != null) {
+            self.patched = true;
+            const res = raw(self.f, .PATCH, jsonPath(self.f, self.source, "") catch return error.OutOfMemory, &.{}, "application/json", "{\"metadata\":{\"moved\":\"yes\"}}") catch return error.NetworkFailure;
+            if (res.status != 200) return error.NetworkFailure;
+        }
+        return self.inner.send(req, arena);
+    }
+
+    fn sendStream(ptr: *anyopaque, req: core.transport.StreamRequest, arena: Allocator) core.transport.StreamError!core.transport.StreamResponse {
+        const self: *PatchBeforeRewrite = @ptrCast(@alignCast(ptr));
+        return self.inner.sendStream(req, arena);
+    }
+};
+
+test "16. copy: a source that changes between the read and the write fails with 412, and nothing is written" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const src = try f.object("moving-source.txt");
+    var up = src.upload("x", .{ .content_type = "text/plain" }) catch |err| return f.report(err);
+    up.deinit();
+
+    // 5. A second client, whose transport changes the source in between.
+    var patcher: PatchBeforeRewrite = .{ .inner = f.faults.transport(), .f = &f, .source = src.name };
+    var client: storage.Client = try .init(testing.allocator, testing.io, .{
+        .token_provider = f.token.provider(),
+        .transport = patcher.transport(),
+        .diagnostics = &f.diag,
+        .user_agent = Fixture.user_agent,
+    });
+    defer client.deinit();
+    const dest = client.bucket(f.bucket_name).object((try f.object("never-written.txt")).name);
+    try testing.expectError(error.FailedPrecondition, client.bucket(f.bucket_name).object(src.name).copyTo(dest, .{ .content_type = "text/csv" }));
+    try testing.expect(patcher.patched);
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "metageneration") != null);
+    try testing.expect(!(try (try f.object("never-written.txt")).exists()));
+}
+
+test "17. parallel: 100 MiB in 8 MiB parts, 8 at a time" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    var pool: PoolTransport = undefined;
+    var client = try pooledClient(&f, &pool);
+    defer pool.deinit();
+    defer client.deinit();
+    const size = 100 * 1024 * 1024;
+    const data = try pattern(testing.allocator, 17, size);
+    defer testing.allocator.free(data);
+    const obj = client.bucket(f.bucket_name).object((try f.object("parallel-100m.bin")).name);
+
+    // 6. The parts, their checksums, the whole object's.
+    const started = std.Io.Clock.awake.now(testing.io);
+    var info = obj.uploadParallel(.{ .data = data }, .{
+        .content_type = "application/octet-stream",
+        .part_size = 8 * 1024 * 1024,
+        .concurrency = 8,
+        .crc32c = core.crc32c.hash(data),
+    }) catch |err| return f.report(err);
+    defer info.deinit();
+    const ms = msSince(started);
+    std.debug.print("100 MiB in 8 MiB parts, 8 at a time: {d} ms ({d} MiB/s); the finish took {d} ms\n", .{
+        ms, @divTrunc(100 * 1000, @max(ms, 1)), pool.finish_ms[0],
+    });
+    std.debug.print("a multipart object: md5 {s}, component_count {?d}\n", .{ if (info.value.md5 == null) "none" else "present", info.value.component_count });
+    try testing.expectEqual(size, info.value.size);
+    try testing.expectEqual(core.crc32c.hash(data), info.value.crc32c.?);
+    try testing.expectEqual(null, info.value.md5);
+    try testing.expectEqual(13, pool.parts_stored);
+    try f.expectContent(f.bucket().object(obj.name), data);
+}
+
+test "18. parallel: what the XML API answers, asked raw" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const a = arena: {
+        break :arena f.arena.allocator();
+    };
+    const name = (try f.object("raw-mpu.txt")).name;
+
+    // 7. A finish's headers, and whether a metadata key keeps its case.
+    const started = try raw(&f, .POST, try xmlPath(&f, name, "?uploads"), &.{.{ .name = "x-goog-meta-Reviewer", .value = "kim" }}, "text/plain", "");
+    try expectStatus(200, started);
+    const id = try a.dupe(u8, xmlText(started.body, "UploadId") orelse return error.TestNoUploadId);
+    var query_buf: std.Io.Writer.Allocating = .init(a);
+    try query_buf.writer.writeAll("?partNumber=1&uploadId=");
+    try core.query.writeValue(&query_buf.writer, id);
+    const part = try raw(&f, .PUT, try xmlPath(&f, name, query_buf.written()), &.{}, null, "one part\n");
+    try expectStatus(200, part);
+    const etag = part.header("ETag") orelse return error.TestNoETag;
+    var id_query: std.Io.Writer.Allocating = .init(a);
+    try id_query.writer.writeAll("?uploadId=");
+    try core.query.writeValue(&id_query.writer, id);
+    const body = try std.fmt.allocPrint(a, "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>", .{etag});
+    const finished = try raw(&f, .POST, try xmlPath(&f, name, id_query.written()), &.{}, "application/xml", body);
+    try expectStatus(200, finished);
+    std.debug.print("a finish answers x-goog-generation {?s}, x-goog-hash {?s}, ETag {?s}\n", .{
+        finished.header("x-goog-generation"), finished.header("x-goog-hash"), xmlText(finished.body, "ETag"),
+    });
+    var info = f.bucket().object(name).get(.{}) catch |err| return f.report(err);
+    defer info.deinit();
+    for (info.value.metadata) |entry| std.debug.print("x-goog-meta-Reviewer came back as key \"{s}\"\n", .{entry.key});
+    std.debug.print("a multipart object: md5 {s}, component_count {?d}\n", .{ if (info.value.md5 == null) "none" else "present", info.value.component_count });
+    try testing.expectEqual(null, info.value.md5);
+
+    // 10. The same finish again. Google documents 404 NoSuchUpload for an
+    // upload that "might have been aborted or completed"; measured, a
+    // repeat soon after answers 200 again. What matters is that it does
+    // not write again: the same generation, not a new one.
+    const first_generation = try std.fmt.parseInt(u64, finished.header("x-goog-generation").?, 10);
+    const again = try raw(&f, .POST, try xmlPath(&f, name, id_query.written()), &.{}, "application/xml", body);
+    var after_again = f.bucket().object(name).get(.{}) catch |err| return f.report(err);
+    defer after_again.deinit();
+    std.debug.print("the same finish again: HTTP {d}, x-goog-generation {?s}; the object's generation {d}, the first finish's {d}\n", .{
+        again.status, again.header("x-goog-generation"), after_again.value.generation, first_generation,
+    });
+    if (again.status == 200) {
+        try testing.expectEqual(first_generation, try std.fmt.parseInt(u64, again.header("x-goog-generation").?, 10));
+    } else {
+        try expectStatus(404, again);
+        try testing.expectEqualStrings("NoSuchUpload", xmlText(again.body, "Code").?);
+    }
+    try testing.expectEqual(first_generation, after_again.value.generation);
+
+    // 8. An empty object: one part of no bytes.
+    const empty_name = (try f.object("raw-empty.txt")).name;
+    const empty_start = try raw(&f, .POST, try xmlPath(&f, empty_name, "?uploads"), &.{}, "text/plain", "");
+    try expectStatus(200, empty_start);
+    const empty_id = try a.dupe(u8, xmlText(empty_start.body, "UploadId").?);
+    var q2: std.Io.Writer.Allocating = .init(a);
+    try q2.writer.writeAll("?partNumber=1&uploadId=");
+    try core.query.writeValue(&q2.writer, empty_id);
+    const empty_part = try raw(&f, .PUT, try xmlPath(&f, empty_name, q2.written()), &.{}, null, "");
+    try expectStatus(200, empty_part);
+    var q3: std.Io.Writer.Allocating = .init(a);
+    try q3.writer.writeAll("?uploadId=");
+    try core.query.writeValue(&q3.writer, empty_id);
+    const empty_finish = try raw(&f, .POST, try xmlPath(&f, empty_name, q3.written()), &.{}, "application/xml", try std.fmt.allocPrint(a, "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>", .{empty_part.header("ETag").?}));
+    std.debug.print("a multipart upload of one empty part finishes with HTTP {d}\n", .{empty_finish.status});
+    if (empty_finish.status != 200) _ = try raw(&f, .DELETE, try xmlPath(&f, empty_name, q3.written()), &.{}, null, null);
+
+    // 9. x-goog-if-generation-match: 0 on a finish over an existing object.
+    const cond_start = try raw(&f, .POST, try xmlPath(&f, name, "?uploads"), &.{}, "text/plain", "");
+    try expectStatus(200, cond_start);
+    const cond_id = try a.dupe(u8, xmlText(cond_start.body, "UploadId").?);
+    var q4: std.Io.Writer.Allocating = .init(a);
+    try q4.writer.writeAll("?partNumber=1&uploadId=");
+    try core.query.writeValue(&q4.writer, cond_id);
+    const cond_part = try raw(&f, .PUT, try xmlPath(&f, name, q4.written()), &.{}, null, "replacement\n");
+    try expectStatus(200, cond_part);
+    var q5: std.Io.Writer.Allocating = .init(a);
+    try q5.writer.writeAll("?uploadId=");
+    try core.query.writeValue(&q5.writer, cond_id);
+    const cond_finish = try raw(&f, .POST, try xmlPath(&f, name, q5.written()), &.{.{ .name = "x-goog-if-generation-match", .value = "0" }}, "application/xml", try std.fmt.allocPrint(a, "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>", .{cond_part.header("ETag").?}));
+    std.debug.print("a finish with x-goog-if-generation-match: 0 over an existing object answers HTTP {d}\n", .{cond_finish.status});
+    if (cond_finish.status != 200) _ = try raw(&f, .DELETE, try xmlPath(&f, name, q5.written()), &.{}, null, null);
+
+    // 10, the other half. A part sent after an abort.
+    const gone_name = (try f.object("raw-aborted.txt")).name;
+    const gone_start = try raw(&f, .POST, try xmlPath(&f, gone_name, "?uploads"), &.{}, "text/plain", "");
+    try expectStatus(200, gone_start);
+    const gone_id = try a.dupe(u8, xmlText(gone_start.body, "UploadId").?);
+    var q6: std.Io.Writer.Allocating = .init(a);
+    try q6.writer.writeAll("?uploadId=");
+    try core.query.writeValue(&q6.writer, gone_id);
+    try expectStatus(204, try raw(&f, .DELETE, try xmlPath(&f, gone_name, q6.written()), &.{}, null, null));
+    var q7: std.Io.Writer.Allocating = .init(a);
+    try q7.writer.writeAll("?partNumber=1&uploadId=");
+    try core.query.writeValue(&q7.writer, gone_id);
+    const late = try raw(&f, .PUT, try xmlPath(&f, gone_name, q7.written()), &.{}, null, "late\n");
+    try expectStatus(404, late);
+    try testing.expectEqualStrings("NoSuchUpload", xmlText(late.body, "Code").?);
+
+    // 11. A part under 5 MiB that is not the last is refused at the finish.
+    const small_name = (try f.object("raw-small.txt")).name;
+    const small_start = try raw(&f, .POST, try xmlPath(&f, small_name, "?uploads"), &.{}, "text/plain", "");
+    try expectStatus(200, small_start);
+    const small_id = try a.dupe(u8, xmlText(small_start.body, "UploadId").?);
+    var etags: [2][]const u8 = undefined;
+    for (&etags, 1..) |*e, n| {
+        var q: std.Io.Writer.Allocating = .init(a);
+        try q.writer.print("?partNumber={d}&uploadId=", .{n});
+        try core.query.writeValue(&q.writer, small_id);
+        const p = try raw(&f, .PUT, try xmlPath(&f, small_name, q.written()), &.{}, null, "a small part\n");
+        try expectStatus(200, p);
+        e.* = try a.dupe(u8, p.header("ETag").?);
+    }
+    var q8: std.Io.Writer.Allocating = .init(a);
+    try q8.writer.writeAll("?uploadId=");
+    try core.query.writeValue(&q8.writer, small_id);
+    const small_finish = try raw(&f, .POST, try xmlPath(&f, small_name, q8.written()), &.{}, "application/xml", try std.fmt.allocPrint(
+        a,
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>",
+        .{ etags[0], etags[1] },
+    ));
+    std.debug.print("a non-final part under 5 MiB: HTTP {d} {?s}: {?s}\n", .{ small_finish.status, xmlText(small_finish.body, "Code"), xmlText(small_finish.body, "Message") });
+    try testing.expectEqual(400, small_finish.status);
+    _ = try raw(&f, .DELETE, try xmlPath(&f, small_name, q8.written()), &.{}, null, null);
+    try testing.expectEqual(0, try openUploads(&f));
+}
+
+test "19. parallel: a cut part, a lost part answer and a lost finish answer are all ridden out" {
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .PUT, .url_contains = "partNumber=2", .action = .{ .cut_request_body = 3 * 1024 * 1024 } },
+        .{ .method = .PUT, .url_contains = "partNumber=3", .action = .lose_response },
+        .{ .method = .POST, .url_contains = "uploadId=", .action = .lose_response },
+    };
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .plan = &plan, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const size = 5 * 5 * 1024 * 1024 + 12345;
+    const data = try pattern(testing.allocator, 19, size);
+    defer testing.allocator.free(data);
+    const obj = try f.object("parallel-faults.bin");
+
+    // 12. One worker, on the fixture's fault transport, which is not for
+    // sharing between tasks.
+    var info = obj.uploadParallel(.{ .data = data }, .{ .part_size = 5 * 1024 * 1024, .concurrency = 1 }) catch |err| return f.report(err);
+    defer info.deinit();
+    for (plan, 0..) |fault, i| {
+        errdefer std.debug.print("fault {d} ({s}) did not fire\n", .{ i, fault.url_contains });
+        try testing.expect(fault.fired);
+    }
+    try testing.expectEqual(core.crc32c.hash(data), info.value.crc32c.?);
+    try f.expectContent(obj, data);
+    try testing.expectEqual(0, try openUploads(&f));
+}
+
+test "20. parallel: a failure and a cancel both leave no multipart upload open" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    var pool: PoolTransport = undefined;
+    var client = try pooledClient(&f, &pool);
+    defer pool.deinit();
+    defer client.deinit();
+    const size = 8 * 5 * 1024 * 1024;
+    const data = try pattern(testing.allocator, 20, size);
+    defer testing.allocator.free(data);
+
+    // 13. A failure: a checksum that does not match, found before the finish.
+    const failed = client.bucket(f.bucket_name).object((try f.object("failed.bin")).name);
+    try testing.expectError(error.ChecksumMismatch, failed.uploadParallel(.{ .data = data }, .{
+        .part_size = 5 * 1024 * 1024,
+        .crc32c = core.crc32c.hash(data) ^ 1,
+    }));
+    try testing.expectEqual(0, try openUploads(&f));
+    try testing.expect(!(try f.bucket().object(failed.name).exists()));
+
+    // And a cancel, once some parts are in.
+    const canceled = client.bucket(f.bucket_name).object((try f.object("canceled.bin")).name);
+    const Running = struct {
+        fn go(target: storage.Object, bytes: []const u8) storage.Error!void {
+            var info = try target.uploadParallel(.{ .data = bytes }, .{ .part_size = 5 * 1024 * 1024, .concurrency = 2 });
+            info.deinit();
+        }
+    };
+    const before = pool.parts_stored;
+    var task = try testing.io.concurrent(Running.go, .{ canceled, data });
+    const deadline_ms: i64 = 120_000;
+    const waiting = std.Io.Clock.awake.now(testing.io);
+    while (true) {
+        pool.mutex.lockUncancelable(testing.io);
+        const stored = pool.parts_stored - before;
+        pool.mutex.unlock(testing.io);
+        if (stored >= 2) break;
+        if (msSince(waiting) > deadline_ms) @panic("no part was stored within two minutes");
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+    }
+    try testing.expectError(error.Canceled, task.cancel(testing.io));
+    try testing.expectEqual(0, try openUploads(&f));
+    try testing.expect(!(try f.bucket().object(canceled.name).exists()));
+}
+
+test "21. parallel: 1 GiB from a file, one connection against eight, timed" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    var pool: PoolTransport = undefined;
+    var client = try pooledClient(&f, &pool);
+    defer pool.deinit();
+    defer client.deinit();
+
+    const size: u64 = 1024 * 1024 * 1024;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const out = try tmp.dir.createFile(testing.io, "gib.bin", .{});
+        defer out.close(testing.io);
+        var buf: [64 * 1024]u8 = undefined;
+        var writer = out.writer(testing.io, &buf);
+        var block: [64 * 1024]u8 = undefined;
+        var i: u64 = 0;
+        while (i < size) : (i += block.len) {
+            for (&block, 0..) |*b, k| b.* = patternByte(21, i + k);
+            try writer.interface.writeAll(&block);
+        }
+        try writer.interface.flush();
+    }
+    const file = try tmp.dir.openFile(testing.io, "gib.bin", .{});
+    defer file.close(testing.io);
+    const expected = patternCrc(21, size);
+
+    // 14. The same file, one worker and then eight. 15. The finish of 103
+    // parts, timed.
+    var ms: [2]i64 = undefined;
+    for ([_]u16{ 1, 8 }, 0..) |concurrency, i| {
+        const obj = client.bucket(f.bucket_name).object(try std.fmt.allocPrint(f.arena.allocator(), "{s}gib-{d}.bin", .{ &f.prefix, concurrency }));
+        const started = std.Io.Clock.awake.now(testing.io);
+        var info = obj.uploadParallel(.{ .file = file }, .{
+            .part_size = 10 * 1024 * 1024,
+            .concurrency = concurrency,
+            .crc32c = expected,
+        }) catch |err| return f.report(err);
+        defer info.deinit();
+        ms[i] = msSince(started);
+        try testing.expectEqual(size, info.value.size);
+        try testing.expectEqual(expected, info.value.crc32c.?);
+        std.debug.print("1 GiB in 103 parts, {d} at a time: {d} ms ({d} MiB/s); the finish took {d} ms\n", .{
+            concurrency, ms[i], @divTrunc(1024 * 1000, @max(ms[i], 1)), pool.finish_ms[pool.finishes - 1],
+        });
+    }
+    std.debug.print("eight at a time was {d:.2} times as fast as one\n", .{@as(f64, @floatFromInt(ms[0])) / @as(f64, @floatFromInt(@max(ms[1], 1)))});
+}
+
+test "22. move: whether objects.move works in a bucket without hierarchical namespace" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const src = try f.object("move-src.txt");
+    var up = src.upload("moving\n", .{}) catch |err| return f.report(err);
+    up.deinit();
+    const dest_name = (try f.object("move-dest.txt")).name;
+    // 16. For the follow-up that would make parallel uploads create-only.
+    const path = try std.fmt.allocPrint(f.arena.allocator(), "{s}/moveTo/o/{s}", .{ try jsonPath(&f, src.name, ""), try segment(&f, dest_name) });
+    const moved = try raw(&f, .POST, try std.fmt.allocPrint(f.arena.allocator(), "{s}?ifGenerationMatch=0", .{path}), &.{}, "application/json", "");
+    std.debug.print("objects.move in a flat bucket: HTTP {d} {s}\n", .{ moved.status, moved.body[0..@min(moved.body.len, 300)] });
+    if (moved.status == 200) {
+        try testing.expect(!(try src.exists()));
+        try f.expectContent(f.bucket().object(dest_name), "moving\n");
+    }
+}

@@ -85,13 +85,17 @@ jobs:
           zig build example-publisher -- orders 500 4
           zig build example-worker
           # A file up and back down through gcs_cp, byte for byte, in
-          # chunks, and a refused overwrite.
+          # chunks, then up again through uploadParallel, which the
+          # emulator takes as one ordinary upload, and a refused overwrite.
           curl -sf -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
             -H "Content-Type: application/json" -d '{"name":"zigps-examples"}' >/dev/null
           head -c 20971520 /dev/urandom > "$RUNNER_TEMP/src.bin"
           zig build example-gcs_cp -- "$RUNNER_TEMP/src.bin" gs://zigps-examples/dir/copy.bin
           zig build example-gcs_cp -- gs://zigps-examples/dir/copy.bin "$RUNNER_TEMP/back.bin"
           cmp "$RUNNER_TEMP/src.bin" "$RUNNER_TEMP/back.bin"
+          zig build example-gcs_cp -- "$RUNNER_TEMP/src.bin" gs://zigps-examples/dir/parallel.bin --parallel 4
+          zig build example-gcs_cp -- gs://zigps-examples/dir/parallel.bin "$RUNNER_TEMP/back-parallel.bin"
+          cmp "$RUNNER_TEMP/src.bin" "$RUNNER_TEMP/back-parallel.bin"
           if zig build example-gcs_cp -- "$RUNNER_TEMP/src.bin" gs://zigps-examples/dir/copy.bin --no-clobber; then
             echo "--no-clobber replaced an existing object"
             exit 1

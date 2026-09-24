@@ -10,9 +10,11 @@
 //! failure after the start aborts the upload, so no part stays behind to be
 //! billed.
 //!
-//! No retry can write twice. Sending a part again replaces it, and a finish
-//! that landed before its answer was lost finds no upload the second time:
-//! it answers 404 `NoSuchUpload`, which reading the object back resolves.
+//! No retry can write twice. Sending a part again replaces it. A finish
+//! that landed before its answer was lost answers 200 again when repeated
+//! soon after, naming the same generation, and 404 `NoSuchUpload` once
+//! Cloud Storage has forgotten the upload, which reading the object back
+//! resolves.
 //!
 //! Against an emulator the object goes up as one ordinary upload instead:
 //! fake-gcs-server has no multipart uploads.
