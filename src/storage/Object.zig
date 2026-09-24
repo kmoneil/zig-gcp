@@ -557,7 +557,17 @@ fn finishStream(
 ///
 /// A file destination is set to exactly the object's length first. On any
 /// failure the destination holds whatever arrived and must be discarded,
-/// so write a file under a temporary name and rename it on success.
+/// so write a file under a temporary name and rename it on success,
+/// unless a checkpoint records what it holds.
+///
+/// With `options.checkpoint`, a download into a file that a process left
+/// unfinished carries on in a later one: the checkpoint records each
+/// written range, the resumed call re-reads those from the file, which
+/// rebuilds their checksums and catches a file changed in between, and
+/// only the rest is fetched, pinned to the same generation. The whole is
+/// verified as always, and the checkpoint is cleared when the download
+/// finishes, or when its bytes are discredited. `storage.CheckpointFile`
+/// is the built-in store.
 pub fn downloadParallel(self: Object, destination: types.ParallelDestination, options: types.ParallelDownloadOptions) Error!types.DownloadResult {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);

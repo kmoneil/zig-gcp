@@ -455,6 +455,109 @@ test "parallel downloads: ranges into memory and into a file, and a gzip-stored 
     try testing.expectEqual(core.crc32c.hash(text), whole.crc32c);
 }
 
+/// A checkpoint store that refuses saves after a set number, wrapping the
+/// real file store: how a test ends a run partway, state on disk, without
+/// ending its process.
+const DyingCheckpoint = struct {
+    inner: storage.Checkpoint,
+    saves_allowed: u32,
+
+    fn checkpoint(self: *DyingCheckpoint) storage.Checkpoint {
+        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .clear = clear } };
+    }
+
+    fn load(ptr: *anyopaque, arena: std.mem.Allocator) storage.Checkpoint.Error!?[]const u8 {
+        const self: *DyingCheckpoint = @ptrCast(@alignCast(ptr));
+        return self.inner.load(arena);
+    }
+
+    fn save(ptr: *anyopaque, state: []const u8) storage.Checkpoint.Error!void {
+        const self: *DyingCheckpoint = @ptrCast(@alignCast(ptr));
+        if (self.saves_allowed == 0) return error.CheckpointFailed;
+        self.saves_allowed -= 1;
+        return self.inner.save(state);
+    }
+
+    fn clear(ptr: *anyopaque) void {
+        const self: *DyingCheckpoint = @ptrCast(@alignCast(ptr));
+        self.inner.clear();
+    }
+};
+
+test "parallel downloads: a checkpoint left by a dead run resumes, and a file changed between runs is caught" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    // Four ranges at the 1 MiB floor, the last one short.
+    const data = try testing.allocator.alloc(u8, 3 * 1024 * 1024 + 17);
+    defer testing.allocator.free(data);
+    var prng: std.Random.DefaultPrng = .init(20260925);
+    prng.random().bytes(data);
+    var uploaded = try f.bucket().object("dir/resumed.bin").upload(data, .{});
+    uploaded.deinit();
+    const obj = f.bucket().object("dir/resumed.bin");
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "resumed.bin", .data = "" });
+    const file = try tmp.dir.openFile(testing.io, "resumed.bin", .{ .mode = .read_write });
+    defer file.close(testing.io);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "resumed.bin.download");
+
+    // The first run records its start and two of the four ranges, then
+    // dies on the next save, its state on disk.
+    var dying: DyingCheckpoint = .{ .inner = store.checkpoint(), .saves_allowed = 3 };
+    try testing.expectError(error.CheckpointFailed, obj.downloadParallel(.{ .file = file }, .{
+        .part_size = 1024 * 1024,
+        .concurrency = 1,
+        .checkpoint = dying.checkpoint(),
+    }));
+    const state = try tmp.dir.readFileAlloc(testing.io, "resumed.bin.download", testing.allocator, .unlimited);
+    defer testing.allocator.free(state);
+    try testing.expect(std.mem.indexOf(u8, state, "\"written\":\"3\"") != null);
+
+    // A second run picks the download up, and the whole is verified.
+    const result = try obj.downloadParallel(.{ .file = file }, .{
+        .part_size = 1024 * 1024,
+        .concurrency = 2,
+        .checkpoint = store.checkpoint(),
+    });
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(data.len, result.bytes_written);
+    try testing.expectEqual(core.crc32c.hash(data), result.crc32c);
+    const got = try tmp.dir.readFileAlloc(testing.io, "resumed.bin", testing.allocator, .unlimited);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, data, got);
+    // Done: the state file is gone.
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "resumed.bin.download", .{}));
+
+    // Again, but a byte of a held range changes on disk between the runs:
+    // the resume re-reads the file rather than trust the checkpoint, so
+    // the mismatch is caught, the state discarded, and a fresh run heals
+    // the file.
+    var dying_again: DyingCheckpoint = .{ .inner = store.checkpoint(), .saves_allowed = 2 };
+    try testing.expectError(error.CheckpointFailed, obj.downloadParallel(.{ .file = file }, .{
+        .part_size = 1024 * 1024,
+        .concurrency = 1,
+        .checkpoint = dying_again.checkpoint(),
+    }));
+    try file.writePositionalAll(testing.io, &.{data[10] ^ 0x01}, 10);
+    const resumed: storage.ParallelDownloadOptions = .{
+        .part_size = 1024 * 1024,
+        .concurrency = 1,
+        .checkpoint = store.checkpoint(),
+    };
+    try testing.expectError(error.ChecksumMismatch, obj.downloadParallel(.{ .file = file }, resumed));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "resumed.bin.download", .{}));
+    const healed = try obj.downloadParallel(.{ .file = file }, resumed);
+    try testing.expect(healed.checksum_verified);
+    const rewritten = try tmp.dir.readFileAlloc(testing.io, "resumed.bin", testing.allocator, .unlimited);
+    defer testing.allocator.free(rewritten);
+    try testing.expectEqualSlices(u8, data, rewritten);
+}
+
 test "parallel uploads with conditions: the ordinary upload an emulator gets carries them" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;
