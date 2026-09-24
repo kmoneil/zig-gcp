@@ -270,6 +270,74 @@ fn errorForCode(code: []const u8) Error {
     return error.Unknown;
 }
 
+/// One part an upload holds, as ListParts reports it.
+pub const ListedPart = struct {
+    /// From 1, as the part was sent.
+    number: u32,
+    /// As the answer sent it, quotes and all, in the caller's arena: the
+    /// finish names the part by it.
+    etag: []const u8,
+    size: u64,
+};
+
+/// How many parts each ListParts page asks for, which is also the most
+/// Cloud Storage returns.
+pub const list_page_size = 1_000;
+
+/// Every part an upload holds, in the order the pages deliver them,
+/// through as many pages as it takes: `IsTruncated` and
+/// `NextPartNumberMarker` lead to the next. ListParts reports no
+/// checksums, and nothing documents a part's ETag as its MD5, so a resume
+/// re-reads the local bytes instead. An upload that is gone answers 404
+/// `NoSuchUpload`, which `uploadIsGone` tells apart.
+pub fn listParts(
+    client: *Client,
+    arena: Allocator,
+    bucket: []const u8,
+    object: []const u8,
+    upload_id: []const u8,
+    page_size: u32,
+) Error![]const ListedPart {
+    var parts: std.ArrayList(ListedPart) = .empty;
+    var marker: u32 = 0;
+    while (true) {
+        var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+        defer scratch.deinit();
+        const path = try names.xmlPath(scratch.allocator(), bucket, object, .{
+            .list = .{ .upload_id = upload_id, .max_parts = page_size, .marker = marker },
+        });
+        var response: std.heap.ArenaAllocator = .init(client.gpa);
+        defer response.deinit();
+        const res = rpc.executeStream(client, &response, .{
+            .method = .GET,
+            .path = path,
+            .decode_error = xml.decodeError,
+        }) catch |err| switch (err) {
+            error.WriteFailed => unreachable,
+            else => |e| return e,
+        };
+        const root = xml.parse(scratch.allocator(), res.body) catch |err| return decodeFailed(client, err, "part list");
+        if (!std.mem.eql(u8, root.name, "ListPartsResult")) return decodeFailed(client, error.InvalidResponse, "part list");
+        for (root.children) |child| {
+            if (!std.mem.eql(u8, child.name, "Part")) continue;
+            const number = std.fmt.parseInt(u32, child.childText("PartNumber") orelse "", 10) catch
+                return decodeFailed(client, error.InvalidResponse, "part list");
+            const size = std.fmt.parseInt(u64, child.childText("Size") orelse "", 10) catch
+                return decodeFailed(client, error.InvalidResponse, "part list");
+            const etag = child.childText("ETag") orelse
+                return decodeFailed(client, error.InvalidResponse, "part list");
+            try parts.append(arena, .{ .number = number, .etag = try arena.dupe(u8, etag), .size = size });
+        }
+        if (!std.mem.eql(u8, root.childText("IsTruncated") orelse "false", "true")) break;
+        const next = std.fmt.parseInt(u32, root.childText("NextPartNumberMarker") orelse "", 10) catch
+            return decodeFailed(client, error.InvalidResponse, "part list");
+        // A marker that does not advance would page forever.
+        if (next <= marker) return decodeFailed(client, error.InvalidResponse, "part list");
+        marker = next;
+    }
+    return parts.items;
+}
+
 /// Aborts an upload, which drops every part it holds. An upload that is
 /// already gone, finished, aborted or never started, counts as aborted.
 pub fn abort(client: *Client, bucket: []const u8, object: []const u8, upload_id: []const u8) Error!void {
@@ -591,4 +659,116 @@ fn everyRequest(gpa: Allocator) !void {
 
 test "multipart requests: every allocation failure is OutOfMemory, and nothing leaks" {
     try testing.checkAllAllocationFailures(testing.allocator, everyRequest, .{});
+}
+
+const list_page_one =
+    \\<?xml version='1.0' encoding='UTF-8'?>
+    \\<ListPartsResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>
+    \\<Bucket>b</Bucket><Key>dir/a b.bin</Key><UploadId>VXBs+b2Fk=</UploadId>
+    \\<PartNumberMarker>0</PartNumberMarker><MaxParts>2</MaxParts>
+    \\<NextPartNumberMarker>2</NextPartNumberMarker><IsTruncated>true</IsTruncated>
+    \\<Part><PartNumber>1</PartNumber><LastModified>2026-09-24T00:00:00.000Z</LastModified><ETag>"etag-1"</ETag><Size>1024</Size></Part>
+    \\<Part><PartNumber>2</PartNumber><LastModified>2026-09-24T00:00:00.000Z</LastModified><ETag>"etag-2"</ETag><Size>1024</Size></Part>
+    \\</ListPartsResult>
+;
+
+const list_page_two =
+    \\<?xml version='1.0' encoding='UTF-8'?>
+    \\<ListPartsResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>
+    \\<Bucket>b</Bucket><Key>dir/a b.bin</Key><UploadId>VXBs+b2Fk=</UploadId>
+    \\<PartNumberMarker>2</PartNumberMarker><MaxParts>2</MaxParts>
+    \\<IsTruncated>false</IsTruncated>
+    \\<Part><PartNumber>5</PartNumber><LastModified>2026-09-24T00:00:00.000Z</LastModified><ETag>"etag-5"</ETag><Size>17</Size></Part>
+    \\</ListPartsResult>
+;
+
+test "golden: listParts pages until IsTruncated says stop, and keeps what each page said" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = list_page_one } },
+        .{ .respond = .{ .body = list_page_two } },
+    }, .{});
+    defer h.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const parts = try listParts(&h.client, arena.allocator(), "b", "dir/a b.bin", "VXBs+b2Fk=", 2);
+    try testing.expectEqual(3, parts.len);
+    try testing.expectEqual(1, parts[0].number);
+    try testing.expectEqualStrings("\"etag-1\"", parts[0].etag);
+    try testing.expectEqual(1024, parts[0].size);
+    try testing.expectEqual(2, parts[1].number);
+    try testing.expectEqual(5, parts[2].number);
+    try testing.expectEqualStrings("\"etag-5\"", parts[2].etag);
+    try testing.expectEqual(17, parts[2].size);
+
+    try testing.expectEqual(2, h.fake.stream_requests.items.len);
+    const first = try h.fake.streamRequest(0);
+    try testing.expectEqual(core.transport.Method.GET, first.method);
+    try testing.expectEqualStrings("https://storage.googleapis.com/b/dir/a%20b.bin?uploadId=VXBs%2Bb2Fk%3D&max-parts=2", first.url);
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/b/dir/a%20b.bin?uploadId=VXBs%2Bb2Fk%3D&max-parts=2&part-number-marker=2",
+        (try h.fake.streamRequest(1)).url,
+    );
+}
+
+test "listParts: a gone upload answers NoSuchUpload, which uploadIsGone tells apart" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{no_such_upload}, .{});
+    defer h.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const outcome = listParts(&h.client, arena.allocator(), "b", "o", "u", list_page_size);
+    try testing.expectError(error.NotFound, outcome);
+    try testing.expect(uploadIsGone(&h.client, error.NotFound));
+}
+
+test "listParts: answers no upload could have given are InvalidResponse" {
+    const wrong_root = "<?xml version='1.0'?><Wrong></Wrong>";
+    const bad_number = "<?xml version='1.0'?><ListPartsResult><IsTruncated>false</IsTruncated>" ++
+        "<Part><PartNumber>x</PartNumber><ETag>\"e\"</ETag><Size>1</Size></Part></ListPartsResult>";
+    const no_etag = "<?xml version='1.0'?><ListPartsResult><IsTruncated>false</IsTruncated>" ++
+        "<Part><PartNumber>1</PartNumber><Size>1</Size></Part></ListPartsResult>";
+    const stuck_marker = "<?xml version='1.0'?><ListPartsResult><IsTruncated>true</IsTruncated>" ++
+        "<NextPartNumberMarker>0</NextPartNumberMarker></ListPartsResult>";
+    const no_marker = "<?xml version='1.0'?><ListPartsResult><IsTruncated>true</IsTruncated></ListPartsResult>";
+    for ([_][]const u8{ wrong_root, bad_number, no_etag, stuck_marker, no_marker }) |body| {
+        var h: test_util.Harness = undefined;
+        try h.init(&.{.{ .respond = .{ .body = body } }}, .{});
+        defer h.deinit();
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        try testing.expectError(error.InvalidResponse, listParts(&h.client, arena.allocator(), "b", "o", "u", list_page_size));
+    }
+}
+
+test "listParts against the fake: every part comes back ascending, however many pages it takes" {
+    const gpa = testing.allocator;
+    var fake: test_util.FakeMultipart = .init(gpa, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var client: Client = try .init(gpa, testing.io, .{
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    const id = try start(&client, arena.allocator(), "b", "o", .{ .content_type = "x/y" });
+    // Sent out of order, and listed in order.
+    for ([_]u32{ 4, 1, 5, 3, 2 }) |number| {
+        var body: [64]u8 = undefined;
+        const bytes = try std.fmt.bufPrint(&body, "part {d} bytes {d}", .{ number, number });
+        _ = try sendPart(&client, arena.allocator(), "b", "o", id, number, .{ .bytes = bytes });
+    }
+    const parts = try listParts(&client, arena.allocator(), "b", "o", id, 2);
+    try testing.expectEqual(5, parts.len);
+    for (parts, 1..) |part, want| {
+        try testing.expectEqual(want, part.number);
+        try testing.expect(part.etag.len > 2);
+        try testing.expectEqual(14, part.size);
+    }
+    // Five parts at two a page is three pages.
+    try testing.expectEqual(3, fake.counts.lists);
+    try abort(&client, "b", "o", id);
 }

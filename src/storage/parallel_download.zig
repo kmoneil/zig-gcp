@@ -253,6 +253,10 @@ fn loadState(
     };
     const s = switch (state) {
         .download_parallel => |s| s,
+        else => {
+            if (d) |diag| diag.print("the checkpoint belongs to another transfer, not a parallel download; give each transfer a checkpoint of its own", .{});
+            return error.CheckpointFailed;
+        },
     };
     if (!std.mem.eql(u8, s.bucket, bucket) or !std.mem.eql(u8, s.object, object)) {
         if (d) |diag| diag.print("the checkpoint belongs to another transfer; overwriting it would orphan that one, so give each transfer a checkpoint of its own", .{});

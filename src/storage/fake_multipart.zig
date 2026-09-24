@@ -48,6 +48,8 @@ pub const FakeMultipart = struct {
         parts: u32 = 0,
         finishes: u32 = 0,
         aborts: u32 = 0,
+        /// ListParts pages served, answered or not.
+        lists: u32 = 0,
         reads: u32 = 0,
         deletes: u32 = 0,
         /// Media reads, of a whole object or a range, answered or not.
@@ -58,7 +60,7 @@ pub const FakeMultipart = struct {
         moves: u32 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, read, delete, media, move };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move };
 
     pub const Fault = enum {
         none,
@@ -275,7 +277,12 @@ pub const FakeMultipart = struct {
             .xml => |x| switch (x.query) {
                 .uploads => .start,
                 .part => .part,
-                .upload => if (method == .POST) .finish else .abort,
+                .upload => switch (method) {
+                    .POST => .finish,
+                    .DELETE => .abort,
+                    .GET => .list,
+                    else => return error.HttpProtocolError,
+                },
             },
         };
         const part_number: u32 = switch (target) {
@@ -523,8 +530,52 @@ pub const FakeMultipart = struct {
                 const index = self.uploadIndex(target.query.upload) orelse return gone;
                 return self.drop(index, .{ .status = 204 });
             },
+            .list => {
+                self.counts.lists += 1;
+                const index = self.uploadIndex(target.query.upload) orelse return gone;
+                if (fault == .gone) return self.drop(index, gone);
+                return self.listParts(index, target, arena);
+            },
             .read, .delete, .media, .move => unreachable,
         }
+    }
+
+    /// One ListParts page: the parts past `marker`, ascending, at most
+    /// `max_parts` of them, with `IsTruncated` and `NextPartNumberMarker`
+    /// leading to the next. As Cloud Storage, no checksum appears anywhere.
+    fn listParts(self: *FakeMultipart, index: usize, target: XmlTarget, arena: Allocator) Allocator.Error!Reply {
+        const u = &self.uploads.items[index];
+        const numbers = try arena.dupe(u32, u.parts.keys());
+        std.mem.sort(u32, numbers, {}, std.sort.asc(u32));
+        var from: usize = 0;
+        while (from < numbers.len and numbers[from] <= target.marker) from += 1;
+        const count = @min(numbers.len - from, target.max_parts);
+        const page = numbers[from..][0..count];
+        const truncated = from + count < numbers.len;
+
+        var out: std.Io.Writer.Allocating = .init(arena);
+        const w = &out.writer;
+        const print = struct {
+            fn go(writer: *std.Io.Writer, comptime format: []const u8, args: anytype) Allocator.Error!void {
+                writer.print(format, args) catch return error.OutOfMemory;
+            }
+        }.go;
+        try print(w, "<?xml version='1.0' encoding='UTF-8'?>" ++
+            "<ListPartsResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>" ++
+            "<Bucket>{s}</Bucket><Key>{s}</Key><UploadId>{s}</UploadId>" ++
+            "<PartNumberMarker>{d}</PartNumberMarker><MaxParts>{d}</MaxParts>", .{
+            target.bucket, target.name, u.id, target.marker, target.max_parts,
+        });
+        if (truncated) try print(w, "<NextPartNumberMarker>{d}</NextPartNumberMarker>", .{page[page.len - 1]});
+        try print(w, "<IsTruncated>{s}</IsTruncated>", .{if (truncated) "true" else "false"});
+        for (page) |number| {
+            const part = u.parts.get(number).?;
+            try print(w, "<Part><PartNumber>{d}</PartNumber>" ++
+                "<LastModified>2026-09-24T00:00:00.000Z</LastModified>" ++
+                "<ETag>{s}</ETag><Size>{d}</Size></Part>", .{ number, part.etag, part.bytes.len });
+        }
+        try print(w, "</ListPartsResult>", .{});
+        return .{ .status = 200, .body = out.written() };
     }
 
     fn finishUpload(self: *FakeMultipart, index: usize, body: []const u8, fault: Fault, arena: Allocator) Allocator.Error!Reply {
@@ -770,6 +821,9 @@ const XmlTarget = struct {
     bucket: []const u8,
     name: []const u8,
     query: Query,
+    /// For a part list.
+    max_parts: u32 = 1_000,
+    marker: u32 = 0,
 
     const Query = union(enum) {
         uploads,
@@ -838,12 +892,18 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
     if (std.mem.eql(u8, query, "uploads")) return .{ .xml = .{ .bucket = bucket, .name = name, .query = .uploads } };
     var number: ?u32 = null;
     var upload_id: ?[]const u8 = null;
+    var max_parts: u32 = 1_000;
+    var marker: u32 = 0;
     var params = std.mem.splitScalar(u8, query, '&');
     while (params.next()) |param| {
         if (std.mem.startsWith(u8, param, "partNumber=")) {
             number = std.fmt.parseInt(u32, param["partNumber=".len..], 10) catch return error.HttpProtocolError;
         } else if (std.mem.startsWith(u8, param, "uploadId=")) {
             upload_id = try decode(arena, param["uploadId=".len..]);
+        } else if (std.mem.startsWith(u8, param, "max-parts=")) {
+            max_parts = std.fmt.parseInt(u32, param["max-parts=".len..], 10) catch return error.HttpProtocolError;
+        } else if (std.mem.startsWith(u8, param, "part-number-marker=")) {
+            marker = std.fmt.parseInt(u32, param["part-number-marker=".len..], 10) catch return error.HttpProtocolError;
         } else return error.HttpProtocolError;
     }
     const id = upload_id orelse return error.HttpProtocolError;
@@ -851,6 +911,8 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         .bucket = bucket,
         .name = name,
         .query = if (number) |n| .{ .part = .{ .number = n, .upload_id = id } } else .{ .upload = id },
+        .max_parts = max_parts,
+        .marker = marker,
     } };
 }
 
