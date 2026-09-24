@@ -1114,9 +1114,21 @@ fn tempFile(tmp: *testing.TmpDir, data: []const u8) !std.Io.File {
 }
 
 test "uploadParallel over real sockets: a file, a connection per worker" {
+    // The first four parts wait at the gate, each holding a worker and its
+    // connection. Without that the count below would depend on how fast
+    // the workers start: on a quick loopback one worker can take every
+    // part before the others are running, as it did on macOS.
+    var rules = [_]Script.Rule{
+        .{ .kind = .part, .part = 1, .fault = .wait },
+        .{ .kind = .part, .part = 2, .fault = .wait },
+        .{ .kind = .part, .part = 3, .fault = .wait },
+        .{ .kind = .part, .part = 4, .fault = .wait },
+    };
+    var script: Script = .{ .rules = &rules };
     var s: OverSockets = undefined;
     try s.init();
     defer s.deinit();
+    s.fake.faults = script.plan();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 200 * 1024 + 3);
@@ -1125,17 +1137,31 @@ test "uploadParallel over real sockets: a file, a connection per worker" {
     const file = try tempFile(&tmp, data);
     defer file.close(testing.io);
 
-    var info = try s.client.bucket("b").object("dir/over sockets.bin").uploadParallel(.{ .file = file }, .{
-        .part_size = 8 * 1024,
-        .concurrency = 4,
-        .metadata = &.{.{ .key = "origin", .value = "zig" }},
-    });
+    const Running = struct {
+        fn go(target: Object, source: std.Io.File) Error!types.Owned(types.ObjectInfo) {
+            return target.uploadParallel(.{ .file = source }, .{
+                .part_size = 8 * 1024,
+                .concurrency = 4,
+                .metadata = &.{.{ .key = "origin", .value = "zig" }},
+            });
+        }
+    };
+    var task = try testing.io.concurrent(Running.go, .{ s.client.bucket("b").object("dir/over sockets.bin"), file });
+    // Four workers held at the gate, each on a connection of its own, and
+    // the caller's, which started the upload.
+    const waiting = std.Io.Clock.awake.now(testing.io);
+    while (s.server.connections.load(.monotonic) < 5) {
+        if (waiting.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() > 10_000) {
+            @panic("four workers never held four connections of their own");
+        }
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    s.fake.gate.set(testing.io);
+    var info = try task.await(testing.io);
     defer info.deinit();
     try testing.expectEqualSlices(u8, data, s.fake.object("dir/over sockets.bin").?.bytes);
     try testing.expectEqual(26, s.fake.counts.parts);
     try testing.expectEqualStrings("zig", s.fake.object("dir/over sockets.bin").?.metadata[0].value);
-    // Four workers, each on a connection of its own, and the caller's.
-    try testing.expect(s.server.connections.load(.monotonic) >= 5);
 }
 
 test "uploadParallel over real sockets: dropped connections and a 503 are ridden out" {
