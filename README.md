@@ -970,28 +970,67 @@ defer uploaded.deinit();
   twice: a part sent again replaces itself, and a finish repeated after a
   lost answer names the same generation as the one that landed.
 - **Emulators.** Against an emulator, which has no multipart uploads, the
-  object goes up as one ordinary upload.
+  object goes up as one ordinary upload, with any conditions.
 
-It takes no preconditions: the multipart upload has none, so it replaces
-whatever has the name, as an unconditional upload does. A precondition
-header is not refused either, only ignored: measured,
-`x-goog-if-generation-match: 0` on a finish replaced an existing object. Custom metadata
-travels as `x-goog-meta-` headers, so keys must be lowercase, which is
-also what Cloud Storage makes of them: measured, `x-goog-meta-Reviewer`
-comes back as `reviewer`. The result is read back with one metadata
-request, which needs `storage.objects.get`, a permission Storage Object
-Creator does not grant.
+Custom metadata travels as `x-goog-meta-` headers, so keys must be
+lowercase, which is also what Cloud Storage makes of them: measured,
+`x-goog-meta-Reviewer` comes back as `reviewer`.
+
+**Conditions.** The multipart upload takes no preconditions, and a
+precondition header on it is not refused, only ignored: measured,
+`x-goog-if-generation-match: 0` on a finish replaced an existing object.
+So `options.preconditions` holds another way:
+
+```zig
+var created = try bucket.object("backups/db.tar").uploadParallel(.{ .file = file }, .{
+    .preconditions = .does_not_exist, // create-only
+});
+defer created.deinit();
+```
+
+1. The object is read under the conditions first, so one that already
+   fails, such as a create-only upload over an existing object, costs one
+   request and refuses with `error.FailedPrecondition` before a byte is
+   sent.
+2. The parts go up and are joined under a temporary name in the same
+   bucket, `zig-gcp-tmp/` and 32 random hex digits.
+3. `objects.move` renames it into place only if the conditions still
+   hold. The move is atomic and pinned to the temporary object's
+   generation, charges no early deletion fee, and skips soft delete. Its
+   answer is the finished object.
+
+A refused move, and any failure after the finish, deletes the temporary
+object again. A move whose answer is lost is settled by reading: if the
+temporary object is gone, the move happened. The temporary object also
+means three things to plan for:
+
+- The move needs `storage.objects.move`, or `get` and `delete`, on the
+  temporary object. Storage Object User and Admin grant them; Storage
+  Object Creator does not, and with it the move fails with 403 once every
+  byte is up, and the temporary object stays.
+- Pub/Sub notifications and event triggers on the bucket see the
+  temporary object come and go.
+- A bucket with a retention policy or default event-based holds keeps
+  objects from being deleted, and may refuse the move; this is unmeasured.
+
+Without conditions, the upload replaces whatever has the name, and the
+result is read back with one metadata request, which needs
+`storage.objects.get`, a permission Storage Object Creator does not grant.
 
 A process that dies mid-upload leaves its parts, and Cloud Storage bills
-them until the upload is aborted: unfinished uploads never expire. A
-lifecycle rule aborts them for you:
+them until the upload is aborted: unfinished uploads never expire. One
+that dies between the finish and the move leaves an object under
+`zig-gcp-tmp/`. Lifecycle rules clean up both:
 
 ```json
-{ "rule": [{ "action": { "type": "AbortIncompleteMultipartUpload" }, "condition": { "age": 7 } }] }
+{ "rule": [
+  { "action": { "type": "AbortIncompleteMultipartUpload" }, "condition": { "age": 7 } },
+  { "action": { "type": "Delete" }, "condition": { "age": 1, "matchesPrefix": ["zig-gcp-tmp/"] } }
+] }
 ```
 
 `gcloud storage buckets update gs://my-bucket --lifecycle-file=rules.json`
-applies it.
+applies them.
 
 Measured from this sandbox against a real bucket on 2026-09-24, 100 MiB in
 8 MiB parts, 8 at a time, went up in 10.0 s (10 MiB/s), where one stream
@@ -999,7 +1038,61 @@ took 34.9 s (2.9 MiB/s). A 1 GiB file in 103 parts took 67.6 s eight at a
 time and 327.2 s one at a time, 4.84 times as fast; its finish took 143
 ms, far from the "several minutes" Google warns of. Smaller objects gain
 less: gcloud starts using parallel uploads only at `150M`.
-`examples/gcs_cp.zig` takes `--parallel N`.
+`examples/gcs_cp.zig` takes `--parallel N`, and `--no-clobber` with it.
+
+### Parallel downloads
+
+`downloadParallel` fetches one object in ranges, several at once, each
+on a connection of its own, and writes each range at its offset in a file
+or a buffer: Google's sliced download, which gcloud does by default. It
+is for large objects on fast links, where one connection is the limit.
+
+```zig
+const cwd = std.Io.Dir.cwd();
+const file = try cwd.createFile(io, "backup.tar.part", .{});
+defer file.close(io);
+const result = try bucket.object("backups/backup.tar").downloadParallel(.{ .file = file }, .{
+    .part_size = 32 * 1024 * 1024, // the default
+    .concurrency = 8,              // the default
+});
+// result.checksum_verified: the ranges' checksums, combined, matched the
+// object's. False for an object stored gzip-compressed, or with checking
+// turned off.
+try std.Io.Dir.rename(cwd, "backup.tar.part", cwd, "backup.tar", io);
+```
+
+- **One metadata read first** names the size, the generation, the
+  CRC32C and the content encoding, with any `preconditions` applied.
+  Every range is pinned to that generation, so an overwrite partway
+  through is `error.NotFound`, never a file spliced from two objects.
+- **Ranges.** Each is fetched with `download`, so it resumes at the byte
+  where a dropped connection or a timeout left it. The workers are tasks
+  with clients of their own and `part_timeout_ms` as their timeout.
+- **Checksums.** A range carries no checksum of its own: Cloud Storage
+  names none on a range short of the whole object, and the emulator names
+  the whole object's. So each range is hashed as it arrives, and the
+  hashes combine into the whole object's, which must match the
+  metadata's. `DownloadResult.crc32c` is the checksum of what a download
+  wrote, on every download.
+- **Files** are set to exactly the object's length first and held to it
+  afterwards. On Linux a file opened for appending takes every write at
+  its end, whatever the offset; its length is what shows it, since the
+  checksum covers the bytes as they arrived, not where they landed. A
+  file that cannot be sized, such as a pipe, is refused. A **buffer** must
+  hold the whole object, or the call is `error.ObjectTooLarge` before any
+  range is read.
+- **Two kinds of object are not split.** An empty object is not read at
+  all. An object stored gzip-compressed is fetched whole by one worker,
+  decompressed and unverified, as `download` fetches it, since Cloud
+  Storage ignores a range while it decompresses.
+
+On any failure the destination holds whatever arrived, so write to a
+temporary name and rename it on success, as `examples/gcs_cp.zig
+--parallel N` does.
+
+Measured from this sandbox against a real bucket on 2026-09-24, 1 GiB in
+32 MiB ranges came down in 64.8 s eight at a time and 333.0 s one at a
+time, 5.14 times as fast.
 
 ### The emulator is not production
 
@@ -1025,9 +1118,15 @@ differences it found:
   Cloud Storage leaves it out, and it ignores a copy's storage class.
   `copyTo` sends everything it means the copy to carry, so both agree on
   every field but the class.
-- It has no multipart uploads at all, so `uploadParallel` sends an ordinary
-  upload to an emulator. The library's own tests run the multipart upload
-  against an in-memory fake and a loopback server that speak it.
+- It has no multipart uploads at all, and no `objects.move`: it takes a
+  move for an update of an object named `{source}/moveTo/o/{destination}`,
+  and answers 404. So `uploadParallel` sends an ordinary upload to an
+  emulator, with any conditions. The library's own tests run the
+  multipart upload and the move against an in-memory fake and a loopback
+  server that speak them.
+- It does serve ranges pinned to a generation, and decompresses a
+  gzip-stored object ignoring a range, as Cloud Storage does, so
+  `downloadParallel` runs against it for real.
 
 ## Zig 0.16 standard library issues handled here
 
