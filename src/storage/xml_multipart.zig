@@ -12,8 +12,10 @@
 //! - The finish's answer carries `x-goog-hash` with the whole object's
 //!   CRC32C, and the object has no MD5. Finishing "can take several
 //!   minutes".
-//! - A finish or part for an upload that is gone, finished or aborted,
-//!   answers 404 `NoSuchUpload`.
+//! - A part for an upload that is gone answers 404 `NoSuchUpload`. So does
+//!   a finish, though one repeated soon after it succeeded answers 200
+//!   again, naming the same generation: measured 2026-09-24, and not what
+//!   the documentation says.
 //! - Errors are XML: `<Error><Code/><Message/></Error>`.
 //!
 //! The upload id is not a credential: every request that names it still
@@ -203,7 +205,8 @@ pub const Finished = struct {
 /// Finishes an upload from `parts`, which must be every part, ascending.
 /// `timeout_ms` bounds each attempt: Google says finishing "can take
 /// several minutes". Retried: a finish that landed and lost its answer
-/// cannot land twice, since the repeat finds no upload and answers 404
+/// does not land twice. A repeat soon after answers 200 again with the
+/// same generation; a later one finds no upload and answers 404
 /// `NoSuchUpload`, which the caller resolves by reading the object back.
 pub fn finish(
     client: *Client,

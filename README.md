@@ -900,6 +900,107 @@ object twice is far more often a loop bug than a request, and a compose
 that deletes its sources is never retried without a precondition, because
 the second attempt would find them gone.
 
+### Copies that change what they carry
+
+`copyTo` copies server-side, and can change the copy's metadata on the way:
+the same fields `updateMetadata` takes, and a storage class.
+
+```zig
+// Onto itself with a new class: how an object's class changes on demand,
+// without its bytes going anywhere near this machine.
+var archived = try object.copyTo(object, .{ .storage_class = "COLDLINE" });
+defer archived.deinit();
+
+var renamed = try object.copyTo(bucket.object("public/report.csv"), .{
+    .content_type = "text/csv",
+    .cache_control = "public, max-age=300",
+});
+defer renamed.deinit();
+```
+
+With no change the copy carries the source's metadata as it is. With any
+change, a storage class included, the copy first reads the source's
+metadata and sends it back with the change applied. That is because Cloud
+Storage takes whatever metadata a copy sends as the whole of the copy's.
+Measured against a real bucket on 2026-09-24:
+
+- A rewrite naming only a content type came back with no cache control, no
+  language, no custom metadata and no custom time.
+- One naming only a storage class, which is exactly what Google's own
+  samples send to change a class, came back with an empty content type
+  and no custom metadata.
+
+The copy is pinned to what it read. `sourceGeneration` fixes the bytes and
+`ifSourceMetagenerationMatch` the metadata, so a source that changes in
+between fails the copy with a 412 rather than mixing two versions. A copy
+with no `storage_class` takes the destination bucket's default: measured,
+a NEARLINE object copied, changed or not, into a STANDARD bucket came out
+STANDARD. ACLs, holds and retention are never copied.
+
+### Parallel uploads
+
+`uploadParallel` sends one object in parts, several at once, each on a
+connection of its own, and has Cloud Storage join them: the XML API's
+multipart upload. It is for large objects on fast links, where one
+connection is the limit.
+
+```zig
+const file = try std.Io.Dir.cwd().openFile(io, "backup.tar", .{});
+defer file.close(io);
+var uploaded = try bucket.object("backups/backup.tar").uploadParallel(.{ .file = file }, .{
+    .content_type = "application/x-tar",
+    .part_size = 32 * 1024 * 1024, // the default
+    .concurrency = 8,              // the default
+});
+defer uploaded.deinit();
+```
+
+- **Sources.** Bytes in memory are sliced, never copied; a file is read at
+  each part's offset, so any number of workers read it at once.
+- **Workers.** Each is a task with a client of its own
+  (`Client.sibling`) and `part_timeout_ms` as its timeout, since one large
+  part takes far longer than a small request.
+- **Checksums.** Every part is checked against the CRC32C Cloud Storage
+  stored for it. The parts' checksums combine into the whole object's
+  with no second pass over the data. That is held to `options.crc32c`
+  before anything is joined, so a file that changed under the upload
+  writes nothing, and to the finished object afterwards.
+- **Failures.** Every failure aborts the upload, so no part is left to be
+  billed, and a cancel stops the workers and aborts too. No retry writes
+  twice: a part sent again replaces itself, and a finish repeated after a
+  lost answer names the same generation as the one that landed.
+- **Emulators.** Against an emulator, which has no multipart uploads, the
+  object goes up as one ordinary upload.
+
+It takes no preconditions: the multipart upload has none, so it replaces
+whatever has the name, as an unconditional upload does. A precondition
+header is not refused either, only ignored: measured,
+`x-goog-if-generation-match: 0` on a finish replaced an existing object. Custom metadata
+travels as `x-goog-meta-` headers, so keys must be lowercase, which is
+also what Cloud Storage makes of them: measured, `x-goog-meta-Reviewer`
+comes back as `reviewer`. The result is read back with one metadata
+request, which needs `storage.objects.get`, a permission Storage Object
+Creator does not grant.
+
+A process that dies mid-upload leaves its parts, and Cloud Storage bills
+them until the upload is aborted: unfinished uploads never expire. A
+lifecycle rule aborts them for you:
+
+```json
+{ "rule": [{ "action": { "type": "AbortIncompleteMultipartUpload" }, "condition": { "age": 7 } }] }
+```
+
+`gcloud storage buckets update gs://my-bucket --lifecycle-file=rules.json`
+applies it.
+
+Measured from this sandbox against a real bucket on 2026-09-24, 100 MiB in
+8 MiB parts, 8 at a time, went up in 10.0 s (10 MiB/s), where one stream
+took 34.9 s (2.9 MiB/s). A 1 GiB file in 103 parts took 67.6 s eight at a
+time and 327.2 s one at a time, 4.84 times as fast; its finish took 143
+ms, far from the "several minutes" Google warns of. Smaller objects gain
+less: gcloud starts using parallel uploads only at `150M`.
+`examples/gcs_cp.zig` takes `--parallel N`.
+
 ### The emulator is not production
 
 The integration suite runs against `fake-gcs-server`, and a second suite
@@ -920,6 +1021,13 @@ differences it found:
   ones.
 - It names the object's checksum on every range read; Cloud Storage names
   it only for a range that spans the whole object.
+- It fills in whatever a copy's metadata leaves out from the source, where
+  Cloud Storage leaves it out, and it ignores a copy's storage class.
+  `copyTo` sends everything it means the copy to carry, so both agree on
+  every field but the class.
+- It has no multipart uploads at all, so `uploadParallel` sends an ordinary
+  upload to an emulator. The library's own tests run the multipart upload
+  against an in-memory fake and a loopback server that speak it.
 
 ## Zig 0.16 standard library issues handled here
 
