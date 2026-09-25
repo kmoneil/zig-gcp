@@ -582,11 +582,14 @@ pub const FaultTransport = struct {
         const claimed = self.claim(req.method, req.url, body_len, if (req.sink == .writer) .streamed else .stream_buffered);
         const action: ?Action = if (claimed) |i| self.plan[i].action else null;
 
-        // The head is taken here first, so it is recorded even when the
-        // body then fails.
+        // The head is recorded even when the body then fails. It reaches the
+        // caller as soon as the inner transport has it, as it would without
+        // this wrapper, except for a response to be lost, which never shows
+        // the caller its head.
         var head: ?StreamRequest.Head = null;
         var sent = req;
-        sent.head_out = &head;
+        const losing = if (action) |a| a == .lose_response else false;
+        sent.head_out = if (losing) &head else req.head_out orelse &head;
         var cut_reader: CutReader = undefined;
         var cut_writer: CutWriter = undefined;
         var discard_buf: [4096]u8 = undefined;
@@ -612,9 +615,10 @@ pub const FaultTransport = struct {
             .lose_response => !std.meta.isError(outcome),
         } else false;
         const result: StreamError!StreamResponse = if (fired) error.ConnectionResetByPeer else outcome;
-        // A lost response never showed the caller its head.
-        const lost = fired and action.? == .lose_response;
-        if (!lost) if (req.head_out) |out| if (head) |h| {
+        if (!losing) {
+            if (req.head_out) |out| head = out.*;
+        } else if (!fired) if (req.head_out) |out| if (head) |h| {
+            // A loss planned and not carried out: the head was the caller's.
             out.* = h;
         };
 
@@ -1801,6 +1805,56 @@ test "FaultTransport loses a response the server sent" {
     try std.testing.expectEqual(200, faults.exchanges.items[0].status.?);
     try std.testing.expectEqual(204, faults.exchanges.items[1].status.?);
     try std.testing.expectEqualStrings("3", faults.exchanges.items[2].responseHeader("x-goog-generation").?);
+}
+
+/// A writer that notes, at its first byte, whether the head was in.
+const HeadAtFirstByte = struct {
+    head: *const ?StreamRequest.Head,
+    seen: ?bool = null,
+    writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *HeadAtFirstByte = @alignCast(@fieldParentPtr("writer", w));
+        if (self.seen == null) self.seen = self.head.* != null;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| n += d.len;
+        return n + data[data.len - 1].len * splat;
+    }
+};
+
+test "FaultTransport shows the head as the transport inside it does, and hides a lost response's" {
+    const gpa = std.testing.allocator;
+    var fake: FakeTransport = .init(gpa, &.{
+        .{ .respond = .{ .body = "hello world\n", .headers = &.{.{ .name = "x-goog-generation", .value = "3" }} } },
+        .{ .respond = .{ .body = "hello world\n", .headers = &.{.{ .name = "x-goog-generation", .value = "3" }} } },
+    });
+    defer fake.deinit();
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .GET, .skip = 1, .action = .lose_response },
+    };
+    var faults: FaultTransport = .{ .inner = fake.transport(), .plan = &plan, .record = gpa };
+    defer faults.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+
+    // Untouched, the head is in before the first body byte, as the inner
+    // transport gives it: a caller that reads it there, as a download
+    // deciding how to take its body does, is not left guessing.
+    var head: ?StreamRequest.Head = null;
+    var first: HeadAtFirstByte = .{ .head = &head };
+    _ = try faults.transport().sendStream(.{ .method = .GET, .url = "http://x/o?alt=media", .sink = .{ .writer = &first.writer }, .head_out = &head }, arena.allocator());
+    try std.testing.expectEqual(true, first.seen);
+    try std.testing.expectEqualStrings("3", head.?.header("x-goog-generation").?);
+
+    // Lost, the caller never sees it, before or after.
+    var lost_head: ?StreamRequest.Head = null;
+    var second: HeadAtFirstByte = .{ .head = &lost_head };
+    try std.testing.expectError(error.ConnectionResetByPeer, faults.transport().sendStream(.{ .method = .GET, .url = "http://x/o?alt=media", .sink = .{ .writer = &second.writer }, .head_out = &lost_head }, arena.allocator()));
+    try std.testing.expectEqual(null, second.seen);
+    try std.testing.expectEqual(null, lost_head);
+    // Both heads are in the record.
+    try std.testing.expectEqualStrings("3", faults.exchanges.items[0].responseHeader("x-goog-generation").?);
+    try std.testing.expectEqualStrings("3", faults.exchanges.items[1].responseHeader("x-goog-generation").?);
 }
 
 const HttpTransport = @import("transport.zig").HttpTransport;

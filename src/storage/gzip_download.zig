@@ -533,15 +533,39 @@ test "gzip: an object stored gzip-compressed comes as stored, is verified, and i
     try testing.expectEqual(1, s.fake.counts.media);
 }
 
+/// Shows the caller the response head only once the call has returned.
+const LateHead = struct {
+    inner: core.transport.Transport,
+
+    fn transport(self: *LateHead) core.transport.Transport {
+        return .{ .ptr = self, .vtable = &.{ .send = send, .sendStream = sendStream } };
+    }
+
+    fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
+        const self: *LateHead = @ptrCast(@alignCast(ptr));
+        return self.inner.send(req, arena);
+    }
+
+    fn sendStream(ptr: *anyopaque, req: core.transport.StreamRequest, arena: Allocator) core.transport.StreamError!core.transport.StreamResponse {
+        const self: *LateHead = @ptrCast(@alignCast(ptr));
+        var head: ?Head = null;
+        var sent = req;
+        sent.head_out = &head;
+        defer if (req.head_out) |out| {
+            out.* = head;
+        };
+        return self.inner.sendStream(sent, arena);
+    }
+};
+
 test "gzip: a transport that shows the head only once the call returns still gets each object right" {
     var s: Setup = undefined;
     try s.init(.{});
     defer s.deinit();
-    // core's FaultTransport hands the head over after the body, as a
-    // recording or proxying transport may: the tap sees its first byte
-    // with no head to read, and must not guess.
-    var late: core.testing.FaultTransport = .{ .inner = s.fake.transport(), .plan = &.{} };
-    defer late.deinit();
+    // A transport that hands the head over after the body, as a recording
+    // or proxying one may: the tap sees its first byte with no head to
+    // read, and must not guess.
+    var late: LateHead = .{ .inner = s.fake.transport() };
     var client: Client = try .init(testing.allocator, testing.io, .{
         .token_provider = s.token.provider(),
         .transport = late.transport(),
