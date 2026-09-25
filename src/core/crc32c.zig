@@ -2,18 +2,78 @@
 //! Secret Manager stores one with every secret version, and Cloud Storage
 //! reports one for every object.
 //!
-//! It is the standard library's CRC-32/ISCSI, which is the same polynomial,
-//! initial value, reflection and final xor, under the name the API docs use.
+//! The answers are the standard library's CRC-32/ISCSI, which is the same
+//! polynomial, initial value, reflection and final xor under the name the
+//! API docs use, at many times its speed. Where the build's CPU has CRC32C
+//! instructions, aarch64's `crc32cx` or x86_64's SSE4.2 `crc32q`, they run
+//! three streams at once; everywhere else eight tables do, eight bytes at a
+//! time. The build chooses, at compile time, and Zig has no per-function
+//! target, so a baseline build cannot carry the instructions: aarch64's
+//! assembler and the self-hosted x86_64 backend refuse them for a CPU
+//! without them, and LLVM's x86_64 assembler takes them, for a CPU that
+//! would fault on them. Measured on an Apple M5 Max on
+//! 2026-09-25, in ReleaseFast: std's one table 570 MiB/s, the eight tables
+//! 3.0 GiB/s, the instructions 27 GiB/s.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const test_util = @import("testing.zig");
 
+/// How this build computes a CRC-32C.
+pub const Implementation = enum {
+    /// The CPU's CRC32C instructions, three streams at once.
+    hardware,
+    /// Eight tables, eight bytes at a time, on any target.
+    software,
+};
+
+/// Decided by the build's target CPU. `zig build` for the machine at hand
+/// takes the instructions where it has them, as does any `-Dcpu` that
+/// names them, such as `x86_64_v2`; a baseline build takes the tables.
+pub const implementation: Implementation = if (has_instructions) .hardware else .software;
+
+const has_instructions = switch (builtin.cpu.arch) {
+    .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc),
+    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .crc32),
+    else => false,
+};
+
 /// The incremental form, for data that arrives in pieces.
-pub const Hasher = std.hash.crc.Crc32Iscsi;
+pub const Hasher = struct {
+    /// The CRC register, which starts inverted and is inverted again at the
+    /// end.
+    register: u32 = 0xffff_ffff,
+
+    pub fn init() Hasher {
+        return .{};
+    }
+
+    pub fn update(self: *Hasher, bytes: []const u8) void {
+        // Instructions cannot run at comptime, where std's CRC could, and
+        // callers compute checksums of fixed bytes there.
+        self.register = if (has_instructions and !@inComptime()) hardware(self.register, bytes) else software(self.register, bytes);
+    }
+
+    pub fn final(self: Hasher) u32 {
+        return ~self.register;
+    }
+
+    pub fn hash(bytes: []const u8) u32 {
+        var hasher: Hasher = .init();
+        hasher.update(bytes);
+        return hasher.final();
+    }
+};
 
 /// The CRC-32C of `data`. Google sends this value as a decimal string.
 pub fn hash(data: []const u8) u32 {
     return Hasher.hash(data);
+}
+
+/// The CRC-32C of `data` by the tables, whatever this build's CPU: the same
+/// answer as `hash`, for tests and benchmarks that hold the two apart.
+pub fn hashSoftware(data: []const u8) u32 {
+    return ~software(0xffff_ffff, data);
 }
 
 /// The form Cloud Storage sends: standard base64, with padding, of the four
@@ -97,6 +157,93 @@ fn x2nModP(n_start: u64, k_start: u32) u32 {
     return p;
 }
 
+/// Slicing-by-8: the classic byte table, and seven more, each a byte
+/// further along, so eight bytes fold into the register with eight lookups.
+const tables: [8][256]u32 = tables: {
+    @setEvalBranchQuota(20_000);
+    var t: [8][256]u32 = undefined;
+    for (0..256) |i| {
+        var c: u32 = i;
+        for (0..8) |_| c = if (c & 1 != 0) (c >> 1) ^ poly else c >> 1;
+        t[0][i] = c;
+    }
+    for (1..8) |k| {
+        for (0..256) |i| t[k][i] = (t[k - 1][i] >> 8) ^ t[0][t[k - 1][i] & 0xff];
+    }
+    break :tables t;
+};
+
+/// Bytes into the register, one at a time.
+fn bytewise(register: u32, bytes: []const u8) u32 {
+    var crc = register;
+    for (bytes) |b| crc = tables[0][(crc ^ b) & 0xff] ^ (crc >> 8);
+    return crc;
+}
+
+/// Bytes into the register, eight at a time through the tables.
+fn software(register: u32, bytes: []const u8) u32 {
+    var crc = register;
+    var rest = bytes;
+    while (rest.len >= 8) : (rest = rest[8..]) {
+        const lo = std.mem.readInt(u32, rest[0..4], .little) ^ crc;
+        const hi = std.mem.readInt(u32, rest[4..8], .little);
+        crc = tables[7][lo & 0xff] ^ tables[6][(lo >> 8) & 0xff] ^ tables[5][(lo >> 16) & 0xff] ^ tables[4][lo >> 24] ^
+            tables[3][hi & 0xff] ^ tables[2][(hi >> 8) & 0xff] ^ tables[1][(hi >> 16) & 0xff] ^ tables[0][hi >> 24];
+    }
+    return bytewise(crc, rest);
+}
+
+/// What each of the three streams takes per block.
+const lane = 4096;
+
+/// Appending `lane` bytes multiplies a register by this: `combine`'s shift,
+/// for the one length the streams need.
+const lane_shift: u32 = shift: {
+    @setEvalBranchQuota(20_000);
+    break :shift x2nModP(lane, 3);
+};
+
+/// Bytes into the register by the CPU's instructions. Each instruction waits
+/// on the one before it, so whole blocks go as three streams over three
+/// neighbouring lanes, joined as `combine` joins parts; the rest goes eight
+/// bytes at a time, and the last few through the table, since the
+/// self-hosted x86_64 backend cannot encode the one-byte instruction.
+fn hardware(register: u32, bytes: []const u8) u32 {
+    var crc = register;
+    var rest = bytes;
+    while (rest.len >= 3 * lane) : (rest = rest[3 * lane ..]) {
+        var a = crc;
+        var b: u32 = 0;
+        var c: u32 = 0;
+        var i: usize = 0;
+        while (i < lane) : (i += 8) {
+            a = word(a, std.mem.readInt(u64, rest[i..][0..8], .little));
+            b = word(b, std.mem.readInt(u64, rest[lane + i ..][0..8], .little));
+            c = word(c, std.mem.readInt(u64, rest[2 * lane + i ..][0..8], .little));
+        }
+        crc = multModP(lane_shift, multModP(lane_shift, a) ^ b) ^ c;
+    }
+    while (rest.len >= 8) : (rest = rest[8..]) crc = word(crc, std.mem.readInt(u64, rest[0..8], .little));
+    return bytewise(crc, rest);
+}
+
+/// Eight bytes, little-endian in `value`, into the register.
+inline fn word(register: u32, value: u64) u32 {
+    return switch (builtin.cpu.arch) {
+        .aarch64 => asm ("crc32cx %[out:w], %[crc:w], %[value:x]"
+            : [out] "=r" (-> u32),
+            : [crc] "r" (register),
+              [value] "r" (value),
+        ),
+        .x86_64 => @truncate(asm ("crc32q %[value], %[out]"
+            : [out] "=r" (-> u64),
+            : [value] "r" (value),
+              [in] "0" (@as(u64, register)),
+        )),
+        else => @compileError("no CRC32C instruction on this architecture"),
+    };
+}
+
 const testing = std.testing;
 
 /// The definition, one bit at a time, with no table: the reflected form of
@@ -156,6 +303,85 @@ test "hashing in pieces matches hashing at once" {
         hasher.update(data[split..]);
         try testing.expectEqual(hash(data), hasher.final());
     }
+}
+
+/// std's CRC-32/ISCSI: one table, a byte at a time, and none of the code
+/// above. The oracle at lengths the bit-at-a-time `reference` is too slow
+/// for.
+const Oracle = std.hash.crc.Crc32Iscsi;
+
+fn expectBothPaths(data: []const u8) !void {
+    errdefer std.debug.print("{d} bytes at address {x}\n", .{ data.len, @intFromPtr(data.ptr) });
+    const want = Oracle.hash(data);
+    try testing.expectEqual(want, hash(data));
+    try testing.expectEqual(want, hashSoftware(data));
+}
+
+test "both paths give std's answer at every length to 64, at every alignment, and around each block" {
+    var buf: [12 * lane + 128]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(0x6372_6333_3263);
+    prng.random().bytes(&buf);
+    const edges = [_]usize{ lane - 1, lane, lane + 1, 3 * lane - 8, 3 * lane - 1, 3 * lane, 3 * lane + 1, 3 * lane + 7, 3 * lane + 8, 6 * lane, 6 * lane + 13, 12 * lane + 63 };
+    for (0..8) |offset| {
+        for (0..65) |len| try expectBothPaths(buf[offset..][0..len]);
+        for (edges) |len| try expectBothPaths(buf[offset..][0..len]);
+    }
+}
+
+test "a checksum at comptime, as std's could be" {
+    const at_comptime = comptime hash("123456789");
+    try testing.expectEqual(0xe306_9283, at_comptime);
+    const long = comptime blk: {
+        @setEvalBranchQuota(200_000);
+        const bytes: [3 * lane + 5]u8 = @splat(0x5a);
+        break :blk hash(&bytes);
+    };
+    const bytes: [3 * lane + 5]u8 = @splat(0x5a);
+    try testing.expectEqual(hash(&bytes), long);
+}
+
+test "the build's CPU picks the path" {
+    const expected: Implementation = switch (builtin.cpu.arch) {
+        .aarch64 => if (std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc)) .hardware else .software,
+        .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .crc32)) .hardware else .software,
+        else => .software,
+    };
+    try testing.expectEqual(expected, implementation);
+}
+
+/// Past one block of three streams and well into the next, at any
+/// alignment, split into up to four updates anywhere.
+fn pathsProperty(_: void, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    var buf: [5 * lane + 8]u8 = undefined;
+    const offset = g.intRange(u8, 0, 7);
+    const len = g.intRange(u16, 0, 5 * lane);
+    var prng: std.Random.DefaultPrng = .init(g.int(u64));
+    const data = buf[offset..][0..len];
+    prng.random().bytes(data);
+    try expectBothPaths(data);
+    var hasher: Hasher = .init();
+    var at: u16 = 0;
+    for (0..3) |_| {
+        const end = g.intRange(u16, at, len);
+        hasher.update(data[at..end]);
+        at = end;
+    }
+    hasher.update(data[at..]);
+    try testing.expectEqual(Oracle.hash(data), hasher.final());
+}
+
+test "fuzz crc32c paths: both, at any length, alignment and split, give std's answer" {
+    try test_util.fuzzBytes({}, pathsProperty, .{
+        .corpus = &.{
+            // One block of three streams exactly, whole.
+            "\x00\x30\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+            // A block and a 7-byte tail, split inside the second lane and the tail.
+            "\x05\x30\x07\x00\x00\x00\x00\x00\x00\x00\x02\x10\x01\x20\x02\x00\x00",
+            // The longest, at the last alignment, split on the block's edges.
+            "\x07\x50\x00\x00\x00\x00\x00\x00\x00\x00\x03\x00\x01\x2f\xff\x00\x01",
+        },
+    });
 }
 
 fn matchesReferenceProperty(_: void, input: []const u8) !void {
