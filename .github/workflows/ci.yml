@@ -88,7 +88,9 @@ jobs:
           # chunks; up again through uploadParallel, which the emulator
           # takes as one ordinary upload, and down in three 32 MiB ranges
           # through downloadParallel; then refused overwrites, plain and
-          # parallel, and a create-only parallel upload of a new name.
+          # parallel, and a create-only parallel upload of a new name; and
+          # a round trip with --resume, whose state files are gone once the
+          # copies are done.
           curl -sf -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
             -H "Content-Type: application/json" -d '{"name":"zigps-examples"}' >/dev/null
           head -c 75497472 /dev/urandom > "$RUNNER_TEMP/src.bin"
@@ -107,6 +109,10 @@ jobs:
             exit 1
           fi
           zig build example-gcs_cp -- "$RUNNER_TEMP/src.bin" gs://zigps-examples/dir/created.bin --no-clobber --parallel 4
+          zig build example-gcs_cp -- "$RUNNER_TEMP/src.bin" gs://zigps-examples/dir/resumed.bin --resume "$RUNNER_TEMP/up.state"
+          zig build example-gcs_cp -- gs://zigps-examples/dir/resumed.bin "$RUNNER_TEMP/back-resumed.bin" --resume "$RUNNER_TEMP/down.state" --parallel 4
+          cmp "$RUNNER_TEMP/src.bin" "$RUNNER_TEMP/back-resumed.bin"
+          test ! -e "$RUNNER_TEMP/up.state" && test ! -e "$RUNNER_TEMP/down.state"
 
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
   # read of undefined memory, can pass in Debug and fail here.

@@ -4,6 +4,47 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.20.0 (unreleased)
+
+- storage: transfers that outlive the process. `Object.uploadFile(file,
+  options)` is a resumable upload from a file, read at offsets a chunk at
+  a time, whose last request carries the whole file's CRC32C, so Cloud
+  Storage refuses an object whose bytes differ before it exists: no read
+  back, and nothing to delete. A lost session starts over from the file.
+  `UploadOptions`, `ParallelUploadOptions` and `ParallelDownloadOptions`
+  gain `checkpoint`, a `storage.Checkpoint`: three functions, `load`,
+  `save` and `clear`, over wherever the caller keeps state, with
+  `storage.CheckpointFile` built in, which keeps it in one file replaced
+  atomically and readable by its owner only. With one, `uploadFile`,
+  `uploadParallel` from a file and `downloadParallel` into a file save
+  what a later process needs, and the same call with the same checkpoint
+  carries the transfer on: it asks the session how much it holds, lists
+  the parts the server holds, or fetches only the ranges the file does
+  not hold. What the earlier run moved is read again locally to rebuild
+  the checksums, so a file changed between runs is caught, and a source
+  whose size or modification time changed starts over. With a
+  checkpoint, a failed or cancelled transfer keeps its session or its
+  parts for a later run; a failure no later run could get past cleans up
+  and clears it all the same. `Client.abandonTransfer(checkpoint)` drops
+  what an unfinished transfer left on the server and clears the
+  checkpoint. An upload's state holds its session URL, a credential, and
+  is never logged. Measured against a real bucket, a cancelled session
+  answers 499 to everything sent to it afterwards, where an expired one
+  answers 404 or 410: 499 now means a session is gone too, so `upload`
+  and `uploadFile` start over, and `uploadFrom` returns
+  `error.UploadSessionLost` where it returned `error.ServerCancelled`,
+  which left a checkpoint whose session had been cancelled failing every
+  resume. Measured too: a create-only resumable upload whose name was
+  taken meanwhile is refused with 412 at its last chunk. The XML reader
+  refuses an element name that is no qualified name, such as `<:/>`,
+  which it read as an element with no name; the nightly fuzzing found it.
+  Breaking, for an exhaustive `switch` over `storage.Error`: it gains
+  `CheckpointFailed`.
+- examples: `gcs_cp --resume STATE` carries a copy on, either way, after
+  a failure or a killed process, when the same command runs again.
+  Uploads without `--parallel` go through `uploadFile`.
+- auth, core, pubsub, secret_manager: unchanged.
+
 ## 0.19.0 (2026-09-24)
 
 - storage: parallel downloads, and parallel uploads that can be
