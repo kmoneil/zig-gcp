@@ -4,6 +4,30 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.21.0 (unreleased)
+
+- core: `crc32c` computes CRC-32C with the CPU's instructions where the
+  build's target CPU has them, aarch64's `crc32cx` or x86_64's SSE4.2
+  `crc32q`, three streams at once, and with eight tables, eight bytes at a
+  time, everywhere else. It was the standard library's one table, a byte
+  at a time. Measured on an Apple M5 Max: 29 GiB/s for the instructions
+  and 3.0 GiB/s for the tables, against 562 MiB/s; in Debug, 2.6 GiB/s
+  against 180 MiB/s. The build chooses, at compile time: a native build,
+  or a `-Dcpu` that names the instructions, takes them, and a baseline
+  build takes the tables. At comptime the tables run, as std's CRC could.
+  `crc32c.implementation` says which a build runs, and
+  `crc32c.hashSoftware` computes by the tables on any machine. Breaking,
+  for code that reached into std's type: `crc32c.Hasher` is now core's
+  own, with the same `init`, `update`, `final` and `hash` and the same
+  answers, but none of std's fields.
+- secret_manager, storage: every checksum they compute goes through
+  `core.crc32c`, with no API change. With `gcs_cp` against a local
+  emulator, a 1 GiB download spent 0.12 s of CPU where it spent 1.83 s,
+  and a resume's re-read of 1 GiB took 88 ms where it took 1.9 s.
+- tools: `zig build bench-crc32c` prints each path's speed on the machine
+  at hand.
+- auth, pubsub: unchanged.
+
 ## 0.20.0 (2026-09-25)
 
 - storage: transfers that outlive the process. `Object.uploadFile(file,
