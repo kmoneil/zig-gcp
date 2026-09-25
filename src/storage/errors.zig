@@ -16,6 +16,11 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// Upload or download bytes do not match the checksum beside them. On
     /// upload nothing was sent; on download the data is discarded.
     ChecksumMismatch,
+    /// An object whose metadata says `Content-Encoding: gzip` holds stored
+    /// bytes that met the stored checksum and do not decompress: Cloud
+    /// Storage never checks that an object is what its encoding says.
+    /// `DownloadOptions.decompress = false` downloads the bytes as they are.
+    DecompressionFailed,
     /// `downloadAlloc` met an object larger than its `max_bytes`, or
     /// `downloadParallel` one larger than the buffer it was given.
     ObjectTooLarge,

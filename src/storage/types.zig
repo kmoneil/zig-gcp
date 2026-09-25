@@ -313,9 +313,20 @@ pub const DownloadOptions = struct {
     /// Download one specific generation instead of the live one.
     generation: ?u64 = null,
     /// Download part of the object. The checksum covers the whole object,
-    /// so a range read reports `checksum_verified = false`.
+    /// so a range read reports `checksum_verified = false`. A range of an
+    /// object stored gzip-compressed is a range of its stored bytes, and
+    /// only `decompress = false` takes one: part of a gzip stream does not
+    /// decompress.
     range: ?Range = null,
     preconditions: Preconditions = .{},
+    /// For an object stored gzip-compressed (`Content-Encoding: gzip`): true
+    /// decompresses it here, after its stored bytes met the stored checksum;
+    /// false writes the stored bytes as they are, verified the same way.
+    /// Either way they come as stored, so a download of one is verified and
+    /// resumes where a connection dropped, which Cloud Storage's own
+    /// decompression on the way allows neither of. Other objects are
+    /// unaffected.
+    decompress: bool = true,
 };
 
 pub const DownloadResult = struct {
@@ -329,6 +340,9 @@ pub const DownloadResult = struct {
     /// The CRC32C of the bytes written, whether or not there was a checksum
     /// to verify them against: a range's, or a decompressed object's.
     crc32c: u32,
+    /// Bytes that came over the wire: `bytes_written`, but for a gzip
+    /// object decompressed here, whose stored bytes are fewer.
+    stored_bytes: u64,
 };
 
 /// A whole object in memory, with how the download went.
