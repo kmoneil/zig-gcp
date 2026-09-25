@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const core = @import("core");
 
 const Client = @import("Client.zig");
+const checkpoint = @import("checkpoint.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
@@ -33,6 +34,13 @@ pub const Source = union(enum) {
     /// A stream: one chunk lives in `buffer` until the server confirms it,
     /// so a resume never needs the reader to go backwards.
     reader: Reader,
+    /// A regular file read at offsets: every chunk is re-read from where
+    /// the server stands, so a lost session, or a later process resuming
+    /// this one's session, starts exactly there. The bytes are hashed as
+    /// they are first read, and the request that finishes the upload
+    /// carries the whole file's CRC32C, which Cloud Storage checks before
+    /// the object exists: no read back, and no delete afterwards.
+    file: File,
 
     pub const Reader = struct {
         r: *std.Io.Reader,
@@ -42,6 +50,14 @@ pub const Source = union(enum) {
         declared: ?u64,
         /// Fed every byte read, for the caller's post-upload verification.
         hasher: ?*core.crc32c.Hasher = null,
+    };
+
+    pub const File = struct {
+        f: std.Io.File,
+        /// `chunk_size` bytes, owned by the caller.
+        buffer: []u8,
+        /// The file's length, measured before the upload.
+        size: u64,
     };
 };
 
@@ -63,15 +79,13 @@ pub fn run(
         var machine: Machine = .{
             .client = client,
             .source = source,
-            .total = switch (source) {
-                .slice => |data| data.len,
-                .reader => |r| r.declared,
-            },
+            .total = sourceTotal(source),
+            .hash_final = client.verify_checksums and source == .file,
         };
         const outcome = machine.upload(&scratch, bucket_name, object_name, options, metadata_crc);
         const err = if (outcome) |result| return result else |err| err;
-        if (err != error.UploadSessionLost or source != .slice) return err;
-        // The bytes are still in memory: a lost session costs a restart,
+        if (err != error.UploadSessionLost or source == .reader) return err;
+        // The bytes can be read again: a lost session costs a restart,
         // not the upload. Bounded like any other retry.
         restarts += 1;
         if (restarts >= client.retry.max_attempts) return err;
@@ -80,6 +94,125 @@ pub fn run(
         try client.io.sleep(.fromMilliseconds(delay_ms), .awake);
         _ = scratch.reset(.retain_capacity);
     }
+}
+
+fn sourceTotal(source: Source) ?u64 {
+    return switch (source) {
+        .slice => |data| data.len,
+        .reader => |r| r.declared,
+        .file => |f| f.size,
+    };
+}
+
+/// Runs one pass over an already-open session, asking it first where it
+/// stands when `resuming`, so a later process carries an upload on from
+/// what the server holds. A session that is gone is
+/// `error.UploadSessionLost`, the caller's to start over. With
+/// `cancel_on_failure` false, a failure a resume could get past leaves
+/// the session standing, for a checkpoint to come back to.
+pub fn runSession(
+    client: *Client,
+    bucket_name: []const u8,
+    object_name: []const u8,
+    source: Source,
+    options: types.UploadOptions,
+    metadata_crc: ?[8]u8,
+    session_uri: []const u8,
+    resuming: bool,
+    cancel_on_failure: bool,
+) Error!types.Owned(types.ObjectInfo) {
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const total = sourceTotal(source);
+    var machine: Machine = .{
+        .client = client,
+        .source = source,
+        .total = total,
+        .session_uri = session_uri,
+        .query_first = resuming,
+        .cancel_on_failure = cancel_on_failure,
+        .hash_final = client.verify_checksums and source == .file,
+        // A dead process may have sent everything before this one began.
+        .sent_high = if (resuming) total orelse 0 else 0,
+    };
+    return machine.upload(&scratch, bucket_name, object_name, options, metadata_crc);
+}
+
+/// Opens a resumable session for `object_name` and returns its URI, in
+/// `arena`. The URI is a credential: anyone holding it can write the
+/// object for up to a week. Retried like a read: an unused session
+/// expires on its own.
+pub fn startSession(
+    client: *Client,
+    arena: Allocator,
+    bucket_name: []const u8,
+    object_name: []const u8,
+    options: types.UploadOptions,
+    metadata_crc: ?[8]u8,
+    total: ?u64,
+) Error![]const u8 {
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try names.uploadResumablePath(a, bucket_name, options.preconditions);
+    const metadata = try codec.encodeUploadMetadata(a, object_name, options, metadata_crc);
+    var length_buf: [20]u8 = undefined;
+    var headers: std.ArrayList(core.transport.Header) = .empty;
+    try headers.append(a, .{ .name = "X-Upload-Content-Type", .value = options.content_type });
+    if (total) |declared| {
+        try headers.append(a, .{
+            .name = "X-Upload-Content-Length",
+            .value = std.fmt.bufPrint(&length_buf, "{d}", .{declared}) catch unreachable,
+        });
+    }
+    var response: std.heap.ArenaAllocator = .init(client.gpa);
+    defer response.deinit();
+    const res = rpc.executeStream(client, &response, .{
+        .method = .POST,
+        .path = path,
+        .content_type = "application/json; charset=UTF-8",
+        .headers = headers.items,
+        .body = .{ .segments = &.{metadata} },
+        .retry = true,
+    }) catch |err| switch (err) {
+        error.WriteFailed => unreachable,
+        else => |e| return e,
+    };
+    const location = res.header("Location") orelse {
+        if (client.diagnostics) |d| d.print("the session-opening response carried no Location header", .{});
+        return error.InvalidResponse;
+    };
+    return try arena.dupe(u8, location);
+}
+
+/// Best-effort DELETE of a session another run opened, so the server can
+/// drop its state: for a source that changed under a checkpoint.
+pub fn dropSession(client: *Client, session_uri: []const u8) void {
+    var response: std.heap.ArenaAllocator = .init(client.gpa);
+    defer response.deinit();
+    _ = client.transport.sendStream(.{
+        .method = .DELETE,
+        .url = session_uri,
+        .timeout_ms = client.request_timeout_ms,
+    }, response.allocator()) catch {};
+}
+
+/// Cancels a session for a caller who will not resume it, as
+/// `Client.abandonTransfer` asks: any answer means the server heard, a
+/// cancelled session answering 499. Only a transport that could not carry
+/// the request fails.
+pub fn cancelSession(client: *Client, session_uri: []const u8) Error!void {
+    var response: std.heap.ArenaAllocator = .init(client.gpa);
+    defer response.deinit();
+    _ = client.transport.sendStream(.{
+        .method = .DELETE,
+        .url = session_uri,
+        .timeout_ms = client.request_timeout_ms,
+    }, response.allocator()) catch |err| switch (err) {
+        // No body travels and the sink is a buffer.
+        error.ReadFailed, error.WriteFailed, error.EndOfStream => unreachable,
+        else => |e| return e,
+    };
 }
 
 const Machine = struct {
@@ -95,6 +228,23 @@ const Machine = struct {
     chunk_len: usize = 0,
     /// Whether the reader has ended.
     eof: bool = false,
+    /// An already-open session to use, or null to open one.
+    session_uri: ?[]const u8 = null,
+    /// Ask the session where it stands before sending anything: how a
+    /// resumed session learns what a dead process got stored.
+    query_first: bool = false,
+    /// False leaves the session standing after failures a resume could
+    /// get past, for a checkpoint to come back to.
+    cancel_on_failure: bool = true,
+    /// For a file source with checksums on: the whole file's running
+    /// CRC32C, hashed as bytes are first read, and rebuilt from the file
+    /// for bytes a dead process sent. The finishing request carries it.
+    hash_final: bool = false,
+    hasher: core.crc32c.Hasher = .init(),
+    /// How far `hasher` has consumed the file.
+    hashed: u64 = 0,
+    /// The highest byte offset ever sent, which a 308 cannot exceed.
+    sent_high: u64 = 0,
 
     /// One exchange with the session URI, classified.
     const Exchange = union(enum) {
@@ -118,21 +268,22 @@ const Machine = struct {
         options: types.UploadOptions,
         metadata_crc: ?[8]u8,
     ) Error!types.Owned(types.ObjectInfo) {
-        const session_uri = try self.openSession(scratch, bucket_name, object_name, options, metadata_crc);
+        const session_uri = self.session_uri orelse
+            try startSession(self.client, scratch.allocator(), bucket_name, object_name, options, metadata_crc, self.total);
         var response: std.heap.ArenaAllocator = .init(self.client.gpa);
         defer response.deinit();
 
         var attempt: u32 = 1;
-        var querying = false;
+        var querying = self.query_first;
         while (true) {
             _ = response.reset(.retain_capacity);
             const outcome = if (querying)
                 self.query(&response, session_uri)
             else
-                self.sendNext(&response, session_uri) catch |err| {
-                    // The reader failed or lied about its size; the session
-                    // has no future.
-                    self.cancel(&response, session_uri);
+                self.sendNext(&response, session_uri, metadata_crc) catch |err| {
+                    // The source failed or lied about its size; the session
+                    // has no future a resume could reach either.
+                    self.maybeCancel(&response, session_uri, err);
                     return err;
                 };
 
@@ -163,31 +314,57 @@ const Machine = struct {
                         }
                         return error.InvalidResponse;
                     }
+                    if (self.hash_final) {
+                        // The whole file, hashed: the finishing request
+                        // already carried this, unless a query finished a
+                        // resumed session that held everything, so a
+                        // mismatch here means the file changed under a
+                        // checkpoint.
+                        self.advanceHashTo(self.total.?) catch |err| return err;
+                        const whole = self.hasher.final();
+                        if (result.value.crc32c) |stored_crc| {
+                            if (stored_crc != whole) {
+                                const deleted = self.discard(bucket_name, object_name, result.value.generation);
+                                if (self.client.diagnostics) |d| d.print(
+                                    "checksum mismatch after the upload finished: the file hashes to {d}, the object stores {d}{s}",
+                                    .{ whole, stored_crc, if (deleted) "; the object was deleted again" else "" },
+                                );
+                                return error.ChecksumMismatch;
+                            }
+                        } else {
+                            logging.warn("upload of {s} finished, but the server named no crc32c to verify against", .{object_name});
+                        }
+                    }
                     if (self.client.diagnostics) |d| d.clear();
                     return result;
                 },
                 .stored => |stored| {
                     querying = false;
                     // A server cannot have stored bytes that were never
-                    // sent; believing it would read past the source.
-                    const sent_high: u64 = switch (self.source) {
-                        .slice => |data| @min(self.confirmed + self.client.chunk_size, data.len),
-                        .reader => self.chunk_start + self.chunk_len,
-                    };
-                    if (stored > sent_high) {
+                    // sent, by this process or the dead one; believing it
+                    // would read past the source.
+                    if (stored > self.sent_high) {
                         if (self.client.diagnostics) |d| d.print(
                             "the session claims {d} bytes stored, more than the {d} sent",
-                            .{ stored, sent_high },
+                            .{ stored, self.sent_high },
                         );
-                        self.cancel(&response, session_uri);
+                        self.maybeCancel(&response, session_uri, error.InvalidResponse);
                         return error.InvalidResponse;
                     }
                     if (self.source == .reader and stored < self.chunk_start) {
                         // The server forgot bytes the reader cannot supply
                         // again: as good as a lost session, but this one
                         // still exists, so cancel it.
-                        self.cancel(&response, session_uri);
+                        self.maybeCancel(&response, session_uri, error.UploadSessionLost);
                         return error.UploadSessionLost;
+                    }
+                    // Bytes a dead process sent are re-read from the file,
+                    // so the running hash still spans everything.
+                    if (self.hash_final and stored > self.hashed) {
+                        self.advanceHashTo(stored) catch |err| {
+                            self.maybeCancel(&response, session_uri, err);
+                            return err;
+                        };
                     }
                     if (stored > self.confirmed) {
                         self.confirmed = stored;
@@ -199,7 +376,7 @@ const Machine = struct {
                         attempt += 1;
                         if (attempt > self.client.retry.max_attempts) {
                             if (self.client.diagnostics) |d| d.print("the server keeps answering 308 without storing anything", .{});
-                            self.cancel(&response, session_uri);
+                            self.maybeCancel(&response, session_uri, error.Internal);
                             return error.Internal;
                         }
                     }
@@ -208,7 +385,7 @@ const Machine = struct {
                 .transient => |err| {
                     attempt += 1;
                     if (attempt > self.client.retry.max_attempts) {
-                        self.cancel(&response, session_uri);
+                        self.maybeCancel(&response, session_uri, err);
                         return err;
                     }
                     querying = true;
@@ -219,84 +396,114 @@ const Machine = struct {
                     try self.client.io.sleep(.fromMilliseconds(delay_ms), .awake);
                 },
                 .fatal => |err| {
-                    self.cancel(&response, session_uri);
+                    self.maybeCancel(&response, session_uri, err);
                     return err;
                 },
             }
         }
     }
 
-    /// Opens the session through the engine, which attaches credentials:
-    /// only this request carries a token. The `Location` answer is the
-    /// session URI.
-    fn openSession(
-        self: *Machine,
-        scratch: *std.heap.ArenaAllocator,
-        bucket_name: []const u8,
-        object_name: []const u8,
-        options: types.UploadOptions,
-        metadata_crc: ?[8]u8,
-    ) Error![]const u8 {
-        const a = scratch.allocator();
-        const path = try names.uploadResumablePath(a, bucket_name, options.preconditions);
-        const metadata = try codec.encodeUploadMetadata(a, object_name, options, metadata_crc);
-        var length_buf: [20]u8 = undefined;
-        var headers: std.ArrayList(core.transport.Header) = .empty;
-        try headers.append(a, .{ .name = "X-Upload-Content-Type", .value = options.content_type });
-        if (self.total) |total| {
-            try headers.append(a, .{
-                .name = "X-Upload-Content-Length",
-                .value = std.fmt.bufPrint(&length_buf, "{d}", .{total}) catch unreachable,
-            });
-        }
-        var response: std.heap.ArenaAllocator = .init(self.client.gpa);
-        defer response.deinit();
-        const res = rpc.executeStream(self.client, &response, .{
-            .method = .POST,
-            .path = path,
-            .content_type = "application/json; charset=UTF-8",
-            .headers = headers.items,
-            .body = .{ .segments = &.{metadata} },
-            // An unused session expires on its own; opening is harmless to
-            // repeat.
-            .retry = true,
-        }) catch |err| switch (err) {
-            error.WriteFailed => unreachable,
-            else => |e| return e,
-        };
-        const location = res.header("Location") orelse {
-            if (self.client.diagnostics) |d| d.print("the session-opening response carried no Location header", .{});
-            return error.InvalidResponse;
-        };
-        return try a.dupe(u8, location);
-    }
-
     /// Sends the next piece: the chunk at `confirmed`, or the empty
-    /// finalize when a known total is fully stored. Reader trouble is
+    /// finalize when a known total is fully stored. Source trouble is
     /// returned raw for the caller to cancel on.
     fn sendNext(
         self: *Machine,
         response: *std.heap.ArenaAllocator,
         session_uri: []const u8,
-    ) error{ ReadFailed, UnexpectedEndOfStream, StreamTooLong }!Exchange {
+        metadata_crc: ?[8]u8,
+    ) error{ ReadFailed, UnexpectedEndOfStream, StreamTooLong, Canceled, ChecksumMismatch }!Exchange {
         const chunk = try self.nextChunk();
         var range_buf: [72]u8 = undefined;
-        var header: [1]core.transport.Header = undefined;
+        var hash_buf: [16]u8 = undefined;
+        var headers: [2]core.transport.Header = undefined;
+        var count: usize = 1;
+        var final = false;
         if (chunk.len == 0 and self.total != null and self.confirmed == self.total.?) {
             // The stream ended exactly on a chunk boundary, or was empty:
             // an empty PUT with `bytes */{total}` finishes the upload.
-            header[0] = .{ .name = "Content-Range", .value = finalizeRange(&range_buf, self.total) };
-            return self.exchange(response, session_uri, &header, &.{}, "finalize");
+            headers[0] = .{ .name = "Content-Range", .value = finalizeRange(&range_buf, self.total) };
+            if (try self.finalHash(&hash_buf, metadata_crc)) |value| {
+                headers[count] = .{ .name = "X-Goog-Hash", .value = value };
+                count += 1;
+            }
+            self.sent_high = @max(self.sent_high, self.confirmed);
+            return self.finishing(self.exchange(response, session_uri, headers[0..count], &.{}, "finalize"), response, session_uri);
         }
         const end = self.confirmed + chunk.len - 1;
-        header[0] = .{ .name = "Content-Range", .value = chunkRange(&range_buf, self.confirmed, end, self.total) };
+        headers[0] = .{ .name = "Content-Range", .value = chunkRange(&range_buf, self.confirmed, end, self.total) };
+        if (self.total != null and end + 1 == self.total.?) {
+            final = true;
+            if (try self.finalHash(&hash_buf, metadata_crc)) |value| {
+                headers[count] = .{ .name = "X-Goog-Hash", .value = value };
+                count += 1;
+            }
+        }
+        self.sent_high = @max(self.sent_high, end + 1);
         const segments = [_][]const u8{chunk};
-        return self.exchange(response, session_uri, &header, &segments, "chunk");
+        const outcome = self.exchange(response, session_uri, headers[0..count], &segments, "chunk");
+        return if (final) self.finishing(outcome, response, session_uri) else outcome;
+    }
+
+    /// A 400 to the request that carried the file's checksum means the
+    /// bytes the session holds are not the file's: stored bytes cannot be
+    /// overwritten, so the session can never recover, but a new one can.
+    /// It is cancelled and treated as lost, which starts the upload over.
+    fn finishing(self: *Machine, outcome: Exchange, response: *std.heap.ArenaAllocator, session_uri: []const u8) Exchange {
+        if (!self.hash_final) return outcome;
+        if (outcome != .fatal or outcome.fatal != error.InvalidArgument) return outcome;
+        logging.warn("the server refused the finishing checksum: the session's bytes are not the file's, so it is cancelled and the upload starts over", .{});
+        self.cancel(response, session_uri);
+        return .lost;
+    }
+
+    /// The whole file's checksum, for the request that finishes the
+    /// upload: Cloud Storage then refuses a mismatched object before it
+    /// ever exists. A caller's `options.crc32c` that contradicts it is
+    /// refused here instead, before the request goes out at all.
+    fn finalHash(self: *const Machine, buf: *[16]u8, metadata_crc: ?[8]u8) error{ChecksumMismatch}!?[]const u8 {
+        if (!self.hash_final) return null;
+        std.debug.assert(self.hashed == self.total.?);
+        const whole = self.hasher.final();
+        if (metadata_crc) |claimed| {
+            const wanted = core.crc32c.fromBase64(&claimed) catch whole;
+            if (wanted != whole) {
+                if (self.client.diagnostics) |d| d.print(
+                    "checksum mismatch before the finish: the file hashes to {d}, options.crc32c says {d}",
+                    .{ whole, wanted },
+                );
+                return error.ChecksumMismatch;
+            }
+        }
+        const encoded = core.crc32c.toBase64(whole);
+        return std.fmt.bufPrint(buf, "crc32c={s}", .{&encoded}) catch unreachable;
+    }
+
+    /// Hashes the file up to `upto`, re-reading what a dead process sent:
+    /// nothing about the data is taken from a checkpoint, so a file that
+    /// changed between runs fails the finishing checksum.
+    fn advanceHashTo(self: *Machine, upto: u64) error{ ReadFailed, Canceled }!void {
+        const source = self.source.file;
+        while (self.hashed < upto) {
+            const want: usize = @intCast(@min(upto - self.hashed, source.buffer.len));
+            const got = source.f.readPositionalAll(self.client.io, source.buffer[0..want], self.hashed) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => {
+                    if (self.client.diagnostics) |d| d.print("the file could not be read back at byte {d} to resume: {t}", .{ self.hashed, err });
+                    return error.ReadFailed;
+                },
+            };
+            if (got < want) {
+                if (self.client.diagnostics) |d| d.print("the file ends at byte {d}, before bytes the session already holds", .{self.hashed + got});
+                return error.ReadFailed;
+            }
+            self.hasher.update(source.buffer[0..got]);
+            self.hashed += got;
+        }
     }
 
     /// The bytes to send from `confirmed`, filling the reader's buffer
     /// when it has all been confirmed. Empty means the source has ended.
-    fn nextChunk(self: *Machine) error{ ReadFailed, UnexpectedEndOfStream, StreamTooLong }![]const u8 {
+    fn nextChunk(self: *Machine) error{ ReadFailed, UnexpectedEndOfStream, StreamTooLong, Canceled }![]const u8 {
         switch (self.source) {
             .slice => |data| {
                 const start: usize = @intCast(self.confirmed);
@@ -309,6 +516,29 @@ const Machine = struct {
                 }
                 const within: usize = @intCast(self.confirmed - self.chunk_start);
                 return source.buffer[within..self.chunk_len];
+            },
+            .file => |source| {
+                const start = self.confirmed;
+                const len: usize = @intCast(@min(self.client.chunk_size, source.size - start));
+                const got = source.f.readPositionalAll(self.client.io, source.buffer[0..len], start) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    else => {
+                        if (self.client.diagnostics) |d| d.print("the file could not be read at byte {d}: {t}", .{ start, err });
+                        return error.ReadFailed;
+                    },
+                };
+                if (got < len) {
+                    if (self.client.diagnostics) |d| d.print("the file ends at byte {d}, short of the {d} it had: it changed under the upload", .{ start + got, source.size });
+                    return error.ReadFailed;
+                }
+                // Hashed on first read: resends re-read at lower offsets
+                // and never advance this.
+                if (self.hash_final and start + len > self.hashed) {
+                    const from: usize = @intCast(self.hashed - start);
+                    self.hasher.update(source.buffer[from..len]);
+                    self.hashed = start + len;
+                }
+                return source.buffer[0..len];
             },
         }
     }
@@ -416,6 +646,16 @@ const Machine = struct {
             return false;
         };
         return true;
+    }
+
+    /// Cancels the session, unless the caller keeps failed sessions for a
+    /// checkpoint and this failure is one a resume could get past.
+    fn maybeCancel(self: *Machine, response: *std.heap.ArenaAllocator, session_uri: []const u8, err: Error) void {
+        if (!self.cancel_on_failure and !checkpoint.uploadAbandons(err)) {
+            logging.warn("the resumable upload failed with {t}; the session and checkpoint stay for a resume", .{err});
+            return;
+        }
+        self.cancel(response, session_uri);
     }
 
     /// Best-effort DELETE of the session, so the server can drop its state.

@@ -26,6 +26,7 @@ const resumable = @import("resumable.zig");
 const rpc = @import("rpc.zig");
 const signing = @import("signing.zig");
 const types = @import("types.zig");
+const upload_file = @import("upload_file.zig");
 const validate = @import("validate.zig");
 const Error = errors.Error;
 
@@ -176,6 +177,7 @@ pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Erro
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
     try checkUploadOptions(self.client, options);
+    try refuseCheckpoint(self.client, options);
     if (options.size) |size| if (size != data.len) {
         if (self.client.diagnostics) |d| d.print("options.size says {d} bytes, the data has {d}", .{ size, data.len });
         return error.InvalidArgument;
@@ -245,6 +247,7 @@ pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOpt
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
     try checkUploadOptions(self.client, options);
+    try refuseCheckpoint(self.client, options);
 
     const checksum: ?[8]u8 = if (options.crc32c) |given| core.crc32c.toBase64(given) else null;
     const buffer = try self.client.gpa.alloc(u8, self.client.chunk_size);
@@ -339,6 +342,44 @@ pub fn copyTo(self: Object, dest: Object, options: types.CopyOptions) Error!type
     try rpc.checkBucketName(self.client, dest.bucket);
     try rpc.checkObjectName(self.client, dest.name);
     return copy_impl.copy(self.client, self.bucket, self.name, dest.bucket, dest.name, options);
+}
+
+/// Uploads the file through the resumable protocol, reading it at offsets
+/// in `chunk_size` chunks, one buffer of memory: `uploadFrom` for a file.
+/// The request that finishes the upload carries the whole file's CRC32C,
+/// which Cloud Storage checks before the object ever exists, so there is
+/// no read back and no delete afterwards. The file must not change until
+/// the call returns; its size comes from the file itself, so
+/// `options.size` must stay null. A lost session starts over from the
+/// file, bounded like a retry.
+///
+/// With `options.checkpoint`, an upload a process left unfinished carries
+/// on in a later one: the session is asked where it stands, the file's
+/// first bytes are re-read to rebuild the running checksum, which the
+/// finishing request still spans whole, and sending continues from there.
+/// A session that expired, or a file that changed, starts over. The state
+/// holds the session URL, which is a credential: `storage.CheckpointFile`
+/// keeps it readable by its owner only, and a custom store should guard
+/// it as it guards credentials. It is also what a Storage Object Creator
+/// role, which cannot read objects back, can resume.
+pub fn uploadFile(self: Object, file: std.Io.File, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    try checkUploadOptions(self.client, options);
+    if (options.size != null) {
+        if (self.client.diagnostics) |d| d.print("uploadFile takes its size from the file; leave options.size null", .{});
+        return error.InvalidArgument;
+    }
+    return upload_file.upload(self.client, self.bucket, self.name, file, options);
+}
+
+/// Only `uploadFile` and the parallel calls resume: memory and streams do
+/// not outlive a process.
+fn refuseCheckpoint(client: *Client, options: types.UploadOptions) Error!void {
+    if (options.checkpoint == null) return;
+    if (client.diagnostics) |d| d.print("a checkpoint needs a source a later process can read again: uploadFile takes one, memory and streams cannot", .{});
+    return error.InvalidArgument;
 }
 
 fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void {
