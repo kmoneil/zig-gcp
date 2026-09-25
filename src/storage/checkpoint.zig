@@ -58,6 +58,25 @@ pub const Checkpoint = struct {
 /// refused unread.
 pub const max_state_len: usize = 64 * 1024;
 
+/// With a checkpoint, which upload failures still clean up on the server
+/// and clear the state: those a resume could only repeat. Everything
+/// else, cancels and exhausted retries included, leaves the session or
+/// parts and the checkpoint for a later process.
+pub fn uploadAbandons(err: @import("errors.zig").Error) bool {
+    return switch (err) {
+        error.ChecksumMismatch,
+        error.InvalidResponse,
+        error.ReadFailed,
+        error.UnexpectedEndOfStream,
+        error.StreamTooLong,
+        error.FailedPrecondition,
+        error.NotModified,
+        error.UploadSessionLost,
+        => true,
+        else => false,
+    };
+}
+
 /// A checkpoint kept in one file: replaced atomically, so a crash mid-save
 /// leaves the old state and never half of a new one, and readable by its
 /// owner only where the system can say so. The directory and path are
@@ -127,6 +146,7 @@ pub const CheckpointFile = struct {
 /// What a transfer saves, by kind. The slices are borrowed.
 pub const State = union(enum) {
     download_parallel: DownloadParallel,
+    upload_file: UploadFile,
     upload_parallel: UploadParallel,
 
     pub const DownloadParallel = struct {
@@ -143,6 +163,18 @@ pub const State = union(enum) {
         /// `digitsFor(parts)` digits. At most 2,500 at the 10,000-range
         /// limit.
         written: []const u8,
+    };
+
+    pub const UploadFile = struct {
+        bucket: []const u8,
+        object: []const u8,
+        /// The source file's size and modification time. A file that
+        /// changed cannot resume: the bytes the session holds are not its.
+        size: u64,
+        mtime: i128,
+        /// The session URL, which is a credential: anyone holding it can
+        /// write the object for up to a week. Never logged.
+        session: []const u8,
     };
 
     pub const UploadParallel = struct {
@@ -184,6 +216,15 @@ pub fn encodeAlloc(gpa: Allocator, state: State) Allocator.Error![]u8 {
             .part_size = s.part_size,
             .written = s.written,
         }) catch return error.OutOfMemory,
+        .upload_file => |s| jw.write(.{
+            .version = 1,
+            .kind = "uploadFile",
+            .bucket = s.bucket,
+            .object = s.object,
+            .size = s.size,
+            .mtime = s.mtime,
+            .session = s.session,
+        }) catch return error.OutOfMemory,
         .upload_parallel => |s| jw.write(.{
             .version = 1,
             .kind = "uploadParallel",
@@ -215,9 +256,10 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
         object: []const u8,
         size: u64,
         generation: ?u64 = null,
-        part_size: u64,
+        part_size: ?u64 = null,
         written: ?[]const u8 = null,
         mtime: ?i128 = null,
+        session: ?[]const u8 = null,
         upload_id: ?[]const u8 = null,
         temp: ?[]const u8 = null,
         if_generation_match: ?u64 = null,
@@ -230,30 +272,48 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
         else => return error.CheckpointFailed,
     };
     if (wire.version != 1) return error.CheckpointFailed;
-    // The plan must reproduce exactly the parts the earlier run saved: a
-    // part size `plan` would grow named a plan that never was.
-    if (wire.part_size == 0 or wire.size > mp.max_object_size) return error.CheckpointFailed;
-    const plan = mp.plan(wire.size, wire.part_size);
-    if (plan.part_size != wire.part_size) return error.CheckpointFailed;
+    if (wire.size > mp.max_object_size) return error.CheckpointFailed;
+    // Where a state names a part size, the plan must reproduce exactly the
+    // pieces the earlier run saved: a part size `plan` would grow named a
+    // plan that never was.
+    const plan: ?mp.Plan = if (wire.part_size) |part_size| p: {
+        if (part_size == 0) return error.CheckpointFailed;
+        const plan = mp.plan(wire.size, part_size);
+        if (plan.part_size != part_size) return error.CheckpointFailed;
+        break :p plan;
+    } else null;
 
     const state: State = if (std.mem.eql(u8, wire.kind, "downloadParallel")) blk: {
         const generation = wire.generation orelse return error.CheckpointFailed;
         const written = wire.written orelse return error.CheckpointFailed;
+        const ranges = plan orelse return error.CheckpointFailed;
         if (generation == 0) return error.CheckpointFailed;
         // An empty object downloads as no ranges at all, where an upload's
         // plan would call it one empty part.
-        try checkWritten(written, if (wire.size == 0) 0 else plan.parts);
+        try checkWritten(written, if (wire.size == 0) 0 else ranges.parts);
         break :blk .{ .download_parallel = .{
             .bucket = wire.bucket,
             .object = wire.object,
             .size = wire.size,
             .generation = generation,
-            .part_size = wire.part_size,
+            .part_size = ranges.part_size,
             .written = written,
+        } };
+    } else if (std.mem.eql(u8, wire.kind, "uploadFile")) blk: {
+        const mtime = wire.mtime orelse return error.CheckpointFailed;
+        const session = wire.session orelse return error.CheckpointFailed;
+        if (session.len == 0) return error.CheckpointFailed;
+        break :blk .{ .upload_file = .{
+            .bucket = wire.bucket,
+            .object = wire.object,
+            .size = wire.size,
+            .mtime = mtime,
+            .session = session,
         } };
     } else if (std.mem.eql(u8, wire.kind, "uploadParallel")) blk: {
         const mtime = wire.mtime orelse return error.CheckpointFailed;
         const upload_id = wire.upload_id orelse return error.CheckpointFailed;
+        const parts = plan orelse return error.CheckpointFailed;
         if (upload_id.len == 0) return error.CheckpointFailed;
         if (wire.temp) |temp| if (temp.len == 0) return error.CheckpointFailed;
         // A temporary name exists exactly when the upload has conditions
@@ -267,7 +327,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
             .size = wire.size,
             .mtime = mtime,
             .upload_id = upload_id,
-            .part_size = wire.part_size,
+            .part_size = parts.part_size,
             .temp = wire.temp,
             .if_generation_match = wire.if_generation_match,
             .if_generation_not_match = wire.if_generation_not_match,
@@ -452,6 +512,43 @@ test "state: everything that is not a canonical state is CheckpointFailed" {
     _ = try parse(arena_state.allocator(), good);
 }
 
+test "uploadFile state: the canonical encoding, round trip, and what is refused" {
+    const state: State = .{ .upload_file = .{
+        .bucket = "b",
+        .object = "backups/db.tar",
+        .size = 123_456_789,
+        .mtime = 1_758_700_000_123_456_789,
+        .session = "https://storage.googleapis.com/upload/storage/v1/b/b/o?uploadType=resumable&upload_id=SECRET",
+    } };
+    const encoded = try encodeAlloc(testing.allocator, state);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqualStrings(
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"backups/db.tar\"," ++
+            "\"size\":123456789,\"mtime\":1758700000123456789," ++
+            "\"session\":\"https://storage.googleapis.com/upload/storage/v1/b/b/o?uploadType=resumable&upload_id=SECRET\"}",
+        encoded,
+    );
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const back = try parse(arena_state.allocator(), encoded);
+    try testing.expectEqualStrings(state.upload_file.session, back.upload_file.session);
+    try testing.expectEqual(state.upload_file.mtime, back.upload_file.mtime);
+
+    const refused = [_][]const u8{
+        // Missing what an uploadFile state must have, or an empty session.
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"session\":\"s\"}",
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":1}",
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":1,\"session\":\"\"}",
+        // Another kind's fields alongside.
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":1,\"session\":\"s\",\"part_size\":1024}",
+    };
+    for (refused) |bytes| {
+        var arena2: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena2.deinit();
+        try testing.expectError(error.CheckpointFailed, parse(arena2.allocator(), bytes));
+    }
+}
+
 test "upload state: the canonical encoding, both shapes, pinned byte for byte" {
     const plain: State = .{ .upload_parallel = .{
         .bucket = "b",
@@ -588,6 +685,9 @@ fn parseProperty(_: void, input: []const u8) !void {
             defer bits.deinit(testing.allocator);
             try testing.expect(bits.count() <= parts);
         },
+        .upload_file => |s| {
+            try testing.expect(s.session.len > 0);
+        },
         .upload_parallel => |s| {
             try testing.expectEqual(s.part_size, mp.plan(s.size, s.part_size).part_size);
             try testing.expect(s.upload_id.len > 0);
@@ -604,6 +704,7 @@ test "fuzz checkpoint state: every input parses to a state that re-encodes to it
         "{\"version\":1,\"kind\":\"downloadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5000,\"generation\":42,\"part_size\":1024,\"written\":\"1f\"}",
         "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"mtime\":1758700000123456789,\"upload_id\":\"VXBs+1=\",\"part_size\":1024}",
         "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":-1,\"upload_id\":\"u\",\"part_size\":1024,\"temp\":\"zig-gcp-tmp/00\",\"if_generation_match\":0}",
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"backups/db.tar\",\"size\":123456789,\"mtime\":1758700000123456789,\"session\":\"https://s.example/u1\"}",
     } });
 }
 

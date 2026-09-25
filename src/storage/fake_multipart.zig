@@ -1,10 +1,19 @@
-//! A Cloud Storage that speaks the XML API's multipart upload, and the
-//! little of the JSON API a parallel transfer needs: metadata reads,
-//! deletes, and media reads of a whole object or one range of it. Kept in
-//! memory and safe to use from several tasks at once. fake-gcs-server has
-//! no multipart uploads and no faults on demand, so this is what
-//! `uploadParallel` and `downloadParallel` are tested against, faults and
-//! all. Test code only.
+//! A Cloud Storage that speaks the XML API's multipart upload, the JSON
+//! API's resumable sessions, and the little of the JSON API a transfer
+//! needs beside them: metadata reads, deletes, and media reads of a whole
+//! object or one range of it. Kept in memory and safe to use from several
+//! tasks at once. fake-gcs-server has no multipart uploads, finishes a
+//! truncated object on a resumable status query, and has no faults on
+//! demand, so this is what `uploadParallel`, `downloadParallel` and
+//! `uploadFile` are tested against, faults and all. Test code only.
+//!
+//! Sessions follow what Google documents: bytes append at the offset the
+//! server holds and resent prefixes are ignored, a status query (`bytes
+//! */T`) finishes a session whose bytes are all there, as an empty
+//! finalize would, a finished session keeps answering 200 with its object
+//! while that object stands, an unknown or dropped session answers 404,
+//! a cancel answers 499, and a finish carrying `X-Goog-Hash` refuses a
+//! mismatched object with 400 before it exists.
 //!
 //! It holds uploads to the rules Google documents: part numbers 1 to
 //! 10,000, a part sent again replaces itself, the finish names parts in
@@ -25,8 +34,10 @@ pub const FakeMultipart = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     uploads: std.ArrayList(Upload) = .empty,
+    sessions: std.ArrayList(Session) = .empty,
     objects: std.ArrayList(Stored) = .empty,
     next_upload: u32 = 1,
+    next_session: u32 = 1,
     next_generation: u64 = 1_000,
     /// Every part but the last must be at least this at the finish, as
     /// Google's 5 MiB. Tests lower it.
@@ -58,9 +69,18 @@ pub const FakeMultipart = struct {
         /// none for an answer that was lost.
         media_bytes: u64 = 0,
         moves: u32 = 0,
+        session_starts: u32 = 0,
+        session_puts: u32 = 0,
+        session_cancels: u32 = 0,
+        /// Payload bytes sessions accepted as new, resent prefixes not
+        /// counted.
+        session_bytes: u64 = 0,
+        /// Payload bytes sessions ignored as already stored: what a
+        /// client that resends what the server holds wastes.
+        session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel };
 
     pub const Fault = enum {
         none,
@@ -123,6 +143,22 @@ pub const FakeMultipart = struct {
         etag: []u8,
     };
 
+    /// One resumable session. A finished one stays, remembering the
+    /// object it made, as Google's do for their week.
+    const Session = struct {
+        id: []u8,
+        bucket: []u8,
+        name: []u8,
+        content_type: []u8,
+        /// From `X-Upload-Content-Length`, or null.
+        declared: ?u64,
+        /// The crc32c the opening metadata claimed, or null.
+        metadata_crc: ?u32,
+        bytes: std.ArrayList(u8) = .empty,
+        /// The generation the finish made, once it has.
+        done: ?u64 = null,
+    };
+
     /// An object the fake holds.
     pub const Stored = struct {
         name: []u8,
@@ -143,9 +179,30 @@ pub const FakeMultipart = struct {
     pub fn deinit(self: *FakeMultipart) void {
         for (self.uploads.items) |*u| freeUpload(self.gpa, u);
         self.uploads.deinit(self.gpa);
+        for (self.sessions.items) |*s| freeSession(self.gpa, s);
+        self.sessions.deinit(self.gpa);
         for (self.objects.items) |*o| freeStored(self.gpa, o);
         self.objects.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    /// Sessions opened and neither finished nor cancelled. Call once every
+    /// task using the fake has returned.
+    pub fn openSessions(self: *const FakeMultipart) usize {
+        var n: usize = 0;
+        for (self.sessions.items) |s| {
+            if (s.done == null) n += 1;
+        }
+        return n;
+    }
+
+    /// The bytes a live session holds. Call once every task using the
+    /// fake has returned.
+    pub fn sessionHolds(self: *const FakeMultipart, id_suffix: []const u8) ?u64 {
+        for (self.sessions.items) |s| {
+            if (std.mem.endsWith(u8, id_suffix, s.id)) return s.bytes.items.len;
+        }
+        return null;
     }
 
     pub fn transport(self: *FakeMultipart) core.transport.Transport {
@@ -274,6 +331,12 @@ pub const FakeMultipart = struct {
                 (if (j.media) .media else .read)
             else if (method == .DELETE) .delete else return error.HttpProtocolError,
             .move => if (method == .POST) .move else return error.HttpProtocolError,
+            .resumable => if (method == .POST) .session_start else return error.HttpProtocolError,
+            .session => switch (method) {
+                .PUT => .session_put,
+                .DELETE => .session_cancel,
+                else => return error.HttpProtocolError,
+            },
             .xml => |x| switch (x.query) {
                 .uploads => .start,
                 .part => .part,
@@ -288,7 +351,8 @@ pub const FakeMultipart = struct {
         const part_number: u32 = switch (target) {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
-            .move => 0,
+            .session => if (kind == .session_put) sessionPart(headers) else 0,
+            .move, .resumable => 0,
         };
 
         self.mutex.lockUncancelable(self.io);
@@ -325,6 +389,11 @@ pub const FakeMultipart = struct {
             .json => |j| try self.json(kind, j, headers, fault, arena),
             .xml => |x| try self.multipartRequest(kind, x, content_type, headers, body, fault, arena),
             .move => |m| try self.moveObject(m, fault, arena),
+            .resumable => |r| try self.sessionStart(r, content_type, headers, body, arena),
+            .session => |id| if (kind == .session_put)
+                try self.sessionPut(id, headers, body, fault, arena)
+            else
+                self.sessionCancel(id),
         };
         if (fault == .lose_answer) return error.ConnectionResetByPeer;
         if (kind == .media and reply.status >= 200 and reply.status < 300) {
@@ -536,7 +605,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel => unreachable,
         }
     }
 
@@ -640,6 +709,169 @@ pub const FakeMultipart = struct {
         return null;
     }
 
+    const session_not_found: Reply = .{ .status = 404, .body = "No such upload." };
+
+    /// Opens a session: the object's name and claimed checksum come from
+    /// the metadata body, the conditions from the query, and they are
+    /// checked here, at the opening `objects.insert`.
+    fn sessionStart(
+        self: *FakeMultipart,
+        target: ResumableTarget,
+        content_type: ?[]const u8,
+        headers: []const Header,
+        body: []const u8,
+        arena: Allocator,
+    ) Allocator.Error!Reply {
+        self.counts.session_starts += 1;
+        const Meta = struct { name: []const u8 = "", contentType: ?[]const u8 = null, crc32c: ?[]const u8 = null };
+        _ = content_type;
+        const meta = std.json.parseFromSliceLeaky(Meta, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"bad metadata\"}}" },
+        };
+        if (meta.name.len == 0) return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"no name\"}}" };
+        const held = if (self.liveIndex(meta.name)) |i|
+            target.conditions.check(&self.objects.items[i]) == .hold
+        else
+            target.conditions.checkAbsent();
+        if (!held) return condition_failed;
+
+        const declared: ?u64 = if (headerValue(headers, "X-Upload-Content-Length")) |text|
+            std.fmt.parseInt(u64, text, 10) catch null
+        else
+            null;
+        const metadata_crc: ?u32 = if (meta.crc32c) |text| core.crc32c.fromBase64(text) catch null else null;
+        const id_text = try std.fmt.allocPrint(arena, "sess-{d}", .{self.next_session});
+        const location = try std.fmt.allocPrint(arena, "{s}/upload/session/{s}", .{ target.origin, id_text });
+        const id = try self.gpa.dupe(u8, id_text);
+        errdefer self.gpa.free(id);
+        const name = try self.gpa.dupe(u8, meta.name);
+        errdefer self.gpa.free(name);
+        const stored_type = try self.gpa.dupe(u8, meta.contentType orelse "application/octet-stream");
+        errdefer self.gpa.free(stored_type);
+        const bucket = try self.gpa.dupe(u8, target.bucket);
+        errdefer self.gpa.free(bucket);
+        try self.sessions.append(self.gpa, .{
+            .id = id,
+            .bucket = bucket,
+            .name = name,
+            .content_type = stored_type,
+            .declared = declared,
+            .metadata_crc = metadata_crc,
+        });
+        self.next_session += 1;
+        return .{ .status = 200, .headers = try replyHeaders(arena, &.{.{ .name = "Location", .value = location }}) };
+    }
+
+    fn sessionIndex(self: *const FakeMultipart, id: []const u8) ?usize {
+        for (self.sessions.items, 0..) |s, i| if (std.mem.eql(u8, s.id, id)) return i;
+        return null;
+    }
+
+    /// One PUT to a session: a chunk, the empty finalize, or the status
+    /// query, which are the same request, told apart only by what the
+    /// session already holds.
+    fn sessionPut(self: *FakeMultipart, id: []const u8, headers: []const Header, body: []const u8, fault: Fault, arena: Allocator) Allocator.Error!Reply {
+        self.counts.session_puts += 1;
+        const index = self.sessionIndex(id) orelse return session_not_found;
+        if (fault == .gone) {
+            var removed = self.sessions.orderedRemove(index);
+            freeSession(self.gpa, &removed);
+            return session_not_found;
+        }
+        const s = &self.sessions.items[index];
+        if (s.done) |generation| {
+            // A finished session keeps answering with its object while
+            // that object stands.
+            for (self.objects.items) |*o| {
+                if (o.generation == generation and std.mem.eql(u8, o.name, s.name)) {
+                    return .{ .status = 200, .body = try objectJson(arena, o, o.name, generation, s.bucket, false) };
+                }
+            }
+            return session_not_found;
+        }
+        const range = sessionRange(headers) orelse return .{ .status = 400, .body = "no Content-Range" };
+        switch (range) {
+            .query => |total| {
+                if (total) |declared| if (s.bytes.items.len == declared) {
+                    return self.finishSession(index, headers, arena);
+                };
+                return sessionProgress(arena, s.bytes.items.len);
+            },
+            .chunk => |chunk| {
+                if (chunk.end < chunk.start or body.len != chunk.end - chunk.start + 1) {
+                    return .{ .status = 400, .body = "the body does not match its Content-Range" };
+                }
+                const held = s.bytes.items.len;
+                if (chunk.start > held) return sessionProgress(arena, held);
+                // Bytes already stored cannot be overwritten; the tail is
+                // new.
+                const fresh = body[@intCast(held - chunk.start)..];
+                try s.bytes.appendSlice(self.gpa, fresh);
+                self.counts.session_bytes += fresh.len;
+                self.counts.session_stale_bytes += body.len - fresh.len;
+                if (fault == .corrupt and fresh.len > 0) {
+                    s.bytes.items[s.bytes.items.len - fresh.len / 2 - 1] ^= 0x01;
+                }
+                if (chunk.total) |declared| if (s.bytes.items.len == declared) {
+                    return self.finishSession(index, headers, arena);
+                };
+                return sessionProgress(arena, s.bytes.items.len);
+            },
+        }
+    }
+
+    /// Finishes a session into an object, checking the checksum the
+    /// finishing request carries and the one the metadata claimed, before
+    /// the object exists.
+    fn finishSession(self: *FakeMultipart, index: usize, headers: []const Header, arena: Allocator) Allocator.Error!Reply {
+        const s = &self.sessions.items[index];
+        const actual = core.crc32c.hash(s.bytes.items);
+        const claimed: ?u32 = if (headerValue(headers, "X-Goog-Hash")) |value| crc32cFromHash(value) else null;
+        const mismatch: Reply = .{
+            .status = 400,
+            .body = "{\"error\":{\"code\":400,\"message\":\"Provided CRC32C does not match calculated CRC32C\",\"errors\":[{\"reason\":\"invalid\"}]}}",
+        };
+        if (claimed) |wanted| if (wanted != actual) return mismatch;
+        if (s.metadata_crc) |wanted| if (wanted != actual) return mismatch;
+
+        const generation = self.next_generation;
+        const name = try self.gpa.dupe(u8, s.name);
+        errdefer self.gpa.free(name);
+        const bytes = try self.gpa.dupe(u8, s.bytes.items);
+        errdefer self.gpa.free(bytes);
+        const stored_type = try self.gpa.dupe(u8, s.content_type);
+        errdefer self.gpa.free(stored_type);
+        const metadata = try self.gpa.alloc(Header, 0);
+        errdefer self.gpa.free(metadata);
+        try self.objects.ensureUnusedCapacity(self.gpa, 1);
+        self.next_generation += 1;
+        if (self.liveIndex(s.name)) |i| {
+            var replaced = self.objects.orderedRemove(i);
+            freeStored(self.gpa, &replaced);
+        }
+        self.objects.appendAssumeCapacity(.{
+            .name = name,
+            .generation = generation,
+            .bytes = bytes,
+            .content_type = stored_type,
+            .metadata = metadata,
+        });
+        s.done = generation;
+        s.bytes.clearAndFree(self.gpa);
+        const o = &self.objects.items[self.objects.items.len - 1];
+        return .{ .status = 200, .body = try objectJson(arena, o, o.name, generation, s.bucket, false) };
+    }
+
+    fn sessionCancel(self: *FakeMultipart, id: []const u8) Reply {
+        self.counts.session_cancels += 1;
+        const index = self.sessionIndex(id) orelse return session_not_found;
+        var removed = self.sessions.orderedRemove(index);
+        freeSession(self.gpa, &removed);
+        // What Google answers a cancel.
+        return .{ .status = 499 };
+    }
+
     fn drop(self: *FakeMultipart, index: usize, reply: Reply) Reply {
         var removed = self.uploads.orderedRemove(index);
         freeUpload(self.gpa, &removed);
@@ -682,6 +914,78 @@ fn freeHeaders(gpa: Allocator, headers: []Header) void {
 fn freePart(gpa: Allocator, part: *FakeMultipart.Part) void {
     gpa.free(part.bytes);
     gpa.free(part.etag);
+}
+
+fn freeSession(gpa: Allocator, s: *FakeMultipart.Session) void {
+    gpa.free(s.id);
+    gpa.free(s.bucket);
+    gpa.free(s.name);
+    gpa.free(s.content_type);
+    s.bytes.deinit(gpa);
+}
+
+/// A 308 with how far the session stands, `Range` absent when it holds
+/// nothing, as Google answers.
+fn sessionProgress(arena: Allocator, held: usize) Allocator.Error!FakeMultipart.Reply {
+    if (held == 0) return .{ .status = 308 };
+    return .{ .status = 308, .headers = try arena.dupe(Header, &.{.{
+        .name = "Range",
+        .value = try std.fmt.allocPrint(arena, "bytes=0-{d}", .{held - 1}),
+    }}) };
+}
+
+/// What one `Content-Range` on a session PUT asks: a chunk of bytes, or
+/// the query-or-finalize form.
+const SessionRange = union(enum) {
+    /// `bytes */T`, T null for `*`.
+    query: ?u64,
+    chunk: struct { start: u64, end: u64, total: ?u64 },
+};
+
+fn sessionRange(headers: []const Header) ?SessionRange {
+    const value = headerValue(headers, "Content-Range") orelse return null;
+    const rest = std.mem.trim(u8, value, " \t");
+    if (!std.ascii.startsWithIgnoreCase(rest, "bytes ")) return null;
+    const spec = rest["bytes ".len..];
+    const slash = std.mem.indexOfScalar(u8, spec, '/') orelse return null;
+    const total: ?u64 = if (std.mem.eql(u8, spec[slash + 1 ..], "*"))
+        null
+    else
+        std.fmt.parseInt(u64, spec[slash + 1 ..], 10) catch return null;
+    const head = spec[0..slash];
+    if (std.mem.eql(u8, head, "*")) return .{ .query = total };
+    const dash = std.mem.indexOfScalar(u8, head, '-') orelse return null;
+    const start = std.fmt.parseInt(u64, head[0..dash], 10) catch return null;
+    const end = std.fmt.parseInt(u64, head[dash + 1 ..], 10) catch return null;
+    return .{ .chunk = .{ .start = start, .end = end, .total = total } };
+}
+
+/// What a fault plan sees as a session PUT's `part`: 1 plus the chunk's
+/// first byte, or 0 for the query-or-finalize form.
+fn sessionPart(headers: []const Header) u32 {
+    const range = sessionRange(headers) orelse return 0;
+    return switch (range) {
+        .query => 0,
+        .chunk => |chunk| std.math.cast(u32, chunk.start +| 1) orelse std.math.maxInt(u32),
+    };
+}
+
+fn headerValue(headers: []const Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
+/// The crc32c a `X-Goog-Hash` header claims, or null.
+fn crc32cFromHash(value: []const u8) ?u32 {
+    var entries = std.mem.splitScalar(u8, value, ',');
+    while (entries.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t");
+        if (!std.ascii.startsWithIgnoreCase(trimmed, "crc32c=")) continue;
+        return core.crc32c.fromBase64(trimmed["crc32c=".len..]) catch null;
+    }
+    return null;
 }
 
 fn freeUpload(gpa: Allocator, u: *FakeMultipart.Upload) void {
@@ -832,10 +1136,21 @@ const XmlTarget = struct {
     };
 };
 
+const ResumableTarget = struct {
+    bucket: []const u8,
+    /// Checked at the open, against the live object the metadata names.
+    conditions: Conditions,
+    /// Scheme, host and port, for the session URL the answer mints.
+    origin: []const u8,
+};
+
 const Target = union(enum) {
     json: JsonTarget,
     xml: XmlTarget,
     move: MoveTarget,
+    resumable: ResumableTarget,
+    /// A session URL's id.
+    session: []const u8,
 };
 
 /// What a URL names, decoded. Anything this fake does not serve is
@@ -848,6 +1163,23 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
     const path = rest[0 .. q orelse rest.len];
     const query = if (q) |i| rest[i + 1 ..] else "";
 
+    if (std.mem.startsWith(u8, path, "/upload/session/")) {
+        return .{ .session = try decode(arena, path["/upload/session/".len..]) };
+    }
+    if (std.mem.startsWith(u8, path, "/upload/storage/v1/b/")) {
+        const after = path["/upload/storage/v1/b/".len..];
+        const slash = std.mem.indexOf(u8, after, "/o") orelse return error.HttpProtocolError;
+        const bucket = try decode(arena, after[0..slash]);
+        var conditions: Conditions = .{};
+        var resumable_type = false;
+        var params = std.mem.splitScalar(u8, query, '&');
+        while (params.next()) |param| {
+            if (try conditions.take(param)) continue;
+            if (std.mem.eql(u8, param, "uploadType=resumable")) resumable_type = true;
+        }
+        if (!resumable_type) return error.HttpProtocolError;
+        return .{ .resumable = .{ .bucket = bucket, .conditions = conditions, .origin = url[0..path_start] } };
+    }
     if (std.mem.startsWith(u8, path, "/storage/v1/b/")) {
         const after = path["/storage/v1/b/".len..];
         const slash = std.mem.indexOf(u8, after, "/o/") orelse return error.HttpProtocolError;

@@ -195,10 +195,18 @@ pub const UploadOptions = struct {
     /// The total size, when known. `uploadFrom` works without it; with it,
     /// a reader that ends early is `error.UnexpectedEndOfStream` and one
     /// with more is `error.StreamTooLong`. `upload` checks it against the
-    /// slice it was given.
+    /// slice it was given; `uploadFile` takes its size from the file and
+    /// refuses one.
     size: ?u64 = null,
     /// `.does_not_exist` makes an upload create-only and safe to retry.
     preconditions: Preconditions = .{},
+    /// Where `uploadFile` keeps what a later process needs to carry the
+    /// upload on: the session URL, which is a credential, so the built-in
+    /// `storage.CheckpointFile` keeps it readable by its owner only and a
+    /// custom store should guard it as it guards credentials. Only
+    /// `uploadFile` takes one; `upload` and `uploadFrom` refuse it, since
+    /// memory and streams do not outlive a process.
+    checkpoint: ?Checkpoint = null,
 };
 
 /// Where `Object.uploadParallel` reads its parts.

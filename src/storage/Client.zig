@@ -13,9 +13,12 @@ const core = @import("core");
 
 const Bucket = @import("Bucket.zig");
 const Endpoint = @import("Endpoint.zig");
+const checkpoint = @import("checkpoint.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
+const parallel = @import("parallel.zig");
+const resumable = @import("resumable.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
 const validate = @import("validate.zig");
@@ -228,6 +231,40 @@ pub fn deinit(self: *Client) void {
 /// client and `name`, and must not outlive either.
 pub fn bucket(self: *Client, name: []const u8) Bucket {
     return .{ .client = self, .name = name };
+}
+
+/// Drops what a checkpoint's transfer left on the server, for a caller
+/// who decides not to resume it: cancels a resumable session, or aborts a
+/// multipart upload and deletes its temporary object; a download left
+/// nothing there, its file being the caller's to remove. Then clears the
+/// checkpoint. One that holds nothing is nothing to do; one holding bytes
+/// this library did not write is `error.CheckpointFailed`, and kept.
+/// Without this, a session expires on its own within a week, and a
+/// multipart upload's parts stay billed until a lifecycle rule aborts it.
+pub fn abandonTransfer(self: *Client, cp: types.Checkpoint) Error!void {
+    rpc.begin(self);
+    var arena: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena.deinit();
+    const bytes = cp.load(arena.allocator()) catch |err| switch (err) {
+        error.CheckpointFailed => {
+            if (self.diagnostics) |d| d.print("the checkpoint could not be read", .{});
+            return error.CheckpointFailed;
+        },
+        else => |e| return e,
+    } orelse return;
+    const state = checkpoint.parse(arena.allocator(), bytes) catch |err| switch (err) {
+        error.CheckpointFailed => {
+            if (self.diagnostics) |d| d.print("the checkpoint holds no state this library wrote; nothing was changed", .{});
+            return error.CheckpointFailed;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    switch (state) {
+        .download_parallel => {},
+        .upload_file => |s| try resumable.cancelSession(self, s.session),
+        .upload_parallel => |s| try parallel.abandon(self, s),
+    }
+    cp.clear();
 }
 
 /// One page of the project's buckets. Needs `Options.project_id`.

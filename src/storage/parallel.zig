@@ -118,20 +118,7 @@ const Persist = struct {
 /// temporary object and clear the state: those a resume could only
 /// repeat. Everything else leaves the parts and the checkpoint for a
 /// later process.
-fn abandons(err: Error) bool {
-    return switch (err) {
-        error.ChecksumMismatch,
-        error.InvalidResponse,
-        error.ReadFailed,
-        error.UnexpectedEndOfStream,
-        error.StreamTooLong,
-        error.FailedPrecondition,
-        error.NotModified,
-        error.UploadSessionLost,
-        => true,
-        else => false,
-    };
-}
+const abandons = checkpoint.uploadAbandons;
 
 fn persistent(
     client: *Client,
@@ -371,30 +358,41 @@ fn abortUnrecorded(client: *Client, bucket: []const u8, object: []const u8, uplo
     };
 }
 
-/// Drops what a checkpoint's upload left on the server, for a transfer
-/// that cannot resume it: the upload and its parts, and the temporary
-/// object where one got as far as existing. Best effort, protected from a
-/// cancel.
+/// Drops what a checkpoint's upload left on the server: aborts the
+/// multipart upload, one already gone counting as aborted, and deletes
+/// the temporary object of an upload with conditions, pinned to whatever
+/// generation the name holds, since nothing else writes there. What
+/// `Client.abandonTransfer` runs for this kind of state.
+pub fn abandon(client: *Client, s: checkpoint.State.UploadParallel) Error!void {
+    try mp.abort(client, s.bucket, s.temp orelse s.object, s.upload_id);
+    const temp = s.temp orelse return;
+    const target: Object = .{ .client = client, .bucket = s.bucket, .name = temp };
+    const generation: u64 = found: {
+        var info = target.get(.{}) catch |err| switch (err) {
+            error.NotFound => return,
+            else => |e| return e,
+        };
+        defer info.deinit();
+        break :found info.value.generation;
+    };
+    target.delete(.{ .generation = generation }) catch |err| switch (err) {
+        error.NotFound => {},
+        else => |e| return e,
+    };
+}
+
+/// `abandon`, best effort and protected from a cancel: for a transfer
+/// starting over that must not fail on its own cleanup.
 fn abandonResumed(client: *Client, bucket: []const u8, s: checkpoint.State.UploadParallel) void {
+    _ = bucket;
     const saved: ?Diagnostics = if (client.diagnostics) |d| d.* else null;
     defer if (client.diagnostics) |d| {
         d.* = saved.?;
     };
     const protection = client.io.swapCancelProtection(.blocked);
     defer _ = client.io.swapCancelProtection(protection);
-    mp.abort(client, bucket, s.temp orelse s.object, s.upload_id) catch |err| {
-        logging.warn("aborting the old multipart upload of {s} failed with {t}: abort upload id {s} by hand, or let a lifecycle rule", .{ s.object, err, s.upload_id });
-    };
-    const temp = s.temp orelse return;
-    const target: Object = .{ .client = client, .bucket = bucket, .name = temp };
-    const generation: ?u64 = found: {
-        var info = target.get(.{}) catch break :found null;
-        defer info.deinit();
-        break :found info.value.generation;
-    };
-    if (generation) |g| target.delete(.{ .generation = g }) catch |err| switch (err) {
-        error.NotFound => {},
-        else => logging.warn("deleting the old temporary object {s} failed with {t}: delete it by hand, or let a lifecycle rule", .{ temp, err }),
+    abandon(client, s) catch |err| {
+        logging.warn("abandoning the old upload of {s} failed with {t}: abort upload id {s} by hand, or let a lifecycle rule", .{ s.object, err, s.upload_id });
     };
 }
 
@@ -3110,6 +3108,11 @@ const PartRecorder = struct {
 /// run with the same checkpoint and no faults: the object is exactly the
 /// file, no part the server already held is sent again, and nothing but
 /// an empty upload a lost start answer left behind stays to be billed.
+/// The one legitimate second-run failure is a checksum mismatch over a
+/// part a first-run fault corrupted on the server while another worker's
+/// failure ended that run first: the finish's checksum then refuses the
+/// object, deletes it, and clears the state, so a third run is whole and
+/// right.
 fn resumeUnderFaults(input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
     const size = g.intRange(usize, 0, 40 * 1024);
@@ -3179,9 +3182,21 @@ fn resumeUnderFaults(input: []const u8) !void {
     var diag: Diagnostics = .{};
     var second = try clientOn(&fake, &token, &diag, 4);
     defer second.deinit();
-    var info = second.bucket("b").object("o").uploadParallel(.{ .file = file }, options) catch |err| {
-        std.debug.print("second run: {t}: {s}\n", .{ err, diag.message() });
-        return err;
+    const target = second.bucket("b").object("o");
+    var info = target.uploadParallel(.{ .file = file }, options) catch |err| {
+        errdefer std.debug.print("second run: {t}: {s}\n", .{ err, diag.message() });
+        try testing.expectEqual(error.ChecksumMismatch, err);
+        try testing.expect(chooser.faulted);
+        // The mismatched object went, the state went, and a third run is
+        // whole and right.
+        try testing.expectEqual(null, saved.stored);
+        try testing.expect(fake.object("o") == null);
+        var third = try target.uploadParallel(.{ .file = file }, options);
+        defer third.deinit();
+        try testing.expectEqual(core.crc32c.hash(data), third.value.crc32c.?);
+        try testing.expectEqualSlices(u8, data, fake.object("o").?.bytes);
+        try testing.expectEqual(0, fake.openParts());
+        return;
     };
     defer info.deinit();
 
