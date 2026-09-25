@@ -12,8 +12,9 @@
 //! */T`) finishes a session whose bytes are all there, as an empty
 //! finalize would, a finished session keeps answering 200 with its object
 //! while that object stands, an unknown or dropped session answers 404,
-//! a cancel answers 499, and a finish carrying `X-Goog-Hash` refuses a
-//! mismatched object with 400 before it exists.
+//! a cancel answers 499 and so does everything sent to that session
+//! afterwards, as measured against Google, and a finish carrying
+//! `X-Goog-Hash` refuses a mismatched object with 400 before it exists.
 //!
 //! It holds uploads to the rules Google documents: part numbers 1 to
 //! 10,000, a part sent again replaces itself, the finish names parts in
@@ -157,6 +158,9 @@ pub const FakeMultipart = struct {
         bytes: std.ArrayList(u8) = .empty,
         /// The generation the finish made, once it has.
         done: ?u64 = null,
+        /// Cancelled before it finished: its bytes are gone, and it
+        /// answers 499 to everything.
+        cancelled: bool = false,
     };
 
     /// An object the fake holds.
@@ -191,7 +195,7 @@ pub const FakeMultipart = struct {
     pub fn openSessions(self: *const FakeMultipart) usize {
         var n: usize = 0;
         for (self.sessions.items) |s| {
-            if (s.done == null) n += 1;
+            if (s.done == null and !s.cancelled) n += 1;
         }
         return n;
     }
@@ -710,6 +714,9 @@ pub const FakeMultipart = struct {
     }
 
     const session_not_found: Reply = .{ .status = 404, .body = "No such upload." };
+    /// What Google answers a cancel, and everything sent to the session
+    /// after it.
+    const session_cancelled: Reply = .{ .status = 499 };
 
     /// Opens a session: the object's name and claimed checksum come from
     /// the metadata body, the conditions from the query, and they are
@@ -774,6 +781,7 @@ pub const FakeMultipart = struct {
     fn sessionPut(self: *FakeMultipart, id: []const u8, headers: []const Header, body: []const u8, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         self.counts.session_puts += 1;
         const index = self.sessionIndex(id) orelse return session_not_found;
+        if (self.sessions.items[index].cancelled) return session_cancelled;
         if (fault == .gone) {
             var removed = self.sessions.orderedRemove(index);
             freeSession(self.gpa, &removed);
@@ -866,10 +874,16 @@ pub const FakeMultipart = struct {
     fn sessionCancel(self: *FakeMultipart, id: []const u8) Reply {
         self.counts.session_cancels += 1;
         const index = self.sessionIndex(id) orelse return session_not_found;
+        const s = &self.sessions.items[index];
+        if (s.done == null) {
+            // A live session stays, answering 499 from now on.
+            s.cancelled = true;
+            s.bytes.clearAndFree(self.gpa);
+            return session_cancelled;
+        }
         var removed = self.sessions.orderedRemove(index);
         freeSession(self.gpa, &removed);
-        // What Google answers a cancel.
-        return .{ .status = 499 };
+        return session_cancelled;
     }
 
     fn drop(self: *FakeMultipart, index: usize, reply: Reply) Reply {

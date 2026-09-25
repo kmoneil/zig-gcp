@@ -613,6 +613,46 @@ test "uploadFile: a gone session starts over; a changed source cancels the old s
     try testing.expectEqual(0, fake.openSessions());
 }
 
+test "uploadFile: a session cancelled behind the checkpoint's back answers 499, and the upload starts over" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 3);
+    defer client.deinit();
+    const data = try testing.allocator.alloc(u8, 400 * 1024);
+    defer testing.allocator.free(data);
+    fill(data, 70);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    const options: types.UploadOptions = .{ .checkpoint = saved.checkpoint() };
+
+    // Run 1 dies after a chunk, and someone cancels its session: Cloud
+    // Storage answers every later request to it with 499, measured on
+    // 2026-09-25, where an expired one would answer 404 or 410.
+    var rules = [_]Script.Rule{.{ .at = chunk_size, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    try testing.expectError(error.Canceled, client.bucket("b").object("o").uploadFile(file, options));
+    fake.faults = null;
+    var state_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state_arena.deinit();
+    const state = try checkpoint.parse(state_arena.allocator(), saved.stored.?);
+    try resumable.cancelSession(&client, state.upload_file.session);
+
+    // Run 2's status query meets the 499, and the upload starts over.
+    var info = try client.bucket("b").object("o").uploadFile(file, options);
+    defer info.deinit();
+    try testing.expectEqualSlices(u8, data, fake.object("o").?.bytes);
+    try testing.expectEqual(2, fake.counts.session_starts);
+    try testing.expectEqual(null, saved.stored);
+    try testing.expectEqual(0, fake.openSessions());
+}
+
 test "uploadFile: a checkpoint of another transfer, or one unreadable, is refused before anything is sent and kept" {
     var fake: FakeMultipart = .init(testing.allocator, testing.io);
     defer fake.deinit();
