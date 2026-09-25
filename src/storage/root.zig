@@ -93,6 +93,7 @@ test {
     _ = @import("compose.zig");
     _ = @import("copy.zig");
     _ = @import("download.zig");
+    _ = @import("gzip_download.zig");
     _ = @import("errors.zig");
     _ = @import("fake_multipart.zig");
     _ = @import("multipart.zig");

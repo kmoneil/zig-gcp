@@ -15,6 +15,7 @@ const compose_impl = @import("compose.zig");
 const copy_impl = @import("copy.zig");
 const dl = @import("download.zig");
 const errors = @import("errors.zig");
+const gzip_download = @import("gzip_download.zig");
 const logging = @import("logging.zig");
 const metadata = @import("metadata.zig");
 const multipart = @import("multipart.zig");
@@ -450,6 +451,16 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
     // short of the whole object, so a resumed download is checked against
     // this. A request from byte 0 starts the bytes over, and replaces it.
     var whole_crc: ?u32 = null;
+    var head: ?core.transport.StreamRequest.Head = null;
+    // Media is asked for as stored, so an object stored gzip-compressed
+    // arrives compressed. Until its first byte the body goes through the
+    // tap, which reads the head then: a plain body passes on as always, and
+    // a gzip object to decompress is pulled from there on.
+    var tap: gzip_download.Tap = .init(&hashing.writer, &head, self.client.gpa, self.client.chunk_size, options.decompress, options.range != null);
+    defer tap.deinit();
+    // Set when a plain object came compressed on its way: asked again,
+    // plainly.
+    var plain_only = false;
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         const delivered = counting.count;
@@ -465,12 +476,14 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
             headers = header_storage[0..1];
         }
 
-        var head: ?core.transport.StreamRequest.Head = null;
+        head = null;
+        const tapped = tap.mode == .undecided;
         const outcome = rpc.executeStream(self.client, &response, .{
             .method = .GET,
             .path = path,
             .headers = headers,
-            .sink = .{ .writer = &hashing.writer },
+            .sink = .{ .writer = if (tapped) &tap.writer else &hashing.writer },
+            .accept_encoding = if (plain_only) .identity else .gzip_as_sent,
             // Resuming is this loop's business: the engine must never
             // repeat a request whose bytes it cannot take back.
             .retry = false,
@@ -487,6 +500,31 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
                 whole_crc = if (h.header("x-goog-hash")) |value| dl.crc32cFromHashHeader(value) else null;
             }
         };
+        if (tapped) {
+            // A body that wrote no byte is settled by its head.
+            if (outcome) |_| tap.decide() else |_| {}
+            switch (tap.mode) {
+                .gzip => {
+                    const first_error: ?Error = if (outcome) |_| null else |err| switch (err) {
+                        error.WriteFailed => null,
+                        else => |e| e,
+                    };
+                    return gzip_download.finish(self.client, self.bucket, self.name, writer, &tap, first_error, generation, whole_crc);
+                },
+                .compressed_in_transit => {
+                    logging.debug("{s} came gzip-compressed, and is stored plain: asking again for plain bytes", .{self.name});
+                    plain_only = true;
+                    tap.mode = .undecided;
+                    attempt = 0;
+                    continue;
+                },
+                .ranged_gzip => {
+                    if (self.client.diagnostics) |d| d.print("{s} is stored gzip-compressed, and a range of it does not decompress: ask for decompress = false to get stored bytes", .{self.name});
+                    return error.InvalidArgument;
+                },
+                .plain, .undecided => {},
+            }
+        }
 
         const err: Error = if (outcome) |res| {
             return self.finishStream(res, options, wants_partial, start, generation, transcoded orelse false, whole_crc, &counting, &hashing);
@@ -501,7 +539,7 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
         // that is the whole object, not a failure.
         if (err == error.OutOfRange and base_offset == 0 and options.range != null and counting.count == 0) {
             if (self.client.diagnostics) |d| d.clear();
-            return .{ .bytes_written = 0, .generation = generation orelse 0, .checksum_verified = false, .crc32c = hashing.hasher.final() };
+            return .{ .bytes_written = 0, .generation = generation orelse 0, .checksum_verified = false, .crc32c = hashing.hasher.final(), .stored_bytes = 0 };
         }
 
         // The attempt counter resets on progress: only a link that
@@ -579,6 +617,7 @@ fn finishStream(
         .generation = generation orelse 0,
         .checksum_verified = verified,
         .crc32c = hashing.hasher.final(),
+        .stored_bytes = counting.count,
     };
 }
 
@@ -1064,8 +1103,10 @@ test "download streams into the caller's writer and verifies" {
     try testing.expectEqual(7, result.generation);
     try testing.expect(result.checksum_verified);
     try testing.expectEqual(core.crc32c.hash("hello world\n"), result.crc32c);
-    // Downloads ask for plain bytes, so the checksum can apply.
-    try testing.expectEqual(.identity, (try h.fake.streamRequest(0)).accept_encoding);
+    // Downloads ask for bytes as stored, so the checksum applies to an
+    // object stored gzip-compressed too; this one is plain, and comes so.
+    try testing.expectEqual(.gzip_as_sent, (try h.fake.streamRequest(0)).accept_encoding);
+    try testing.expectEqual(12, result.stored_bytes);
 }
 
 test "download: a range is asked for exactly and never checksum-verified" {

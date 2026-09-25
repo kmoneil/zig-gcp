@@ -108,7 +108,7 @@ pub const StreamRequest = struct {
     body: Body = .none,
     /// Where a successful response body goes.
     sink: Sink = .buffer,
-    /// What `Accept-Encoding` offers the server. Either way, a compressed
+    /// What `Accept-Encoding` offers the server, and whether a compressed
     /// response body is decompressed on its way to the sink.
     accept_encoding: AcceptEncoding = .identity,
     /// As `Request.timeout_ms`. While the clock runs the request runs on
@@ -163,8 +163,13 @@ pub const StreamRequest = struct {
         /// Ask for plain bytes, as a download whose bytes must match a
         /// checksum wants.
         identity,
-        /// Offer gzip and deflate, as `send` does for JSON responses.
+        /// Offer gzip and deflate, as `send` does for JSON responses, and
+        /// decompress what comes back.
         compressed,
+        /// Offer gzip, and deliver the body as it arrived: a gzip body stays
+        /// gzip, for a caller that must hash the bytes the server stored.
+        /// The head's `Content-Encoding` says which arrived.
+        gzip_as_sent,
     };
 };
 
@@ -410,6 +415,7 @@ pub const HttpTransport = struct {
                 .accept_encoding = switch (req.accept_encoding) {
                     .compressed => .default,
                     .identity => .{ .override = "identity" },
+                    .gzip_as_sent => .{ .override = "gzip" },
                 },
             },
             .extra_headers = req.headers,
@@ -459,7 +465,8 @@ pub const HttpTransport = struct {
             .writer => |w| if (status < 300) w else null,
         };
 
-        const encoding = head.content_encoding;
+        // A body wanted as sent is not decoded, whatever it says it is.
+        const encoding: http.ContentEncoding = if (req.accept_encoding == .gzip_as_sent) .identity else head.content_encoding;
         const decompress_buffer: []u8 = switch (encoding) {
             .identity => &.{},
             .gzip, .deflate => try arena.alloc(u8, std.compress.flate.max_window_len),
@@ -1990,6 +1997,60 @@ test "sendStream decompresses a gzip body on its way to the writer" {
     try testing.expectEqual(expected.len, res.bytes_streamed);
     try serving.await(io);
     try expectHeader(server.request(0), "accept-encoding: gzip, deflate\r\n");
+}
+
+test "sendStream delivers a gzip body as sent when asked, and a plain one as it is" {
+    const io = testing.io;
+    const gzip_body = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xabV*\xc9/\xc8L.V\xb2" ++
+        "\x8a\xaeV\xcaK\xccMU\xb2R*(\xca\xcfJM.)\xd6/\xd0\x87H\xeaWe\x16\x14\xa4\xa6(\xd5\xc6\xd6\x02\x00\x80\xdd\xe810\x00\x00\x00";
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+            "14\x0d\x0a" ++ gzip_body[0..20] ++ "\x0d\x0a2c\x0d\x0a" ++ gzip_body[20..] ++ "\x0d\x0a0\x0d\x0a\x0d\x0a",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nplain",
+    });
+    server.per_connection = 2;
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [128]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    const res = try ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/a"),
+        .sink = .{ .writer = &out },
+        .accept_encoding = .gzip_as_sent,
+    }, arena.allocator());
+    // The bytes the server sent, gzip and all, and they are the JSON.
+    try testing.expectEqualSlices(u8, gzip_body, out.buffered());
+    try testing.expectEqual(gzip_body.len, res.bytes_streamed);
+    try testing.expectEqualStrings("gzip", res.header("content-encoding").?);
+    var in: std.Io.Reader = .fixed(out.buffered());
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var inflate: std.compress.flate.Decompress = .init(&in, .gzip, &window);
+    var json_buf: [128]u8 = undefined;
+    const json = json_buf[0..try inflate.reader.readSliceShort(&json_buf)];
+    try testing.expectEqualStrings("{\"topics\":[{\"name\":\"projects/p/topics/zipped\"}]}", json);
+
+    // A body that was never compressed comes as it is, on the same
+    // connection.
+    var plain_buf: [16]u8 = undefined;
+    var plain: std.Io.Writer = .fixed(&plain_buf);
+    _ = try ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/b"),
+        .sink = .{ .writer = &plain },
+        .accept_encoding = .gzip_as_sent,
+    }, arena.allocator());
+    try testing.expectEqualStrings("plain", plain.buffered());
+    try serving.await(io);
+    try expectHeader(server.request(0), "accept-encoding: gzip\r\n");
+    try testing.expectEqual(1, server.connections);
 }
 
 test "sendStream buffers an error body even when a writer was given" {

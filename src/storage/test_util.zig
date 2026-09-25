@@ -14,6 +14,7 @@ const RetryPolicy = core.RetryPolicy;
 pub const FakeTransport = core.testing.FakeTransport;
 pub const FakeMultipart = @import("fake_multipart.zig").FakeMultipart;
 pub const MultipartServer = @import("fake_multipart.zig").MultipartServer;
+pub const gzipAlloc = @import("fake_multipart.zig").gzipAlloc;
 pub const FakeTokenProvider = core.testing.FakeTokenProvider;
 pub const FakeClock = core.testing.FakeClock;
 pub const ByteGen = core.testing.ByteGen;

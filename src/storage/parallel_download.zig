@@ -206,7 +206,7 @@ fn transfer(
     if (client.verify_checksums and expected == null) {
         logging.warn("parallel download of {s} carried no crc32c to verify against", .{object});
     }
-    return .{ .bytes_written = size, .generation = generation, .checksum_verified = expected != null, .crc32c = crc };
+    return .{ .bytes_written = size, .generation = generation, .checksum_verified = expected != null, .crc32c = crc, .stored_bytes = size };
 }
 
 /// Refuses what no download could use, before anything is sent.
@@ -1259,11 +1259,13 @@ test "downloadParallel: a gzip-stored object on the fake, into memory and into a
     try s.init(testing.io, .{});
     defer s.deinit();
     const decompressed = "hello, " ** 300;
-    try s.fake.putGzip("page.html", "pretend this is gzip", decompressed);
+    try s.fake.putGzipped("page.html", decompressed);
     var out: [decompressed.len + 10]u8 = undefined;
     const result = try s.object("page.html").downloadParallel(.{ .buffer = &out }, .{ .part_size = 1024 });
     try testing.expectEqualStrings(decompressed, out[0..result.bytes_written]);
-    try testing.expect(!result.checksum_verified);
+    // Its stored bytes came as stored, and met the stored checksum.
+    try testing.expect(result.checksum_verified);
+    try testing.expect(result.stored_bytes < result.bytes_written);
     try testing.expectEqual(1, s.fake.counts.media);
 
     // Into a file with older, longer contents: emptied first, then exactly
@@ -1778,7 +1780,7 @@ test "downloadParallel: a gzip-stored object with a checkpoint saves nothing and
     try s.init(testing.io, .{});
     defer s.deinit();
     const decompressed = "what the object decompresses to";
-    try s.fake.putGzip("page", "stored form", decompressed);
+    try s.fake.putGzipped("page", decompressed);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try junkFile(&tmp, "old");
@@ -1919,7 +1921,7 @@ fn downloadEverything(gpa: Allocator) !void {
     var data: [3000]u8 = undefined;
     fill(&data, 12);
     try fake.put("o", &data);
-    try fake.putGzip("z", "stored", "served");
+    try fake.putGzipped("z", "served");
     var out: [3000]u8 = undefined;
     _ = try client.bucket("b").object("o").downloadParallel(.{ .buffer = &out }, .{ .part_size = 1024 });
     _ = try client.bucket("b").object("z").downloadParallel(.{ .buffer = &out }, .{ .part_size = 1024 });
@@ -1983,12 +1985,11 @@ fn runUnderFaults(io: std.Io, files: bool, input: []const u8) !void {
     var s: Setup = undefined;
     try s.init(io, .{ .verify_checksums = verify });
     defer s.deinit();
-    const decompressed = "decompressed " ** 40;
-    if (gzip) try s.fake.putGzip("o", data, decompressed) else try s.fake.put("o", data);
+    if (gzip) try s.fake.putGzipped("o", data) else try s.fake.put("o", data);
     var chooser: Chooser = .{ .bytes = g.rest() };
     s.fake.faults = chooser.plan();
 
-    const expected: []const u8 = if (gzip) decompressed else data;
+    const expected: []const u8 = data;
     const buffer = try testing.allocator.alloc(u8, expected.len);
     defer testing.allocator.free(buffer);
     var tmp: ?testing.TmpDir = if (to_file) testing.tmpDir(.{}) else null;
@@ -2004,7 +2005,9 @@ fn runUnderFaults(io: std.Io, files: bool, input: []const u8) !void {
         try testing.expectEqual(expected.len, result.bytes_written);
         try testing.expectEqual(expected.len, written.len);
         try testing.expectEqual(core.crc32c.hash(written), result.crc32c);
-        try testing.expectEqual(verify and !gzip, result.checksum_verified);
+        // A gzip object's stored bytes meet the stored checksum like any
+        // other object's.
+        try testing.expectEqual(verify, result.checksum_verified);
         if (result.checksum_verified or !chooser.faulted) try testing.expectEqualSlices(u8, expected, written);
     } else |err| {
         errdefer std.debug.print("{t}: {s}\n", .{ err, s.diag.message() });

@@ -248,6 +248,14 @@ pub const FakeMultipart = struct {
     /// Stores an object as gzip-compressed, as another writer would have:
     /// `stored` is what Cloud Storage keeps, sizes and hashes, and
     /// `decompressed` what a media read gets.
+    /// `plain`, gzip-compressed by std and stored so, served decompressed to
+    /// a request that does not take gzip as sent.
+    pub fn putGzipped(self: *FakeMultipart, name: []const u8, plain: []const u8) Allocator.Error!void {
+        const stored = try gzipAlloc(self.gpa, plain, .default);
+        defer self.gpa.free(stored);
+        try self.putGzip(name, stored, plain);
+    }
+
     pub fn putGzip(self: *FakeMultipart, name: []const u8, stored: []const u8, decompressed: []const u8) Allocator.Error!void {
         const served = try self.gpa.dupe(u8, decompressed);
         errdefer self.gpa.free(served);
@@ -277,7 +285,7 @@ pub const FakeMultipart = struct {
 
     fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
         const self = fromPtr(ptr);
-        const res = try self.handle(req.method, req.url, null, &.{}, req.body orelse "", arena);
+        const res = try self.handle(req.method, req.url, null, &.{}, req.body orelse "", false, arena);
         return .{ .status = res.status, .body = res.body, .headers = res.headers };
     }
 
@@ -296,7 +304,7 @@ pub const FakeMultipart = struct {
                 break :b buf;
             },
         };
-        const res = try self.handle(req.method, req.url, req.content_type, req.headers, body, arena);
+        const res = try self.handle(req.method, req.url, req.content_type, req.headers, body, req.accept_encoding == .gzip_as_sent, arena);
         if (req.head_out) |out| out.* = .{ .status = res.status, .headers = res.headers };
         if (req.sink == .writer and res.status >= 200 and res.status < 300) {
             if (res.cut) {
@@ -319,6 +327,8 @@ pub const FakeMultipart = struct {
 
     /// One request, whichever entry it came through. The URL is parsed
     /// outside the lock; everything that reads or changes state is inside.
+    /// `accept_gzip` is a request that takes gzip as sent, which Cloud
+    /// Storage answers with a gzip object's stored bytes.
     fn handle(
         self: *FakeMultipart,
         method: Method,
@@ -326,6 +336,7 @@ pub const FakeMultipart = struct {
         content_type: ?[]const u8,
         headers: []const Header,
         body: []const u8,
+        accept_gzip: bool,
         arena: Allocator,
     ) core.transport.Error!Reply {
         const target = try parseTarget(arena, url);
@@ -390,7 +401,7 @@ pub const FakeMultipart = struct {
         defer self.mutex.unlock(self.io);
 
         const reply = switch (target) {
-            .json => |j| try self.json(kind, j, headers, fault, arena),
+            .json => |j| try self.json(kind, j, headers, accept_gzip, fault, arena),
             .xml => |x| try self.multipartRequest(kind, x, content_type, headers, body, fault, arena),
             .move => |m| try self.moveObject(m, fault, arena),
             .resumable => |r| try self.sessionStart(r, content_type, headers, body, arena),
@@ -406,7 +417,7 @@ pub const FakeMultipart = struct {
         return reply;
     }
 
-    fn json(self: *FakeMultipart, kind: Kind, target: JsonTarget, headers: []const Header, fault: Fault, arena: Allocator) Allocator.Error!Reply {
+    fn json(self: *FakeMultipart, kind: Kind, target: JsonTarget, headers: []const Header, accept_gzip: bool, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         const not_found: Reply = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
         const index = for (self.objects.items, 0..) |o, i| {
             if (std.mem.eql(u8, o.name, target.name) and (target.generation == null or target.generation.? == o.generation)) break i;
@@ -433,7 +444,7 @@ pub const FakeMultipart = struct {
                     };
                     return not_found;
                 }
-                return media(&self.objects.items[index orelse return not_found], headers, fault, arena);
+                return media(&self.objects.items[index orelse return not_found], headers, accept_gzip, fault, arena);
             },
             .delete => {
                 self.counts.deletes += 1;
@@ -490,14 +501,20 @@ pub const FakeMultipart = struct {
     /// fake-gcs-server sends it. An object stored gzip-compressed is served
     /// decompressed and whole, the range ignored, as Cloud Storage
     /// transcodes it.
-    fn media(o: *const Stored, headers: []const Header, fault: Fault, arena: Allocator) Allocator.Error!Reply {
+    /// A gzip object comes decompressed, whole whatever range was asked,
+    /// unless the request takes gzip as sent: then its stored bytes come,
+    /// ranges and all, with `Content-Encoding: gzip`, as Cloud Storage and
+    /// fake-gcs-server serve them.
+    fn media(o: *const Stored, headers: []const Header, accept_gzip: bool, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         const hash = core.crc32c.toBase64(core.crc32c.hash(o.bytes));
         var reply_headers: std.ArrayList(Header) = .empty;
         try reply_headers.append(arena, .{ .name = "x-goog-generation", .value = try std.fmt.allocPrint(arena, "{d}", .{o.generation}) });
         try reply_headers.append(arena, .{ .name = "x-goog-hash", .value = try std.fmt.allocPrint(arena, "crc32c={s}", .{&hash}) });
+        try reply_headers.append(arena, .{ .name = "x-goog-stored-content-length", .value = try std.fmt.allocPrint(arena, "{d}", .{o.bytes.len}) });
         if (o.served) |served| {
             try reply_headers.append(arena, .{ .name = "x-goog-stored-content-encoding", .value = "gzip" });
-            return .{ .status = 200, .headers = reply_headers.items, .body = served, .cut = fault == .cut };
+            if (!accept_gzip) return .{ .status = 200, .headers = reply_headers.items, .body = served, .cut = fault == .cut };
+            try reply_headers.append(arena, .{ .name = "Content-Encoding", .value = "gzip" });
         }
         const size = o.bytes.len;
         var start: usize = 0;
@@ -1362,7 +1379,11 @@ pub const MultipartServer = struct {
         try r.readSliceAll(body);
 
         const full_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}{s}", .{ s.port, target });
-        const reply = s.fake.handle(method, full_url, content_type, headers.items, body, arena) catch |err| switch (err) {
+        // A client that offers gzip takes a gzip object's stored bytes.
+        const accept_gzip = for (headers.items) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) break std.mem.indexOf(u8, h.value, "gzip") != null;
+        } else false;
+        const reply = s.fake.handle(method, full_url, content_type, headers.items, body, accept_gzip, arena) catch |err| switch (err) {
             // Dropped, as a failing network drops it: no answer.
             error.ConnectionResetByPeer => return false,
             else => |e| return e,
@@ -1381,3 +1402,16 @@ pub const MultipartServer = struct {
         return true;
     }
 };
+
+/// `data` gzip-compressed by std, as a test's stored object. Owned. The
+/// output only fails for want of memory, so that is how any failure shows.
+pub fn gzipAlloc(gpa: Allocator, data: []const u8, options: std.compress.flate.Compress.Options) Allocator.Error![]u8 {
+    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+    defer out.deinit();
+    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(window);
+    var compress: std.compress.flate.Compress = std.compress.flate.Compress.init(&out.writer, window, .gzip, options) catch return error.OutOfMemory;
+    compress.writer.writeAll(data) catch return error.OutOfMemory;
+    compress.finish() catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
