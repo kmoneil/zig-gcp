@@ -8,17 +8,18 @@ modules it imports.
 | --- | --- | --- |
 | `pubsub` | Pub/Sub v1: publish, one call at a time or batched from many tasks, pull, a worker loop, acknowledge, and topic and subscription management | beta |
 | `secret_manager` | Secret Manager v1: read a secret's bytes, add versions, and manage secrets and their versions, global or regional | experimental |
-| `storage` | Cloud Storage JSON API: buckets, object metadata and listings, uploads from memory or any reader and downloads into any writer, streamed in constant memory, resumed after failures and checksummed both ways, preconditions, server-side copies, and signed URLs | experimental |
+| `storage` | Cloud Storage JSON API: buckets, object metadata and listings, uploads from memory, a file or any reader and downloads into any writer or file, streamed in constant memory or in parallel parts and ranges, resumed after failures and across processes, and checksummed both ways; preconditions, server-side copies, and signed URLs | experimental |
 | `auth` | Credentials for the service modules: `findDefault` picks between the metadata server on Google Cloud, the login `gcloud auth application-default login` saves (impersonating a service account or not), and a file the environment names. They sign signed URLs too, on this machine or through IAM. | experimental |
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` and `Signer` seams, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 749 unit, property and fuzz tests, Google's 29 V4 signing
+- Tested with 986 unit, property and fuzz tests, Google's 29 V4 signing
   vectors among them; 28 Pub/Sub integration tests that pass against both
   the emulator and production, and 20 more through a proxy that drops,
-  cuts and stalls the connection; 18 Cloud Storage tests against
-  fake-gcs-server and 9 against a real bucket, where uploads and
-  downloads cut off mid-body resume against Google itself; 12 Secret
+  cuts and stalls the connection; 22 Cloud Storage tests against
+  fake-gcs-server, and 38 against a real bucket, where uploads and
+  downloads cut off mid-body, or ended with their process, resume against
+  Google itself, plus 17 that sign URLs and POST policies for one; 12 Secret
   Manager tests against a real project, since it has no emulator; 10 auth
   tests against Google's token, STS and IAM Credentials endpoints; and a
   run on a Compute Engine VM, where the metadata server is the one that
@@ -559,8 +560,8 @@ pattern before it becomes part of a host name.
 
 A client for the Cloud Storage JSON API. Objects of any size stream both
 ways in constant memory, pick up where they stopped after a dropped
-connection, and are checked against the CRC-32C Cloud Storage keeps for
-every object.
+connection, or with a checkpoint after the process itself ended, and are
+checked against the CRC-32C Cloud Storage keeps for every object.
 
 ```zig
 const std = @import("std");
@@ -601,29 +602,32 @@ HTTP and never receives a token.
 
 ### Files of any size
 
-`uploadFrom` reads from any `std.Io.Reader`, and `download` writes into any
-`std.Io.Writer`:
+`uploadFile` sends a file, `uploadFrom` reads from any `std.Io.Reader`, and
+`download` writes into any `std.Io.Writer`:
 
 ```zig
 const file = try std.Io.Dir.cwd().openFile(io, "backup.tar", .{});
 defer file.close(io);
-var buffer: [64 * 1024]u8 = undefined;
-var reader = file.reader(io, &buffer);
-const size = (try file.stat(io)).size;
-var uploaded = try bucket.object("backups/backup.tar").uploadFrom(&reader.interface, .{ .size = size });
+var uploaded = try bucket.object("backups/backup.tar").uploadFile(file, .{
+    .content_type = "application/x-tar",
+});
 defer uploaded.deinit();
 ```
 
 - An upload goes through the resumable protocol in `chunk_size` pieces,
-  8 MiB by default and always a multiple of 256 KiB. One chunk stays in
-  memory until the server confirms it, so a resume never needs the reader
-  to go backwards; after a failure the client asks the server how much it
-  kept and carries on from there. `upload` does the same above
-  `single_request_limit` (8 MiB), slicing chunks from the caller's memory
-  instead of copying them. When the session itself is lost, `upload`
-  starts over from its bytes; `uploadFrom` cannot, since the reader has
-  moved on, so it returns `error.UploadSessionLost` for the caller to
-  reopen the source and try again.
+  8 MiB by default and always a multiple of 256 KiB; after a failure the
+  client asks the server how much it kept and carries on from there.
+  `uploadFile` reads the file at offsets, a chunk at a time, and its last
+  request carries the whole file's CRC32C, so Cloud Storage refuses an
+  object whose bytes differ before it exists: no read back, and nothing
+  to delete. `uploadFrom` keeps one chunk in memory until the server
+  confirms it, so a resume never needs the reader to go backwards.
+  `upload` does the same above `single_request_limit` (8 MiB), slicing
+  chunks from the caller's memory instead of copying them.
+- When the session itself is lost, expired or cancelled, `upload` and
+  `uploadFile` start over from their bytes; `uploadFrom` cannot, since
+  the reader has moved on, so it returns `error.UploadSessionLost` for the
+  caller to reopen the source and try again.
 - A download writes into the caller's writer as the bytes arrive, and
   never flushes it: the buffer is the caller's. A connection that drops
   mid-body resumes at the byte it stopped at, pinned to the generation the
@@ -632,8 +636,8 @@ defer uploaded.deinit();
   object.
 - `examples/gcs_cp.zig` copies a file up or down, as
   `zig build example-gcs_cp -- backup.tar gs://my-bucket/backups/backup.tar`
-  and back. Copying a 1 GiB file each way with it, the process peaked at
-  15 MiB resident going up and 5.5 MiB coming down.
+  and back. Copying a 1 GiB file each way with it on macOS, the process
+  peaked at 13.4 MiB resident going up and 5.0 MiB coming down.
 
 ### Checksums
 
@@ -642,6 +646,7 @@ Every object has a CRC-32C, and it is checked in both directions:
 | Call | Checked by | On a mismatch |
 | --- | --- | --- |
 | `upload` | The server, against the checksum the request carries | `error.InvalidArgument` (HTTP 400); nothing is stored |
+| `uploadFile` | The server, against the file's checksum, which the last request carries | Nothing is stored: stored bytes cannot be overwritten, so the session is cancelled and the file sent again, up to `retry.max_attempts` times, then `error.UploadSessionLost` |
 | `uploadFrom` with `options.crc32c` | The server, once the last chunk is in | The same |
 | `uploadFrom` without it | The client, which hashes the stream and compares it with the finished object | `error.ChecksumMismatch`; the object is deleted again, pinned to its generation |
 | `download`, `downloadAlloc` | The client, which hashes the bytes as they pass | `error.ChecksumMismatch`; the writer holds bytes to discard |
@@ -815,6 +820,9 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-23:
 | `bucket.listObjects(options)` | One page of objects, with `prefix`, a `delimiter` for folders, and paging |
 | `bucket.object(name).get(options)`, `.exists()`, `.delete(options)` | An object's metadata, whether it exists, and deleting it or one generation of it |
 | `.upload(data, options)`, `.uploadFrom(reader, options)` | Bytes in memory, or any reader |
+| `.uploadFile(file, options)` | A file, read at offsets, resumable in a later process with `options.checkpoint` |
+| `.uploadParallel(source, options)`, `.downloadParallel(destination, options)` | One object in parts or ranges, several at once |
+| `client.abandonTransfer(checkpoint)` | Drops what a checkpoint's unfinished transfer left on the server |
 | `.download(writer, options)`, `.downloadAlloc(max_bytes, options)` | Into any writer, or into memory up to a cap |
 | `.copyTo(dest, options)` | A server-side copy, across buckets too |
 | `.updateMetadata(options)` | Changes what an object says about itself, leaving its bytes alone |
@@ -825,9 +833,8 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-23:
 The default OAuth scope is `devstorage.read_write`; `Options.scope` picks
 `.read_only` or `.cloud_platform` instead. Not in this version: `update`
 (PUT, which replaces a whole resource where `patch` merges), parallel
-composite uploads, resumable sessions that outlive the process, parallel
-downloads, requester pays, customer-supplied encryption keys, listing old
-versions or soft-deleted objects, and gRPC.
+composite uploads, requester pays, customer-supplied encryption keys,
+listing old versions or soft-deleted objects, and gRPC.
 
 ### Metadata, after the upload
 
@@ -965,10 +972,13 @@ defer uploaded.deinit();
   with no second pass over the data. That is held to `options.crc32c`
   before anything is joined, so a file that changed under the upload
   writes nothing, and to the finished object afterwards.
-- **Failures.** Every failure aborts the upload, so no part is left to be
-  billed, and a cancel stops the workers and aborts too. No retry writes
-  twice: a part sent again replaces itself, and a finish repeated after a
-  lost answer names the same generation as the one that landed.
+- **Failures.** Without a checkpoint, every failure aborts the upload, so
+  no part is left to be billed, and a cancel stops the workers and aborts
+  too; with one, the parts stay for a later run, as
+  [Transfers that outlive the process](#transfers-that-outlive-the-process)
+  says. No retry writes twice: a part sent again replaces itself, and a
+  finish repeated after a lost answer names the same generation as the
+  one that landed.
 - **Emulators.** Against an emulator, which has no multipart uploads, the
   object goes up as one ordinary upload, with any conditions.
 
@@ -1018,9 +1028,10 @@ result is read back with one metadata request, which needs
 `storage.objects.get`, a permission Storage Object Creator does not grant.
 
 A process that dies mid-upload leaves its parts, and Cloud Storage bills
-them until the upload is aborted: unfinished uploads never expire. One
-that dies between the finish and the move leaves an object under
-`zig-gcp-tmp/`. Lifecycle rules clean up both:
+them until the upload is aborted: unfinished uploads never expire. With a
+checkpoint, a later run carries the upload on, or `abandonTransfer`
+aborts it. One that dies between the finish and the move leaves an
+object under `zig-gcp-tmp/`. Lifecycle rules clean up both:
 
 ```json
 { "rule": [
@@ -1088,11 +1099,136 @@ try std.Io.Dir.rename(cwd, "backup.tar.part", cwd, "backup.tar", io);
 
 On any failure the destination holds whatever arrived, so write to a
 temporary name and rename it on success, as `examples/gcs_cp.zig
---parallel N` does.
+--parallel N` does. With a checkpoint, a later run fetches only the ranges
+the file does not hold yet.
 
 Measured from this sandbox against a real bucket on 2026-09-24, 1 GiB in
 32 MiB ranges came down in 64.8 s eight at a time and 333.0 s one at a
 time, 5.14 times as fast.
+
+### Transfers that outlive the process
+
+A dropped connection is ridden out within a call. A process that ends
+partway, crashed, killed or restarted, loses its place, unless the
+transfer has a checkpoint: somewhere to keep what a later process needs to
+carry it on. `uploadFile` takes one, and so do `uploadParallel` and
+`downloadParallel` with a file.
+
+```zig
+var saved: storage.CheckpointFile = .init(io, state_dir, "db.tar.upload");
+var info = try bucket.object("backups/db.tar").uploadFile(file, .{
+    .content_type = "application/x-tar",
+    .checkpoint = saved.checkpoint(),
+});
+defer info.deinit();
+```
+
+After a failure, the same call with the same checkpoint, in this process
+or another, carries the transfer on:
+
+| Call | Saves | A later run |
+| --- | --- | --- |
+| `uploadFile` | The session URL, once, when it opens | Asks the session how much it holds, and sends the rest |
+| `uploadParallel` | The upload id, once, when it starts | Lists the parts the server holds, and sends the others |
+| `downloadParallel` | After every range it writes | Fetches only the ranges the file does not hold |
+
+- **Nothing about the data is taken on trust.** A later run re-reads
+  locally what the earlier one moved, the prefix, the parts or the
+  ranges, to rebuild the checksum that verifies the whole. A source file
+  whose size or modification time changed starts the transfer over. One
+  changed with its time put back is still caught: measured, the server
+  refused the resumed upload's last request with 400, and the file went
+  up again whole.
+- **What a failure leaves.** With a checkpoint, a failed or cancelled
+  transfer keeps its session or its parts for a later run, where one
+  without cleans up. A failure no later run could get past cleans up and
+  clears the checkpoint all the same: a checksum mismatch, a response the
+  library cannot use, a failed precondition, a source that could not be
+  read. A session that expired or was cancelled, and an upload that is
+  gone, start over by themselves.
+- **The state** is compact JSON with a version, readable for debugging
+  but not an API. A checkpoint of another transfer, another object or
+  kind, is refused with `error.CheckpointFailed` before anything is sent,
+  rather than orphan that transfer's session; so is a save that fails,
+  since the caller asked for a transfer that can resume.
+- **Abandoning.** `client.abandonTransfer(checkpoint)` drops what a
+  transfer left on the server, cancelling its session or aborting its
+  parts, and then clears the checkpoint. Left alone, a session expires in
+  a week, and parts stay billed until a lifecycle rule aborts them.
+- **A store of your own** is three functions on `storage.Checkpoint`:
+  `load`, `save` and `clear`. `CheckpointFile` keeps the state in one
+  file, replaced atomically, readable and writable by its owner only.
+
+An upload's state holds its session URL, and the URL is a credential:
+anyone who has it can write the object for up to a week. The library never
+logs it or puts it in `Diagnostics`; keep a custom store's copy as you keep
+credentials.
+
+`examples/gcs_cp.zig --resume STATE` keeps a `CheckpointFile`: kill a copy
+partway, run the same command again, and it carries on.
+
+Measured against a real bucket on 2026-09-25:
+
+- A 64 MiB upload cut 3 MiB into its fifth 8 MiB chunk had 2.75 MiB of
+  that chunk stored, in 256 KiB steps; a second client sent exactly the
+  other 29.25 MiB, and its last request carried the file's CRC32C.
+- A cancelled session answers 499 to the cancel, and to every status
+  query or cancel after it. Google documents 404 and 410 for a session
+  that expired; the library takes all three for a session that is gone.
+- A create-only upload whose name another writer took while its session
+  was open is refused with 412 at its last chunk: the condition is held
+  again when the object would come into being, which Google's
+  documentation does not say.
+- ListParts pages with `max-parts`, and says `IsTruncated`, with a
+  `NextPartNumberMarker` that is 0 on the last page. A part carries its
+  number, time, ETag and size, and no checksum.
+
+A plain `download` takes no checkpoint, but can be carried on by hand:
+fetch the rest as a range, pinned to the generation the first run read,
+and join the checksums, since a range has none of its own to meet.
+`core.crc32c` does the joining.
+
+```zig
+/// Carries on a download an earlier run left partway in `file`, from the
+/// generation it was reading, and holds the whole to the object's CRC32C.
+fn finishDownload(io: std.Io, object: storage.Object, file: std.Io.File, generation: u64) !void {
+    var info = try object.get(.{ .generation = generation });
+    defer info.deinit();
+    const have = try file.length(io);
+    var buffer: [64 * 1024]u8 = undefined;
+
+    // The rest, pinned to the generation: an overwrite since the first
+    // run is error.NotFound, never a file spliced from two objects.
+    var rest_crc: u32 = 0;
+    var rest_len: u64 = 0;
+    if (have < info.value.size) {
+        var writer = file.writer(io, &buffer);
+        try writer.seekTo(have);
+        const rest = try object.download(&writer.interface, .{
+            .generation = generation,
+            .range = .{ .offset = have },
+        });
+        try writer.interface.flush();
+        rest_crc = rest.crc32c;
+        rest_len = rest.bytes_written;
+    }
+
+    // A range has no checksum of its own to meet, so join its CRC32C to
+    // that of the bytes the file already held, and compare the whole.
+    var hasher: core.crc32c.Hasher = .init();
+    var reader = file.reader(io, &buffer);
+    var left = have;
+    while (left > 0) {
+        const chunk = try reader.interface.peekGreedy(1);
+        const n: usize = @intCast(@min(chunk.len, left));
+        hasher.update(chunk[0..n]);
+        reader.interface.toss(n);
+        left -= n;
+    }
+    const whole = core.crc32c.combine(hasher.final(), rest_crc, rest_len);
+    if (info.value.crc32c != whole) return error.ChecksumMismatch;
+}
+```
 
 ### The emulator is not production
 
@@ -1108,8 +1244,9 @@ differences it found:
   never answers 304.
 - It takes a resumable upload's status query for the final request, and
   finishes a truncated object. The client refuses that answer with
-  `error.InvalidResponse` and deletes the object, so an interrupted upload
-  can only be tested against Google.
+  `error.InvalidResponse` and deletes the object, so an interrupted upload,
+  carried on in the same process or a later one, can only be tested
+  against Google.
 - It checks a declared CRC-32C on multipart uploads, not on resumable
   ones.
 - It names the object's checksum on every range read; Cloud Storage names
@@ -1121,7 +1258,7 @@ differences it found:
 - It has no multipart uploads at all, and no `objects.move`: it takes a
   move for an update of an object named `{source}/moveTo/o/{destination}`,
   and answers 404. So `uploadParallel` sends an ordinary upload to an
-  emulator, with any conditions. The library's own tests run the
+  emulator, with any conditions, and ignores a checkpoint, with a warning. The library's own tests run the
   multipart upload and the move against an in-memory fake and a loopback
   server that speak them.
 - It does serve ranges pinned to a generation, and decompresses a
@@ -1222,14 +1359,17 @@ GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth application-default pri
 # Cloud Storage against fake-gcs-server. Every test creates a zigps-*
 # bucket and deletes it.
 docker run -d -p 4443:4443 fsouza/fake-gcs-server -scheme http -port 4443
+# Or without Docker: go install github.com/fsouza/fake-gcs-server@latest
+fake-gcs-server -backend memory -scheme http -port 4443
 STORAGE_EMULATOR_HOST=http://127.0.0.1:4443 zig build test-integration
 
 # And against a real bucket, for what an emulator cannot show: every
 # precondition enforced, checksums checked by the server, gzip transcoding,
-# and uploads and downloads cut mid-body that resume against Google itself.
-# Objects live under zig-gcp-test/ and are deleted. The token needs Storage
-# Object Admin on the bucket, which must not have object versioning on. It
-# moves about 230 MiB over the wire, 100 MiB of it in one object each way.
+# uploads and downloads cut mid-body that resume against Google itself, and
+# transfers a second client carries on from a checkpoint. Objects live under
+# zig-gcp-test/ and are deleted. The token needs Storage Object Admin on the
+# bucket, which must not have object versioning on. It moves about 5.7 GiB
+# over the wire, 1 GiB of it in one object at a time.
 GCP_TEST_BUCKET=my-bucket GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
     zig build test-integration-gcp
 

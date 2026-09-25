@@ -7,11 +7,13 @@
 //!     ... -- backup.tar gs://my-bucket/backup.tar --no-clobber
 //!     ... -- backup.tar gs://my-bucket/backup.tar --parallel 8
 //!     ... -- gs://my-bucket/backup.tar restored.tar --parallel 8
+//!     ... -- backup.tar gs://my-bucket/backup.tar --resume backup.tar.state
 //!
-//! Both directions are checksummed end to end. An upload hashes the file as
-//! it streams and compares the result with the finished object; a download
-//! is checked against the checksum Cloud Storage keeps, and goes to
-//! `<file>.part` first, renamed into place only once it has verified.
+//! Both directions are checksummed end to end. An upload reads the file at
+//! offsets, a chunk at a time, and its last request carries the file's
+//! CRC32C, so Cloud Storage refuses an object whose bytes differ; a
+//! download is checked against the checksum Cloud Storage keeps, and goes
+//! to `<file>.part` first, renamed into place only once it has verified.
 //! `--no-clobber` refuses to replace an existing object, with a
 //! precondition the server enforces. `--parallel N` moves the file in
 //! parts, N at a time on connections of their own, for a large file on a
@@ -19,6 +21,15 @@
 //! written at their offsets. With `--no-clobber` too, a parallel upload
 //! finishes under a temporary name and moves into place only if nothing
 //! took the name meanwhile.
+//!
+//! `--resume STATE` keeps what a later run needs in the file STATE, so a
+//! copy that failed, or whose process was killed, carries on where it
+//! stopped when the same command runs again: an upload in the session or
+//! the parts Cloud Storage already holds, a download in the ranges
+//! `<file>.part` already holds. A download that resumes goes in ranges,
+//! one at a time unless `--parallel` says more. The state is removed once
+//! the copy is done, and holds an upload's session URL, which lets anyone
+//! who has it write the object: keep it as private as a credential.
 //!
 //! Credentials come from `auth.findDefault`: the file
 //! `GOOGLE_APPLICATION_CREDENTIALS` names, then the one `gcloud auth
@@ -38,8 +49,8 @@ pub const std_options: std.Options = .{
     },
 };
 
-const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber] [--parallel N]\n" ++
-    "       gcs_cp gs://<bucket>/<object> <file> [--parallel N]\n";
+const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber] [--parallel N] [--resume STATE]\n" ++
+    "       gcs_cp gs://<bucket>/<object> <file> [--parallel N] [--resume STATE]\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -51,6 +62,7 @@ pub fn main(init: std.process.Init) !void {
     var count: usize = 0;
     var no_clobber = false;
     var parallel: ?u16 = null;
+    var state: ?[]const u8 = null;
     var bad = false;
     const args = try init.minimal.args.toSlice(arena);
     var i: usize = @min(1, args.len);
@@ -62,6 +74,10 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             parallel = if (i < args.len) std.fmt.parseInt(u16, args[i], 10) catch null else null;
             if (parallel == null) bad = true;
+        } else if (std.mem.eql(u8, arg, "--resume")) {
+            i += 1;
+            state = if (i < args.len) args[i] else null;
+            if (state == null) bad = true;
         } else if (count < paths.len) {
             paths[count] = arg;
             count += 1;
@@ -100,9 +116,9 @@ pub fn main(init: std.process.Init) !void {
 
     const started = std.Io.Clock.awake.now(init.io);
     if (to_remote) |remote| {
-        try upload(&client, init.io, paths[0], remote, no_clobber, parallel, out, &diag, started);
+        try upload(&client, init.io, paths[0], remote, no_clobber, parallel, state, out, &diag, started);
     } else {
-        try download(&client, init.io, arena, from_remote.?, paths[1], parallel, out, &diag, started);
+        try download(&client, init.io, arena, from_remote.?, paths[1], parallel, state, out, &diag, started);
     }
     try out.flush();
 }
@@ -128,6 +144,7 @@ fn upload(
     remote: Remote,
     no_clobber: bool,
     parallel: ?u16,
+    state: ?[]const u8,
     out: *std.Io.Writer,
     diag: *const storage.Diagnostics,
     started: std.Io.Timestamp,
@@ -135,12 +152,15 @@ fn upload(
     const file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const preconditions: storage.Preconditions = if (no_clobber) .does_not_exist else .{};
+    var saved: storage.CheckpointFile = .init(io, std.Io.Dir.cwd(), state orelse "");
+    const checkpoint: ?storage.Checkpoint = if (state != null) saved.checkpoint() else null;
     if (parallel) |concurrency| {
         // Each part is read at its own offset, and checked on its own.
         var info = client.bucket(remote.bucket).object(remote.name).uploadParallel(.{ .file = file }, .{
             .concurrency = concurrency,
             .preconditions = preconditions,
-        }) catch |err| return refused(err, no_clobber, remote, diag);
+            .checkpoint = checkpoint,
+        }) catch |err| return refused(err, no_clobber, remote, diag, io, state);
         defer info.deinit();
         const ms = elapsedMs(io, started);
         try out.print("{s} -> gs://{s}/{s} through uploadParallel, concurrency {d}: {d} bytes in {d} ms ({d:.1} MiB/s), generation {d}, crc32c {?x:0>8}\n", .{
@@ -148,16 +168,12 @@ fn upload(
         });
         return;
     }
-    // A declared size lets the server check the upload is whole, and the
-    // library that the file neither shrank nor grew while it was read.
-    const size = (try file.stat(io)).size;
-    var buffer: [64 * 1024]u8 = undefined;
-    var reader = file.reader(io, &buffer);
-
-    var info = client.bucket(remote.bucket).object(remote.name).uploadFrom(&reader.interface, .{
-        .size = size,
+    // The file is read at offsets, so a lost session starts over from it,
+    // and a later run can carry on from what the server holds.
+    var info = client.bucket(remote.bucket).object(remote.name).uploadFile(file, .{
         .preconditions = preconditions,
-    }) catch |err| return refused(err, no_clobber, remote, diag);
+        .checkpoint = checkpoint,
+    }) catch |err| return refused(err, no_clobber, remote, diag, io, state);
     defer info.deinit();
     const ms = elapsedMs(io, started);
     try out.print("{s} -> gs://{s}/{s}: {d} bytes in {d} ms ({d:.1} MiB/s), generation {d}, crc32c {?x:0>8}\n", .{
@@ -166,12 +182,27 @@ fn upload(
 }
 
 /// An upload's failure, told as `--no-clobber`'s refusal where it is one.
-fn refused(err: anyerror, no_clobber: bool, remote: Remote, diag: *const storage.Diagnostics) anyerror {
+fn refused(err: anyerror, no_clobber: bool, remote: Remote, diag: *const storage.Diagnostics, io: std.Io, state: ?[]const u8) anyerror {
     if (err == error.FailedPrecondition and no_clobber) {
         std.debug.print("gs://{s}/{s} exists, and --no-clobber keeps it\n", .{ remote.bucket, remote.name });
         return err;
     }
-    return fail(err, diag);
+    return failResumable(err, diag, io, state);
+}
+
+/// A failure, and whether running the command again carries the copy on:
+/// the library keeps the state only for a transfer that can resume.
+fn failResumable(err: anyerror, diag: *const storage.Diagnostics, io: std.Io, state: ?[]const u8) anyerror {
+    const failed = fail(err, diag);
+    if (state) |path| if (stateKept(io, path)) {
+        std.debug.print("{s} holds where the copy stopped: run the same command again to carry it on\n", .{path});
+    };
+    return failed;
+}
+
+fn stateKept(io: std.Io, path: []const u8) bool {
+    std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    return true;
 }
 
 fn download(
@@ -181,26 +212,33 @@ fn download(
     remote: Remote,
     path: []const u8,
     parallel: ?u16,
+    state: ?[]const u8,
     out: *std.Io.Writer,
     diag: *const storage.Diagnostics,
     started: std.Io.Timestamp,
 ) !void {
     // The bytes land in a file of their own until they have verified, so a
     // failed or corrupted download never leaves a file that looks finished.
+    // One a later run can carry on stays, with the state that says which
+    // ranges it holds.
     const cwd = std.Io.Dir.cwd();
     const part = try std.fmt.allocPrint(arena, "{s}.part", .{path});
     var finished = false;
-    defer if (!finished) cwd.deleteFile(io, part) catch {};
+    defer if (!finished and !(state != null and stateKept(io, state.?))) cwd.deleteFile(io, part) catch {};
+    var saved: storage.CheckpointFile = .init(io, cwd, state orelse "");
 
     const result = r: {
-        const file = try cwd.createFile(io, part, .{});
+        // A resumed download reads back the ranges the file holds, so it
+        // opens the file as it is.
+        const file = try cwd.createFile(io, part, .{ .read = state != null, .truncate = state == null });
         defer file.close(io);
-        if (parallel) |concurrency| {
+        if (parallel != null or state != null) {
             // Each range is written at its own offset, and the ranges'
             // checksums combine into the whole object's.
             break :r client.bucket(remote.bucket).object(remote.name).downloadParallel(.{ .file = file }, .{
-                .concurrency = concurrency,
-            }) catch |err| return fail(err, diag);
+                .concurrency = parallel orelse 1,
+                .checkpoint = if (state != null) saved.checkpoint() else null,
+            }) catch |err| return failResumable(err, diag, io, state);
         }
         var buffer: [64 * 1024]u8 = undefined;
         var writer = file.writer(io, &buffer);
@@ -218,7 +256,7 @@ fn download(
         remote.bucket,
         remote.name,
         path,
-        if (parallel != null) " through downloadParallel" else "",
+        if (parallel != null or state != null) " through downloadParallel" else "",
         result.bytes_written,
         ms,
         mibPerSecond(result.bytes_written, ms),

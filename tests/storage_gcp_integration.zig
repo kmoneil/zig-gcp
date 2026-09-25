@@ -20,10 +20,16 @@
 //! ago.
 //!
 //! The largest tests move 1 GiB up twice, and 1 GiB up and twice down,
-//! and print the throughput; the suite as a whole moves about 5.4 GiB over
+//! and print the throughput; the suite as a whole moves about 5.7 GiB over
 //! the wire, and its copies are server-side. One copy is stored as
 //! NEARLINE, whose 30-day minimum is billed on delete: about a tenth of a
 //! cent.
+//!
+//! The resume tests end a first run partway, as a process that died there
+//! would leave it, and carry the transfer on with a second client from a
+//! checkpoint on disk. They abandon whatever a failure of theirs leaves
+//! open, and the sweep aborts multipart uploads a crashed run left open
+//! for more than a day, since their parts are billed until then.
 //!
 //! Faults come from `core.testing.FaultTransport` around the real HTTP
 //! transport: it closes real connections partway through real bodies, so
@@ -1083,6 +1089,29 @@ test "sweep: delete anything a crashed run left under zig-gcp-test/ or zig-gcp-t
         }
     }
     if (deleted > 0) std.debug.print("swept {d} leftover test object(s)\n", .{deleted});
+
+    // And the multipart uploads a crashed run left open, whose parts are
+    // billed until they are aborted: the resume tests leave some open on
+    // purpose, and a run that dies before it abandons them keeps them.
+    var aborted: usize = 0;
+    for ([_][]const u8{ "zig-gcp-test/", "zig-gcp-tmp/" }) |prefix| {
+        const path = try std.fmt.allocPrint(f.arena.allocator(), "/{s}?uploads&prefix={s}", .{ f.bucket_name, prefix });
+        const res = try raw(&f, .GET, path, &.{}, null, null);
+        try expectStatus(200, res);
+        var rest = res.body;
+        while (std.mem.indexOf(u8, rest, "<Upload>")) |start| {
+            const end = std.mem.indexOfPos(u8, rest, start, "</Upload>") orelse break;
+            const upload = rest[start..end];
+            rest = rest[end..];
+            const key = xmlText(upload, "Key") orelse continue;
+            const id = xmlText(upload, "UploadId") orelse continue;
+            const initiated = storage.parseTimestamp(xmlText(upload, "Initiated") orelse continue) catch continue;
+            if (now - initiated.nanoseconds < day) continue;
+            const abort = try raw(&f, .DELETE, try xmlPath(&f, key, try uploadIdQuery(&f, id, "")), &.{}, null, null);
+            if (abort.status == 204) aborted += 1;
+        }
+    }
+    if (aborted > 0) std.debug.print("aborted {d} leftover multipart upload(s)\n", .{aborted});
 }
 
 // Parallel uploads and copies with changes: the parallel-uploads-and-copy
@@ -2059,5 +2088,658 @@ test "30. create-only parallel upload: a lost move answer is settled by reading,
     try testing.expect(repeat.status.? == 404 or repeat.status.? == 412);
     try testing.expectEqual(core.crc32c.hash(data), info.value.crc32c.?);
     try f.expectContent(obj, data);
+    try testing.expectEqual(0, try tempObjects(&f));
+}
+
+// Persistent sessions: the persistent-sessions spec's section 8,
+// real-bucket cases 1 to 7. A first run ends partway, as a process that
+// died there would leave it, and a second run carries the transfer on
+// from its checkpoint.
+
+/// A client that gives up at its first failure, on the fixture's
+/// connection but through faults of its own: how a test ends a run
+/// partway, leaving on the server and in the checkpoint what a process
+/// that died there would leave.
+const Dying = struct {
+    faults: FaultTransport,
+    client: storage.Client,
+
+    fn init(d: *Dying, f: *Fixture, plan: []FaultTransport.Fault, chunk_size: usize) !void {
+        d.faults = .{ .inner = f.http.transport(), .plan = plan };
+        errdefer d.faults.deinit();
+        d.client = try .init(testing.allocator, testing.io, .{
+            .token_provider = f.token.provider(),
+            .transport = d.faults.transport(),
+            .diagnostics = &f.diag,
+            .chunk_size = chunk_size,
+            .retry = .{ .max_attempts = 1 },
+            .request_timeout_ms = 120_000,
+            .user_agent = Fixture.user_agent,
+        });
+    }
+
+    fn deinit(d: *Dying) void {
+        d.client.deinit();
+        d.faults.deinit();
+    }
+
+    fn object(d: *Dying, f: *Fixture, what: []const u8) !storage.Object {
+        return d.client.bucket(f.bucket_name).object((try f.object(what)).name);
+    }
+};
+
+/// A checkpoint that fails every save after the first `saves_allowed`,
+/// over a real file store: how a download's run ends partway, its state on
+/// disk.
+const DyingCheckpoint = struct {
+    inner: storage.Checkpoint,
+    saves_allowed: u32,
+
+    fn checkpoint(self: *DyingCheckpoint) storage.Checkpoint {
+        return .{ .ptr = self, .vtable = &.{ .load = load, .save = save, .clear = clear } };
+    }
+
+    fn load(ptr: *anyopaque, arena: Allocator) storage.Checkpoint.Error!?[]const u8 {
+        const self: *DyingCheckpoint = @ptrCast(@alignCast(ptr));
+        return self.inner.load(arena);
+    }
+
+    fn save(ptr: *anyopaque, state: []const u8) storage.Checkpoint.Error!void {
+        const self: *DyingCheckpoint = @ptrCast(@alignCast(ptr));
+        if (self.saves_allowed == 0) return error.CheckpointFailed;
+        self.saves_allowed -= 1;
+        return self.inner.save(state);
+    }
+
+    fn clear(ptr: *anyopaque) void {
+        const self: *DyingCheckpoint = @ptrCast(@alignCast(ptr));
+        self.inner.clear();
+    }
+};
+
+/// A file of `size` pattern bytes, open for reading and writing.
+fn patternFile(dir: std.Io.Dir, name: []const u8, seed: u64, size: u64) !std.Io.File {
+    const file = try dir.createFile(testing.io, name, .{ .read = true });
+    errdefer file.close(testing.io);
+    var buf: [64 * 1024]u8 = undefined;
+    var writer = file.writer(testing.io, &buf);
+    var block: [64 * 1024]u8 = undefined;
+    var i: u64 = 0;
+    while (i < size) {
+        const n: usize = @intCast(@min(block.len, size - i));
+        for (block[0..n], 0..) |*b, k| b.* = patternByte(seed, i + k);
+        try writer.interface.writeAll(block[0..n]);
+        i += n;
+    }
+    try writer.interface.flush();
+    return file;
+}
+
+fn hasState(dir: std.Io.Dir, name: []const u8) !bool {
+    dir.access(testing.io, name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => |e| return e,
+    };
+    return true;
+}
+
+/// A string field of the state a checkpoint file holds, for a test to act
+/// on as another process would. Never printed: a session URL is a
+/// credential.
+fn savedField(f: *Fixture, dir: std.Io.Dir, name: []const u8, field: []const u8) ![]const u8 {
+    const arena = f.arena.allocator();
+    const bytes = try dir.readFileAlloc(testing.io, name, arena, .limited(64 * 1024));
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{});
+    return switch (parsed.object.get(field) orelse return error.TestMissingField) {
+        .string => |s| s,
+        else => error.TestMissingField,
+    };
+}
+
+/// A URL fit to print: the origin dropped, and an upload id's value
+/// elided, since a resumable session's is a credential.
+fn redacted(f: *Fixture, url: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(f.arena.allocator());
+    const origin = "https://storage.googleapis.com";
+    var i: usize = if (std.mem.startsWith(u8, url, origin)) origin.len else 0;
+    while (i < url.len) {
+        const value_start = for ([_][]const u8{ "upload_id=", "uploadId=" }) |key| {
+            if (std.mem.startsWith(u8, url[i..], key)) break i + key.len;
+        } else null;
+        if (value_start) |start| {
+            try out.writer.print("{s}...", .{url[i..start]});
+            i = std.mem.indexOfScalarPos(u8, url, start, '&') orelse url.len;
+        } else {
+            try out.writer.writeByte(url[i]);
+            i += 1;
+        }
+    }
+    return out.written();
+}
+
+/// Every exchange from `from` on, one line each, fit to print.
+fn printExchanges(f: *Fixture, from: usize) !void {
+    for (f.faults.exchanges.items[from..]) |e| {
+        std.debug.print("  {t} {?d}, {d} bytes: {s}\n", .{ e.method, e.status, e.body_len, try redacted(f, e.url) });
+    }
+}
+
+/// A request to a resumable session's own URL, which needs no token: the
+/// URL is the credential. A PUT is a status query, with an empty body.
+fn toSession(f: *Fixture, method: core.transport.Method, session: []const u8, content_range: ?[]const u8) !core.transport.StreamResponse {
+    const headers = [_]Header{.{ .name = "Content-Range", .value = content_range orelse "" }};
+    const empty = [_][]const u8{""};
+    return f.http.transport().sendStream(.{
+        .method = method,
+        .url = session,
+        .headers = if (content_range != null) &headers else &.{},
+        .body = if (method == .PUT) .{ .segments = &empty } else .none,
+    }, f.arena.allocator());
+}
+
+/// `?uploadId=ID` and `rest`, the id escaped as a query value.
+fn uploadIdQuery(f: *Fixture, id: []const u8, rest: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(f.arena.allocator());
+    try out.writer.writeAll("?uploadId=");
+    try core.query.writeValue(&out.writer, id);
+    try out.writer.writeAll(rest);
+    return out.written();
+}
+
+/// The CRC32C a request's `X-Goog-Hash: crc32c=...` names.
+fn hashHeaderCrc(value: []const u8) !u32 {
+    if (!std.mem.startsWith(u8, value, "crc32c=")) return error.TestUnexpectedHash;
+    return core.crc32c.fromBase64(value["crc32c=".len..]);
+}
+
+/// Streams an object through a hash, and holds it to `expected`.
+fn expectObjectCrc(f: *Fixture, obj: storage.Object, expected: u32) !void {
+    var sink = hashingSink();
+    const result = obj.download(&sink.writer, .{}) catch |err| return f.report(err);
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(expected, sink.hasher.final());
+}
+
+test "31. sessions: 64 MiB through uploadFile, cut at a drawn chunk, carried on by a second client" {
+    const size: u64 = 64 * 1024 * 1024;
+    const chunk = 8 * 1024 * 1024;
+    var draw: [1]u8 = undefined;
+    testing.io.random(&draw);
+    // The chunk the first run dies in, counted from 0: never the first,
+    // so the server holds something, and never the last.
+    const cut: u32 = 1 + draw[0] % 6;
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .chunk_size = chunk, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try patternFile(tmp.dir, "source.bin", 31, size);
+    defer file.close(testing.io);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "source.bin.upload");
+    defer f.client.abandonTransfer(store.checkpoint()) catch {};
+
+    // 1. The first run opens its session, saves it, sends `cut` chunks
+    // whole, and dies 3 MiB into the next.
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .PUT, .url_contains = "upload_id=", .skip = cut, .action = .{ .cut_request_body = 3 * 1024 * 1024 } },
+    };
+    var dying: Dying = undefined;
+    try dying.init(&f, &plan, chunk);
+    defer dying.deinit();
+    const target = try dying.object(&f, "resumed-64m.bin");
+    if (target.uploadFile(file, .{ .checkpoint = store.checkpoint() })) |finished| {
+        var owned = finished;
+        owned.deinit();
+        return error.TestExpectedFailure;
+    } else |err| std.debug.print("the first run, cut in chunk {d} of 8: error.{t}\n", .{ cut + 1, err });
+    try testing.expect(plan[0].fired);
+    try testing.expect(try hasState(tmp.dir, "source.bin.upload"));
+
+    // The second client asks the session where it stands, sends only what
+    // the server does not hold, and its last request carries the whole
+    // file's CRC32C.
+    const before = f.faults.exchanges.items.len;
+    const obj = f.bucket().object(target.name);
+    var info = obj.uploadFile(file, .{ .checkpoint = store.checkpoint() }) catch |err| return f.report(err);
+    defer info.deinit();
+    const expected = patternCrc(31, size);
+    try testing.expectEqual(size, info.value.size);
+    try testing.expectEqual(expected, info.value.crc32c.?);
+    try testing.expect(!try hasState(tmp.dir, "source.bin.upload"));
+    try printExchanges(&f, before);
+    const exchanges = f.faults.exchanges.items[before..];
+    const query = exchanges[0];
+    try testing.expectEqual(.PUT, query.method);
+    try testing.expectEqual(0, query.body_len);
+    try testing.expectEqualStrings("bytes */67108864", query.header("Content-Range").?);
+    try testing.expectEqual(308, query.status.?);
+    const kept = try keptFromRange(query.responseHeader("Range"));
+    try testing.expect(kept >= cut * chunk and kept < (cut + 1) * chunk);
+    var sent: u64 = 0;
+    for (exchanges[1..]) |e| {
+        try testing.expectEqual(.PUT, e.method);
+        sent += e.body_len;
+    }
+    try testing.expectEqual(size - kept, sent);
+    const last = exchanges[exchanges.len - 1];
+    try testing.expectEqual(expected, try hashHeaderCrc(last.header("X-Goog-Hash").?));
+    try testing.expect(last.status.? == 200 or last.status.? == 201);
+    std.debug.print("the second run: the server held {d} bytes, {d} into the cut chunk; {d} more went in {d} requests\n", .{
+        kept, kept - cut * chunk, sent, exchanges.len - 1,
+    });
+    try expectObjectCrc(&f, obj, expected);
+}
+
+test "32. sessions: a source changed under its checkpoint, its time put back, is refused by the server's checksum and sent again whole" {
+    const size: u64 = 6 * 1024 * 1024;
+    const chunk = 1024 * 1024;
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .chunk_size = chunk, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try patternFile(tmp.dir, "source.bin", 32, size);
+    defer file.close(testing.io);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "source.bin.upload");
+    defer f.client.abandonTransfer(store.checkpoint()) catch {};
+
+    // The first run dies in its fourth chunk, three whole ones in.
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .PUT, .url_contains = "upload_id=", .skip = 3, .action = .{ .cut_request_body = 512 * 1024 } },
+    };
+    var dying: Dying = undefined;
+    try dying.init(&f, &plan, chunk);
+    defer dying.deinit();
+    const target = try dying.object(&f, "changed.bin");
+    if (target.uploadFile(file, .{ .checkpoint = store.checkpoint() })) |finished| {
+        var owned = finished;
+        owned.deinit();
+        return error.TestExpectedFailure;
+    } else |_| {}
+    try testing.expect(plan[0].fired);
+
+    // 2. A byte changes inside what the server holds, and the file's
+    // modification time is put back, as `touch -r` or `rsync -t` would
+    // put it: the size and time that guard a resume see nothing.
+    const stat = try file.stat(testing.io);
+    try file.writePositionalAll(testing.io, &.{patternByte(32, 10) ^ 0xff}, 10);
+    try file.setTimestamps(testing.io, .{ .modify_timestamp = .{ .new = stat.mtime } });
+    try testing.expectEqual(stat.mtime.nanoseconds, (try file.stat(testing.io)).mtime.nanoseconds);
+    const changed = try fileCrc(file);
+
+    // The resume re-reads the prefix from the changed file, so the
+    // checksum its last request carries is the changed file's, and the
+    // server, holding the old prefix, refuses it. Stored bytes cannot be
+    // overwritten, so the session is cancelled and the file sent again.
+    const before = f.faults.exchanges.items.len;
+    const obj = f.bucket().object(target.name);
+    var info = obj.uploadFile(file, .{ .checkpoint = store.checkpoint() }) catch |err| return f.report(err);
+    defer info.deinit();
+    try printExchanges(&f, before);
+    try testing.expectEqual(changed, info.value.crc32c.?);
+    try testing.expect(!try hasState(tmp.dir, "source.bin.upload"));
+    const exchanges = f.faults.exchanges.items[before..];
+    const refused = for (exchanges, 0..) |e, i| {
+        if (e.header("X-Goog-Hash") != null) break i;
+    } else return error.TestExpectedFinish;
+    try testing.expectEqual(changed, try hashHeaderCrc(exchanges[refused].header("X-Goog-Hash").?));
+    try testing.expectEqual(400, exchanges[refused].status.?);
+    const rest = exchanges[refused + 1 ..];
+    try testing.expect(rest.len >= 3);
+    try testing.expectEqual(.DELETE, rest[0].method);
+    try testing.expectEqual(.POST, rest[1].method);
+    std.debug.print("the finish over the old prefix: HTTP 400; the cancel: HTTP {?d}; then a new session, {d} bytes\n", .{
+        rest[0].status, size,
+    });
+    try expectObjectCrc(&f, obj, changed);
+}
+
+/// Creates `other` just before a resumable upload's last request, the one
+/// carrying the file's checksum: another writer taking the name while a
+/// create-only session is open.
+const CreateBeforeFinish = struct {
+    inner: core.transport.Transport,
+    other: storage.Object,
+    created: bool = false,
+
+    fn transport(self: *CreateBeforeFinish) core.transport.Transport {
+        return .{ .ptr = self, .vtable = &.{ .send = send, .sendStream = sendStream } };
+    }
+
+    fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
+        const self: *CreateBeforeFinish = @ptrCast(@alignCast(ptr));
+        return self.inner.send(req, arena);
+    }
+
+    fn sendStream(ptr: *anyopaque, req: core.transport.StreamRequest, arena: Allocator) core.transport.StreamError!core.transport.StreamResponse {
+        const self: *CreateBeforeFinish = @ptrCast(@alignCast(ptr));
+        if (!self.created and req.method == .PUT) {
+            for (req.headers) |h| {
+                if (!std.ascii.eqlIgnoreCase(h.name, "X-Goog-Hash")) continue;
+                self.created = true;
+                var info = self.other.upload("another writer's bytes\n", .{}) catch return error.NetworkFailure;
+                info.deinit();
+                break;
+            }
+        }
+        return self.inner.sendStream(req, arena);
+    }
+};
+
+test "33. sessions: a create-only session is refused with 412 at its last chunk when another writer's object appeared meanwhile" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const name = (try f.object("raced-session.bin")).name;
+    var other: storage.Client = try .init(testing.allocator, testing.io, .{
+        .token_provider = f.token.provider(),
+        .user_agent = Fixture.user_agent,
+    });
+    defer other.deinit();
+    var creator: CreateBeforeFinish = .{ .inner = f.faults.transport(), .other = other.bucket(f.bucket_name).object(name) };
+    var client: storage.Client = try .init(testing.allocator, testing.io, .{
+        .token_provider = f.token.provider(),
+        .transport = creator.transport(),
+        .diagnostics = &f.diag,
+        .chunk_size = 1024 * 1024,
+        .user_agent = Fixture.user_agent,
+    });
+    defer client.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try patternFile(tmp.dir, "source.bin", 33, 3 * 1024 * 1024 + 5);
+    defer file.close(testing.io);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "source.bin.upload");
+    defer f.client.abandonTransfer(store.checkpoint()) catch {};
+
+    // 3. The precondition goes on the request that opens the session; the
+    // object appears after it, before the last chunk. Measured: the
+    // finish is refused with 412, so the condition is held again when the
+    // object would come into being, which the docs do not say.
+    const before = f.faults.exchanges.items.len;
+    const result = client.bucket(f.bucket_name).object(name).uploadFile(file, .{
+        .preconditions = .does_not_exist,
+        .checkpoint = store.checkpoint(),
+    });
+    try testing.expect(creator.created);
+    try printExchanges(&f, before);
+    if (result) |finished| {
+        var owned = finished;
+        owned.deinit();
+        std.debug.print("the session finished over the other writer's object\n", .{});
+        return error.TestExpectedFailure;
+    } else |err| {
+        std.debug.print("the last chunk, refused: error.{t} (HTTP {d} {s}: {s})\n", .{ err, f.diag.http_status, f.diag.status(), f.diag.message() });
+        try testing.expectEqual(error.FailedPrecondition, err);
+    }
+    const exchanges = f.faults.exchanges.items[before..];
+    const finish = for (exchanges) |e| {
+        if (e.header("X-Goog-Hash") != null) break e;
+    } else return error.TestExpectedFinish;
+    try testing.expectEqual(412, finish.status.?);
+    // The other writer's object stands, and a refusal a resume could only
+    // repeat drops the session and the checkpoint.
+    try f.expectContent(f.bucket().object(name), "another writer's bytes\n");
+    try testing.expect(!try hasState(tmp.dir, "source.bin.upload"));
+}
+
+test "34. sessions: a cancelled session answers 499 to everything after, and a resume starts over" {
+    const size: u64 = 3 * 1024 * 1024;
+    const chunk = 1024 * 1024;
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .chunk_size = chunk, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try patternFile(tmp.dir, "source.bin", 34, size);
+    defer file.close(testing.io);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "source.bin.upload");
+    defer f.client.abandonTransfer(store.checkpoint()) catch {};
+
+    // The first run dies in its second chunk.
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .PUT, .url_contains = "upload_id=", .skip = 1, .action = .{ .cut_request_body = 512 * 1024 } },
+    };
+    var dying: Dying = undefined;
+    try dying.init(&f, &plan, chunk);
+    defer dying.deinit();
+    const target = try dying.object(&f, "cancelled.bin");
+    if (target.uploadFile(file, .{ .checkpoint = store.checkpoint() })) |finished| {
+        var owned = finished;
+        owned.deinit();
+        return error.TestExpectedFailure;
+    } else |_| {}
+    try testing.expect(plan[0].fired);
+
+    // 4. Someone cancels the session behind the checkpoint's back. The docs
+    // name 404 and 410 for a session that expired; a cancelled one, as
+    // measured, answers 499 to a status query and to a second cancel too.
+    const session = try savedField(&f, tmp.dir, "source.bin.upload", "session");
+    const cancel = try toSession(&f, .DELETE, session, null);
+    std.debug.print("a cancel: HTTP {d}\n", .{cancel.status});
+    try testing.expectEqual(499, cancel.status);
+    const range = try std.fmt.allocPrint(f.arena.allocator(), "bytes */{d}", .{size});
+    const query = try toSession(&f, .PUT, session, range);
+    const again = try toSession(&f, .DELETE, session, null);
+    std.debug.print("then a status query: HTTP {d}; a second cancel: HTTP {d}\n", .{ query.status, again.status });
+    try testing.expectEqual(499, query.status);
+    try testing.expectEqual(499, again.status);
+
+    // A resume meets the same answer and starts over in a new session,
+    // where it once failed with ServerCancelled on every run.
+    const before = f.faults.exchanges.items.len;
+    const obj = f.bucket().object(target.name);
+    var info = obj.uploadFile(file, .{ .checkpoint = store.checkpoint() }) catch |err| return f.report(err);
+    defer info.deinit();
+    try printExchanges(&f, before);
+    const exchanges = f.faults.exchanges.items[before..];
+    try testing.expectEqual(.PUT, exchanges[0].method);
+    try testing.expectEqual(query.status, exchanges[0].status.?);
+    try testing.expectEqual(.POST, exchanges[1].method);
+    try testing.expectEqual(patternCrc(34, size), info.value.crc32c.?);
+    try testing.expect(!try hasState(tmp.dir, "source.bin.upload"));
+    try expectObjectCrc(&f, obj, patternCrc(34, size));
+}
+
+test "35. sessions: a parallel upload of 12 parts dies after 7, ListParts pages them, and a second client sends only the rest" {
+    const part: u64 = 5 * 1024 * 1024;
+    const size: u64 = 11 * part + 1024 * 1024 + 7;
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try patternFile(tmp.dir, "source.bin", 35, size);
+    defer file.close(testing.io);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "source.bin.upload");
+    defer f.client.abandonTransfer(store.checkpoint()) catch {};
+
+    // The first run sends one part at a time, and dies in the eighth.
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .PUT, .url_contains = "partNumber=", .skip = 7, .action = .{ .cut_request_body = 1024 * 1024 } },
+    };
+    var dying: Dying = undefined;
+    try dying.init(&f, &plan, 8 * 1024 * 1024);
+    defer dying.deinit();
+    const target = try dying.object(&f, "parts.bin");
+    const options: storage.ParallelUploadOptions = .{ .part_size = part, .concurrency = 1, .checkpoint = store.checkpoint() };
+    if (target.uploadParallel(.{ .file = file }, options)) |finished| {
+        var owned = finished;
+        owned.deinit();
+        return error.TestExpectedFailure;
+    } else |_| {}
+    try testing.expect(plan[0].fired);
+    try testing.expectEqual(1, try openUploads(&f));
+
+    // 5. ListParts, five parts to a page, asked raw.
+    const upload_id = try savedField(&f, tmp.dir, "source.bin.upload", "upload_id");
+    var listed: std.ArrayList(u32) = .empty;
+    var marker: []const u8 = "";
+    var pages: usize = 0;
+    while (pages < 10) {
+        const rest = if (marker.len == 0) "&max-parts=5" else try std.fmt.allocPrint(f.arena.allocator(), "&max-parts=5&part-number-marker={s}", .{marker});
+        const res = try raw(&f, .GET, try xmlPath(&f, target.name, try uploadIdQuery(&f, upload_id, rest)), &.{}, null, null);
+        try expectStatus(200, res);
+        pages += 1;
+        var body = res.body;
+        if (pages == 1) {
+            const first_part = body[std.mem.indexOf(u8, body, "<Part>").?..];
+            std.debug.print("a listed part: PartNumber {s}, LastModified {s}, ETag {s}, Size {s}\n", .{
+                xmlText(first_part, "PartNumber").?, xmlText(first_part, "LastModified").?, xmlText(first_part, "ETag").?, xmlText(first_part, "Size").?,
+            });
+        }
+        std.debug.print("page {d}: IsTruncated {s}, NextPartNumberMarker {s}, MaxParts {s}\n", .{
+            pages, xmlText(body, "IsTruncated") orelse "(none)", xmlText(body, "NextPartNumberMarker") orelse "(none)", xmlText(body, "MaxParts") orelse "(none)",
+        });
+        const truncated = std.mem.eql(u8, xmlText(body, "IsTruncated") orelse "false", "true");
+        const next = xmlText(body, "NextPartNumberMarker");
+        while (std.mem.indexOf(u8, body, "<Part>")) |start| {
+            const end = std.mem.indexOfPos(u8, body, start, "</Part>") orelse break;
+            const entry = body[start..end];
+            try listed.append(f.arena.allocator(), try std.fmt.parseInt(u32, xmlText(entry, "PartNumber").?, 10));
+            try testing.expectEqual(part, try std.fmt.parseInt(u64, xmlText(entry, "Size").?, 10));
+            body = body[end..];
+        }
+        if (!truncated) break;
+        marker = next orelse return error.TestExpectedMarker;
+    }
+    try testing.expectEqual(2, pages);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 6, 7 }, listed.items);
+
+    // The second client lists the parts itself, sends parts 8 to 12 and
+    // no other, and the finish holds to the whole file's checksum.
+    const before = f.faults.exchanges.items.len;
+    const obj = f.bucket().object(target.name);
+    var info = obj.uploadParallel(.{ .file = file }, options) catch |err| return f.report(err);
+    defer info.deinit();
+    try printExchanges(&f, before);
+    var sent: std.ArrayList(u32) = .empty;
+    for (f.faults.exchanges.items[before..]) |e| {
+        const at = std.mem.indexOf(u8, e.url, "partNumber=") orelse continue;
+        const digits = e.url[at + "partNumber=".len ..];
+        const end = std.mem.indexOfScalar(u8, digits, '&') orelse digits.len;
+        try sent.append(f.arena.allocator(), try std.fmt.parseInt(u32, digits[0..end], 10));
+    }
+    try testing.expectEqualSlices(u32, &.{ 8, 9, 10, 11, 12 }, sent.items);
+    try testing.expectEqual(patternCrc(35, size), info.value.crc32c.?);
+    try testing.expectEqual(0, try openUploads(&f));
+    try testing.expect(!try hasState(tmp.dir, "source.bin.upload"));
+    try expectObjectCrc(&f, obj, patternCrc(35, size));
+}
+
+test "36. sessions: a parallel download dies after half its ranges, and a second run fetches only the rest" {
+    const mib = 1024 * 1024;
+    const size = 8 * mib;
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const data = try pattern(testing.allocator, 36, size);
+    defer testing.allocator.free(data);
+    const obj = try f.object("ranges.bin");
+    var up = obj.upload(data, .{}) catch |err| return f.report(err);
+    up.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try tmp.dir.createFile(testing.io, "down.bin", .{ .read = true });
+    defer out.close(testing.io);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "down.bin.download");
+
+    // 6. The first run saves its start and four ranges, then dies on the
+    // fifth range's save, that range written but not recorded.
+    var dying: DyingCheckpoint = .{ .inner = store.checkpoint(), .saves_allowed = 5 };
+    try testing.expectError(error.CheckpointFailed, obj.downloadParallel(.{ .file = out }, .{
+        .part_size = mib,
+        .concurrency = 1,
+        .checkpoint = dying.checkpoint(),
+    }));
+    try testing.expect(try hasState(tmp.dir, "down.bin.download"));
+
+    // The second run re-reads the four, fetches the other four, and
+    // verifies the whole.
+    const before = f.faults.exchanges.items.len;
+    const result = obj.downloadParallel(.{ .file = out }, .{
+        .part_size = mib,
+        .concurrency = 1,
+        .checkpoint = store.checkpoint(),
+    }) catch |err| return f.report(err);
+    try printExchanges(&f, before);
+    var ranges: usize = 0;
+    for (f.faults.exchanges.items[before..]) |e| {
+        if (std.mem.indexOf(u8, e.url, "alt=media") == null) continue;
+        ranges += 1;
+        const range = e.header("Range").?;
+        const start = try std.fmt.parseInt(u64, range["bytes=".len..std.mem.indexOfScalar(u8, range, '-').?], 10);
+        try testing.expect(start >= 4 * mib);
+    }
+    try testing.expectEqual(4, ranges);
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(core.crc32c.hash(data), result.crc32c);
+    try testing.expectEqual(core.crc32c.hash(data), try fileCrc(out));
+    try testing.expect(!try hasState(tmp.dir, "down.bin.download"));
+}
+
+test "37. sessions: abandonTransfer cancels a session and aborts a multipart upload, create-only or not, leaving none open" {
+    const size: u64 = 11 * 1024 * 1024;
+    const chunk = 1024 * 1024;
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try patternFile(tmp.dir, "source.bin", 37, size);
+    defer file.close(testing.io);
+
+    // 7. A session, its first run dead in the second chunk.
+    var session_store: storage.CheckpointFile = .init(testing.io, tmp.dir, "session.upload");
+    defer f.client.abandonTransfer(session_store.checkpoint()) catch {};
+    var session_plan = [_]FaultTransport.Fault{
+        .{ .method = .PUT, .url_contains = "upload_id=", .skip = 1, .action = .{ .cut_request_body = 512 * 1024 } },
+    };
+    var session_run: Dying = undefined;
+    try session_run.init(&f, &session_plan, chunk);
+    defer session_run.deinit();
+    if ((try session_run.object(&f, "session.bin")).uploadFile(file, .{ .checkpoint = session_store.checkpoint() })) |finished| {
+        var owned = finished;
+        owned.deinit();
+        return error.TestExpectedFailure;
+    } else |_| {}
+    const session = try savedField(&f, tmp.dir, "session.upload", "session");
+    f.client.abandonTransfer(session_store.checkpoint()) catch |err| return f.report(err);
+    try testing.expect(!try hasState(tmp.dir, "session.upload"));
+    const range = try std.fmt.allocPrint(f.arena.allocator(), "bytes */{d}", .{size});
+    const query = try toSession(&f, .PUT, session, range);
+    std.debug.print("a status query on an abandoned session: HTTP {d}\n", .{query.status});
+    try testing.expectEqual(499, query.status);
+
+    // A multipart upload, and a create-only one, which runs under
+    // zig-gcp-tmp/: each dead in its second part.
+    const temp_uploads = try openTempUploads(&f);
+    for ([_]storage.Preconditions{ .{}, .does_not_exist }, [_][]const u8{ "parts.bin", "created.bin" }) |conditions, what| {
+        var parts_store: storage.CheckpointFile = .init(testing.io, tmp.dir, "parts.upload");
+        defer f.client.abandonTransfer(parts_store.checkpoint()) catch {};
+        var parts_plan = [_]FaultTransport.Fault{
+            .{ .method = .PUT, .url_contains = "partNumber=", .skip = 1, .action = .{ .cut_request_body = 1024 * 1024 } },
+        };
+        var parts_run: Dying = undefined;
+        try parts_run.init(&f, &parts_plan, chunk);
+        defer parts_run.deinit();
+        if ((try parts_run.object(&f, what)).uploadParallel(.{ .file = file }, .{
+            .part_size = 5 * 1024 * 1024,
+            .concurrency = 1,
+            .preconditions = conditions,
+            .checkpoint = parts_store.checkpoint(),
+        })) |finished| {
+            var owned = finished;
+            owned.deinit();
+            return error.TestExpectedFailure;
+        } else |_| {}
+        try testing.expect(parts_plan[0].fired);
+        const open = if (conditions.if_generation_match == null) try openUploads(&f) else try openTempUploads(&f) - temp_uploads;
+        try testing.expectEqual(1, open);
+        f.client.abandonTransfer(parts_store.checkpoint()) catch |err| return f.report(err);
+        try testing.expect(!try hasState(tmp.dir, "parts.upload"));
+        try testing.expectEqual(0, try openUploads(&f));
+        try testing.expectEqual(temp_uploads, try openTempUploads(&f));
+    }
     try testing.expectEqual(0, try tempObjects(&f));
 }
