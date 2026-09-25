@@ -141,9 +141,8 @@ const Parser = struct {
         if (depth >= max_depth) return error.InvalidResponse;
         p.pos += 1; // '<'
         const qualified = p.name();
-        if (qualified.len == 0) return error.InvalidResponse;
+        const local = localName(qualified) orelse return error.InvalidResponse;
         const self_closing = try p.skipAttributes();
-        const local = localName(qualified);
         if (self_closing) return .{ .name = local, .text = "", .children = &.{} };
 
         var text: std.ArrayList(u8) = .empty;
@@ -226,10 +225,15 @@ const Parser = struct {
     }
 };
 
-/// `UploadId` for `s3:UploadId`.
-fn localName(qualified: []const u8) []const u8 {
-    const colon = std.mem.lastIndexOfScalar(u8, qualified, ':') orelse return qualified;
-    return qualified[colon + 1 ..];
+/// `UploadId` for `s3:UploadId`, and `UploadId` for itself. Null for a
+/// name that is no qualified name: empty, or with an empty prefix, an
+/// empty local name, or a second colon.
+fn localName(qualified: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, qualified, ':') orelse
+        return if (qualified.len == 0) null else qualified;
+    const local = qualified[colon + 1 ..];
+    if (colon == 0 or local.len == 0 or std.mem.indexOfScalar(u8, local, ':') != null) return null;
+    return local;
 }
 
 /// Character data with its references decoded: `&lt;`, `&gt;`, `&amp;`,
@@ -366,6 +370,19 @@ test "refused: everything that is not a plain, well-formed document" {
         "<?xml version='1.0'?><!DOCTYPE a SYSTEM \"http://example.com/a.dtd\"><a/>",
         "<a><!ELEMENT b ANY></a>",
         "< a></a>",
+        // No name at all, where no closing tag can differ from it.
+        "<></>",
+        "< a/>",
+        "<r><></></r>",
+        // A prefix or a local name that is empty, or a second colon, is
+        // no qualified name. The nightly fuzz job of 2026-09-25 found the
+        // first, which parsed to an element with no name.
+        "<:/>",
+        "<a:/>",
+        "<:a/>",
+        "<a:b:c/>",
+        "<:></:>",
+        "<r><s:/></r>",
         deep,
     }) |bad| {
         errdefer std.debug.print("accepted: {s}\n", .{bad});
@@ -395,22 +412,32 @@ test "the finish body, written out by hand" {
 fn parseAnything(_: void, input: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    // Any bytes: a document or InvalidResponse, never a crash or a hang.
+    // Any bytes: a document or InvalidResponse, never a crash or a hang,
+    // and every element a document holds has a name.
     if (parse(arena.allocator(), input)) |root| {
-        try testing.expect(root.name.len > 0);
+        try expectNamed(root);
     } else |err| try testing.expectEqual(error.InvalidResponse, err);
     _ = try decodeError(arena.allocator(), input);
 }
 
+fn expectNamed(element: Element) !void {
+    try testing.expect(element.name.len > 0);
+    for (element.children) |c| try expectNamed(c);
+}
+
 test "fuzz xml: any bytes parse or are refused cleanly" {
-    try test_util.fuzzBytes({}, parseAnything, .{ .corpus = &.{
-        "<a><b>t</b></a>",
-        "<?xml version='1.0'?><Error><Code>NoSuchUpload</Code></Error>",
-        "<a>&#x1F600;&amp;</a>",
-        "<a><![CDATA[x]]><!--c--><b/></a>",
-        "<!DOCTYPE a><a/>",
-        "<a b='>'>",
-    } });
+    try test_util.fuzzBytes({}, parseAnything, .{
+        .corpus = &.{
+            "<a><b>t</b></a>",
+            "<?xml version='1.0'?><Error><Code>NoSuchUpload</Code></Error>",
+            "<a>&#x1F600;&amp;</a>",
+            "<a><![CDATA[x]]><!--c--><b/></a>",
+            "<!DOCTYPE a><a/>",
+            "<a b='>'>",
+            // The 2026-09-25 nightly: a name that is only a colon.
+            "<:/>",
+        },
+    });
 }
 
 fn completeRoundTrip(_: void, input: []const u8) !void {
