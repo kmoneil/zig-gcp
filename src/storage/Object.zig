@@ -503,6 +503,11 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
         if (tapped) {
             // A body that wrote no byte is settled by its head.
             if (outcome) |_| tap.decide() else |_| {}
+            // A transport that shows the head only once the call returns
+            // left the tap holding the first bytes; it decides now.
+            const was_pending = tap.mode == .pending;
+            tap.settle();
+            if (tap.out_of_memory) return error.OutOfMemory;
             switch (tap.mode) {
                 .gzip => {
                     const first_error: ?Error = if (outcome) |_| null else |err| switch (err) {
@@ -514,7 +519,7 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
                 .compressed_in_transit => {
                     logging.debug("{s} came gzip-compressed, and is stored plain: asking again for plain bytes", .{self.name});
                     plain_only = true;
-                    tap.mode = .undecided;
+                    tap.reset();
                     attempt = 0;
                     continue;
                 },
@@ -522,7 +527,25 @@ pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOpt
                     if (self.client.diagnostics) |d| d.print("{s} is stored gzip-compressed, and a range of it does not decompress: ask for decompress = false to get stored bytes", .{self.name});
                     return error.InvalidArgument;
                 },
-                .plain, .undecided => {},
+                .plain => if (was_pending) {
+                    // The held bytes are the object's from its first byte,
+                    // passed on now as they would have been at once.
+                    hashing.writer.writeAll(tap.buffer[0..tap.collected]) catch return error.WriteFailed;
+                    const cut_short = tap.full;
+                    tap.dropBuffer();
+                    // A chunk that filled was ended on purpose; the rest
+                    // comes as a range, as after any interruption.
+                    if (cut_short) {
+                        if (generation == null) {
+                            if (self.client.diagnostics) |d| d.print("cannot fetch the rest: the server named no generation to pin it to", .{});
+                            return error.InvalidResponse;
+                        }
+                        attempt = 0;
+                        continue;
+                    }
+                },
+                .undecided => {},
+                .pending => unreachable,
             }
         }
 

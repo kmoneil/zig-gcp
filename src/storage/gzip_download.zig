@@ -60,6 +60,10 @@ pub const Tap = struct {
         compressed_in_transit,
         /// A range of a gzip object, which no decompressor can start from.
         ranged_gzip,
+        /// No head yet at the first byte, as a transport that shows the
+        /// head only once the call returns gives it: the bytes are
+        /// collected as a gzip object's are, and `settle` decides.
+        pending,
     };
 
     pub fn init(forward: *std.Io.Writer, head: *const ?Head, gpa: Allocator, chunk_size: usize, decompress: bool, ranged: bool) Tap {
@@ -83,18 +87,48 @@ pub const Tap = struct {
     pub fn decide(self: *Tap) void {
         if (self.mode != .undecided) return;
         const h = self.head.* orelse {
-            self.mode = .plain;
+            self.mode = .pending;
             return;
         };
         if (!headerIs(h, "content-encoding", "gzip")) {
             self.mode = .plain;
             return;
         }
-        self.mode = if (!headerIs(h, "x-goog-stored-content-encoding", "gzip"))
+        self.mode = modeOf(h, self.decompress, self.ranged);
+    }
+
+    /// A pending tap, decided now the call has returned: by the head, if
+    /// the transport showed one at last, else as a plain body, which is all
+    /// a transport that shows no head at all leaves to go on.
+    pub fn settle(self: *Tap) void {
+        if (self.mode != .pending) return;
+        const h = self.head.* orelse {
+            self.mode = .plain;
+            return;
+        };
+        self.mode = if (headerIs(h, "content-encoding", "gzip")) modeOf(h, self.decompress, self.ranged) else .plain;
+    }
+
+    /// Back to the first byte, the collected bytes dropped: for a download
+    /// asked for again from the start.
+    pub fn reset(self: *Tap) void {
+        self.dropBuffer();
+        self.mode = .undecided;
+        self.full = false;
+    }
+
+    pub fn dropBuffer(self: *Tap) void {
+        if (self.buffer.len > 0) self.gpa.free(self.buffer);
+        self.buffer = &.{};
+        self.collected = 0;
+    }
+
+    fn modeOf(h: Head, decompress: bool, ranged: bool) Mode {
+        return if (!headerIs(h, "x-goog-stored-content-encoding", "gzip"))
             .compressed_in_transit
-        else if (!self.decompress)
+        else if (!decompress)
             .plain
-        else if (self.ranged)
+        else if (ranged)
             .ranged_gzip
         else
             .gzip;
@@ -105,7 +139,7 @@ pub const Tap = struct {
         self.decide();
         switch (self.mode) {
             .plain => return self.forward.writeSplatHeader(w.buffered(), data, splat),
-            .gzip => {
+            .gzip, .pending => {
                 if (self.buffer.len == 0) {
                     self.buffer = self.gpa.alloc(u8, self.chunk_size) catch {
                         self.out_of_memory = true;
@@ -497,6 +531,49 @@ test "gzip: an object stored gzip-compressed comes as stored, is verified, and i
     try testing.expectEqual(core.crc32c.hash(plain), result.crc32c);
     // It fit in one chunk: one request.
     try testing.expectEqual(1, s.fake.counts.media);
+}
+
+test "gzip: a transport that shows the head only once the call returns still gets each object right" {
+    var s: Setup = undefined;
+    try s.init(.{});
+    defer s.deinit();
+    // core's FaultTransport hands the head over after the body, as a
+    // recording or proxying transport may: the tap sees its first byte
+    // with no head to read, and must not guess.
+    var late: core.testing.FaultTransport = .{ .inner = s.fake.transport(), .plan = &.{} };
+    defer late.deinit();
+    var client: Client = try .init(testing.allocator, testing.io, .{
+        .token_provider = s.token.provider(),
+        .transport = late.transport(),
+        .diagnostics = &s.diag,
+        .chunk_size = 256 * 1024,
+        .retry = .{ .max_attempts = 4, .initial_backoff_ms = 1, .max_backoff_ms = 2 },
+    });
+    defer client.deinit();
+    const small = "a small page of text\n" ** 100;
+    const big = try randomBytes(testing.allocator, 700 * 1024, 5);
+    defer testing.allocator.free(big);
+    try s.fake.putGzipped("small.txt", small);
+    try s.fake.putGzipped("big.bin", big);
+    try s.fake.put("plain-small", small);
+    try s.fake.put("plain-big", big);
+    // Gzip and plain, under one chunk and over it.
+    for ([_]struct { name: []const u8, want: []const u8 }{
+        .{ .name = "small.txt", .want = small },
+        .{ .name = "big.bin", .want = big },
+        .{ .name = "plain-small", .want = small },
+        .{ .name = "plain-big", .want = big },
+    }) |case| {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        const result = client.bucket("b").object(case.name).download(&out.writer, .{}) catch |err| {
+            std.debug.print("{s}: {t}: {s}\n", .{ case.name, err, s.diag.message() });
+            return err;
+        };
+        errdefer std.debug.print("{s}\n", .{case.name});
+        try testing.expectEqualSlices(u8, case.want, out.written());
+        try testing.expect(result.checksum_verified);
+    }
 }
 
 test "gzip: decompress = false writes the stored bytes, verified" {
