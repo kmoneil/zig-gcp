@@ -869,11 +869,16 @@ const Chooser = struct {
 };
 
 /// One upload under drawn faults, cut wherever they cut it, then a second
-/// run with the same checkpoint and no faults: the second run always
-/// succeeds with exactly the file's bytes, a resume of a live session
-/// sends no byte the server already holds, the state is cleared, and no
-/// session with bytes in it stays behind (an empty one whose opening
-/// answer was lost may, its URL never having reached the client).
+/// run with the same checkpoint and no faults: the second run succeeds
+/// with exactly the file's bytes, a resume of a live session sends no
+/// byte the server already holds, the state is cleared, and no session
+/// with bytes in it stays behind (an empty one whose opening answer was
+/// lost may, its URL never having reached the client). The one
+/// legitimate second-run failure is the checksum backstop: a first-run
+/// fault corrupted a stored chunk and the run died with every byte in,
+/// so the second run's status query finalizes the session, hashless, and
+/// the whole-file verification refuses the object, deletes it, and
+/// clears the state; a third run is then whole and right.
 fn resumeUnderFaults(input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
     const size = g.intRange(usize, 0, 600 * 1024);
@@ -934,9 +939,23 @@ fn resumeUnderFaults(input: []const u8) !void {
     var diag: Diagnostics = .{};
     var second = try clientOn(&fake, &token, &diag, 4);
     defer second.deinit();
-    var info = second.bucket("b").object("o").uploadFile(file, options) catch |err| {
-        std.debug.print("second run: {t}: {s}\n", .{ err, diag.message() });
-        return err;
+    const target = second.bucket("b").object("o");
+    var info = target.uploadFile(file, options) catch |err| {
+        errdefer std.debug.print("second run: {t}: {s}\n", .{ err, diag.message() });
+        try testing.expectEqual(error.ChecksumMismatch, err);
+        try testing.expect(chooser.faulted);
+        // The mismatched object went, the state went, and a third run is
+        // whole and right.
+        try testing.expectEqual(null, saved.stored);
+        try testing.expect(fake.object("o") == null);
+        var third = try target.uploadFile(file, options);
+        defer third.deinit();
+        try testing.expectEqual(core.crc32c.hash(data), third.value.crc32c.?);
+        try testing.expectEqualSlices(u8, data, fake.object("o").?.bytes);
+        for (fake.sessions.items) |session| {
+            if (session.done == null) try testing.expectEqual(0, session.bytes.items.len);
+        }
+        return;
     };
     defer info.deinit();
 
