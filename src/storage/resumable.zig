@@ -3,9 +3,11 @@
 //! answer to a non-final chunk is a 308 whose `Range` header says how much
 //! the server kept, which is never assumed to be everything sent. After a
 //! transient failure a status query asks where the server is, and sending
-//! resumes there. A dead session (404 or 410) restarts a `slice` source
-//! from its bytes and fails a `reader` source with
-//! `error.UploadSessionLost`, since its bytes are gone.
+//! resumes there. A dead session restarts a `slice` source from its bytes
+//! and fails a `reader` source with `error.UploadSessionLost`, since its
+//! bytes are gone. Dead is 404 or 410, as Google documents for a session
+//! that expired, or 499, which a cancelled session answers to everything
+//! sent to it afterwards.
 //!
 //! The session URI is a credential: anyone holding it can write the
 //! object. It is never logged and never placed in `Diagnostics`, and
@@ -252,7 +254,7 @@ const Machine = struct {
         done: core.transport.StreamResponse,
         /// 308: bytes stored so far.
         stored: u64,
-        /// 404 or 410: the session is gone.
+        /// 404 or 410, expired, or 499, cancelled: the session is gone.
         lost,
         /// Worth a status query and another attempt.
         transient: Error,
@@ -604,7 +606,11 @@ const Machine = struct {
             return switch (res.status) {
                 200, 201 => .{ .done = res },
                 308 => .{ .stored = storedFromRange(res.header("Range")) },
-                404, 410 => .lost,
+                // Measured against Cloud Storage on 2026-09-25: once a
+                // session is cancelled, a status query or a chunk sent to
+                // it answers 499, as the cancel itself did, and keeps
+                // answering it.
+                404, 410, 499 => .lost,
                 else => self.failure(res),
             };
         } else |err| {
@@ -943,6 +949,30 @@ test "a dead session restarts an in-memory upload from its bytes" {
     // Two session openings: the second run started from byte zero again.
     try testing.expectEqualStrings("bytes 0-262143/614400", (try h.fake.streamRequest(3)).header("Content-Range").?);
     try testing.expectEqual(6, h.fake.stream_requests.items.len);
+}
+
+test "a cancelled session, which answers 499 to everything after, is as dead as an expired one" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        opened,
+        .{ .respond = .{ .status = 499, .body = "" } },
+        opened,
+        kept(chunk_size - 1),
+        kept(2 * chunk_size - 1),
+        finished,
+    }, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+    var info = try h.client.bucket("b").object("backup.tar").upload(data, .{});
+    defer info.deinit();
+    try testing.expectEqualStrings("bytes 0-262143/614400", (try h.fake.streamRequest(3)).header("Content-Range").?);
+
+    var g: Harness = undefined;
+    try g.init(&.{ opened, kept(chunk_size - 1), .{ .respond = .{ .status = 499, .body = "" } } }, resumableOptions());
+    defer g.deinit();
+    var reader: std.Io.Reader = .fixed(data);
+    try testing.expectError(error.UploadSessionLost, g.client.bucket("b").object("backup.tar").uploadFrom(&reader, .{}));
 }
 
 test "a dead session fails a reader, whose bytes are gone" {
