@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.21.0 (unreleased)
+## 0.21.0 (2026-09-25)
 
 - core: `crc32c` computes CRC-32C with the CPU's instructions where the
   build's target CPU has them, aarch64's `crc32cx` or x86_64's SSE4.2
