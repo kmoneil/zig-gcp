@@ -10,10 +10,10 @@ modules it imports.
 | `secret_manager` | Secret Manager v1: read a secret's bytes, add versions, and manage secrets and their versions, global or regional | experimental |
 | `storage` | Cloud Storage JSON API: buckets, object metadata and listings, uploads from memory, a file or any reader and downloads into any writer or file, streamed in constant memory or in parallel parts and ranges, resumed after failures and across processes, and checksummed both ways; preconditions, server-side copies, and signed URLs | experimental |
 | `auth` | Credentials for the service modules: `findDefault` picks between the metadata server on Google Cloud, the login `gcloud auth application-default login` saves (impersonating a service account or not), and a file the environment names. They sign signed URLs too, on this machine or through IAM. | experimental |
-| `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, the `TokenProvider` and `Signer` seams, and test fakes. Services re-export what their callers need. | beta |
+| `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, the `TokenProvider` and `Signer` seams, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 986 unit, property and fuzz tests, Google's 29 V4 signing
+- Tested with 990 unit, property and fuzz tests, Google's 29 V4 signing
   vectors among them; 28 Pub/Sub integration tests that pass against both
   the emulator and production, and 20 more through a proxy that drops,
   cuts and stalls the connection; 22 Cloud Storage tests against
@@ -659,6 +659,27 @@ ones the checksum covers. A resumed download is still verified: Cloud
 Storage names no checksum on a partial range, so the client holds it to
 the one its first response named. `Options.verify_checksums = false` turns
 all of this off.
+
+Checking costs little. `core.crc32c` runs the CPU's CRC32C instructions
+where the build's target CPU has them, aarch64's CRC extension or x86_64's
+SSE4.2, three streams at once, and eight tables, eight bytes at a time,
+everywhere else. The build chooses, at compile time: `zig build` on a
+machine that has the instructions takes them, as does any `-Dcpu` that
+names them, and a baseline cross-compile takes the tables. Measured on an
+Apple M5 Max on 2026-09-25:
+
+| CRC-32C | ReleaseFast | Debug |
+| --- | ---: | ---: |
+| The standard library's, one table, which this used through v0.20.0 | 562 MiB/s | 180 MiB/s |
+| The tables | 3.0 GiB/s | 0.7 GiB/s |
+| The instructions | 29 GiB/s | 2.6 GiB/s |
+
+In use, with `gcs_cp` in ReleaseFast against a local emulator, a 1 GiB
+download spent 0.12 s of CPU where it spent 1.83 s, and finished in about
+0.4 s where it took 2.2 s: the checksum had been most of the work. A
+resume's re-read of 1 GiB, which rebuilds its checksum from the file, took
+88 ms where it took 1.9 s. `zig build bench-crc32c` measures the machine at
+hand.
 
 ### Preconditions and retries
 
@@ -1325,8 +1346,9 @@ Markdown, including every line no test reached. kcov counts lines, not
 branches, and sees only code the compiler kept.
 
 CI runs the unit tests on Linux, macOS and Windows, and on Linux also in
-ReleaseSafe and ReleaseFast; the integration tests and examples against the
-emulator; and coverage, whose summary and report are attached to each run. Every night it
+ReleaseSafe and ReleaseFast, and core's on a baseline CPU, whose build
+computes CRC-32C with tables rather than instructions; the integration
+tests and examples against the emulator; and coverage, whose summary and report are attached to each run. Every night it
 also fuzzes, one job per module, each starting from the corpus that earlier
 nights built up for it, and one job for each property too slow to share
 one: auth's RSA signing, and pubsub's Publisher and Subscriber models. A
