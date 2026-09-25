@@ -466,6 +466,44 @@ test "parallel downloads: ranges into memory and into a file, and a gzip-stored 
     const kept = try f.bucket().object("page.txt").download(&raw.writer, .{ .decompress = false });
     try testing.expectEqualSlices(u8, gzipped, raw.written());
     try testing.expect(kept.checksum_verified);
+
+    // A larger one's stored bytes in ranges, several at once, which the
+    // emulator serves as Cloud Storage does to a client taking gzip as sent;
+    // and the same object decompressed in one stream.
+    const noise = try testing.allocator.alloc(u8, 3 * 1024 * 1024 + 11);
+    defer testing.allocator.free(noise);
+    var noise_prng: std.Random.DefaultPrng = .init(20260925);
+    noise_prng.random().bytes(noise);
+    const packed_bytes = try gzipAlloc(noise);
+    defer testing.allocator.free(packed_bytes);
+    var big = try f.bucket().object("noise.bin").upload(packed_bytes, .{ .content_encoding = "gzip" });
+    big.deinit();
+    const ranged = try testing.allocator.alloc(u8, packed_bytes.len);
+    defer testing.allocator.free(ranged);
+    const in_ranges = try f.bucket().object("noise.bin").downloadParallel(.{ .buffer = ranged }, .{
+        .part_size = 1024 * 1024,
+        .concurrency = 3,
+        .decompress = false,
+    });
+    try testing.expectEqualSlices(u8, packed_bytes, ranged[0..in_ranges.bytes_written]);
+    try testing.expect(in_ranges.checksum_verified);
+    const unpacked = try testing.allocator.alloc(u8, noise.len);
+    defer testing.allocator.free(unpacked);
+    const one_stream = try f.bucket().object("noise.bin").downloadParallel(.{ .buffer = unpacked }, .{ .part_size = 1024 * 1024 });
+    try testing.expectEqualSlices(u8, noise, unpacked[0..one_stream.bytes_written]);
+    try testing.expect(one_stream.checksum_verified);
+}
+
+/// `data` gzip-compressed by std. Owned by the testing allocator.
+fn gzipAlloc(data: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer out.deinit();
+    const window = try testing.allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer testing.allocator.free(window);
+    var compress: std.compress.flate.Compress = try .init(&out.writer, window, .gzip, .fastest);
+    try compress.writer.writeAll(data);
+    try compress.finish();
+    return out.toOwnedSlice();
 }
 
 /// A checkpoint store that refuses saves after a set number, wrapping the

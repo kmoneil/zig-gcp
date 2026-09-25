@@ -120,6 +120,21 @@ jobs:
           zig build example-gcs_cp -- gs://zigps-examples/dir/resumed.bin "$RUNNER_TEMP/back-resumed.bin" --resume "$RUNNER_TEMP/down.state" --parallel 4
           cmp "$RUNNER_TEMP/src.bin" "$RUNNER_TEMP/back-resumed.bin"
           test ! -e "$RUNNER_TEMP/up.state" && test ! -e "$RUNNER_TEMP/down.state"
+          # An object stored gzip-compressed: decompressed here, and kept as
+          # stored with --no-decompress, in one stream and in ranges, each
+          # checked against the stored checksum.
+          head -c 3000000 /dev/urandom | base64 > "$RUNNER_TEMP/page.txt"
+          gzip -c -n "$RUNNER_TEMP/page.txt" > "$RUNNER_TEMP/page.txt.gz"
+          { printf -- '--BB\r\nContent-Type: application/json\r\n\r\n{"name":"dir/page.txt","contentEncoding":"gzip","contentType":"text/plain"}\r\n--BB\r\nContent-Type: text/plain\r\n\r\n'
+            cat "$RUNNER_TEMP/page.txt.gz"; printf '\r\n--BB--\r\n'; } > "$RUNNER_TEMP/upload.body"
+          curl -sf -X POST "http://127.0.0.1:4443/upload/storage/v1/b/zigps-examples/o?uploadType=multipart" \
+            -H "Content-Type: multipart/related; boundary=BB" --data-binary @"$RUNNER_TEMP/upload.body" >/dev/null
+          zig build example-gcs_cp -- gs://zigps-examples/dir/page.txt "$RUNNER_TEMP/page-back.txt"
+          cmp "$RUNNER_TEMP/page.txt" "$RUNNER_TEMP/page-back.txt"
+          zig build example-gcs_cp -- gs://zigps-examples/dir/page.txt "$RUNNER_TEMP/page-back.txt.gz" --no-decompress
+          cmp "$RUNNER_TEMP/page.txt.gz" "$RUNNER_TEMP/page-back.txt.gz"
+          zig build example-gcs_cp -- gs://zigps-examples/dir/page.txt "$RUNNER_TEMP/page-ranges.txt.gz" --no-decompress --parallel 4
+          cmp "$RUNNER_TEMP/page.txt.gz" "$RUNNER_TEMP/page-ranges.txt.gz"
 
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
   # read of undefined memory, can pass in Debug and fail here.
