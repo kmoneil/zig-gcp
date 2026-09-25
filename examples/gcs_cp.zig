@@ -8,12 +8,16 @@
 //!     ... -- backup.tar gs://my-bucket/backup.tar --parallel 8
 //!     ... -- gs://my-bucket/backup.tar restored.tar --parallel 8
 //!     ... -- backup.tar gs://my-bucket/backup.tar --resume backup.tar.state
+//!     ... -- gs://my-bucket/page.html page.html.gz --no-decompress
 //!
 //! Both directions are checksummed end to end. An upload reads the file at
 //! offsets, a chunk at a time, and its last request carries the file's
 //! CRC32C, so Cloud Storage refuses an object whose bytes differ; a
 //! download is checked against the checksum Cloud Storage keeps, and goes
 //! to `<file>.part` first, renamed into place only once it has verified.
+//! An object stored gzip-compressed comes as stored, is checked against
+//! the stored checksum, and is decompressed here; `--no-decompress` writes
+//! its stored bytes as they are, in ranges with `--parallel`.
 //! `--no-clobber` refuses to replace an existing object, with a
 //! precondition the server enforces. `--parallel N` moves the file in
 //! parts, N at a time on connections of their own, for a large file on a
@@ -50,7 +54,7 @@ pub const std_options: std.Options = .{
 };
 
 const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber] [--parallel N] [--resume STATE]\n" ++
-    "       gcs_cp gs://<bucket>/<object> <file> [--parallel N] [--resume STATE]\n";
+    "       gcs_cp gs://<bucket>/<object> <file> [--parallel N] [--resume STATE] [--no-decompress]\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -61,6 +65,7 @@ pub fn main(init: std.process.Init) !void {
     var paths: [2][]const u8 = undefined;
     var count: usize = 0;
     var no_clobber = false;
+    var no_decompress = false;
     var parallel: ?u16 = null;
     var state: ?[]const u8 = null;
     var bad = false;
@@ -70,6 +75,8 @@ pub fn main(init: std.process.Init) !void {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--no-clobber")) {
             no_clobber = true;
+        } else if (std.mem.eql(u8, arg, "--no-decompress")) {
+            no_decompress = true;
         } else if (std.mem.eql(u8, arg, "--parallel")) {
             i += 1;
             parallel = if (i < args.len) std.fmt.parseInt(u16, args[i], 10) catch null else null;
@@ -87,10 +94,10 @@ pub fn main(init: std.process.Init) !void {
     }
     const from_remote = if (count == 2) Remote.parse(paths[0]) else null;
     const to_remote = if (count == 2) Remote.parse(paths[1]) else null;
-    // Exactly one side is in Cloud Storage, and only an upload can refuse
-    // to replace what is there.
+    // Exactly one side is in Cloud Storage, only an upload can refuse to
+    // replace what is there, and only a download decompresses.
     if (bad or count != 2 or (from_remote == null) == (to_remote == null) or
-        (no_clobber and to_remote == null))
+        (no_clobber and to_remote == null) or (no_decompress and from_remote == null))
     {
         try out.writeAll(usage);
         return out.flush();
@@ -118,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
     if (to_remote) |remote| {
         try upload(&client, init.io, paths[0], remote, no_clobber, parallel, state, out, &diag, started);
     } else {
-        try download(&client, init.io, arena, from_remote.?, paths[1], parallel, state, out, &diag, started);
+        try download(&client, init.io, arena, from_remote.?, paths[1], parallel, state, !no_decompress, out, &diag, started);
     }
     try out.flush();
 }
@@ -213,6 +220,7 @@ fn download(
     path: []const u8,
     parallel: ?u16,
     state: ?[]const u8,
+    decompress: bool,
     out: *std.Io.Writer,
     diag: *const storage.Diagnostics,
     started: std.Io.Timestamp,
@@ -238,11 +246,12 @@ fn download(
             break :r client.bucket(remote.bucket).object(remote.name).downloadParallel(.{ .file = file }, .{
                 .concurrency = parallel orelse 1,
                 .checkpoint = if (state != null) saved.checkpoint() else null,
+                .decompress = decompress,
             }) catch |err| return failResumable(err, diag, io, state);
         }
         var buffer: [64 * 1024]u8 = undefined;
         var writer = file.writer(io, &buffer);
-        const got = client.bucket(remote.bucket).object(remote.name).download(&writer.interface, .{}) catch |err|
+        const got = client.bucket(remote.bucket).object(remote.name).download(&writer.interface, .{ .decompress = decompress }) catch |err|
             return fail(err, diag);
         // The library never flushes a caller's writer: the buffer is ours.
         try writer.interface.flush();
@@ -261,7 +270,7 @@ fn download(
         ms,
         mibPerSecond(result.bytes_written, ms),
         result.generation,
-        if (result.checksum_verified) "verified" else "not verifiable (decompressed in transit, or none sent)",
+        if (result.checksum_verified) "verified" else "not verifiable (none sent, or decompressed on the way by a proxy)",
     });
 }
 

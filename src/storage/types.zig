@@ -300,6 +300,12 @@ pub const ParallelDownloadOptions = struct {
     /// store. A buffer destination refuses one, since only a file outlives
     /// the process.
     checkpoint: ?Checkpoint = null,
+    /// For an object stored gzip-compressed: true, the default, fetches it
+    /// in one verified stream and decompresses it here, since a
+    /// decompressor must see the bytes in order; false fetches its stored
+    /// bytes in ranges, several at once, like any object's, and writes them
+    /// as they are. Other objects are unaffected.
+    decompress: bool = true,
 };
 
 /// A byte range of an object: `length` bytes from `offset`, or everything

@@ -11,9 +11,10 @@
 //! and hold that to the metadata's.
 //!
 //! An empty object is not read at all, since an empty range is a 416. An
-//! object stored gzip-compressed is fetched whole by one worker, as
-//! `download` fetches it: Cloud Storage ignores a range while it
-//! decompresses. A file is checked afterwards to be exactly the object's
+//! object stored gzip-compressed and to be decompressed is fetched by one
+//! worker, as `download` fetches it: as stored, verified, and decompressed
+//! in order. Its stored bytes, with `decompress = false`, come in ranges
+//! like any object's. A file is checked afterwards to be exactly the object's
 //! length. Linux puts every write to a file opened for appending at its
 //! end, whatever the offset, and the checksum, which covers the bytes as
 //! they arrived, would never notice them landing out of place.
@@ -111,7 +112,7 @@ fn transfer(
         );
         return error.InvalidResponse;
     }
-    if (info.value.content_encoding) |encoding| if (std.ascii.eqlIgnoreCase(encoding, "gzip")) {
+    if (info.value.content_encoding) |encoding| if (options.decompress and std.ascii.eqlIgnoreCase(encoding, "gzip")) {
         return whole(client, bucket, object, destination, generation, options);
     };
 
@@ -320,10 +321,10 @@ fn rereadWritten(
     }
 }
 
-/// A gzip-stored object, fetched whole by one worker as `download` fetches
-/// it: decompressed and unverified, since the stored checksum covers the
-/// compressed bytes, and in one request, since offsets into the
-/// decompressed bytes mean nothing to the server.
+/// A gzip-stored object to decompress, fetched by one worker as `download`
+/// fetches it: its stored bytes in order, verified against the stored
+/// checksum, and decompressed as they come, which no set of ranges written
+/// at their offsets could be.
 fn whole(
     client: *Client,
     bucket: []const u8,
@@ -536,6 +537,9 @@ const Worker = struct {
         const options: types.DownloadOptions = .{
             .generation = run.generation,
             .range = .{ .offset = offset, .length = len },
+            // A range is always of the stored bytes: a gzip object comes
+            // here only when its stored bytes are wanted.
+            .decompress = false,
         };
         const result = switch (run.destination) {
             .buffer => |buffer| b: {
@@ -1282,6 +1286,48 @@ test "downloadParallel: a gzip-stored object on the fake, into memory and into a
     try testing.expectEqual(2, s.fake.counts.media);
 }
 
+test "downloadParallel: a gzip object's stored bytes, with decompress = false, come in ranges, verified, and resume" {
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    var plain: [5000]u8 = undefined;
+    fill(&plain, 31);
+    try s.fake.putGzipped("page.gz", &plain);
+    const stored = s.fake.object("page.gz").?.bytes;
+    const ranges = std.math.divCeil(usize, stored.len, 1024) catch unreachable;
+    const options: types.ParallelDownloadOptions = .{ .part_size = 1024, .concurrency = 3, .decompress = false };
+    const out = try testing.allocator.alloc(u8, stored.len);
+    defer testing.allocator.free(out);
+    const result = try s.object("page.gz").downloadParallel(.{ .buffer = out }, options);
+    try testing.expectEqualSlices(u8, stored, out[0..result.bytes_written]);
+    try testing.expect(result.checksum_verified);
+    try testing.expectEqual(core.crc32c.hash(stored), result.crc32c);
+    try testing.expectEqual(stored.len, result.stored_bytes);
+    try testing.expectEqual(ranges, s.fake.counts.media);
+
+    // Into a file: the first run records its start and two ranges, dies on
+    // the third's save, and the second fetches only the rest.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try junkFile(&tmp, "");
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator, .saves_allowed = 3 };
+    defer saved.deinit();
+    var one_at_a_time = options;
+    one_at_a_time.concurrency = 1;
+    one_at_a_time.checkpoint = saved.checkpoint();
+    try testing.expectError(error.CheckpointFailed, s.object("page.gz").downloadParallel(.{ .file = file }, one_at_a_time));
+    saved.saves_allowed = null;
+    const before = s.fake.counts.media;
+    const resumed = try s.object("page.gz").downloadParallel(.{ .file = file }, one_at_a_time);
+    const got = try readBack(&tmp);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, stored, got);
+    try testing.expect(resumed.checksum_verified);
+    try testing.expectEqual(ranges - 2, s.fake.counts.media - before);
+    try testing.expectEqual(null, saved.stored);
+}
+
 test "check: what a parallel download refuses, before anything is sent" {
     var s: Setup = undefined;
     try s.init(testing.io, .{});
@@ -1978,6 +2024,8 @@ fn runUnderFaults(io: std.Io, files: bool, input: []const u8) !void {
     const verify = g.intRange(u8, 0, 7) != 0;
     const to_file = g.boolean() and files;
     const gzip = g.intRange(u8, 0, 15) == 0;
+    // A gzip object's stored bytes, kept as they are, come in ranges.
+    const keep_stored = gzip and g.boolean();
     const data = try testing.allocator.alloc(u8, size);
     defer testing.allocator.free(data);
     fill(data, g.int(u64));
@@ -1989,7 +2037,9 @@ fn runUnderFaults(io: std.Io, files: bool, input: []const u8) !void {
     var chooser: Chooser = .{ .bytes = g.rest() };
     s.fake.faults = chooser.plan();
 
-    const expected: []const u8 = data;
+    const stored = try testing.allocator.dupe(u8, s.fake.object("o").?.bytes);
+    defer testing.allocator.free(stored);
+    const expected: []const u8 = if (keep_stored) stored else data;
     const buffer = try testing.allocator.alloc(u8, expected.len);
     defer testing.allocator.free(buffer);
     var tmp: ?testing.TmpDir = if (to_file) testing.tmpDir(.{}) else null;
@@ -1998,7 +2048,7 @@ fn runUnderFaults(io: std.Io, files: bool, input: []const u8) !void {
     defer if (file) |f| f.close(testing.io);
     const destination: types.ParallelDestination = if (file) |f| .{ .file = f } else .{ .buffer = buffer };
 
-    const outcome = s.object("o").downloadParallel(destination, .{ .part_size = part_size, .concurrency = concurrency });
+    const outcome = s.object("o").downloadParallel(destination, .{ .part_size = part_size, .concurrency = concurrency, .decompress = !keep_stored });
     if (outcome) |result| {
         const written = if (tmp) |*t| try readBack(t) else try testing.allocator.dupe(u8, buffer[0..result.bytes_written]);
         defer testing.allocator.free(written);
@@ -2034,6 +2084,9 @@ test "fault property parallel download: every run under faults writes the object
             "\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x01\x01",
             // A cut, then a corrupted range.
             "\x00\x00\x00\x00\x00\x00\x50\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xe6\xec",
+            // 20,000 bytes gzipped, their stored bytes kept, in 2 KiB ranges,
+            // 3 at once, into a file.
+            "\x00\x00\x00\x00\x00\x00\x4e\x20\x00\x00\x00\x00\x00\x00\x04\x00\x00\x02\x01\x01\x00\x01\x00\x00\x00\x00\x00\x00\x00\x07",
         },
     });
 }
