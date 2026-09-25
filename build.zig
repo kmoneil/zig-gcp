@@ -305,6 +305,24 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&exe.step);
     }
 
+    // How fast this build computes a CRC-32C, always in ReleaseFast: the
+    // numbers are about the code the CPU runs, not a debug build's.
+    const bench_crc32c = b.addExecutable(.{
+        .name = "bench-crc32c",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/bench_crc32c.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "core", .module = b.createModule(.{
+                .root_source_file = b.path("src/core/root.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+            }) }},
+        }),
+    });
+    b.step("bench-crc32c", "Measure CRC-32C throughput, in ReleaseFast").dependOn(&b.addRunArtifact(bench_crc32c).step);
+    test_step.dependOn(&bench_crc32c.step);
+
     const fmt = b.addFmt(.{
         .paths = &.{ "build.zig", "build.zig.zon", "src", "tests", "examples", "tools" },
         .check = true,

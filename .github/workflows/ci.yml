@@ -39,6 +39,13 @@ jobs:
       - name: Unit, property and fuzz-corpus tests
         run: zig build test --summary all
 
+      # core.crc32c runs the CPU's CRC32C instructions where the build's CPU
+      # has them, as this runner's does, and tables everywhere else. A
+      # baseline x86_64 has none: the tables' build, and proof that no
+      # instruction leaks into it.
+      - name: Core unit tests on a baseline CPU
+        run: zig build test -Dmodule=core -Dcpu=baseline --summary all
+
       - name: Start the Pub/Sub emulator
         run: |
           docker run -d --name pubsub -p 8085:8085 \
