@@ -523,7 +523,7 @@ test "3. downloads carry x-goog-hash and x-goog-generation, and verify against t
     try f.expectContent(empty, "");
 }
 
-test "4. a gzip-encoded object is decompressed in transit and reports checksum_verified = false" {
+test "4. a gzip-encoded object comes as stored, is verified against the stored checksum, and is decompressed here" {
     var f: Fixture = undefined;
     if (!try f.init(.{ .record = true })) return error.SkipZigTest;
     defer f.deinit();
@@ -551,14 +551,16 @@ test "4. a gzip-encoded object is decompressed in transit and reports checksum_v
     const served = f.faults.exchanges.items.len;
     var got = obj.downloadAlloc(plain.len + 1, .{}) catch |err| return f.report(err);
     defer got.deinit();
-    // The client asked for plain bytes, so Cloud Storage decompressed them,
-    // and the stored checksum, over the compressed bytes, cannot apply.
+    // The client asked for the bytes as stored, so the stored checksum,
+    // over the compressed bytes, applies, and they were decompressed here.
     try testing.expectEqualStrings(plain, got.value.data);
-    try testing.expect(!got.value.result.checksum_verified);
+    try testing.expect(got.value.result.checksum_verified);
+    try testing.expectEqual(gz.len, got.value.result.stored_bytes);
     const exchange = f.faults.exchanges.items[served];
     try testing.expectEqualStrings("gzip", exchange.responseHeader("x-goog-stored-content-encoding").?);
-    if (exchange.responseHeader("content-encoding")) |sent| try testing.expectEqualStrings("identity", sent);
-    std.debug.print("transcoded: {d} bytes stored, {d} served\n", .{ gz.len, got.value.data.len });
+    try testing.expectEqualStrings("gzip", exchange.responseHeader("content-encoding").?);
+    try testing.expectEqualStrings("gzip", exchange.header("Accept-Encoding") orelse "gzip");
+    std.debug.print("as stored: {d} bytes over the wire, {d} decompressed here, verified\n", .{ gz.len, got.value.data.len });
 }
 
 fn gzip(gpa: Allocator, data: []const u8) ![]u8 {
@@ -1899,7 +1901,7 @@ test "25. parallel download: an overwrite partway through fails with NotFound, n
     try testing.expectEqual(overwrite.generation, fresh.generation);
 }
 
-test "26. parallel download: a gzip-stored object is fetched whole, in one request, decompressed" {
+test "26. parallel download: a gzip-stored object is fetched in one request, verified, and decompressed here" {
     var f: Fixture = undefined;
     if (!try f.init(.{ .record = true })) return error.SkipZigTest;
     defer f.deinit();
@@ -1920,13 +1922,14 @@ test "26. parallel download: a gzip-stored object is fetched whole, in one reque
     defer gpa.free(out);
     const result = obj.downloadParallel(.{ .buffer = out }, .{ .part_size = 1024 * 1024 }) catch |err| return f.report(err);
     try testing.expectEqualStrings(plain, out[0..result.bytes_written]);
-    try testing.expect(!result.checksum_verified);
+    try testing.expect(result.checksum_verified);
     try testing.expectEqual(core.crc32c.hash(plain), result.crc32c);
     // The metadata read, then one read of the object, with no range.
     const exchanges = f.faults.exchanges.items[before..];
     try testing.expectEqual(2, exchanges.len);
     try testing.expectEqual(null, exchanges[1].header("Range"));
     try testing.expectEqualStrings("gzip", exchanges[1].responseHeader("x-goog-stored-content-encoding").?);
+    try testing.expectEqualStrings("gzip", exchanges[1].responseHeader("content-encoding").?);
 }
 
 test "27. create-only parallel upload: over an existing object, refused before a byte is sent" {
@@ -2742,4 +2745,264 @@ test "37. sessions: abandonTransfer cancels a session and aborts a multipart upl
         try testing.expectEqual(temp_uploads, try openTempUploads(&f));
     }
     try testing.expectEqual(0, try tempObjects(&f));
+}
+
+// Objects stored gzip-compressed: the gzip spec's section 6, real-bucket
+// cases 1 to 7. Downloads ask for bytes as stored and decompress here, so
+// the stored checksum applies and a cut resumes; what Cloud Storage's own
+// transcoding does is asked raw, for the README.
+
+/// `data` gzip-compressed by std. Owned by the testing allocator.
+fn gzipAlloc(data: []const u8, options: std.compress.flate.Compress.Options) ![]u8 {
+    var out: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 64);
+    defer out.deinit();
+    const window = try testing.allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer testing.allocator.free(window);
+    var compress: std.compress.flate.Compress = try .init(&out.writer, window, .gzip, options);
+    try compress.writer.writeAll(data);
+    try compress.finish();
+    return out.toOwnedSlice();
+}
+
+/// Text that compresses about eight to one, as logs and HTML do.
+fn textBytes(n: usize, seed: u64) ![]u8 {
+    const data = try testing.allocator.alloc(u8, n);
+    var prng: std.Random.DefaultPrng = .init(seed);
+    for (data, 0..) |*b, i| b.* = if (i % 64 == 63) '\n' else "abcdefghij klmnop"[prng.random().uintLessThan(usize, 17)];
+    return data;
+}
+
+/// A raw media read, with `accept` as the transport offers it and an
+/// optional range: what Cloud Storage serves, asked without the library's
+/// handling. Lives in the fixture's arena.
+fn rawMedia(f: *Fixture, name: []const u8, accept: core.transport.StreamRequest.AcceptEncoding, range: ?[]const u8) !core.transport.StreamResponse {
+    const arena = f.arena.allocator();
+    const url = try std.fmt.allocPrint(arena, "https://storage.googleapis.com{s}", .{try jsonPath(f, name, "?alt=media")});
+    const headers = [_]Header{.{ .name = "Range", .value = range orelse "" }};
+    return f.http.transport().sendStream(.{
+        .method = .GET,
+        .url = url,
+        .bearer = f.token.token,
+        .headers = if (range != null) &headers else &.{},
+        .accept_encoding = accept,
+    }, arena);
+}
+
+fn describe(res: core.transport.StreamResponse) void {
+    std.debug.print("HTTP {d}, {d} bytes, Content-Encoding {s}, x-goog-stored-content-encoding {s}, x-goog-hash {s}\n", .{
+        res.status,
+        res.body.len,
+        res.header("content-encoding") orelse "(none)",
+        res.header("x-goog-stored-content-encoding") orelse "(none)",
+        res.header("x-goog-hash") orelse "(none)",
+    });
+}
+
+test "38. gzip: an object stored compressed downloads verified, decompressed in one stream and kept in ranges" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const plain = try pattern(testing.allocator, 38, 3 * 1024 * 1024 + 5);
+    defer testing.allocator.free(plain);
+    const stored = try gzipAlloc(plain, .fastest);
+    defer testing.allocator.free(stored);
+    const obj = try f.object("noise.bin");
+    var up = obj.upload(stored, .{ .content_encoding = "gzip" }) catch |err| return f.report(err);
+    up.deinit();
+
+    // 1. One stream: as stored, verified, decompressed here.
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const streamed = obj.download(&out.writer, .{}) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, plain, out.written());
+    try testing.expect(streamed.checksum_verified);
+    try testing.expectEqual(stored.len, streamed.stored_bytes);
+
+    // The stored bytes in ranges, several at once, verified by the
+    // combined checksum.
+    const ranged = try testing.allocator.alloc(u8, stored.len);
+    defer testing.allocator.free(ranged);
+    const in_ranges = obj.downloadParallel(.{ .buffer = ranged }, .{
+        .part_size = 1024 * 1024,
+        .concurrency = 1,
+        .decompress = false,
+    }) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, stored, ranged[0..in_ranges.bytes_written]);
+    try testing.expect(in_ranges.checksum_verified);
+    std.debug.print("{d} bytes stored as {d}: one verified stream, and four verified ranges of the stored bytes\n", .{ plain.len, stored.len });
+}
+
+test "39. gzip: what a range of a gzip object answers, asked for as stored and asked for plainly" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const plain = try textBytes(256 * 1024, 39);
+    defer testing.allocator.free(plain);
+    const stored = try gzipAlloc(plain, .default);
+    defer testing.allocator.free(stored);
+    const obj = try f.object("page.txt");
+    var up = obj.upload(stored, .{ .content_type = "text/plain", .content_encoding = "gzip" }) catch |err| return f.report(err);
+    up.deinit();
+
+    // 2. As stored: the range is honoured.
+    const as_stored = try rawMedia(&f, obj.name, .gzip_as_sent, "bytes=0-99");
+    std.debug.print("a range, as stored: ", .{});
+    describe(as_stored);
+    try expectStatus(206, as_stored);
+    try testing.expectEqualSlices(u8, stored[0..100], as_stored.body);
+    try testing.expectEqualStrings("gzip", as_stored.header("content-encoding").?);
+    // Plainly: decompressed, and the range ignored, as Google documents.
+    const transcoded = try rawMedia(&f, obj.name, .identity, "bytes=0-99");
+    std.debug.print("a range, plainly: ", .{});
+    describe(transcoded);
+    try expectStatus(200, transcoded);
+    try testing.expectEqualSlices(u8, plain, transcoded.body);
+}
+
+test "40. gzip: a plain object asked for as gzip, text and noise, small and large" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const text = try textBytes(2 * 1024 * 1024, 40);
+    defer testing.allocator.free(text);
+    const noise = try pattern(testing.allocator, 40, 64 * 1024);
+    defer testing.allocator.free(noise);
+    // 3. Does Cloud Storage ever compress in transit an object stored
+    // plain, for a client that takes gzip?
+    for ([_]struct { what: []const u8, bytes: []const u8, content_type: []const u8 }{
+        .{ .what = "text.txt", .bytes = text, .content_type = "text/plain" },
+        .{ .what = "text.html", .bytes = text[0..4096], .content_type = "text/html" },
+        .{ .what = "noise.bin", .bytes = noise, .content_type = "application/octet-stream" },
+    }) |case| {
+        const obj = try f.object(case.what);
+        var up = obj.upload(case.bytes, .{ .content_type = case.content_type }) catch |err| return f.report(err);
+        up.deinit();
+        const res = try rawMedia(&f, obj.name, .gzip_as_sent, null);
+        std.debug.print("{s} ({s}, {d} bytes), asked for as gzip: ", .{ case.what, case.content_type, case.bytes.len });
+        describe(res);
+        try expectStatus(200, res);
+        try testing.expectEqual(null, res.header("content-encoding"));
+        try testing.expectEqualSlices(u8, case.bytes, res.body);
+        // And through the library, verified.
+        try f.expectContent(obj, case.bytes);
+    }
+}
+
+test "41. gzip: Cache-Control no-transform serves the stored bytes to every request, and downloads verified" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const plain = try textBytes(100 * 1024, 41);
+    defer testing.allocator.free(plain);
+    const stored = try gzipAlloc(plain, .default);
+    defer testing.allocator.free(stored);
+    const obj = try f.object("kept.txt");
+    var up = obj.upload(stored, .{ .content_type = "text/plain", .content_encoding = "gzip", .cache_control = "no-transform" }) catch |err| return f.report(err);
+    up.deinit();
+
+    // 4.
+    const res = try rawMedia(&f, obj.name, .identity, null);
+    std.debug.print("no-transform, asked for plainly: ", .{});
+    describe(res);
+    try expectStatus(200, res);
+    try testing.expectEqualStrings("gzip", res.header("content-encoding").?);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const result = obj.download(&out.writer, .{}) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, plain, out.written());
+    try testing.expect(result.checksum_verified);
+}
+
+test "42. gzip: an object that says gzip and is not, transcoded by Google and refused here" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const obj = try f.object("mislabelled.txt");
+    const bytes = "these bytes were never gzip-compressed\n";
+    var up = obj.upload(bytes, .{ .content_type = "text/plain", .content_encoding = "gzip" }) catch |err| return f.report(err);
+    up.deinit();
+
+    // 5. What Cloud Storage's own transcoding makes of it.
+    const res = rawMedia(&f, obj.name, .identity, null) catch |err| {
+        std.debug.print("a mislabelled object, asked for plainly: error.{t}\n", .{err});
+        return err;
+    };
+    std.debug.print("a mislabelled object, asked for plainly: ", .{});
+    describe(res);
+    std.debug.print("  body: {s}\n", .{res.body[0..@min(res.body.len, 200)]});
+
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expectError(error.DecompressionFailed, obj.download(&out.writer, .{}));
+    std.debug.print("here: {s}\n", .{f.diag.message()});
+    var raw_out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer raw_out.deinit();
+    const kept = obj.download(&raw_out.writer, .{ .decompress = false }) catch |err| return f.report(err);
+    try testing.expectEqualStrings(bytes, raw_out.written());
+    try testing.expect(kept.checksum_verified);
+}
+
+test "43. gzip: two members, and what Google's transcoding serves of them" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const first = try gzipAlloc("the first member, ", .default);
+    defer testing.allocator.free(first);
+    const second = try gzipAlloc("and the second\n", .best);
+    defer testing.allocator.free(second);
+    const stored = try std.mem.concat(testing.allocator, u8, &.{ first, second });
+    defer testing.allocator.free(stored);
+    const obj = try f.object("members.txt");
+    var up = obj.upload(stored, .{ .content_type = "text/plain", .content_encoding = "gzip" }) catch |err| return f.report(err);
+    up.deinit();
+
+    // 6.
+    const res = try rawMedia(&f, obj.name, .identity, null);
+    std.debug.print("two members, asked for plainly: ", .{});
+    describe(res);
+    std.debug.print("  body: {s}\n", .{res.body});
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const result = obj.download(&out.writer, .{}) catch |err| return f.report(err);
+    try testing.expectEqualStrings("the first member, and the second\n", out.written());
+    try testing.expect(result.checksum_verified);
+}
+
+test "44. gzip: a cut in the first response and in a range resume at compressed offsets against Google" {
+    const chunk = 1024 * 1024;
+    var plan = [_]FaultTransport.Fault{
+        // The first response, 600,000 stored bytes in.
+        .{ .method = .GET, .url_contains = "alt=media", .action = .{ .cut_response_body = 600_000 } },
+        // The second range, 300,000 bytes in.
+        .{ .method = .GET, .url_contains = "alt=media", .skip = 2, .action = .{ .cut_response_body = 300_000 } },
+    };
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .chunk_size = chunk, .plan = &plan, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    // About 2.8 MiB stored: the first response and three ranges of a chunk.
+    const plain = try pattern(testing.allocator, 44, 12 * 1024 * 1024);
+    defer testing.allocator.free(plain);
+    const stored = try gzipAlloc(plain, .fastest);
+    defer testing.allocator.free(stored);
+    const obj = try f.object("cut.bin");
+    // Uploaded before the faults can meet it: they match media reads only.
+    var up = obj.upload(stored, .{ .content_encoding = "gzip" }) catch |err| return f.report(err);
+    up.deinit();
+
+    // 7.
+    const before = f.faults.exchanges.items.len;
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const result = obj.download(&out.writer, .{}) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, plain, out.written());
+    try testing.expect(result.checksum_verified);
+    try testing.expect(plan[0].fired and plan[1].fired);
+    try printExchanges(&f, before);
+    // Every range asked for as stored, from where the bytes stopped.
+    var saw_resume = false;
+    for (f.faults.exchanges.items[before..]) |e| {
+        const range = e.header("Range") orelse continue;
+        if (std.mem.startsWith(u8, range, "bytes=600000-")) saw_resume = true;
+    }
+    try testing.expect(saw_resume);
 }

@@ -4,6 +4,38 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.22.0 (unreleased)
+
+- storage: objects stored gzip-compressed (`Content-Encoding: gzip`) now
+  download verified. Every download asked for plain bytes, so Cloud
+  Storage decompressed such an object on the way: there was nothing to
+  check the bytes against, since the stored checksum covers the
+  compressed ones, and a dropped connection could not resume, since
+  Cloud Storage ignores a range while it decompresses. Downloads now ask
+  for bytes as stored. A plain object comes as before. A gzip object's
+  stored bytes are held to the stored checksum and decompressed here;
+  past the first chunk they come in ranges pinned to the generation, so
+  a dropped connection costs at most one range. Every gzip member is
+  decompressed, as `gzip -d` does, and each member's CRC-32 and length
+  are checked, which std's decompressor reads and does not check.
+  `downloadAlloc`'s cap counts decompressed bytes. `DownloadOptions` and
+  `ParallelDownloadOptions` gain `decompress`, true by default; false
+  keeps the stored bytes, verified, and `downloadParallel` then fetches
+  them in ranges. `DownloadResult` gains `stored_bytes`. A plain object
+  compressed on its way would be asked for again plainly; measured,
+  Cloud Storage never does that. Measured too: an object that says gzip
+  and is not makes Cloud Storage's own transcoding answer 400. Breaking,
+  for an exhaustive `switch` over `storage.Error`: it gains
+  `DecompressionFailed`, for such an object; for code that builds a
+  `DownloadResult` itself, which must now give `stored_bytes`; and a
+  range of a gzip object is now `error.InvalidArgument` unless
+  `decompress` is false, where it was `error.InvalidResponse`.
+- core: `transport.StreamRequest.AcceptEncoding` gains `gzip_as_sent`,
+  which offers gzip and delivers the body as it arrived. Breaking, for an
+  exhaustive `switch` over `AcceptEncoding`.
+- examples: `gcs_cp --no-decompress` keeps a gzip object as stored.
+- auth, pubsub, secret_manager: unchanged.
+
 ## 0.21.0 (2026-09-25)
 
 - core: `crc32c` computes CRC-32C with the CPU's instructions where the

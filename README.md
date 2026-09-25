@@ -13,11 +13,11 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, the `TokenProvider` and `Signer` seams, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 990 unit, property and fuzz tests, Google's 29 V4 signing
+- Tested with 1009 unit, property and fuzz tests, Google's 29 V4 signing
   vectors among them; 28 Pub/Sub integration tests that pass against both
   the emulator and production, and 20 more through a proxy that drops,
   cuts and stalls the connection; 22 Cloud Storage tests against
-  fake-gcs-server, and 38 against a real bucket, where uploads and
+  fake-gcs-server, and 45 against a real bucket, where uploads and
   downloads cut off mid-body, or ended with their process, resume against
   Google itself, plus 17 that sign URLs and POST policies for one; 12 Secret
   Manager tests against a real project, since it has no emulator; 10 auth
@@ -652,13 +652,11 @@ Every object has a CRC-32C, and it is checked in both directions:
 | `download`, `downloadAlloc` | The client, which hashes the bytes as they pass | `error.ChecksumMismatch`; the writer holds bytes to discard |
 
 `checksum_verified = false` means there was nothing to check against: a
-`range` read, whose bytes are only part of what the checksum covers, or an
-object stored gzip-compressed, which Cloud Storage decompresses for a
-client that did not ask for gzip, so the bytes that arrive are not the
-ones the checksum covers. A resumed download is still verified: Cloud
-Storage names no checksum on a partial range, so the client holds it to
-the one its first response named. `Options.verify_checksums = false` turns
-all of this off.
+`range` read, whose bytes are only part of what the checksum covers. A
+resumed download is still verified: Cloud Storage names no checksum on a
+partial range, so the client holds it to the one its first response named.
+An object stored gzip-compressed is verified too, as the next section
+says. `Options.verify_checksums = false` turns all of this off.
 
 Checking costs little. `core.crc32c` runs the CPU's CRC32C instructions
 where the build's target CPU has them, aarch64's CRC extension or x86_64's
@@ -680,6 +678,61 @@ download spent 0.12 s of CPU where it spent 1.83 s, and finished in about
 resume's re-read of 1 GiB, which rebuilds its checksum from the file, took
 88 ms where it took 1.9 s. `zig build bench-crc32c` measures the machine at
 hand.
+
+### Objects stored gzip-compressed
+
+An object uploaded compressed with `Content-Encoding: gzip`, as
+`gcloud storage cp -z` makes them, has a CRC-32C of its compressed bytes.
+Cloud Storage decompresses it on the way for a client that does not ask
+for gzip, and then there is nothing to check the bytes against, and a
+dropped connection cannot resume, since it ignores a range while it
+decompresses. So downloads ask for every object as stored:
+
+- **Decompressed here.** The stored bytes are checked against the stored
+  checksum and decompressed on their way to the caller's writer. Every
+  gzip member is decompressed, as `gzip -d` does, and each member's own
+  CRC-32 and length are checked too. `downloadAlloc`'s cap counts the
+  decompressed bytes, so a small object that decompresses to gigabytes
+  stops there.
+- **Resumed like any object.** Past its first chunk (`chunk_size`, 8 MiB)
+  the rest comes in ranges of the stored bytes, pinned to the generation,
+  so a dropped connection costs at most one range, and the decompressor
+  never sees it.
+- **Or kept as stored.** `DownloadOptions.decompress = false` writes the
+  stored bytes as they are, verified the same way;
+  `ParallelDownloadOptions.decompress = false` fetches them in ranges,
+  several at once. `DownloadResult.stored_bytes` counts what came over
+  the wire.
+- **Refused.** A range of a gzip object is refused with
+  `error.InvalidArgument` unless `decompress` is false: part of a gzip
+  stream does not decompress. An object whose metadata says gzip and
+  whose bytes are not fails with `error.DecompressionFailed`; Cloud
+  Storage never checks that an object is what its encoding says.
+
+```zig
+var page: std.Io.Writer.Allocating = .init(gpa);
+defer page.deinit();
+const result = try bucket.object("site/index.html").download(&page.writer, .{});
+// result.checksum_verified: the stored bytes met the stored checksum.
+// result.stored_bytes: fewer than result.bytes_written.
+```
+
+Measured against a real bucket on 2026-09-25:
+
+- A range asked for as stored comes as asked, 206 with `Content-Encoding:
+  gzip` and no `x-goog-hash`. Asked for plainly, the object comes whole
+  and decompressed, the range ignored, as Google documents.
+- An object stored plain is never compressed on its way: 2 MiB of text,
+  4 KiB of HTML and 64 KiB of noise all came as stored to a client that
+  offered gzip.
+- `Cache-Control: no-transform` serves the stored bytes even to a client
+  that asked for them plainly; they are decompressed here all the same.
+- An object that says gzip and is not makes Cloud Storage's own
+  transcoding answer 400 Bad Request.
+- A gzip object of two members is decompressed whole by Cloud Storage's
+  transcoding, and here.
+
+`examples/gcs_cp.zig --no-decompress` keeps a gzip object as stored.
 
 ### Preconditions and retries
 
@@ -1088,8 +1141,7 @@ const result = try bucket.object("backups/backup.tar").downloadParallel(.{ .file
     .concurrency = 8,              // the default
 });
 // result.checksum_verified: the ranges' checksums, combined, matched the
-// object's. False for an object stored gzip-compressed, or with checking
-// turned off.
+// object's. False with checking turned off.
 try std.Io.Dir.rename(cwd, "backup.tar.part", cwd, "backup.tar", io);
 ```
 
@@ -1114,9 +1166,10 @@ try std.Io.Dir.rename(cwd, "backup.tar.part", cwd, "backup.tar", io);
   hold the whole object, or the call is `error.ObjectTooLarge` before any
   range is read.
 - **Two kinds of object are not split.** An empty object is not read at
-  all. An object stored gzip-compressed is fetched whole by one worker,
-  decompressed and unverified, as `download` fetches it, since Cloud
-  Storage ignores a range while it decompresses.
+  all. An object stored gzip-compressed is fetched by one worker, as
+  `download` fetches it: as stored, verified, and decompressed in order,
+  which no set of ranges written at their offsets could be. With
+  `decompress = false` its stored bytes come in ranges like any object's.
 
 On any failure the destination holds whatever arrived, so write to a
 temporary name and rename it on success, as `examples/gcs_cp.zig
@@ -1284,12 +1337,14 @@ differences it found:
   server that speak them.
 - It does serve ranges pinned to a generation, and decompresses a
   gzip-stored object ignoring a range, as Cloud Storage does, so
-  `downloadParallel` runs against it for real.
+  `downloadParallel` runs against it for real. To a client that takes
+  gzip it serves a gzip object as stored, ranges and all, as Cloud
+  Storage does, so gzip objects download verified against it too.
 
 ## Zig 0.16 standard library issues handled here
 
-The HTTP transport works around these, each covered by a regression test in
-`src/core/transport.zig`:
+Each of these is worked around here, and covered by a regression test in
+`src/core/transport.zig` unless it says otherwise:
 
 - A chunk size near 2^64 panics `std.http`'s chunked decoder (integer
   overflow), so the transport decodes chunked bodies itself.
@@ -1312,6 +1367,11 @@ The HTTP transport works around these, each covered by a regression test in
   gets: a retry it may not deserve. On other platforms `error.Unexpected`
   stays a permanent `NetworkFailure`.
 - `zig build test --fuzz` does not compile; see `-Dfuzz-runner` below.
+- `std.compress.flate.Decompress` reads each gzip member's trailer, its
+  CRC-32 and length, and checks neither, so a corrupted member
+  decompresses to wrong bytes without complaint. `storage`'s downloads
+  check both themselves, in `src/storage/gzip_download.zig`, where a test
+  also holds std to what it does.
 
 ## Development
 
