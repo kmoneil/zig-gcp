@@ -9,6 +9,8 @@
 //!     ... -- gs://my-bucket/backup.tar restored.tar --parallel 8
 //!     ... -- backup.tar gs://my-bucket/backup.tar --resume backup.tar.state
 //!     ... -- gs://my-bucket/page.html page.html.gz --no-decompress
+//!     ... -- access.log gs://my-bucket/logs/access.log -z log,txt
+//!     ... -- report.csv gs://my-bucket/report.csv -Z
 //!
 //! Both directions are checksummed end to end. An upload reads the file at
 //! offsets, a chunk at a time, and its last request carries the file's
@@ -25,6 +27,15 @@
 //! written at their offsets. With `--no-clobber` too, a parallel upload
 //! finishes under a temporary name and moves into place only if nothing
 //! took the name meanwhile.
+//!
+//! `-z EXTS` compresses the file with gzip on its way up when its name
+//! ends in one of the comma-separated extensions, as `gcloud storage cp
+//! -z` does, and `-Z` compresses it whatever its name. The object keeps
+//! its name and is stored compressed, with `Content-Encoding: gzip` and,
+//! as gcloud sets it, `Cache-Control: no-transform`, so every client gets
+//! the stored bytes. The compression is checked before the upload
+//! finishes, by decompressing it again, and a download decompresses it.
+//! A compressed file goes up as one stream: `--parallel` does not apply.
 //!
 //! `--resume STATE` keeps what a later run needs in the file STATE, so a
 //! copy that failed, or whose process was killed, carries on where it
@@ -53,7 +64,7 @@ pub const std_options: std.Options = .{
     },
 };
 
-const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber] [--parallel N] [--resume STATE]\n" ++
+const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber] [--parallel N] [--resume STATE] [-z EXTS | -Z]\n" ++
     "       gcs_cp gs://<bucket>/<object> <file> [--parallel N] [--resume STATE] [--no-decompress]\n";
 
 pub fn main(init: std.process.Init) !void {
@@ -68,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
     var no_decompress = false;
     var parallel: ?u16 = null;
     var state: ?[]const u8 = null;
+    var compress: Compress = .none;
     var bad = false;
     const args = try init.minimal.args.toSlice(arena);
     var i: usize = @min(1, args.len);
@@ -85,6 +97,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             state = if (i < args.len) args[i] else null;
             if (state == null) bad = true;
+        } else if (std.mem.eql(u8, arg, "-z")) {
+            i += 1;
+            if (i >= args.len or args[i].len == 0 or compress != .none) bad = true else compress = .{ .extensions = args[i] };
+        } else if (std.mem.eql(u8, arg, "-Z")) {
+            if (compress != .none) bad = true;
+            compress = .all;
         } else if (count < paths.len) {
             paths[count] = arg;
             count += 1;
@@ -95,9 +113,10 @@ pub fn main(init: std.process.Init) !void {
     const from_remote = if (count == 2) Remote.parse(paths[0]) else null;
     const to_remote = if (count == 2) Remote.parse(paths[1]) else null;
     // Exactly one side is in Cloud Storage, only an upload can refuse to
-    // replace what is there, and only a download decompresses.
+    // replace what is there or compress, and only a download decompresses.
     if (bad or count != 2 or (from_remote == null) == (to_remote == null) or
-        (no_clobber and to_remote == null) or (no_decompress and from_remote == null))
+        (no_clobber and to_remote == null) or (compress != .none and to_remote == null) or
+        (no_decompress and from_remote == null))
     {
         try out.writeAll(usage);
         return out.flush();
@@ -123,12 +142,37 @@ pub fn main(init: std.process.Init) !void {
 
     const started = std.Io.Clock.awake.now(init.io);
     if (to_remote) |remote| {
-        try upload(&client, init.io, paths[0], remote, no_clobber, parallel, state, out, &diag, started);
+        try upload(&client, init.io, paths[0], remote, no_clobber, parallel, state, compress.applies(paths[0]), out, &diag, started);
     } else {
         try download(&client, init.io, arena, from_remote.?, paths[1], parallel, state, !no_decompress, out, &diag, started);
     }
     try out.flush();
 }
+
+/// Which files `-z` and `-Z` compress.
+const Compress = union(enum) {
+    none,
+    all,
+    /// Comma-separated, matched against the end of the file's name as
+    /// gcloud matches them: case-sensitive, a leading dot optional.
+    extensions: []const u8,
+
+    fn applies(c: Compress, path: []const u8) bool {
+        switch (c) {
+            .none => return false,
+            .all => return true,
+            .extensions => |list| {
+                var it = std.mem.splitScalar(u8, list, ',');
+                while (it.next()) |raw| {
+                    const ext = std.mem.trimStart(u8, std.mem.trim(u8, raw, " "), ".");
+                    if (ext.len == 0) continue;
+                    if (path.len > ext.len and path[path.len - ext.len - 1] == '.' and std.mem.endsWith(u8, path, ext)) return true;
+                }
+                return false;
+            },
+        }
+    }
+};
 
 /// `gs://bucket/object`, split. The object name is everything after the
 /// bucket's slash, slashes and all.
@@ -152,6 +196,7 @@ fn upload(
     no_clobber: bool,
     parallel: ?u16,
     state: ?[]const u8,
+    compress: bool,
     out: *std.Io.Writer,
     diag: *const storage.Diagnostics,
     started: std.Io.Timestamp,
@@ -161,6 +206,25 @@ fn upload(
     const preconditions: storage.Preconditions = if (no_clobber) .does_not_exist else .{};
     var saved: storage.CheckpointFile = .init(io, std.Io.Dir.cwd(), state orelse "");
     const checkpoint: ?storage.Checkpoint = if (state != null) saved.checkpoint() else null;
+    if (compress) {
+        if (parallel != null) std.debug.print("{s} is compressed, which goes up as one stream: --parallel does not apply\n", .{path});
+        const size = try file.length(io);
+        var info = client.bucket(remote.bucket).object(remote.name).uploadFile(file, .{
+            .preconditions = preconditions,
+            .checkpoint = checkpoint,
+            .gzip = .{},
+            // As gcloud sets it: every client gets the stored bytes, and
+            // with them the stored checksum.
+            .cache_control = "no-transform",
+        }) catch |err| return refused(err, no_clobber, remote, diag, io, state);
+        defer info.deinit();
+        const ms = elapsedMs(io, started);
+        const percent = if (size == 0) 100.0 else 100.0 * @as(f64, @floatFromInt(info.value.size)) / @as(f64, @floatFromInt(size));
+        try out.print("{s} -> gs://{s}/{s}, gzip: {d} bytes stored for {d} ({d:.1}%) in {d} ms ({d:.1} MiB/s of the file), generation {d}, crc32c {?x:0>8}\n", .{
+            path, remote.bucket, remote.name, info.value.size, size, percent, ms, mibPerSecond(size, ms), info.value.generation, info.value.crc32c,
+        });
+        return;
+    }
     if (parallel) |concurrency| {
         // Each part is read at its own offset, and checked on its own.
         var info = client.bucket(remote.bucket).object(remote.name).uploadParallel(.{ .file = file }, .{

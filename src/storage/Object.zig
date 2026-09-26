@@ -398,6 +398,15 @@ pub fn copyTo(self: Object, dest: Object, options: types.CopyOptions) Error!type
 /// keeps it readable by its owner only, and a custom store should guard
 /// it as it guards credentials. It is also what a Storage Object Creator
 /// role, which cannot read objects back, can resume.
+///
+/// With `options.gzip`, the file is compressed on its way up, checked as
+/// `upload` checks it, and a lost session compresses it again. A later
+/// process holding the checkpoint compresses the file again from its
+/// first byte and passes over what the session holds, spending the CPU
+/// again but not the bandwidth: at level 6, about 9 seconds a GiB already
+/// sent. That needs the same level and the same Zig as the process that
+/// began it, whose compressor another Zig may not reproduce; a checkpoint
+/// from another starts over.
 pub fn uploadFile(self: Object, file: std.Io.File, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
@@ -405,10 +414,6 @@ pub fn uploadFile(self: Object, file: std.Io.File, options: types.UploadOptions)
     try checkUploadOptions(self.client, options);
     if (options.size != null) {
         if (self.client.diagnostics) |d| d.print("uploadFile takes its size from the file; leave options.size null", .{});
-        return error.InvalidArgument;
-    }
-    if (options.gzip != null) {
-        if (self.client.diagnostics) |d| d.print("uploadFile does not compress yet; uploadFrom with the file's reader does", .{});
         return error.InvalidArgument;
     }
     return upload_file.upload(self.client, self.bucket, self.name, file, options);

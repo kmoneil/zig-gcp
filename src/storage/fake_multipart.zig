@@ -842,6 +842,13 @@ pub const FakeMultipart = struct {
                 if (chunk.end < chunk.start or body.len != chunk.end - chunk.start + 1) {
                     return .{ .status = 400, .body = "the body does not match its Content-Range" };
                 }
+                // Cloud Storage holds an upload to the length its opening
+                // declared.
+                if (s.declared) |declared| {
+                    const past = chunk.end + 1 > declared;
+                    const other_total = if (chunk.total) |total| total != declared else false;
+                    if (past or other_total) return .{ .status = 400, .body = "the upload's length is not the X-Upload-Content-Length it declared" };
+                }
                 const held = s.bytes.items.len;
                 if (chunk.start > held) return sessionProgress(arena, held);
                 // Bytes already stored cannot be overwritten; the tail is

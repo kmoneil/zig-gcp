@@ -11,11 +11,13 @@
 //! only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const core = @import("core");
 
 const Client = @import("Client.zig");
 const checkpoint = @import("checkpoint.zig");
+const gzip_upload = @import("gzip_upload.zig");
 const logging = @import("logging.zig");
 const mp = @import("xml_multipart.zig");
 const resumable = @import("resumable.zig");
@@ -44,6 +46,7 @@ pub fn upload(
         if (client.diagnostics) |d| d.print("the file is {d} bytes, and an object holds at most 5 TiB", .{size});
         return error.InvalidArgument;
     }
+    if (options.gzip) |gzip| return uploadCompressed(client, bucket, object, file, size, options, gzip);
     const metadata_crc: ?[8]u8 = if (options.crc32c) |given| core.crc32c.toBase64(given) else null;
     const buffer = try client.gpa.alloc(u8, client.chunk_size);
     defer client.gpa.free(buffer);
@@ -51,12 +54,65 @@ pub fn upload(
     const cp = options.checkpoint orelse {
         return resumable.run(client, bucket, object, source, options, metadata_crc);
     };
-    const result = resumeOrStart(client, bucket, object, file, source, size, options, metadata_crc, cp);
+    return finish(cp, resumeOrStart(client, bucket, object, file, source, .{ .size = size }, options, metadata_crc, cp));
+}
+
+/// `uploadFile` with `options.gzip`: the file compressed on its way up.
+/// The session holds compressed bytes, whose count only the end of the
+/// file settles, so it opens with no length. A later process holding the
+/// checkpoint compresses the file again from its first byte, passes over
+/// what the session holds, and sends the rest: the same file at the same
+/// level, on the same Zig, compresses to the same bytes, and the finishing
+/// checksum covers the whole stream in case it did not.
+fn uploadCompressed(
+    client: *Client,
+    bucket: []const u8,
+    object: []const u8,
+    file: std.Io.File,
+    size: u64,
+    options: types.UploadOptions,
+    gzip: types.Gzip,
+) Error!types.Owned(types.ObjectInfo) {
+    const stream = try gzip_upload.Stream.create(client, .{ .file = .{ .f = file, .size = size } }, gzip.level, options.crc32c);
+    defer stream.destroy();
+    const cp = options.checkpoint orelse
+        return gzip_upload.uploadResumable(stream, client, bucket, object, options);
+    const buffer = try client.gpa.alloc(u8, client.chunk_size);
+    defer client.gpa.free(buffer);
+    const source: resumable.Source = .{ .reader = .{
+        .r = &stream.interface,
+        .buffer = buffer,
+        .declared = null,
+        .final_hash = if (client.verify_checksums) &stream.compressed_hash else null,
+        .restart = stream.restart(),
+        .failure = &stream.failure,
+    } };
+    const shape: Shape = .{ .size = size, .gzip = .{ .level = gzip.level, .zig = builtin.zig_version_string } };
+    return finish(cp, resumeOrStart(client, bucket, object, file, source, shape, gzip_upload.storedOptions(options), null, cp));
+}
+
+/// Clears the checkpoint once the upload is done, or failed in a way a
+/// resume could only repeat.
+fn finish(cp: checkpoint.Checkpoint, result: Error!types.Owned(types.ObjectInfo)) Error!types.Owned(types.ObjectInfo) {
     if (result) |_| {
         cp.clear();
     } else |err| if (checkpoint.uploadAbandons(err)) cp.clear();
     return result;
 }
+
+/// What makes a checkpoint's session this upload's: the file's size, and
+/// how the upload compresses it.
+const Shape = struct {
+    size: u64,
+    gzip: ?checkpoint.State.UploadFile.Gzip = null,
+
+    fn matches(shape: Shape, saved: checkpoint.State.UploadFile) bool {
+        if (saved.size != shape.size) return false;
+        const a = shape.gzip orelse return saved.gzip == null;
+        const b = saved.gzip orelse return false;
+        return a.level == b.level and std.mem.eql(u8, a.zig, b.zig);
+    }
+};
 
 /// Picks the upload up at whatever its session holds, or opens one and
 /// records it. A session that is gone, expired or cancelled starts over,
@@ -68,7 +124,7 @@ fn resumeOrStart(
     object: []const u8,
     file: std.Io.File,
     source: resumable.Source,
-    size: u64,
+    shape: Shape,
     options: types.UploadOptions,
     metadata_crc: ?[8]u8,
     cp: checkpoint.Checkpoint,
@@ -77,24 +133,38 @@ fn resumeOrStart(
     defer state_arena.deinit();
     const mtime = try statMtime(client, file);
     var saved = try loadState(client, cp, state_arena.allocator(), bucket, object);
-    if (saved) |s| if (s.size != size or s.mtime != mtime) {
-        logging.warn("{s}: the source file changed under the checkpoint; cancelling the old session and starting over", .{object});
+    if (saved) |s| if (!shape.matches(s) or s.mtime != mtime) {
+        if (s.size != shape.size or s.mtime != mtime) {
+            logging.warn("{s}: the source file changed under the checkpoint; cancelling the old session and starting over", .{object});
+        } else {
+            logging.warn("{s}: the checkpoint's upload was compressed another way, or by another Zig; cancelling the old session and starting over", .{object});
+        }
         resumable.dropSession(client, s.session);
         saved = null;
     };
+    // A compressed upload's session opens with no length: the end of the
+    // file settles how many compressed bytes there are.
+    const declared: ?u64 = if (shape.gzip == null) shape.size else null;
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         var session_arena: std.heap.ArenaAllocator = .init(client.gpa);
         defer session_arena.deinit();
+        // A stream starts every session from its first byte; the file
+        // source reads at whatever offset the session names.
+        if (attempt > 0) switch (source) {
+            .reader => |r| try r.restart.?.rewind(r.restart.?.ctx),
+            else => {},
+        };
         const resuming = saved != null;
         const session = if (saved) |s| s.session else blk: {
-            const uri = try resumable.startSession(client, session_arena.allocator(), bucket, object, options, metadata_crc, size);
+            const uri = try resumable.startSession(client, session_arena.allocator(), bucket, object, options, metadata_crc, declared);
             saveState(client, cp, .{ .upload_file = .{
                 .bucket = bucket,
                 .object = object,
-                .size = size,
+                .size = shape.size,
                 .mtime = mtime,
                 .session = uri,
+                .gzip = shape.gzip,
             } }) catch |err| {
                 // A session the checkpoint never recorded would only take
                 // writes for a week: drop it again before any data moves.
@@ -1099,4 +1169,433 @@ test "uploadFile over real sockets: an upload its connection keeps killing resum
     try testing.expectEqual(1, fake.counts.session_starts);
     try testing.expectEqual(0, fake.openSessions());
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "o.upload", .{}));
+}
+
+/// What std makes of `data` at `level`, which a compressed upload must
+/// store byte for byte however it got there.
+fn gzipOf(data: []const u8, level: u4) ![]u8 {
+    const levels = [_]std.compress.flate.Compress.Options{ .level_1, .level_2, .level_3, .level_4, .level_5, .level_6, .level_7, .level_8, .level_9 };
+    return test_util.gzipAlloc(testing.allocator, data, levels[level - 1]);
+}
+
+/// The fake's object: exactly `gzipOf(data, level)`, labelled gzip, and
+/// described by `info`.
+fn expectCompressed(fake: *const FakeMultipart, name: []const u8, data: []const u8, level: u4, info: types.ObjectInfo) !void {
+    const want = try gzipOf(data, level);
+    defer testing.allocator.free(want);
+    const o = fake.object(name) orelse return error.TestExpectedObject;
+    try testing.expectEqualSlices(u8, want, o.bytes);
+    try testing.expectEqualSlices(u8, data, o.served orelse return error.TestExpectedGzipLabel);
+    try testing.expectEqual(want.len, info.size);
+    try testing.expectEqual(core.crc32c.hash(want), info.crc32c.?);
+    try testing.expectEqualStrings("gzip", info.content_encoding.?);
+}
+
+test "compressed uploadFile: whole and empty, stored as std's gzip of the file" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 3);
+    defer client.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]usize{ 0, 600 * 1024 }) |size| {
+        const data = try testing.allocator.alloc(u8, size);
+        defer testing.allocator.free(data);
+        fill(data, 70);
+        const file = try sourceOn(&tmp, data);
+        defer file.close(testing.io);
+        var info = try client.bucket("b").object("o").uploadFile(file, .{ .gzip = .{ .level = 3 }, .content_type = "text/csv" });
+        defer info.deinit();
+        try expectCompressed(&fake, "o", data, 3, info.value);
+        try testing.expectEqualStrings("text/csv", fake.object("o").?.content_type);
+    }
+    try testing.expectEqual(2, fake.counts.session_starts);
+}
+
+test "compressed uploadFile: a corrupted chunk poisons the session, and the file is compressed again" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 3);
+    defer client.deinit();
+    const data = try testing.allocator.alloc(u8, 600 * 1024);
+    defer testing.allocator.free(data);
+    fill(data, 71);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, data);
+    defer file.close(testing.io);
+    var rules = [_]Script.Rule{.{ .fault = .corrupt }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    var info = try client.bucket("b").object("o").uploadFile(file, .{ .gzip = .{} });
+    defer info.deinit();
+    try expectCompressed(&fake, "o", data, 6, info.value);
+    try testing.expectEqual(2, fake.counts.session_starts);
+    try testing.expectEqual(1, fake.counts.session_cancels);
+}
+
+test "compressed uploadFile: a run that dies partway resumes on a second client, passing over what the session holds" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    // Noise, so the compressed stream spans three chunks.
+    const data = try testing.allocator.alloc(u8, 600 * 1024);
+    defer testing.allocator.free(data);
+    fill(data, 72);
+    const compressed = try gzipOf(data, 6);
+    defer testing.allocator.free(compressed);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, data);
+    defer file.close(testing.io);
+    var store: checkpoint.CheckpointFile = .init(testing.io, tmp.dir, "o.upload");
+    const options: types.UploadOptions = .{ .checkpoint = store.checkpoint(), .gzip = .{} };
+
+    // The first process stores two chunks; the request for the third is
+    // canceled with it, which leaves the session for the checkpoint.
+    var rules = [_]Script.Rule{.{ .at = 2 * chunk_size, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    {
+        var diag: Diagnostics = .{};
+        var first = try clientOn(&fake, &token, &diag, 3);
+        defer first.deinit();
+        try testing.expectError(error.Canceled, first.bucket("b").object("dir/o").uploadFile(file, options));
+    }
+    try testing.expectEqual(1, fake.openSessions());
+    try testing.expectEqual(0, fake.counts.session_cancels);
+    try testing.expectEqual(2 * chunk_size, fake.counts.session_bytes);
+    fake.faults = null;
+
+    // The second process compresses the file again, passes over the two
+    // chunks the session holds, and sends only the rest.
+    var diag: Diagnostics = .{};
+    var second = try clientOn(&fake, &token, &diag, 3);
+    defer second.deinit();
+    var info = try second.bucket("b").object("dir/o").uploadFile(file, options);
+    defer info.deinit();
+    try expectCompressed(&fake, "dir/o", data, 6, info.value);
+    try testing.expectEqual(1, fake.counts.session_starts);
+    try testing.expectEqual(compressed.len, fake.counts.session_bytes);
+    try testing.expectEqual(0, fake.counts.session_stale_bytes);
+    try testing.expectEqual(0, fake.openSessions());
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "o.upload", .{}));
+}
+
+test "compressed uploadFile: a checkpoint of a finished upload compresses the file again to check it, and sends nothing" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 3);
+    defer client.deinit();
+    const data = try testing.allocator.alloc(u8, 400 * 1024);
+    defer testing.allocator.free(data);
+    fill(data, 73);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, data);
+    defer file.close(testing.io);
+    // The process dies between the finish and the clear.
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator, .keep_on_clear = true };
+    defer saved.deinit();
+    const options: types.UploadOptions = .{ .checkpoint = saved.checkpoint(), .gzip = .{ .level = 2 } };
+    var first = try client.bucket("b").object("o").uploadFile(file, options);
+    first.deinit();
+    const bytes_before = fake.counts.session_bytes;
+
+    saved.keep_on_clear = false;
+    var info = try client.bucket("b").object("o").uploadFile(file, options);
+    defer info.deinit();
+    try expectCompressed(&fake, "o", data, 2, info.value);
+    try testing.expectEqual(bytes_before, fake.counts.session_bytes);
+    try testing.expectEqual(1, fake.counts.session_starts);
+    try testing.expectEqual(null, saved.stored);
+}
+
+/// Replaces the saved state's fields as `edit` says, as another process,
+/// another version or a forger might have written it.
+fn forgeState(saved: *MemoryCheckpoint, edit: anytype) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var state = (try checkpoint.parse(arena.allocator(), saved.stored.?)).upload_file;
+    inline for (std.meta.fields(@TypeOf(edit))) |field| @field(state, field.name) = @field(edit, field.name);
+    const forged = try checkpoint.encodeAlloc(testing.allocator, .{ .upload_file = state });
+    testing.allocator.free(saved.stored.?);
+    saved.stored = forged;
+}
+
+/// A first run that stores two chunks of the file compressed at `level`
+/// and dies, leaving its checkpoint.
+fn dieAfterTwoChunks(fake: *FakeMultipart, token: *core.StaticToken, file: std.Io.File, saved: *MemoryCheckpoint, level: u4) !void {
+    var rules = [_]Script.Rule{.{ .at = 2 * chunk_size, .fault = .canceled }};
+    var script: Script = .{ .rules = &rules };
+    fake.faults = script.plan();
+    defer fake.faults = null;
+    var diag: Diagnostics = .{};
+    var first = try clientOn(fake, token, &diag, 3);
+    defer first.deinit();
+    const options: types.UploadOptions = .{ .checkpoint = saved.checkpoint(), .gzip = .{ .level = level } };
+    try testing.expectError(error.Canceled, first.bucket("b").object("o").uploadFile(file, options));
+    try testing.expectEqual(2 * chunk_size, fake.sessions.items[fake.sessions.items.len - 1].bytes.items.len);
+}
+
+test "compressed uploadFile: a checkpoint at another level, or from another Zig, cancels its session and starts over" {
+    const data = try testing.allocator.alloc(u8, 700 * 1024);
+    defer testing.allocator.free(data);
+    fill(data, 74);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, data);
+    defer file.close(testing.io);
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+
+    for ([_]bool{ false, true }) |other_zig| {
+        var fake: FakeMultipart = .init(testing.allocator, testing.io);
+        defer fake.deinit();
+        var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+        defer saved.deinit();
+        try dieAfterTwoChunks(&fake, &token, file, &saved, 1);
+        if (other_zig) try forgeState(&saved, .{ .gzip = checkpoint.State.UploadFile.Gzip{ .level = 1, .zig = "0.15.1" } });
+
+        var diag: Diagnostics = .{};
+        var client = try clientOn(&fake, &token, &diag, 3);
+        defer client.deinit();
+        const level: u4 = if (other_zig) 1 else 9;
+        const bytes_before = fake.counts.session_bytes;
+        var info = try client.bucket("b").object("o").uploadFile(file, .{ .checkpoint = saved.checkpoint(), .gzip = .{ .level = level } });
+        defer info.deinit();
+        try expectCompressed(&fake, "o", data, level, info.value);
+        try testing.expectEqual(2, fake.counts.session_starts);
+        try testing.expectEqual(1, fake.counts.session_cancels);
+        try testing.expectEqual(null, saved.stored);
+        // The old session was cancelled before a byte moved: only the new
+        // one got any.
+        try testing.expectEqual(info.value.size, fake.counts.session_bytes - bytes_before);
+    }
+}
+
+test "compressed uploadFile: a session holding other bytes is refused at the finish, or holds more than the file makes, and the upload starts over" {
+    const data = try testing.allocator.alloc(u8, 700 * 1024);
+    defer testing.allocator.free(data);
+    fill(data, 75);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, data);
+    defer file.close(testing.io);
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+
+    // Level 1's bytes in the session, a state forged to say level 9: the
+    // file at level 9 makes other bytes of about the same length, which
+    // the finishing checksum refuses.
+    {
+        var fake: FakeMultipart = .init(testing.allocator, testing.io);
+        defer fake.deinit();
+        var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+        defer saved.deinit();
+        try dieAfterTwoChunks(&fake, &token, file, &saved, 1);
+        try forgeState(&saved, .{ .gzip = checkpoint.State.UploadFile.Gzip{ .level = 9, .zig = builtin.zig_version_string } });
+        var diag: Diagnostics = .{};
+        var client = try clientOn(&fake, &token, &diag, 3);
+        defer client.deinit();
+        var info = try client.bucket("b").object("o").uploadFile(file, .{ .checkpoint = saved.checkpoint(), .gzip = .{ .level = 9 } });
+        defer info.deinit();
+        try expectCompressed(&fake, "o", data, 9, info.value);
+        try testing.expectEqual(2, fake.counts.session_starts);
+        try testing.expectEqual(1, fake.counts.session_cancels);
+    }
+
+    // Another file's session, 512 KiB of it, under a state forged to name
+    // this small file, which compresses to less than that.
+    {
+        var fake: FakeMultipart = .init(testing.allocator, testing.io);
+        defer fake.deinit();
+        var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+        defer saved.deinit();
+        try dieAfterTwoChunks(&fake, &token, file, &saved, 6);
+        const small = "a small file\n" ** 1000;
+        var tmp2 = testing.tmpDir(.{});
+        defer tmp2.cleanup();
+        const small_file = try sourceOn(&tmp2, small);
+        defer small_file.close(testing.io);
+        try forgeState(&saved, .{ .size = @as(u64, small.len), .mtime = (try small_file.stat(testing.io)).mtime.nanoseconds });
+        var diag: Diagnostics = .{};
+        var client = try clientOn(&fake, &token, &diag, 3);
+        defer client.deinit();
+        var info = try client.bucket("b").object("o").uploadFile(small_file, .{ .checkpoint = saved.checkpoint(), .gzip = .{} });
+        defer info.deinit();
+        try expectCompressed(&fake, "o", small, 6, info.value);
+        try testing.expectEqual(2, fake.counts.session_starts);
+        try testing.expectEqual(1, fake.counts.session_cancels);
+    }
+}
+
+fn compressedUploadWithCheckpoint(gpa: Allocator) !void {
+    var fake: FakeMultipart = .init(gpa, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: Diagnostics = .{};
+    var client = try Client.init(gpa, testing.io, .{
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+        .diagnostics = &diag,
+        .chunk_size = chunk_size,
+        .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 2 },
+    });
+    defer client.deinit();
+    var data: [300 * 1024]u8 = undefined;
+    fill(&data, 76);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, &data);
+    defer file.close(testing.io);
+    var saved: MemoryCheckpoint = .{ .gpa = gpa };
+    defer saved.deinit();
+    var info = try client.bucket("b").object("o").uploadFile(file, .{ .checkpoint = saved.checkpoint(), .gzip = .{} });
+    info.deinit();
+}
+
+test "compressed uploadFile with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, compressedUploadWithCheckpoint, .{});
+}
+
+/// `resumeUnderFaults` for a compressed upload: whatever the faults cut,
+/// the second run ends with exactly std's compression of the file, which
+/// shows a resume makes the same bytes as the run that began it, and a
+/// clean resume of a live session sends none the session holds.
+fn compressedResumeUnderFaults(input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    const level = g.intRange(u4, 1, 9);
+    const size = g.intRange(usize, 0, 700 * 1024);
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    // Noise, or noise diluted with runs, so the compressed stream is
+    // anywhere from a few bytes to three chunks.
+    fill(data, g.int(u64));
+    const runs = g.intRange(u8, 0, 3);
+    if (runs > 0) for (data, 0..) |*b, i| {
+        if ((i / 64) % 4 < runs) b.* = 'x';
+    };
+    const compressed = try gzipOf(data, level);
+    defer testing.allocator.free(compressed);
+
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
+    defer saved.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, data);
+    defer file.close(testing.io);
+    const options: types.UploadOptions = .{ .checkpoint = saved.checkpoint(), .gzip = .{ .level = level } };
+
+    var chooser: Chooser = .{ .bytes = g.rest() };
+    fake.faults = chooser.plan();
+    var first_diag: Diagnostics = .{};
+    var first = try clientOn(&fake, &token, &first_diag, 2);
+    defer first.deinit();
+    if (first.bucket("b").object("o").uploadFile(file, options)) |finished| {
+        var owned = finished;
+        owned.deinit();
+    } else |err| {
+        errdefer std.debug.print("first run: {t}: {s}\n", .{ err, first_diag.message() });
+        try testing.expect(chooser.faulted);
+    }
+
+    var held_before: u64 = 0;
+    var resumed_session = false;
+    if (saved.stored) |bytes| {
+        var state_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer state_arena.deinit();
+        const s = (try checkpoint.parse(state_arena.allocator(), bytes)).upload_file;
+        try testing.expectEqual(level, s.gzip.?.level);
+        for (fake.sessions.items) |session| {
+            if (!std.mem.endsWith(u8, s.session, session.id)) continue;
+            if (session.done == null) {
+                resumed_session = true;
+                held_before = session.bytes.items.len;
+            }
+        }
+    }
+    const bytes_before = fake.counts.session_bytes;
+    const starts_before = fake.counts.session_starts;
+
+    fake.faults = null;
+    var diag: Diagnostics = .{};
+    var second = try clientOn(&fake, &token, &diag, 4);
+    defer second.deinit();
+    const target = second.bucket("b").object("o");
+    var info = target.uploadFile(file, options) catch |err| {
+        errdefer std.debug.print("second run: {t}: {s}\n", .{ err, diag.message() });
+        // The checksum backstop, as for an uncompressed file: a corrupted
+        // chunk stored with every byte in, finished by the second run's
+        // hashless status query, found wrong and deleted.
+        try testing.expectEqual(error.ChecksumMismatch, err);
+        try testing.expect(chooser.faulted);
+        try testing.expectEqual(null, saved.stored);
+        try testing.expect(fake.object("o") == null);
+        var third = try target.uploadFile(file, options);
+        defer third.deinit();
+        try expectCompressed(&fake, "o", data, level, third.value);
+        return;
+    };
+    defer info.deinit();
+    try expectCompressed(&fake, "o", data, level, info.value);
+    try testing.expectEqual(null, saved.stored);
+    if (resumed_session and fake.counts.session_starts == starts_before) {
+        try testing.expectEqual(compressed.len - held_before, fake.counts.session_bytes - bytes_before);
+        try testing.expectEqual(0, fake.counts.session_stale_bytes);
+    }
+    for (fake.sessions.items) |s| {
+        if (s.done == null) try testing.expectEqual(0, s.bytes.items.len);
+    }
+}
+
+fn compressedResumeProperty(_: void, input: []const u8) !void {
+    try compressedResumeUnderFaults(input);
+}
+
+// Compressing up to 700 KiB several times a run in Debug, over a real
+// file: named out of the nightly filters, like the uncompressed resume
+// property.
+test "fault property compressed uploadFile resume: a second run ends with std's bytes, sending nothing the session holds" {
+    try test_util.fuzzBytes({}, compressedResumeProperty, .{
+        .random_runs = 60,
+        .max_len = 256,
+        .corpus = &.{
+            "",
+            // 700 KiB of noise at level 9, a reset and a lost answer.
+            "\x09\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\xdc\xe6",
+            // A corrupted chunk: refused at the finish, started over.
+            "\x06\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xf0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            // Canceled partway: the second run passes over what it holds.
+            "\x01\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xe6",
+        },
+    });
+}
+
+test "compressed uploadFile: a file shorter than it measured is caught, and nothing is stored" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var token: core.StaticToken = .{ .token = "ya29.t" };
+    var diag: Diagnostics = .{};
+    var client = try clientOn(&fake, &token, &diag, 3);
+    defer client.deinit();
+    const data = "a line that repeats\n" ** 5000;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try sourceOn(&tmp, data);
+    defer file.close(testing.io);
+    // A stream told the file is longer than it is, as one that shrank
+    // after it was measured would read.
+    const stream = try gzip_upload.Stream.create(&client, .{ .file = .{ .f = file, .size = data.len + 100 } }, 6, null);
+    defer stream.destroy();
+    try testing.expectError(error.ReadFailed, gzip_upload.uploadResumable(stream, &client, "b", "o", .{ .gzip = .{} }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "it changed under the upload") != null);
+    try testing.expect(fake.object("o") == null);
 }

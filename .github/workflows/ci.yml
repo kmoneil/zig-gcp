@@ -135,6 +135,22 @@ jobs:
           cmp "$RUNNER_TEMP/page.txt.gz" "$RUNNER_TEMP/page-back.txt.gz"
           zig build example-gcs_cp -- gs://zigps-examples/dir/page.txt "$RUNNER_TEMP/page-ranges.txt.gz" --no-decompress --parallel 4
           cmp "$RUNNER_TEMP/page.txt.gz" "$RUNNER_TEMP/page-ranges.txt.gz"
+          # Compressed on the way up with -z: the object holds gzip that the
+          # system's gzip reads back, and comes down decompressed. A name -z
+          # does not list goes up as it is. -Z compresses whatever the name,
+          # with --resume, whose state is gone once the copy is done.
+          zig build example-gcs_cp -- "$RUNNER_TEMP/page.txt" gs://zigps-examples/dir/zipped.txt -z log,txt
+          zig build example-gcs_cp -- gs://zigps-examples/dir/zipped.txt "$RUNNER_TEMP/zipped-back.txt"
+          cmp "$RUNNER_TEMP/page.txt" "$RUNNER_TEMP/zipped-back.txt"
+          zig build example-gcs_cp -- gs://zigps-examples/dir/zipped.txt "$RUNNER_TEMP/zipped-back.txt.gz" --no-decompress
+          gzip -dc "$RUNNER_TEMP/zipped-back.txt.gz" | cmp - "$RUNNER_TEMP/page.txt"
+          zig build example-gcs_cp -- "$RUNNER_TEMP/page.txt" gs://zigps-examples/dir/unzipped.txt -z log
+          zig build example-gcs_cp -- gs://zigps-examples/dir/unzipped.txt "$RUNNER_TEMP/unzipped-back.txt" --no-decompress
+          cmp "$RUNNER_TEMP/page.txt" "$RUNNER_TEMP/unzipped-back.txt"
+          zig build example-gcs_cp -- "$RUNNER_TEMP/src.bin" gs://zigps-examples/dir/zipped.bin -Z --resume "$RUNNER_TEMP/zip.state"
+          zig build example-gcs_cp -- gs://zigps-examples/dir/zipped.bin "$RUNNER_TEMP/zipped-back.bin"
+          cmp "$RUNNER_TEMP/src.bin" "$RUNNER_TEMP/zipped-back.bin"
+          test ! -e "$RUNNER_TEMP/zip.state"
 
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
   # read of undefined memory, can pass in Debug and fail here.

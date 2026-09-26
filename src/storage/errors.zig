@@ -13,8 +13,9 @@ const core = @import("core");
 /// Every error a client call can return. `core.Signer.Error` adds
 /// `SigningRejected` and `SigningFailed`, which only `signedUrl` returns.
 pub const Error = core.rpc.Error || core.Signer.Error || error{
-    /// Upload or download bytes do not match the checksum beside them. On
-    /// upload nothing was sent; on download the data is discarded.
+    /// Upload or download bytes do not match the checksum beside them, or
+    /// a compressed upload's bytes do not decompress to its data. On upload
+    /// nothing is left stored; on download the data is discarded.
     ChecksumMismatch,
     /// An object whose metadata says `Content-Encoding: gzip` holds stored
     /// bytes that met the stored checksum and do not decompress: Cloud
