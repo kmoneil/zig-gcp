@@ -3006,3 +3006,251 @@ test "44. gzip: a cut in the first response and in a range resume at compressed 
     }
     try testing.expect(saw_resume);
 }
+
+test "45. gzip uploads: each call stores std's gzip of the data, labelled, and a plain request is transcoded" {
+    var f: Fixture = undefined;
+    // 1 MiB chunks and one-request limit, so each protocol is taken.
+    if (!try f.init(.{ .chunk_size = 1024 * 1024, .single_request_limit = 1024 * 1024 })) return error.SkipZigTest;
+    defer f.deinit();
+    const text = try textBytes(12 * 1024 * 1024, 45);
+    defer testing.allocator.free(text);
+    const small = "a short line of text, compressed and sent in one request\n" ** 20;
+    const want = try gzipAlloc(text, .default);
+    defer testing.allocator.free(want);
+    const small_want = try gzipAlloc(small, .default);
+    defer testing.allocator.free(small_want);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "text.log", .data = text });
+    const file = try tmp.dir.openFile(testing.io, "text.log", .{});
+    defer file.close(testing.io);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "text.log.state");
+    defer f.client.abandonTransfer(store.checkpoint()) catch {};
+
+    // 1.
+    const options: storage.UploadOptions = .{ .content_type = "text/plain", .gzip = .{} };
+    const one_request = try f.object("one-request.txt");
+    var a = one_request.upload(small, options) catch |err| return f.report(err);
+    a.deinit();
+    const memory = try f.object("memory.log");
+    var b = memory.upload(text, options) catch |err| return f.report(err);
+    b.deinit();
+    const stream = try f.object("stream.log");
+    var reader: std.Io.Reader = .fixed(text);
+    var c = stream.uploadFrom(&reader, options) catch |err| return f.report(err);
+    c.deinit();
+    const from_file = try f.object("file.log");
+    var file_options = options;
+    file_options.checkpoint = store.checkpoint();
+    var d = from_file.uploadFile(file, file_options) catch |err| return f.report(err);
+    d.deinit();
+    try testing.expect(!try hasState(tmp.dir, "text.log.state"));
+
+    const cases = [_]struct { obj: storage.Object, data: []const u8, stored: []const u8 }{
+        .{ .obj = one_request, .data = small, .stored = small_want },
+        .{ .obj = memory, .data = text, .stored = want },
+        .{ .obj = stream, .data = text, .stored = want },
+        .{ .obj = from_file, .data = text, .stored = want },
+    };
+    for (cases) |case| {
+        var info = case.obj.get(.{}) catch |err| return f.report(err);
+        defer info.deinit();
+        try testing.expectEqualStrings("gzip", info.value.content_encoding.?);
+        try testing.expectEqualStrings("text/plain", info.value.content_type);
+        try testing.expectEqual(case.stored.len, info.value.size);
+        try testing.expectEqual(core.crc32c.hash(case.stored), info.value.crc32c.?);
+
+        var plain: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer plain.deinit();
+        const decompressed = case.obj.download(&plain.writer, .{}) catch |err| return f.report(err);
+        try testing.expectEqualSlices(u8, case.data, plain.written());
+        try testing.expect(decompressed.checksum_verified);
+        var kept: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer kept.deinit();
+        const as_stored = case.obj.download(&kept.writer, .{ .decompress = false }) catch |err| return f.report(err);
+        try testing.expectEqualSlices(u8, case.stored, kept.written());
+        try testing.expect(as_stored.checksum_verified);
+
+        // A client that takes no gzip gets the data, transcoded by Google.
+        const res = try rawMedia(&f, case.obj.name, .identity, null);
+        std.debug.print("{s}: {d} bytes stored as {d}; asked for plainly: ", .{ case.obj.name[f.prefix.len..], case.data.len, case.stored.len });
+        describe(res);
+        try expectStatus(200, res);
+        try testing.expectEqualSlices(u8, case.data, res.body);
+    }
+}
+
+test "46. gzip uploads: a compressed uploadFile cut at a drawn chunk is carried on by a second client, passing over what Google holds" {
+    const size: u64 = 6 * 1024 * 1024;
+    const chunk = 1024 * 1024;
+    var draw: [1]u8 = undefined;
+    testing.io.random(&draw);
+    // Noise, so the compressed stream is about as long as the file: six
+    // chunks. The first run dies in chunk `cut`, never the first or last.
+    const cut: u32 = 1 + draw[0] % 4;
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .chunk_size = chunk, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Real noise: the suite's pattern bytes compress to a quarter.
+    const data = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(data);
+    var prng: std.Random.DefaultPrng = .init(46);
+    prng.random().bytes(data);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "noise.bin", .data = data });
+    const file = try tmp.dir.openFile(testing.io, "noise.bin", .{});
+    defer file.close(testing.io);
+    const compressed = try gzipAlloc(data, .fastest);
+    defer testing.allocator.free(compressed);
+    const expected = core.crc32c.hash(compressed);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "noise.bin.upload");
+    defer f.client.abandonTransfer(store.checkpoint()) catch {};
+    const options: storage.UploadOptions = .{ .checkpoint = store.checkpoint(), .gzip = .{ .level = 1 } };
+
+    // 2. The first run sends `cut` chunks whole and dies 300 KiB into the
+    // next.
+    var plan = [_]FaultTransport.Fault{
+        .{ .method = .PUT, .url_contains = "upload_id=", .skip = cut, .action = .{ .cut_request_body = 300 * 1024 } },
+    };
+    var dying: Dying = undefined;
+    try dying.init(&f, &plan, chunk);
+    defer dying.deinit();
+    const target = try dying.object(&f, "resumed.bin");
+    if (target.uploadFile(file, options)) |finished| {
+        var owned = finished;
+        owned.deinit();
+        return error.TestExpectedFailure;
+    } else |err| std.debug.print("the first run, cut in chunk {d}: error.{t}\n", .{ cut + 1, err });
+    try testing.expect(plan[0].fired);
+    try testing.expect(try hasState(tmp.dir, "noise.bin.upload"));
+
+    // The second client compresses the file again, asks the session where
+    // it stands, passes over that much, and sends only the rest.
+    const before = f.faults.exchanges.items.len;
+    const obj = f.bucket().object(target.name);
+    var info = obj.uploadFile(file, options) catch |err| return f.report(err);
+    defer info.deinit();
+    try testing.expectEqual(compressed.len, info.value.size);
+    try testing.expectEqual(expected, info.value.crc32c.?);
+    try testing.expect(!try hasState(tmp.dir, "noise.bin.upload"));
+    try printExchanges(&f, before);
+    const exchanges = f.faults.exchanges.items[before..];
+    const query = exchanges[0];
+    try testing.expectEqual(0, query.body_len);
+    try testing.expectEqualStrings("bytes */*", query.header("Content-Range").?);
+    try testing.expectEqual(308, query.status.?);
+    const kept = try keptFromRange(query.responseHeader("Range"));
+    try testing.expect(kept >= cut * chunk and kept < (cut + 1) * chunk);
+    var sent: u64 = 0;
+    for (exchanges[1..]) |e| sent += e.body_len;
+    try testing.expectEqual(compressed.len - kept, sent);
+    const last = exchanges[exchanges.len - 1];
+    try testing.expectEqual(expected, try hashHeaderCrc(last.header("X-Goog-Hash").?));
+    std.debug.print("the second run: Google held {d} compressed bytes; {d} more went in {d} requests, the stream {d} bytes for a {d}-byte file\n", .{
+        kept, sent, exchanges.len - 1, compressed.len, size,
+    });
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const result = obj.download(&out.writer, .{}) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, data, out.written());
+    try testing.expect(result.checksum_verified);
+}
+
+test "47. gzip uploads: Cache-Control no-transform, as gcs_cp -z sets it, serves the stored bytes to every client" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const text = try textBytes(200 * 1024, 47);
+    defer testing.allocator.free(text);
+    const want = try gzipAlloc(text, .default);
+    defer testing.allocator.free(want);
+    const obj = try f.object("no-transform.txt");
+    var up = obj.upload(text, .{ .content_type = "text/plain", .gzip = .{}, .cache_control = "no-transform" }) catch |err| return f.report(err);
+    up.deinit();
+
+    // 4. Served as stored, `Content-Encoding: gzip`, to a request that
+    // asked for plain bytes; the transport, which did not ask for gzip,
+    // decompresses what it was sent.
+    const res = try rawMedia(&f, obj.name, .identity, null);
+    std.debug.print("no-transform, asked for plainly: ", .{});
+    describe(res);
+    try expectStatus(200, res);
+    try testing.expectEqualStrings("gzip", res.header("content-encoding").?);
+    try testing.expectEqualSlices(u8, text, res.body);
+    var info = obj.get(.{}) catch |err| return f.report(err);
+    defer info.deinit();
+    try testing.expectEqual(want.len, info.value.size);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    const result = obj.download(&out.writer, .{}) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, text, out.written());
+    try testing.expect(result.checksum_verified);
+}
+
+/// What Google stored under `obj`: its size, encoding and bytes as stored,
+/// printed, for a measurement.
+fn printStored(f: *Fixture, obj: storage.Object, what: []const u8) !void {
+    var info = obj.get(.{}) catch |err| {
+        std.debug.print("{s}: no object ({t})\n", .{ what, err });
+        return;
+    };
+    defer info.deinit();
+    std.debug.print("{s}: stored {d} bytes, contentEncoding {s}, crc32c {?x:0>8}\n", .{
+        what, info.value.size, info.value.content_encoding orelse "(none)", info.value.crc32c,
+    });
+    _ = f;
+}
+
+test "48. gzip uploads, for later: what a request body sent with Content-Encoding: gzip becomes" {
+    var f: Fixture = undefined;
+    if (!try f.init(.{})) return error.SkipZigTest;
+    defer f.deinit();
+    const text = try textBytes(300 * 1024, 48);
+    defer testing.allocator.free(text);
+    const packed_text = try gzipAlloc(text, .default);
+    defer testing.allocator.free(packed_text);
+    std.debug.print("the data: {d} bytes, crc32c {x:0>8}; gzip-compressed {d} bytes\n", .{ text.len, core.crc32c.hash(text), packed_text.len });
+    const arena = f.arena.allocator();
+    const gzip_header = [_]Header{.{ .name = "Content-Encoding", .value = "gzip" }};
+
+    // 5a. A media upload whose body is sent compressed.
+    const media = try f.object("in-transit-media.txt");
+    const media_path = try std.fmt.allocPrint(arena, "/upload/storage/v1/b/{s}/o?uploadType=media&name={s}", .{ f.bucket_name, try segment(&f, media.name) });
+    const a = try raw(&f, .POST, media_path, &gzip_header, "text/plain", packed_text);
+    std.debug.print("media, body compressed in transit: HTTP {d}\n", .{a.status});
+    try printStored(&f, media, "  media");
+
+    // 5b. A multipart upload whose whole body, metadata included, is sent
+    // compressed, as gcloud's -j does, with the data's checksum.
+    const multipart = try f.object("in-transit-multipart.txt");
+    const crc = core.crc32c.toBase64(core.crc32c.hash(text));
+    const body = try std.fmt.allocPrint(arena, "--BB\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{{\"name\":\"{s}\",\"contentType\":\"text/plain\",\"crc32c\":\"{s}\"}}\r\n--BB\r\nContent-Type: text/plain\r\n\r\n{s}\r\n--BB--\r\n", .{ multipart.name, &crc, text });
+    const packed_body = try gzipAlloc(body, .default);
+    defer testing.allocator.free(packed_body);
+    const multipart_path = try std.fmt.allocPrint(arena, "/upload/storage/v1/b/{s}/o?uploadType=multipart", .{f.bucket_name});
+    const b = try raw(&f, .POST, multipart_path, &gzip_header, "multipart/related; boundary=BB", packed_body);
+    std.debug.print("multipart, whole body compressed in transit: HTTP {d}\n", .{b.status});
+    try printStored(&f, multipart, "  multipart");
+
+    // 5c. A resumable session whose one chunk is sent compressed, its
+    // Content-Range counting the data's bytes, as gcloud's -j counts them.
+    const session_obj = try f.object("in-transit-resumable.txt");
+    const start_path = try std.fmt.allocPrint(arena, "/upload/storage/v1/b/{s}/o?uploadType=resumable", .{f.bucket_name});
+    const meta = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"contentType\":\"text/plain\"}}", .{session_obj.name});
+    const opened = try raw(&f, .POST, start_path, &.{}, "application/json; charset=UTF-8", meta);
+    try expectStatus(200, opened);
+    const session = opened.header("Location").?;
+    const range = try std.fmt.allocPrint(arena, "bytes 0-{d}/{d}", .{ text.len - 1, text.len });
+    const headers = [_]Header{ .{ .name = "Content-Encoding", .value = "gzip" }, .{ .name = "Content-Range", .value = range } };
+    const segments = [_][]const u8{packed_text};
+    const c = try f.faults.transport().sendStream(.{
+        .method = .PUT,
+        .url = session,
+        .headers = &headers,
+        .body = .{ .segments = &segments },
+    }, arena);
+    std.debug.print("resumable, one chunk compressed in transit, range in the data's bytes: HTTP {d}\n", .{c.status});
+    try printStored(&f, session_obj, "  resumable");
+    if (c.status >= 300) _ = raw(&f, .DELETE, session["https://storage.googleapis.com".len..], &.{}, null, null) catch {};
+}
