@@ -4,6 +4,28 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.23.0 (unreleased)
+
+- storage: uploads can compress. `UploadOptions.gzip` (`storage.Gzip`,
+  level 1 to 9, 6 by default) gzip-compresses the data on its way up with
+  the standard library's compressor and stores it with `Content-Encoding:
+  gzip`, as `gcloud storage cp -z` does; `upload`, `uploadFrom` and
+  `uploadFile` take it. Before the upload may finish, the compressed bytes
+  are decompressed again as they are made and must give back exactly the
+  data, and the last request carries their CRC-32C for Cloud Storage to
+  check. `options.crc32c` names the data before compression. `upload`
+  compresses data of at most `single_request_limit` in memory and sends it
+  in one request; larger data, streams and files go a chunk at a time.
+  `uploadFile` with a checkpoint resumes in a later process by compressing
+  the file again and passing over what the session holds; a checkpoint
+  written at another level or by another Zig starts over. Refused before
+  sending: `content_encoding` alongside `gzip`, a `content_type` of
+  `application/gzip`, and a level outside 1 to 9. `uploadParallel` does not
+  compress. Not breaking.
+- examples: `gcs_cp -z EXTS` and `-Z` compress an upload, with
+  `Cache-Control: no-transform` as gcloud sets it.
+- auth, core, pubsub, secret_manager: unchanged.
+
 ## 0.22.0 (2026-09-26)
 
 - storage: objects stored gzip-compressed (`Content-Encoding: gzip`) now
