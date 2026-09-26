@@ -61,6 +61,16 @@ pub const Source = union(enum) {
         /// can be read again; null when it cannot, as a caller's stream
         /// cannot, and a lost session is `error.UploadSessionLost`.
         restart: ?Restart = null,
+        /// Where whoever made `r` records why it failed, when it can say
+        /// more than `ReadFailed`: a cancel then leaves the session for a
+        /// resume, as a cancel should, where a broken source does not.
+        failure: ?*const ?Error = null,
+
+        /// Why `r` failed, as well as its maker can say.
+        fn why(self: Reader) Error {
+            if (self.failure) |f| if (f.*) |err| return err;
+            return error.ReadFailed;
+        }
     };
 
     pub const Restart = struct {
@@ -164,8 +174,9 @@ pub fn runSession(
         .query_first = resuming,
         .cancel_on_failure = cancel_on_failure,
         .hash_final = hashesFinal(client, source),
-        // A dead process may have sent everything before this one began.
-        .sent_high = if (resuming) total orelse 0 else 0,
+        // A dead process may have sent everything before this one began:
+        // all of a known total, or of a stream, anything.
+        .sent_high = if (resuming) total orelse std.math.maxInt(u64) else 0,
     };
     return machine.upload(&scratch, bucket_name, object_name, options, metadata_crc);
 }
@@ -321,6 +332,12 @@ const Machine = struct {
 
             switch (outcome) {
                 .done => |res| {
+                    // A resumed session that a dead process finished: the
+                    // reader makes the rest of the upload's bytes, sent
+                    // before, so the whole can be held to what it stored.
+                    if (self.source == .reader and self.query_first and !self.eof) {
+                        self.passOver(std.math.maxInt(u64)) catch |err| return err;
+                    }
                     var result: types.Owned(types.ObjectInfo) = try .init(self.client.gpa);
                     errdefer result.deinit();
                     // The decode copies every string it keeps, so the
@@ -389,6 +406,19 @@ const Machine = struct {
                         self.maybeCancel(&response, session_uri, error.InvalidResponse);
                         return error.InvalidResponse;
                     }
+                    // A resumed session holds bytes a dead process sent. A
+                    // reader that can make them again makes them now, and
+                    // passes over them rather than send them twice.
+                    if (self.source == .reader and stored > self.chunk_start + self.chunk_len) {
+                        self.passOver(stored) catch |err| {
+                            // A session holding more than the upload makes
+                            // holds another upload's bytes: of no use to
+                            // anyone, so it goes (a lost session abandons),
+                            // and the upload starts over.
+                            self.maybeCancel(&response, session_uri, err);
+                            return err;
+                        };
+                    }
                     if (self.source == .reader and stored < self.chunk_start) {
                         // The server forgot bytes the reader cannot supply
                         // again: as good as a lost session, but this one
@@ -449,7 +479,7 @@ const Machine = struct {
         response: *std.heap.ArenaAllocator,
         session_uri: []const u8,
         metadata_crc: ?[8]u8,
-    ) error{ ReadFailed, UnexpectedEndOfStream, StreamTooLong, Canceled, ChecksumMismatch }!Exchange {
+    ) Error!Exchange {
         const chunk = try self.nextChunk();
         var range_buf: [72]u8 = undefined;
         var hash_buf: [16]u8 = undefined;
@@ -548,7 +578,7 @@ const Machine = struct {
 
     /// The bytes to send from `confirmed`, filling the reader's buffer
     /// when it has all been confirmed. Empty means the source has ended.
-    fn nextChunk(self: *Machine) error{ ReadFailed, UnexpectedEndOfStream, StreamTooLong, Canceled }![]const u8 {
+    fn nextChunk(self: *Machine) Error![]const u8 {
         switch (self.source) {
             .slice => |data| {
                 const start: usize = @intCast(self.confirmed);
@@ -588,16 +618,48 @@ const Machine = struct {
         }
     }
 
+    /// Makes the reader's bytes up to `upto` and passes over them unsent,
+    /// for a resumed session that holds them already: up to its end when
+    /// `upto` is past it, which then settles the total. A reader that ends
+    /// before `upto` was not what the session holds.
+    fn passOver(self: *Machine, upto: u64) Error!void {
+        const source = self.source.reader;
+        const have = self.chunk_start + self.chunk_len;
+        const want = upto - have;
+        var passed: u64 = 0;
+        while (passed < want) {
+            const n = source.r.discard(.limited64(want - passed)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return source.why(),
+            };
+            passed += n;
+        }
+        self.chunk_start = have + passed;
+        self.chunk_len = 0;
+        if (upto == std.math.maxInt(u64)) {
+            self.eof = true;
+            self.total = self.chunk_start;
+            return;
+        }
+        if (passed < want) {
+            if (self.client.diagnostics) |d| d.print(
+                "the session holds {d} bytes, more than the {d} this upload makes; it was cancelled",
+                .{ upto, have + passed },
+            );
+            return error.UploadSessionLost;
+        }
+    }
+
     /// Reads the next chunk into the buffer, hashes it, and settles the
     /// total when the stream ends.
-    fn fill(self: *Machine, source: Source.Reader) error{ ReadFailed, UnexpectedEndOfStream, StreamTooLong }!void {
+    fn fill(self: *Machine, source: Source.Reader) Error!void {
         self.chunk_start = self.confirmed;
         self.chunk_len = 0;
         var want: usize = self.client.chunk_size;
         if (source.declared) |declared| {
             want = @intCast(@min(want, declared - self.chunk_start));
         }
-        const n = source.r.readSliceShort(source.buffer[0..want]) catch return error.ReadFailed;
+        const n = source.r.readSliceShort(source.buffer[0..want]) catch return source.why();
         self.chunk_len = n;
         if (source.hasher) |hasher| hasher.update(source.buffer[0..n]);
         if (source.declared) |declared| {
@@ -605,7 +667,7 @@ const Machine = struct {
             if (self.chunk_start + n == declared) {
                 // The declared size is reached: one more byte would be a lie.
                 var probe: [1]u8 = undefined;
-                const extra = source.r.readSliceShort(&probe) catch return error.ReadFailed;
+                const extra = source.r.readSliceShort(&probe) catch return source.why();
                 if (extra != 0) return error.StreamTooLong;
                 self.eof = true;
             }

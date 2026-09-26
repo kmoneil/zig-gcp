@@ -175,6 +175,17 @@ pub const State = union(enum) {
         /// The session URL, which is a credential: anyone holding it can
         /// write the object for up to a week. Never logged.
         session: []const u8,
+        /// How a compressed upload compresses, or null for one that does
+        /// not. The session holds compressed bytes, which a later process
+        /// makes again to resume, so both must match: the same level, and
+        /// the same Zig, whose compressor another Zig may not reproduce.
+        gzip: ?Gzip = null,
+
+        pub const Gzip = struct {
+            level: u4,
+            /// `builtin.zig_version_string` of the process that began it.
+            zig: []const u8,
+        };
     };
 
     pub const UploadParallel = struct {
@@ -224,6 +235,8 @@ pub fn encodeAlloc(gpa: Allocator, state: State) Allocator.Error![]u8 {
             .size = s.size,
             .mtime = s.mtime,
             .session = s.session,
+            .gzip_level = if (s.gzip) |g| @as(?u8, g.level) else null,
+            .gzip_zig = if (s.gzip) |g| g.zig else null,
         }) catch return error.OutOfMemory,
         .upload_parallel => |s| jw.write(.{
             .version = 1,
@@ -266,6 +279,8 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
         if_generation_not_match: ?u64 = null,
         if_metageneration_match: ?u64 = null,
         if_metageneration_not_match: ?u64 = null,
+        gzip_level: ?u8 = null,
+        gzip_zig: ?[]const u8 = null,
     };
     const wire = std.json.parseFromSliceLeaky(Wire, arena, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -303,12 +318,19 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
         const mtime = wire.mtime orelse return error.CheckpointFailed;
         const session = wire.session orelse return error.CheckpointFailed;
         if (session.len == 0) return error.CheckpointFailed;
+        // Both halves of a compressed upload's settings, or neither.
+        const gzip: ?State.UploadFile.Gzip = if (wire.gzip_level) |level| g: {
+            const zig = wire.gzip_zig orelse return error.CheckpointFailed;
+            if (level < 1 or level > 9 or zig.len == 0) return error.CheckpointFailed;
+            break :g .{ .level = @intCast(level), .zig = zig };
+        } else if (wire.gzip_zig != null) return error.CheckpointFailed else null;
         break :blk .{ .upload_file = .{
             .bucket = wire.bucket,
             .object = wire.object,
             .size = wire.size,
             .mtime = mtime,
             .session = session,
+            .gzip = gzip,
         } };
     } else if (std.mem.eql(u8, wire.kind, "uploadParallel")) blk: {
         const mtime = wire.mtime orelse return error.CheckpointFailed;
@@ -549,6 +571,46 @@ test "uploadFile state: the canonical encoding, round trip, and what is refused"
     }
 }
 
+test "uploadFile state: a compressed upload's settings, and what is refused" {
+    const state: State = .{ .upload_file = .{
+        .bucket = "b",
+        .object = "logs/app.log",
+        .size = 5000,
+        .mtime = -7,
+        .session = "https://s.example/u2",
+        .gzip = .{ .level = 6, .zig = "0.16.0" },
+    } };
+    const encoded = try encodeAlloc(testing.allocator, state);
+    defer testing.allocator.free(encoded);
+    try testing.expectEqualStrings(
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"logs/app.log\",\"size\":5000," ++
+            "\"mtime\":-7,\"session\":\"https://s.example/u2\",\"gzip_level\":6,\"gzip_zig\":\"0.16.0\"}",
+        encoded,
+    );
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const back = (try parse(arena_state.allocator(), encoded)).upload_file;
+    try testing.expectEqual(6, back.gzip.?.level);
+    try testing.expectEqualStrings("0.16.0", back.gzip.?.zig);
+
+    const refused = [_][]const u8{
+        // One half without the other.
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":1,\"session\":\"s\",\"gzip_level\":6}",
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":1,\"session\":\"s\",\"gzip_zig\":\"0.16.0\"}",
+        // A level no upload uses, and no Zig at all.
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":1,\"session\":\"s\",\"gzip_level\":0,\"gzip_zig\":\"0.16.0\"}",
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":1,\"session\":\"s\",\"gzip_level\":10,\"gzip_zig\":\"0.16.0\"}",
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":1,\"session\":\"s\",\"gzip_level\":6,\"gzip_zig\":\"\"}",
+        // Another kind with them.
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":1,\"upload_id\":\"u\",\"part_size\":1024,\"gzip_level\":6,\"gzip_zig\":\"0.16.0\"}",
+    };
+    for (refused) |bytes| {
+        var arena2: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena2.deinit();
+        try testing.expectError(error.CheckpointFailed, parse(arena2.allocator(), bytes));
+    }
+}
+
 test "upload state: the canonical encoding, both shapes, pinned byte for byte" {
     const plain: State = .{ .upload_parallel = .{
         .bucket = "b",
@@ -687,6 +749,10 @@ fn parseProperty(_: void, input: []const u8) !void {
         },
         .upload_file => |s| {
             try testing.expect(s.session.len > 0);
+            if (s.gzip) |g| {
+                try testing.expect(g.level >= 1 and g.level <= 9);
+                try testing.expect(g.zig.len > 0);
+            }
         },
         .upload_parallel => |s| {
             try testing.expectEqual(s.part_size, mp.plan(s.size, s.part_size).part_size);
@@ -705,6 +771,7 @@ test "fuzz checkpoint state: every input parses to a state that re-encodes to it
         "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"dir/o\",\"size\":5000,\"mtime\":1758700000123456789,\"upload_id\":\"VXBs+1=\",\"part_size\":1024}",
         "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":1,\"mtime\":-1,\"upload_id\":\"u\",\"part_size\":1024,\"temp\":\"zig-gcp-tmp/00\",\"if_generation_match\":0}",
         "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"backups/db.tar\",\"size\":123456789,\"mtime\":1758700000123456789,\"session\":\"https://s.example/u1\"}",
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"logs/app.log\",\"size\":5000,\"mtime\":-7,\"session\":\"https://s.example/u2\",\"gzip_level\":6,\"gzip_zig\":\"0.16.0\"}",
     } });
 }
 

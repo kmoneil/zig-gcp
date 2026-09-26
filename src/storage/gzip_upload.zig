@@ -39,6 +39,17 @@ pub const Input = union(enum) {
     slice: []const u8,
     /// A stream, read into the staging buffer a piece at a time.
     reader: Reader,
+    /// A regular file, read at offsets into the staging buffer, in the
+    /// same pieces every time, so a lost session, or a later process
+    /// holding a checkpoint, can make the same bytes again.
+    file: File,
+
+    pub const File = struct {
+        f: std.Io.File,
+        /// The file's length, measured before the upload. A file that
+        /// ends short of it changed under the upload.
+        size: u64,
+    };
 
     pub const Reader = struct {
         r: *std.Io.Reader,
@@ -81,6 +92,7 @@ pub fn namesGzip(content_type: []const u8) bool {
 /// must not move once made, so it lives on the heap.
 pub const Stream = struct {
     gpa: Allocator,
+    io: std.Io,
     diagnostics: ?*core.Diagnostics,
     input: Input,
     options: flate.Compress.Options,
@@ -89,8 +101,8 @@ pub const Stream = struct {
     /// The caller's checksum of the data, checked when the data ends.
     expected: ?u32,
 
-    /// How far into a slice input the compressor has read.
-    slice_pos: usize = 0,
+    /// How far into a slice or file input the compressor has read.
+    slice_pos: u64 = 0,
     /// Bytes of data fed to the compressor.
     consumed: u64 = 0,
     data_hash: core.crc32c.Hasher = .init(),
@@ -165,6 +177,7 @@ pub const Stream = struct {
         errdefer client.gpa.destroy(s);
         s.* = .{
             .gpa = client.gpa,
+            .io = client.io,
             .diagnostics = client.diagnostics,
             .input = input,
             .options = levelOptions(level),
@@ -198,9 +211,9 @@ pub const Stream = struct {
     }
 
     /// Starts over from the data's first byte, for a lost session: a slice
-    /// can be read again, a caller's stream cannot.
+    /// or a file can be read again, a caller's stream cannot.
     pub fn rewind(s: *Stream) Error!void {
-        std.debug.assert(s.input == .slice);
+        std.debug.assert(s.input != .reader);
         s.slice_pos = 0;
         s.consumed = 0;
         s.data_hash = .init();
@@ -231,7 +244,7 @@ pub const Stream = struct {
     /// For the resumable machine: how a lost session starts over, when the
     /// input can be read again.
     pub fn restart(s: *Stream) ?resumable.Source.Restart {
-        return if (s.input == .slice) .{ .ctx = s, .rewind = rewindOpaque } else null;
+        return if (s.input != .reader) .{ .ctx = s, .rewind = rewindOpaque } else null;
     }
 
     fn start(s: *Stream) Error!void {
@@ -270,7 +283,8 @@ pub const Stream = struct {
     fn nextInput(s: *Stream) error{Failed}![]const u8 {
         switch (s.input) {
             .slice => |data| {
-                const piece = data[s.slice_pos..][0..@min(step_len, data.len - s.slice_pos)];
+                const at: usize = @intCast(s.slice_pos);
+                const piece = data[at..][0..@min(step_len, data.len - at)];
                 s.slice_pos += piece.len;
                 return piece;
             },
@@ -294,6 +308,21 @@ pub const Stream = struct {
                     return s.fail(error.UnexpectedEndOfStream, "the reader ended after {d} of the declared {d} bytes", .{ s.consumed + n, declared });
                 };
                 return s.work.staging[0..n];
+            },
+            .file => |in| {
+                const offset = s.slice_pos;
+                const want: usize = @intCast(@min(step_len, in.size - offset));
+                const got = in.f.readPositionalAll(s.io, s.work.staging[0..want], offset) catch |err| switch (err) {
+                    error.Canceled => return s.fail(error.Canceled, "canceled", .{}),
+                    else => return s.fail(error.ReadFailed, "the file could not be read at byte {d}: {t}", .{ offset, err }),
+                };
+                if (got < want) return s.fail(
+                    error.ReadFailed,
+                    "the file ends at byte {d}, short of the {d} it had: it changed under the upload",
+                    .{ offset + got, in.size },
+                );
+                s.slice_pos += want;
+                return s.work.staging[0..want];
             },
         }
     }
@@ -528,6 +557,7 @@ pub fn uploadResumable(
         .declared = null,
         .final_hash = if (s.check) &s.compressed_hash else null,
         .restart = s.restart(),
+        .failure = &s.failure,
     } }, storedOptions(options), null) catch |err| switch (err) {
         error.ReadFailed => return s.failure orelse err,
         else => return err,

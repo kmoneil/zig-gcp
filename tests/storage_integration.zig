@@ -926,3 +926,79 @@ test "signed URLs: a bucket-level GET lists the bucket through the XML API" {
     try testing.expect(std.mem.indexOf(u8, body.written(), "<Key>cats/tom.txt</Key>") != null);
     try testing.expect(std.mem.indexOf(u8, body.written(), "dogs/rex.txt") == null);
 }
+
+test "gzip uploads: every call stores std's gzip of the data, labelled, and it downloads back verified" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    var diag: storage.Diagnostics = .{};
+    // Small chunks and a small one-request limit, so each path is taken.
+    var client = try smallChunkClient(&f, &diag);
+    defer client.deinit();
+    const bucket = client.bucket(&f.bucket_name);
+
+    const line = "2026-09-26T12:00:00Z GET /index.html 200 5120 \"zig-gcp\"\n";
+    const text = try testing.allocator.alloc(u8, 3 * 1024 * 1024);
+    defer testing.allocator.free(text);
+    var prng: std.Random.DefaultPrng = .init(20260926);
+    for (text, 0..) |*b, i| b.* = if (prng.random().uintLessThan(u8, 50) == 0) 'x' else line[i % line.len];
+    const want = try gzipAlloc(text);
+    defer testing.allocator.free(want);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "access.log", .data = text });
+    const file = try tmp.dir.openFile(testing.io, "access.log", .{});
+    defer file.close(testing.io);
+    var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "access.log.state");
+
+    const small = "a short line, compressed in one request\n";
+    const small_want = try gzipAlloc(small);
+    defer testing.allocator.free(small_want);
+    // Level 1, as gzipAlloc compresses, so the stored bytes can be
+    // compared whole.
+    var one_request = try bucket.object("small.txt").upload(small, .{ .content_type = "text/plain", .gzip = .{ .level = 1 } });
+    one_request.deinit();
+
+    const options: storage.UploadOptions = .{ .content_type = "text/plain", .gzip = .{ .level = 1 } };
+    var from_memory = try bucket.object("memory.log").upload(text, options);
+    from_memory.deinit();
+    var reader: std.Io.Reader = .fixed(text);
+    var from_stream = try bucket.object("stream.log").uploadFrom(&reader, options);
+    from_stream.deinit();
+    var file_options = options;
+    file_options.checkpoint = store.checkpoint();
+    var from_file = try bucket.object("file.log").uploadFile(file, file_options);
+    from_file.deinit();
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "access.log.state", .{}));
+
+    const cases = [_]struct { name: []const u8, data: []const u8, stored: []const u8 }{
+        .{ .name = "small.txt", .data = small, .stored = small_want },
+        .{ .name = "memory.log", .data = text, .stored = want },
+        .{ .name = "stream.log", .data = text, .stored = want },
+        .{ .name = "file.log", .data = text, .stored = want },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("{s}: {s}\n", .{ case.name, diag.message() });
+        const obj = bucket.object(case.name);
+        var info = try obj.get(.{});
+        defer info.deinit();
+        try testing.expectEqualStrings("gzip", info.value.content_encoding.?);
+        try testing.expectEqual(case.stored.len, info.value.size);
+        try testing.expectEqual(core.crc32c.hash(case.stored), info.value.crc32c.?);
+
+        var plain: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer plain.deinit();
+        const decompressed = try obj.download(&plain.writer, .{});
+        try testing.expectEqualSlices(u8, case.data, plain.written());
+        try testing.expect(decompressed.checksum_verified);
+
+        var raw: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer raw.deinit();
+        const as_stored = try obj.download(&raw.writer, .{ .decompress = false });
+        try testing.expectEqualSlices(u8, case.stored, raw.written());
+        try testing.expect(as_stored.checksum_verified);
+    }
+}
