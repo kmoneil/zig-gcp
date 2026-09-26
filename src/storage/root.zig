@@ -46,6 +46,7 @@ pub const PageOptions = @import("types.zig").PageOptions;
 pub const Preconditions = @import("types.zig").Preconditions;
 pub const Range = @import("types.zig").Range;
 pub const UploadOptions = @import("types.zig").UploadOptions;
+pub const Gzip = @import("types.zig").Gzip;
 pub const ParallelSource = @import("types.zig").ParallelSource;
 pub const ParallelUploadOptions = @import("types.zig").ParallelUploadOptions;
 pub const ParallelDestination = @import("types.zig").ParallelDestination;
@@ -94,6 +95,7 @@ test {
     _ = @import("copy.zig");
     _ = @import("download.zig");
     _ = @import("gzip_download.zig");
+    _ = @import("gzip_upload.zig");
     _ = @import("errors.zig");
     _ = @import("fake_multipart.zig");
     _ = @import("multipart.zig");

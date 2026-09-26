@@ -16,6 +16,7 @@ const copy_impl = @import("copy.zig");
 const dl = @import("download.zig");
 const errors = @import("errors.zig");
 const gzip_download = @import("gzip_download.zig");
+const gzip_upload = @import("gzip_upload.zig");
 const logging = @import("logging.zig");
 const metadata = @import("metadata.zig");
 const multipart = @import("multipart.zig");
@@ -173,6 +174,11 @@ pub fn delete(self: Object, options: types.DeleteOptions) Error!void {
 /// lost, and a blind repeat would overwrite whatever is there by then. A
 /// resumable upload always retries: its offsets make a repeat safe, and a
 /// lost session simply starts over from the same bytes.
+///
+/// With `options.gzip`, the data is compressed first: in memory, whole,
+/// when it is at most `single_request_limit`, and sent in one request;
+/// above that, a chunk at a time through the resumable protocol, one
+/// `chunk_size` buffer of memory, and a lost session compresses it again.
 pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
@@ -183,6 +189,7 @@ pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Erro
         if (self.client.diagnostics) |d| d.print("options.size says {d} bytes, the data has {d}", .{ size, data.len });
         return error.InvalidArgument;
     };
+    if (options.gzip) |gzip| return self.uploadCompressed(.{ .slice = data }, options, gzip);
 
     var checksum: ?[8]u8 = null;
     if (self.client.verify_checksums) {
@@ -204,7 +211,28 @@ pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Erro
     if (data.len > self.client.single_request_limit) {
         return resumable.run(self.client, self.bucket, self.name, .{ .slice = data }, options, checksum);
     }
+    return self.sendMultipart(data, options, checksum);
+}
 
+/// `upload` and `uploadFrom` with `options.gzip`: the data compressed on
+/// its way up and checked as it is made; `gzip_upload.zig` says how.
+fn uploadCompressed(self: Object, input: gzip_upload.Input, options: types.UploadOptions, gzip: types.Gzip) Error!types.Owned(types.ObjectInfo) {
+    const stream = try gzip_upload.Stream.create(self.client, input, gzip.level, options.crc32c);
+    defer stream.destroy();
+    // Data small enough for one request goes in one, compressed whole in
+    // memory first: it shrinks, or grows by a few bytes in a thousand.
+    if (input == .slice and input.slice.len <= self.client.single_request_limit) {
+        const body = try stream.readAll();
+        defer self.client.gpa.free(body);
+        const checksum: ?[8]u8 = if (self.client.verify_checksums) core.crc32c.toBase64(stream.compressed_hash.final()) else null;
+        return self.sendMultipart(body, gzip_upload.storedOptions(options), checksum);
+    }
+    return gzip_upload.uploadResumable(stream, self.client, self.bucket, self.name, options);
+}
+
+/// One `multipart/related` request: the metadata, `checksum` among it,
+/// and `data`.
+fn sendMultipart(self: Object, data: []const u8, options: types.UploadOptions, checksum: ?[8]u8) Error!types.Owned(types.ObjectInfo) {
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
     const path = try names.uploadMultipartPath(scratch.allocator(), self.bucket, options.preconditions);
@@ -243,12 +271,19 @@ pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Erro
 /// lost session is `error.UploadSessionLost`: the earlier bytes are gone
 /// and the reader cannot supply them again, so the caller reopens the
 /// source and retries.
+///
+/// With `options.gzip`, the stream is compressed on its way, and the
+/// request that finishes the upload carries the compressed bytes'
+/// checksum, so Cloud Storage refuses a mismatch before the object
+/// exists: no read back, and no delete afterwards. `options.size` still
+/// counts the bytes the reader gives.
 pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
     try checkUploadOptions(self.client, options);
     try refuseCheckpoint(self.client, options);
+    if (options.gzip) |gzip| return self.uploadCompressed(.{ .reader = .{ .r = reader, .declared = options.size } }, options, gzip);
 
     const checksum: ?[8]u8 = if (options.crc32c) |given| core.crc32c.toBase64(given) else null;
     const buffer = try self.client.gpa.alloc(u8, self.client.chunk_size);
@@ -372,6 +407,10 @@ pub fn uploadFile(self: Object, file: std.Io.File, options: types.UploadOptions)
         if (self.client.diagnostics) |d| d.print("uploadFile takes its size from the file; leave options.size null", .{});
         return error.InvalidArgument;
     }
+    if (options.gzip != null) {
+        if (self.client.diagnostics) |d| d.print("uploadFile does not compress yet; uploadFrom with the file's reader does", .{});
+        return error.InvalidArgument;
+    }
     return upload_file.upload(self.client, self.bucket, self.name, file, options);
 }
 
@@ -388,6 +427,23 @@ fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void 
     if (!core.transport.isValidHeaderValue(options.content_type)) {
         if (client.diagnostics) |d| d.print("invalid content type: expected a header value", .{});
         return error.InvalidArgument;
+    }
+    if (options.gzip) |gzip| {
+        if (gzip.level < 1 or gzip.level > 9) {
+            if (client.diagnostics) |d| d.print("invalid gzip level {d}: expected 1 to 9", .{gzip.level});
+            return error.InvalidArgument;
+        }
+        if (options.content_encoding != null) {
+            if (client.diagnostics) |d| d.print("options.gzip sets the content encoding; leave options.content_encoding null", .{});
+            return error.InvalidArgument;
+        }
+        if (gzip_upload.namesGzip(options.content_type)) {
+            if (client.diagnostics) |d| d.print(
+                "content type {s} with gzip compression would tell a client that decompresses that it still holds gzip; give the data's own type",
+                .{options.content_type},
+            );
+            return error.InvalidArgument;
+        }
     }
     // An empty key was already refused here; a repeated one was not, and
     // made a body carrying two entries of one name.

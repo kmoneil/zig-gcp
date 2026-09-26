@@ -207,6 +207,25 @@ pub const UploadOptions = struct {
     /// `uploadFile` takes one; `upload` and `uploadFrom` refuse it, since
     /// memory and streams do not outlive a process.
     checkpoint: ?Checkpoint = null,
+    /// Compress the data with gzip on its way up and store it that way,
+    /// with `Content-Encoding: gzip`, as `gcloud storage cp -z` does. The
+    /// object's size and checksum are then the compressed bytes', and a
+    /// download decompresses it again. `content_encoding` must be left
+    /// null, since this sets it, and `crc32c` names the data before
+    /// compression. With `Client.verify_checksums`, the compressed bytes
+    /// are decompressed again as they are made, and must give back the
+    /// data before the upload may finish. Data already compressed, such as
+    /// images, video or archives, only grows.
+    gzip: ?Gzip = null,
+};
+
+/// How `UploadOptions.gzip` compresses.
+pub const Gzip = struct {
+    /// 1 (fastest) to 9 (smallest), as `gzip -1` to `gzip -9`. At 6, Zig's
+    /// compressor takes text to about 13% of its size at about 110 MiB/s
+    /// in `ReleaseFast`; at 9, about the same size at 44 MiB/s; at 1, 17%
+    /// at 200 MiB/s. A Debug build is about eight times slower.
+    level: u4 = 6,
 };
 
 /// Where `Object.uploadParallel` reads its parts.
