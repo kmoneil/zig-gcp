@@ -52,6 +52,20 @@ pub const Source = union(enum) {
         declared: ?u64,
         /// Fed every byte read, for the caller's post-upload verification.
         hasher: ?*core.crc32c.Hasher = null,
+        /// A running CRC32C of every byte `r` gives, kept by whoever made
+        /// `r`: the request that finishes the upload carries it, as a
+        /// file's does, so Cloud Storage refuses a mismatch before the
+        /// object exists.
+        final_hash: ?*const core.crc32c.Hasher = null,
+        /// How a lost session starts over from the first byte, when `r`
+        /// can be read again; null when it cannot, as a caller's stream
+        /// cannot, and a lost session is `error.UploadSessionLost`.
+        restart: ?Restart = null,
+    };
+
+    pub const Restart = struct {
+        ctx: *anyopaque,
+        rewind: *const fn (ctx: *anyopaque) Error!void,
     };
 
     pub const File = struct {
@@ -82,11 +96,15 @@ pub fn run(
             .client = client,
             .source = source,
             .total = sourceTotal(source),
-            .hash_final = client.verify_checksums and source == .file,
+            .hash_final = hashesFinal(client, source),
         };
         const outcome = machine.upload(&scratch, bucket_name, object_name, options, metadata_crc);
         const err = if (outcome) |result| return result else |err| err;
-        if (err != error.UploadSessionLost or source == .reader) return err;
+        if (err != error.UploadSessionLost) return err;
+        const restart: ?Source.Restart = switch (source) {
+            .reader => |r| r.restart orelse return err,
+            else => null,
+        };
         // The bytes can be read again: a lost session costs a restart,
         // not the upload. Bounded like any other retry.
         restarts += 1;
@@ -95,7 +113,19 @@ pub fn run(
         logging.warn("resumable upload of {s}: the session was lost; starting over in {d} ms", .{ object_name, delay_ms });
         try client.io.sleep(.fromMilliseconds(delay_ms), .awake);
         _ = scratch.reset(.retain_capacity);
+        if (restart) |r| try r.rewind(r.ctx);
     }
+}
+
+/// Whether the finishing request carries the whole upload's checksum: a
+/// file's, rebuilt from the file, or a reader's whose maker keeps one.
+fn hashesFinal(client: *const Client, source: Source) bool {
+    if (!client.verify_checksums) return false;
+    return switch (source) {
+        .slice => false,
+        .reader => |r| r.final_hash != null,
+        .file => true,
+    };
 }
 
 fn sourceTotal(source: Source) ?u64 {
@@ -133,7 +163,7 @@ pub fn runSession(
         .session_uri = session_uri,
         .query_first = resuming,
         .cancel_on_failure = cancel_on_failure,
-        .hash_final = client.verify_checksums and source == .file,
+        .hash_final = hashesFinal(client, source),
         // A dead process may have sent everything before this one began.
         .sent_high = if (resuming) total orelse 0 else 0,
     };
@@ -317,19 +347,25 @@ const Machine = struct {
                         return error.InvalidResponse;
                     }
                     if (self.hash_final) {
-                        // The whole file, hashed: the finishing request
+                        // The whole upload, hashed: the finishing request
                         // already carried this, unless a query finished a
                         // resumed session that held everything, so a
                         // mismatch here means the file changed under a
                         // checkpoint.
-                        self.advanceHashTo(self.total.?) catch |err| return err;
-                        const whole = self.hasher.final();
+                        const whole = switch (self.source) {
+                            .file => blk: {
+                                self.advanceHashTo(self.total.?) catch |err| return err;
+                                break :blk self.hasher.final();
+                            },
+                            .reader => |r| r.final_hash.?.final(),
+                            .slice => unreachable,
+                        };
                         if (result.value.crc32c) |stored_crc| {
                             if (stored_crc != whole) {
                                 const deleted = self.discard(bucket_name, object_name, result.value.generation);
                                 if (self.client.diagnostics) |d| d.print(
-                                    "checksum mismatch after the upload finished: the file hashes to {d}, the object stores {d}{s}",
-                                    .{ whole, stored_crc, if (deleted) "; the object was deleted again" else "" },
+                                    "checksum mismatch after the upload finished: the {s} hashes to {d}, the object stores {d}{s}",
+                                    .{ if (self.source == .file) "file" else "stream", whole, stored_crc, if (deleted) "; the object was deleted again" else "" },
                                 );
                                 return error.ChecksumMismatch;
                             }
@@ -362,7 +398,7 @@ const Machine = struct {
                     }
                     // Bytes a dead process sent are re-read from the file,
                     // so the running hash still spans everything.
-                    if (self.hash_final and stored > self.hashed) {
+                    if (self.hash_final and self.source == .file and stored > self.hashed) {
                         self.advanceHashTo(stored) catch |err| {
                             self.maybeCancel(&response, session_uri, err);
                             return err;
@@ -464,8 +500,15 @@ const Machine = struct {
     /// refused here instead, before the request goes out at all.
     fn finalHash(self: *const Machine, buf: *[16]u8, metadata_crc: ?[8]u8) error{ChecksumMismatch}!?[]const u8 {
         if (!self.hash_final) return null;
-        std.debug.assert(self.hashed == self.total.?);
-        const whole = self.hasher.final();
+        const whole = switch (self.source) {
+            .file => blk: {
+                std.debug.assert(self.hashed == self.total.?);
+                break :blk self.hasher.final();
+            },
+            // The reader has ended, so its maker has hashed every byte.
+            .reader => |r| r.final_hash.?.final(),
+            .slice => unreachable,
+        };
         if (metadata_crc) |claimed| {
             const wanted = core.crc32c.fromBase64(&claimed) catch whole;
             if (wanted != whole) {

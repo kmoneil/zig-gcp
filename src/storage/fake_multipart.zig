@@ -73,6 +73,8 @@ pub const FakeMultipart = struct {
         session_starts: u32 = 0,
         session_puts: u32 = 0,
         session_cancels: u32 = 0,
+        /// One-request `uploadType=multipart` uploads.
+        inserts: u32 = 0,
         /// Payload bytes sessions accepted as new, resent prefixes not
         /// counted.
         session_bytes: u64 = 0,
@@ -81,7 +83,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert };
 
     pub const Fault = enum {
         none,
@@ -155,6 +157,8 @@ pub const FakeMultipart = struct {
         declared: ?u64,
         /// The crc32c the opening metadata claimed, or null.
         metadata_crc: ?u32,
+        /// The metadata said `contentEncoding: gzip`.
+        gzip: bool = false,
         bytes: std.ArrayList(u8) = .empty,
         /// The generation the finish made, once it has.
         done: ?u64 = null,
@@ -347,6 +351,7 @@ pub const FakeMultipart = struct {
             else if (method == .DELETE) .delete else return error.HttpProtocolError,
             .move => if (method == .POST) .move else return error.HttpProtocolError,
             .resumable => if (method == .POST) .session_start else return error.HttpProtocolError,
+            .insert => if (method == .POST) .insert else return error.HttpProtocolError,
             .session => switch (method) {
                 .PUT => .session_put,
                 .DELETE => .session_cancel,
@@ -367,7 +372,16 @@ pub const FakeMultipart = struct {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
             .session => if (kind == .session_put) sessionPart(headers) else 0,
-            .move, .resumable => 0,
+            .move, .resumable, .insert => 0,
+        };
+        // Cloud Storage and fake-gcs-server take a request body sent with
+        // `Content-Encoding: gzip` apart and store it plain. This library
+        // never sends one: an object it compresses is stored compressed,
+        // and the encoding goes in the metadata. A request that carries
+        // one fails the test that sent it.
+        if (headerValue(headers, "Content-Encoding") != null) return .{
+            .status = 400,
+            .body = "{\"error\":{\"code\":400,\"message\":\"this fake takes no request Content-Encoding\"}}",
         };
 
         self.mutex.lockUncancelable(self.io);
@@ -405,6 +419,7 @@ pub const FakeMultipart = struct {
             .xml => |x| try self.multipartRequest(kind, x, content_type, headers, body, fault, arena),
             .move => |m| try self.moveObject(m, fault, arena),
             .resumable => |r| try self.sessionStart(r, content_type, headers, body, arena),
+            .insert => |t| try self.insertObject(t, content_type, body, arena),
             .session => |id| if (kind == .session_put)
                 try self.sessionPut(id, headers, body, fault, arena)
             else
@@ -626,7 +641,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert => unreachable,
         }
     }
 
@@ -747,7 +762,6 @@ pub const FakeMultipart = struct {
         arena: Allocator,
     ) Allocator.Error!Reply {
         self.counts.session_starts += 1;
-        const Meta = struct { name: []const u8 = "", contentType: ?[]const u8 = null, crc32c: ?[]const u8 = null };
         _ = content_type;
         const meta = std.json.parseFromSliceLeaky(Meta, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -782,6 +796,7 @@ pub const FakeMultipart = struct {
             .content_type = stored_type,
             .declared = declared,
             .metadata_crc = metadata_crc,
+            .gzip = meta.gzip(),
         });
         self.next_session += 1;
         return .{ .status = 200, .headers = try replyHeaders(arena, &.{.{ .name = "Location", .value = location }}) };
@@ -860,32 +875,75 @@ pub const FakeMultipart = struct {
         if (claimed) |wanted| if (wanted != actual) return mismatch;
         if (s.metadata_crc) |wanted| if (wanted != actual) return mismatch;
 
-        const generation = self.next_generation;
-        const name = try self.gpa.dupe(u8, s.name);
-        errdefer self.gpa.free(name);
-        const bytes = try self.gpa.dupe(u8, s.bytes.items);
-        errdefer self.gpa.free(bytes);
-        const stored_type = try self.gpa.dupe(u8, s.content_type);
+        const o = try self.store(s.name, s.bytes.items, s.content_type, s.gzip);
+        s.done = o.generation;
+        s.bytes.clearAndFree(self.gpa);
+        return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, s.bucket, false) };
+    }
+
+    /// Stores `bytes` as the live object `name` at the next generation,
+    /// replacing any. One whose metadata said gzip is served decompressed
+    /// to a request that does not take gzip as sent, as Cloud Storage
+    /// transcodes it; its bytes are not checked here, and ones that do not
+    /// decompress are served as nothing.
+    fn store(self: *FakeMultipart, name: []const u8, bytes: []const u8, content_type: []const u8, gzip: bool) Allocator.Error!*Stored {
+        const owned_name = try self.gpa.dupe(u8, name);
+        errdefer self.gpa.free(owned_name);
+        const owned_bytes = try self.gpa.dupe(u8, bytes);
+        errdefer self.gpa.free(owned_bytes);
+        const stored_type = try self.gpa.dupe(u8, content_type);
         errdefer self.gpa.free(stored_type);
         const metadata = try self.gpa.alloc(Header, 0);
         errdefer self.gpa.free(metadata);
+        const served: ?[]u8 = if (gzip) try gunzipOrEmpty(self.gpa, bytes) else null;
+        errdefer if (served) |d| self.gpa.free(d);
         try self.objects.ensureUnusedCapacity(self.gpa, 1);
+        const generation = self.next_generation;
         self.next_generation += 1;
-        if (self.liveIndex(s.name)) |i| {
+        if (self.liveIndex(name)) |i| {
             var replaced = self.objects.orderedRemove(i);
             freeStored(self.gpa, &replaced);
         }
         self.objects.appendAssumeCapacity(.{
-            .name = name,
+            .name = owned_name,
             .generation = generation,
-            .bytes = bytes,
+            .bytes = owned_bytes,
             .content_type = stored_type,
             .metadata = metadata,
+            .served = served,
         });
-        s.done = generation;
-        s.bytes.clearAndFree(self.gpa);
-        const o = &self.objects.items[self.objects.items.len - 1];
-        return .{ .status = 200, .body = try objectJson(arena, o, o.name, generation, s.bucket, false) };
+        return &self.objects.items[self.objects.items.len - 1];
+    }
+
+    /// A one-request `uploadType=multipart` upload: the metadata part, then
+    /// the data, checked against the metadata's crc32c and the query's
+    /// conditions before the object exists.
+    fn insertObject(self: *FakeMultipart, target: InsertTarget, content_type: ?[]const u8, body: []const u8, arena: Allocator) Allocator.Error!Reply {
+        self.counts.inserts += 1;
+        const bad: Reply = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"bad multipart body\"}}" };
+        const parts = splitMultipart(arena, content_type orelse return bad, body) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Malformed => return bad,
+        };
+        const meta = std.json.parseFromSliceLeaky(Meta, arena, parts.metadata, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return bad,
+        };
+        if (meta.name.len == 0) return bad;
+        const held = if (self.liveIndex(meta.name)) |i|
+            target.conditions.check(&self.objects.items[i]) == .hold
+        else
+            target.conditions.checkAbsent();
+        if (!held) return condition_failed;
+        if (meta.crc32c) |text| {
+            const wanted = core.crc32c.fromBase64(text) catch return bad;
+            if (wanted != core.crc32c.hash(parts.data)) return .{
+                .status = 400,
+                .body = "{\"error\":{\"code\":400,\"message\":\"Provided CRC32C does not match calculated CRC32C\",\"errors\":[{\"reason\":\"invalid\"}]}}",
+            };
+        }
+        const o = try self.store(meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip());
+        return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false) };
     }
 
     fn sessionCancel(self: *FakeMultipart, id: []const u8) Reply {
@@ -1096,6 +1154,51 @@ const Conditions = struct {
     }
 };
 
+/// What the fake reads of an upload's metadata.
+const Meta = struct {
+    name: []const u8 = "",
+    contentType: ?[]const u8 = null,
+    contentEncoding: ?[]const u8 = null,
+    crc32c: ?[]const u8 = null,
+
+    fn gzip(m: Meta) bool {
+        return std.ascii.eqlIgnoreCase(m.contentEncoding orelse "", "gzip");
+    }
+};
+
+/// The two parts of a `multipart/related` upload body, as this library
+/// frames it: JSON metadata, then the data.
+fn splitMultipart(arena: Allocator, content_type: []const u8, body: []const u8) error{ OutOfMemory, Malformed }!struct { metadata: []const u8, data: []const u8 } {
+    const marker = "boundary=";
+    const at = std.mem.indexOf(u8, content_type, marker) orelse return error.Malformed;
+    const boundary = content_type[at + marker.len ..];
+    const opening = try std.fmt.allocPrint(arena, "--{s}\r\n", .{boundary});
+    const middle = try std.fmt.allocPrint(arena, "\r\n--{s}\r\n", .{boundary});
+    const closing = try std.fmt.allocPrint(arena, "\r\n--{s}--\r\n", .{boundary});
+    if (!std.mem.startsWith(u8, body, opening) or !std.mem.endsWith(u8, body, closing)) return error.Malformed;
+    const inner = body[opening.len .. body.len - closing.len];
+    const meta_start = (std.mem.indexOf(u8, inner, "\r\n\r\n") orelse return error.Malformed) + 4;
+    const meta_len = std.mem.indexOf(u8, inner[meta_start..], middle) orelse return error.Malformed;
+    const rest = inner[meta_start + meta_len + middle.len ..];
+    const data_start = (std.mem.indexOf(u8, rest, "\r\n\r\n") orelse return error.Malformed) + 4;
+    return .{ .metadata = inner[meta_start..][0..meta_len], .data = rest[data_start..] };
+}
+
+/// `bytes` gzip-decompressed, or nothing when they do not decompress.
+fn gunzipOrEmpty(gpa: Allocator, bytes: []const u8) Allocator.Error![]u8 {
+    var in: std.Io.Reader = .fixed(bytes);
+    const window = try gpa.alloc(u8, core.flate.max_window_len);
+    defer gpa.free(window);
+    var inflate: core.flate.Decompress = .init(&in, .gzip, window);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    _ = inflate.reader.streamRemaining(&out.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        error.ReadFailed => return gpa.alloc(u8, 0),
+    };
+    return out.toOwnedSlice();
+}
+
 fn freeStored(gpa: Allocator, o: *FakeMultipart.Stored) void {
     gpa.free(o.name);
     gpa.free(o.bytes);
@@ -1175,11 +1278,18 @@ const ResumableTarget = struct {
     origin: []const u8,
 };
 
+const InsertTarget = struct {
+    bucket: []const u8,
+    /// Checked against the live object the metadata names.
+    conditions: Conditions,
+};
+
 const Target = union(enum) {
     json: JsonTarget,
     xml: XmlTarget,
     move: MoveTarget,
     resumable: ResumableTarget,
+    insert: InsertTarget,
     /// A session URL's id.
     session: []const u8,
 };
@@ -1203,11 +1313,14 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         const bucket = try decode(arena, after[0..slash]);
         var conditions: Conditions = .{};
         var resumable_type = false;
+        var multipart_type = false;
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
             if (try conditions.take(param)) continue;
             if (std.mem.eql(u8, param, "uploadType=resumable")) resumable_type = true;
+            if (std.mem.eql(u8, param, "uploadType=multipart")) multipart_type = true;
         }
+        if (multipart_type) return .{ .insert = .{ .bucket = bucket, .conditions = conditions } };
         if (!resumable_type) return error.HttpProtocolError;
         return .{ .resumable = .{ .bucket = bucket, .conditions = conditions, .origin = url[0..path_start] } };
     }
