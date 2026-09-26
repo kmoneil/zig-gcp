@@ -13,7 +13,7 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, the `TokenProvider` and `Signer` seams, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 1009 unit, property and fuzz tests, Google's 29 V4 signing
+- Tested with 1033 unit, property and fuzz tests, Google's 29 V4 signing
   vectors among them; 28 Pub/Sub integration tests that pass against both
   the emulator and production, and 20 more through a proxy that drops,
   cuts and stalls the connection; 22 Cloud Storage tests against
@@ -1372,6 +1372,12 @@ Each of these is worked around here, and covered by a regression test in
   decompresses to wrong bytes without complaint. `storage`'s downloads
   check both themselves, in `src/storage/gzip_download.zig`, where a test
   also holds std to what it does.
+- The same decompressor panics on input that ends partway through a code,
+  such as a gzip body cut short or a truncated object: its
+  `tossBitsShort` counts consumed bits as bits still to read. The nightly
+  fuzzing found it with 19 bytes. `core.flate.Decompress`
+  (`src/core/flate/`) is std's, with that fixed, and both the transport and
+  `storage`'s gzip downloads decompress with it.
 
 ## Development
 

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const flate = @import("flate.zig");
 const Allocator = std.mem.Allocator;
 const http = std.http;
 
@@ -489,8 +490,22 @@ pub const HttpTransport = struct {
             dechunker = .init(request.reader.in, &transfer_buffer, max_chunk);
             break :t &dechunker.interface;
         } else request.reader.bodyReader(&transfer_buffer, head.transfer_encoding, head.content_length);
-        var decompress: http.Decompress = undefined;
-        const reader = decompress.init(transfer, decompress_buffer, encoding);
+        // core's copy of std's decompressor, where std.http would use std's,
+        // which panics on a body that ends partway, as a dropped
+        // connection's can.
+        var inflate: flate.Decompress = undefined;
+        const reader: *std.Io.Reader = switch (encoding) {
+            .identity => transfer,
+            .gzip => r: {
+                inflate = .init(transfer, .gzip, decompress_buffer);
+                break :r &inflate.reader;
+            },
+            .deflate => r: {
+                inflate = .init(transfer, .zlib, decompress_buffer);
+                break :r &inflate.reader;
+            },
+            .zstd, .compress => unreachable,
+        };
 
         var body: []const u8 = "";
         var streamed: u64 = 0;
@@ -2031,8 +2046,8 @@ test "sendStream delivers a gzip body as sent when asked, and a plain one as it 
     try testing.expectEqual(gzip_body.len, res.bytes_streamed);
     try testing.expectEqualStrings("gzip", res.header("content-encoding").?);
     var in: std.Io.Reader = .fixed(out.buffered());
-    var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var inflate: std.compress.flate.Decompress = .init(&in, .gzip, &window);
+    var window: [flate.max_window_len]u8 = undefined;
+    var inflate: flate.Decompress = .init(&in, .gzip, &window);
     var json_buf: [128]u8 = undefined;
     const json = json_buf[0..try inflate.reader.readSliceShort(&json_buf)];
     try testing.expectEqualStrings("{\"topics\":[{\"name\":\"projects/p/topics/zipped\"}]}", json);
@@ -2051,6 +2066,31 @@ test "sendStream delivers a gzip body as sent when asked, and a plain one as it 
     try serving.await(io);
     try expectHeader(server.request(0), "accept-encoding: gzip\r\n");
     try testing.expectEqual(1, server.connections);
+}
+
+test "a gzip body that ends partway is refused, never a panic: whole framing is a bad body, cut framing a drop" {
+    const io = testing.io;
+    // Nineteen bytes of gzip that end partway through a code, which std's
+    // own decompressor panics on (nightly run 36230092734).
+    const cut_gzip = "\x1f\x8b\x08\x00\x00\x00\x00\xb5\x33\x8e\x2d\x00\x02\x29\xbd\xfb\x54\x0f\xcc";
+    var server: ScriptedServer = try .start(io, &.{
+        // All the body the length promised: the body itself is bad.
+        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 19\r\n\r\n" ++ cut_gzip,
+        // A length the connection never delivers: it dropped mid-body.
+        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 400\r\n\r\n" ++ cut_gzip,
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.HttpProtocolError, ht.transport().send(.{ .method = .GET, .url = server.url(&buf, "/a") }, arena.allocator()));
+    try testing.expectError(error.ConnectionResetByPeer, ht.transport().send(.{ .method = .GET, .url = server.url(&buf, "/b") }, arena.allocator()));
+    try serving.await(io);
 }
 
 test "sendStream buffers an error body even when a writer was given" {

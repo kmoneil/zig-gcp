@@ -32,9 +32,18 @@ including the ones that did not change.
   `decompress` is false, where it was `error.InvalidResponse`.
 - core: `transport.StreamRequest.AcceptEncoding` gains `gzip_as_sent`,
   which offers gzip and delivers the body as it arrived. Breaking, for an
-  exhaustive `switch` over `AcceptEncoding`.
+  exhaustive `switch` over `AcceptEncoding`. New `core.flate.Decompress`:
+  std's decompressor from Zig 0.16.0, which panics on input that ends
+  partway through a code (its `tossBitsShort` counts consumed bits as
+  bits still to read), with that fixed. The nightly fuzzing found it with
+  19 bytes of gzip. The transport now decompresses gzip and deflate
+  response bodies with it, so a gzip response cut short by a dropped
+  connection is `error.ConnectionResetByPeer`, where it could panic, and
+  `storage`'s gzip downloads do too.
+- pubsub, secret_manager: every JSON response the transport decompresses
+  goes through the fixed decompressor; no API change.
 - examples: `gcs_cp --no-decompress` keeps a gzip object as stored.
-- auth, pubsub, secret_manager: unchanged.
+- auth: unchanged.
 
 ## 0.21.0 (2026-09-25)
 
