@@ -53,6 +53,10 @@ pub const CountingWriter = @import("CountingWriter.zig");
 /// CRC-32C, the checksum Google sends beside payload bytes.
 pub const crc32c = @import("crc32c.zig");
 
+/// gzip, zlib and deflate decompression: std's, fixed for input that ends
+/// partway, which std's panics on.
+pub const flate = @import("flate.zig");
+
 /// Percent-encoding for request paths, and a query-string builder.
 pub const query = @import("query.zig");
 
@@ -74,6 +78,7 @@ test {
     _ = @import("WipingAllocator.zig");
     _ = @import("base64.zig");
     _ = @import("crc32c.zig");
+    _ = @import("flate.zig");
     _ = @import("endpoint.zig");
     _ = @import("errors.zig");
     _ = @import("logging.zig");

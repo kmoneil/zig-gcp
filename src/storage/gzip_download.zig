@@ -358,7 +358,7 @@ pub fn finish(
     if (tap.buffer.len == 0) tap.buffer = try tap.gpa.alloc(u8, tap.chunk_size);
 
     var pull: Pull = .init(client, bucket, name, generation, total, tap.buffer, tap.collected);
-    const window = try client.gpa.alloc(u8, std.compress.flate.max_window_len);
+    const window = try client.gpa.alloc(u8, core.flate.max_window_len);
     defer client.gpa.free(window);
     var counting: core.CountingWriter = .init(writer);
     var hashing: std.Io.Writer.Hashed(core.crc32c.Hasher) = .initHasher(&counting.writer, .init(), &.{});
@@ -367,7 +367,9 @@ pub fn finish(
     // that start no member are ignored, as `gzip -d` ignores them.
     var decompress_error: ?anyerror = null;
     while (true) {
-        var inflate: std.compress.flate.Decompress = .init(&pull.interface, .gzip, window);
+        // core's copy of std's decompressor: std's panics on stored bytes
+        // that end partway through a code.
+        var inflate: core.flate.Decompress = .init(&pull.interface, .gzip, window);
         // std reads each member's trailer, its CRC-32 and length, and checks
         // neither (Zig 0.16.0), so they are checked here, as `gzip -d` does:
         // with verification off, they are all that stands between a flipped
@@ -682,6 +684,19 @@ test "gzip: a stored byte flipped on the way is caught, with checking on or off"
     }
 }
 
+test "gzip: stored bytes that end partway through a code are DecompressionFailed, where std's decompressor panicked" {
+    var s: Setup = undefined;
+    try s.init(.{});
+    defer s.deinit();
+    // Found by the nightly fuzzing on 2026-09-26: std's decompressor tossed
+    // a code past the end of these bytes, then underflowed.
+    try s.fake.putGzip("cut.gz", "\x1f\x8b\x08\x00\x00\x00\x00\xb5\x33\x8e\x2d\x00\x02\x29\xbd\xfb\x54\x0f\xcc", "unused");
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expectError(error.DecompressionFailed, s.object("cut.gz").download(&out.writer, .{}));
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "EndOfStream") != null);
+}
+
 test "gzip: a member whose trailer lies is DecompressionFailed, checking on or off, though std's decompressor would pass it" {
     // Valid deflate for "hello world\n", with the trailer's CRC-32, then its
     // length, one off. The stored bytes are what is stored, so the stored
@@ -937,6 +952,9 @@ test "fuzz gzip: any stored bytes decompress or fail with DecompressionFailed" {
             "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x28\xcf\x2f\xca\x49\xe1\x02\x00\x2d\x3b\x08\xaf\x0c\x00\x00\x00",
             // Two members.
             "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x4b\xcb\x2c\x2a\x2e\x51\x00\x00\xfc\x7a\xf1\x1c\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\x4e\x4d\xce\xcf\x4b\xe1\x02\x00\x7e\xc0\x0f\x06\x07\x00\x00\x00",
+            // The 2026-09-26 nightly: gzip that ends partway through a
+            // code, which std's decompressor panicked on.
+            "\x1f\x8b\x08\x00\x00\x00\x00\xb5\x33\x8e\x2d\x00\x02\x29\xbd\xfb\x54\x0f\xcc",
         },
     });
 }
