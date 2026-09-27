@@ -67,6 +67,8 @@ pub const logging = @import("logging.zig");
 pub const timestamp = @import("timestamp.zig");
 /// Durations, as Google's JSON APIs write them: `600s`, `1.500s`.
 pub const duration = @import("duration.zig");
+/// gzip for request bodies held whole in memory, checked by reading back.
+pub const gzip = @import("gzip.zig");
 
 /// Fakes and property-test helpers, for tests only.
 pub const testing = @import("testing.zig");
@@ -92,5 +94,6 @@ test {
     _ = @import("testing.zig");
     _ = @import("timestamp.zig");
     _ = @import("duration.zig");
+    _ = @import("gzip.zig");
     _ = @import("transport.zig");
 }

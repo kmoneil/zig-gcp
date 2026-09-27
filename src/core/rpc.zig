@@ -35,6 +35,9 @@ pub const Call = struct {
     /// Path and query, starting with `/v1/`. Appended to the base URL.
     path: []const u8,
     body: ?[]const u8 = null,
+    /// Extra request headers, such as the `Content-Encoding` of a compressed
+    /// body. The quota project's goes after them.
+    headers: []const transport.Header = &.{},
     /// False where the caller opted out of retries, as a publish does.
     retry: bool = true,
     /// Whether a failed attempt is worth another. `http_status` is the
@@ -151,11 +154,13 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             const log_path = call.path[0 .. std.mem.indexOfScalar(u8, call.path, '?') orelse call.path.len];
             var max_attempts: u32 = if (call.retry) self.retry.max_attempts else 1;
 
-            var header_buf: [1]transport.Header = undefined;
-            var headers: []const transport.Header = &.{};
+            // The call's headers, plus the quota project when there is one.
+            var headers: []const transport.Header = call.headers;
             if (try self.quotaProject()) |project| {
-                header_buf[0] = .{ .name = "x-goog-user-project", .value = project };
-                headers = header_buf[0..1];
+                const all = try scratch.allocator().alloc(transport.Header, call.headers.len + 1);
+                @memcpy(all[0..call.headers.len], call.headers);
+                all[call.headers.len] = .{ .name = "x-goog-user-project", .value = project };
+                headers = all;
             }
 
             var reauthenticated = false;
@@ -1165,4 +1170,23 @@ test "error_body_out: a backoff that is canceled leaves no body behind" {
     var body: ?[]const u8 = "stale";
     try testing.expectError(error.Canceled, h.engine().execute(&h.arena, .{ .method = .GET, .path = "/v1/a", .error_body_out = &body }));
     try testing.expectEqual(null, body);
+}
+
+test "a call's own headers go first, then the quota project's" {
+    var h: Harness = undefined;
+    h.init(&.{ ok, ok });
+    defer h.deinit();
+    h.token.quota_project = "billing-project";
+    const e = h.engine();
+    const gzip: []const transport.Header = &.{.{ .name = "Content-Encoding", .value = "gzip" }};
+    _ = try e.execute(&h.arena, .{ .method = .POST, .path = "/v1/a", .body = "x", .headers = gzip });
+    const sent = try h.fake.request(0);
+    try testing.expectEqual(2, sent.headers.len);
+    try testing.expectEqualStrings("Content-Encoding", sent.headers[0].name);
+    try testing.expectEqualStrings("gzip", sent.headers[0].value);
+    try testing.expectEqualStrings("billing-project", sent.header("x-goog-user-project").?);
+    // Without a quota project, the call's own alone.
+    h.token.quota_project = null;
+    _ = try e.execute(&h.arena, .{ .method = .POST, .path = "/v1/b", .body = "x", .headers = gzip });
+    try testing.expectEqual(1, (try h.fake.request(1)).headers.len);
 }

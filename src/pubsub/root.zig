@@ -28,6 +28,7 @@ pub const Owned = @import("types.zig").Owned;
 pub const Attribute = @import("types.zig").Attribute;
 pub const Message = @import("types.zig").Message;
 pub const PublishOptions = @import("types.zig").PublishOptions;
+pub const Compression = @import("types.zig").Compression;
 pub const PublishResult = @import("types.zig").PublishResult;
 pub const PageOptions = @import("types.zig").PageOptions;
 pub const PullOptions = @import("types.zig").PullOptions;

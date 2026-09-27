@@ -261,9 +261,14 @@ jobs:
         # made a local run about 1.5 times as long, so slow-subscriber drops
         # from 105K to 75K; and heavy-pubsub, pubsub's per-id ack answers,
         # builds a client and a fake server each run, about 2 ms locally.
-        # Re-size both from the first nightly that runs them.
+        # Re-size both from the first nightly that runs them. core's two
+        # gzip properties, added since, cost 1.8 ms a run locally against
+        # 3.4 ms for the rest of core, so core drops from 1250K to 1000K
+        # until a nightly measures it too. The Publisher property now
+        # compresses a quarter of its scripts, about 30% more a run
+        # locally, which slow-pubsub's 1M still fits.
         include:
-          - { job: core, module: core, filter: fuzz, iterations: 1250K }
+          - { job: core, module: core, filter: fuzz, iterations: 1000K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
           - { job: slow-auth, module: auth, filter: slow property, iterations: 50K }
           - { job: pubsub, module: pubsub, filter: fuzz, iterations: 750K }

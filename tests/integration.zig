@@ -335,6 +335,33 @@ test "binary safety: all 256 byte values survive the round trip" {
     try testing.expectEqualSlices(u8, &all, got.messages.items[0].data);
 }
 
+test "compressed publish: every byte value and a long text arrive exactly as sent" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("gzip");
+    const sub = try f.createSubscription("gzip-sub", .{ .topic_id = topic.id });
+    var all: [256]u8 = undefined;
+    for (&all, 0..) |*b, i| b.* = @intCast(i);
+    const text = "a line of text that compresses well\n" ** 1000;
+    const messages = [_]pubsub.Message{
+        .{ .data = &all, .attributes = &.{.{ .key = "kind", .value = "bytes" }} },
+        .{ .data = text, .attributes = &.{.{ .key = "kind", .value = "text" }} },
+    };
+    var sent = topic.publish(&messages, .{ .compression = .{} }) catch |err| return f.fail(err);
+    defer sent.deinit();
+    try testing.expectEqual(2, sent.value.message_ids.len);
+
+    var got: Collector = .init();
+    defer got.deinit();
+    try pullUntil(&f, sub, 2, f.patience(), &got, true);
+    for (messages, sent.value.message_ids) |want, id| {
+        const m = got.find(want.data) orelse return error.TestMessageMissing;
+        try testing.expectEqualStrings(id, m.message_id);
+    }
+    try expectNoMessages(&f, sub);
+}
+
 // 6.
 test "attribute-only message with empty data" {
     var f: Fixture = undefined;
@@ -1096,6 +1123,7 @@ const PublisherKnobs = struct {
     max_batch_delay_ms: u32 = 10,
     enable_message_ordering: bool = false,
     max_outstanding_bytes: u64 = 10_000_000,
+    compression: ?pubsub.Compression = null,
 };
 
 /// Options for a publisher on the fixture's server.
@@ -1117,6 +1145,7 @@ fn publisherOptions(f: *Fixture, topic_id: []const u8, knobs: PublisherKnobs) Pu
         .max_batch_delay_ms = knobs.max_batch_delay_ms,
         .enable_message_ordering = knobs.enable_message_ordering,
         .max_outstanding_bytes = knobs.max_outstanding_bytes,
+        .compression = knobs.compression,
     };
 }
 
@@ -1291,10 +1320,20 @@ test "publisher: a lone message goes out once its delay runs out" {
 }
 
 test "publisher: a batch at exactly the 10,485,760-byte limit is accepted, and a byte more splits it" {
+    try exactLimit(null);
+}
+
+test "publisher: compressed, the limit counts the bytes before compression, as Google's clients count them" {
+    // The batches compress to a few kilobytes, and still split where they
+    // would uncompressed.
+    try exactLimit(.{});
+}
+
+fn exactLimit(compression: ?pubsub.Compression) !void {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;
     defer f.deinit();
-    const topic = try f.createTopic("publimit");
+    const topic = try f.createTopic(if (compression == null) "publimit" else "publimit-gz");
     const gpa = testing.allocator;
     const limit = pubsub.limits.max_publish_request_bytes;
 
@@ -1341,6 +1380,7 @@ test "publisher: a batch at exactly the 10,485,760-byte limit is accepted, and a
         // Encoding a 4 MB message outlasts a short delay, which would send
         // the first message alone. Only size or flush may close a batch.
         .max_batch_delay_ms = 30_000,
+        .compression = compression,
     }));
     defer live.deinit();
     for ([_]pubsub.Message{ exact, over }, [_]u64{ 1, 3 }) |second, requests| {
@@ -1355,6 +1395,42 @@ test "publisher: a batch at exactly the 10,485,760-byte limit is accepted, and a
         try testing.expectEqual(requests, live.publisher.stats().requests);
     }
     try live.finish();
+}
+
+test "publisher: compressed batches arrive intact" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("pubgz");
+    const sub = try f.createSubscription("pubgz-sub", .{ .topic_id = topic.id });
+    var live: LivePublisher = undefined;
+    try live.start(publisherOptions(&f, topic.id, .{ .compression = .{ .level = 9 } }));
+    defer live.deinit();
+
+    const count = 300;
+    var receipts: [count]Publisher.Receipt = undefined;
+    var made: usize = 0;
+    defer for (receipts[0..made]) |r| r.release();
+    for (&receipts, 0..) |*r, i| {
+        var buf: [64]u8 = undefined;
+        r.* = try live.publisher.publish(.{ .data = try std.fmt.bufPrint(&buf, "compressed message {d:0>4}, in a batch", .{i}) }, .{});
+        made += 1;
+    }
+    for (receipts) |r| _ = waitReceipt(r, 60) catch |err| return f.fail(err);
+    try live.finish();
+    try testing.expectEqual(count, live.publisher.stats().succeeded);
+
+    var got: Collector = .init();
+    defer got.deinit();
+    try pullUntil(&f, sub, count, f.patience(), &got, true);
+    for (0..count) |i| {
+        var buf: [64]u8 = undefined;
+        const data = try std.fmt.bufPrint(&buf, "compressed message {d:0>4}, in a batch", .{i});
+        if (got.find(data) == null) {
+            std.debug.print("{s} never arrived\n", .{data});
+            return error.TestMessageMissing;
+        }
+    }
 }
 
 test "publisher: after its topic is deleted, receipts fail with NotFound and the publisher carries on" {

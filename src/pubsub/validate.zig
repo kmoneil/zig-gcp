@@ -193,6 +193,11 @@ fn labelText(text: []const u8, is_key: bool, index: usize, diag: ?*Diagnostics) 
     };
 }
 
+/// A compression level: 1 to 9.
+pub fn compression(c: types.Compression, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (c.level < 1 or c.level > 9) return refuse(diag, "compression level {d} is outside 1 to 9", .{c.level});
+}
+
 /// A subscription's filter: at most 256 bytes of UTF-8. Its grammar is the
 /// server's to check.
 pub fn filter(text: []const u8, diag: ?*Diagnostics) error{InvalidArgument}!void {
