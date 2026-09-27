@@ -247,28 +247,28 @@ jobs:
       matrix:
         # `--fuzz=N` runs every matching property N times, so a job takes N
         # times the sum of its properties' costs per run. Each count aims at
-        # about 90 of the job's 180 minutes, from what the 2026-09-23
-        # nightly cost per run at the counts it ran: core 2.7 ms, auth
-        # 6.8 ms, slow-auth 49 ms, pubsub 2.7 ms, slow-pubsub 1.7 ms, the
-        # Subscriber property 52 ms, secret_manager 0.79 ms, storage
-        # 0.58 ms, slow-storage 0.57 ms. Take a count from a nightly rather
-        # than from a local run, which does not keep pace for every
-        # property: the Subscriber property costs 31 ms locally and 52 ms
-        # here, which is how its job reached 129 of its 180 minutes.
-        # The two storage counts are under their aim on purpose: the POST
-        # policy properties are new, and local timings of them disagreed
-        # with each other, so they are sized to finish well inside the
-        # timeout and the next nightly measures what they really cost.
+        # about 90 of the job's 180 minutes. The 2026-09-27 nightly cost per
+        # run: core 4.2 ms, auth 7.2 ms, slow-auth 31 ms, pubsub 3.2 ms,
+        # slow-pubsub 1.6 ms, the Subscriber property 30 ms,
+        # secret_manager 1.4 ms, slow-storage 1.4 ms; storage ran out of
+        # time at 5M. Measured on a Mac the same day under the fuzz runner:
+        # storage 2.6 ms (21 properties from 0.005 to 0.3 ms each; the gzip
+        # download property, 0.8 ms more, moved to heavy-storage), and
+        # heavy-storage 25 ms. A job runs from as fast as the Mac to 1.5
+        # times slower, and from night to night by up to twice, so the
+        # timeout is the margin. Take a count from a nightly rather than
+        # from a local run when there is one.
         include:
-          - { job: core, module: core, filter: fuzz, iterations: 2M }
+          - { job: core, module: core, filter: fuzz, iterations: 1250K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
           - { job: slow-auth, module: auth, filter: slow property, iterations: 50K }
           - { job: pubsub, module: pubsub, filter: fuzz, iterations: 750K }
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1M }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 105K }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
-          - { job: storage, module: storage, filter: fuzz, iterations: 5M }
-          - { job: slow-storage, module: storage, filter: slow property, iterations: 6M }
+          - { job: storage, module: storage, filter: fuzz, iterations: 1500K }
+          - { job: slow-storage, module: storage, filter: slow property, iterations: 3800K }
+          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 150K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:

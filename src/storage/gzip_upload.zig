@@ -1081,8 +1081,8 @@ fn sameBytesHoweverSplit(_: void, input: []const u8) !void {
 
 // Compressing up to 140 KiB twice a run: too slow for the nightly "fuzz"
 // and "slow property" filters, whose counts run into millions, so it runs
-// with every test run, under that run's seed.
-test "property gzip compress: std compresses the same data to the same bytes however it is split" {
+// in the heavy-storage job.
+test "heavy property gzip compress: std compresses the same data to the same bytes however it is split" {
     try test_util.fuzzBytes({}, sameBytesHoweverSplit, .{
         .random_runs = 40,
         .corpus = &.{
@@ -1134,9 +1134,9 @@ fn expectGzipOf(data: []const u8, body: []const u8) !void {
     try testing.expectEqual(body.len, in.seek);
 }
 
-// Compressing up to 20 KiB twice a run, named out of the nightly filters
-// for the same reason.
-test "fault property gzip upload: a wrong compressed byte anywhere is caught, or still decompresses to the data" {
+// Compressing up to 20 KiB twice a run: in the heavy-storage job for the
+// same reason.
+test "heavy property gzip upload: a wrong compressed byte anywhere is caught, or still decompresses to the data" {
     try test_util.fuzzBytes({}, flipCaught, .{
         .random_runs = 100,
         .corpus = &.{
@@ -1166,9 +1166,8 @@ fn anyDataRoundTrips(_: void, input: []const u8) !void {
 }
 
 // About 1.5 ms a run under the fuzz runner, so millions of nightly runs
-// would take hours: named out of the nightly filters, and run with every
-// test run under that run's seed.
-test "property gzip upload: any bytes compress to gzip of themselves, checked" {
+// would take hours: in the heavy-storage job.
+test "heavy property gzip upload: any bytes compress to gzip of themselves, checked" {
     try test_util.fuzzBytes({}, anyDataRoundTrips, .{
         .corpus = &.{ "", "\x00", "\x09aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "\x05the quick brown fox jumps over the lazy dog" },
     });
