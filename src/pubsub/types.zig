@@ -92,9 +92,15 @@ pub const TopicPage = struct {
 pub const SubscriptionConfig = struct {
     /// Id of a topic in the same project.
     topic_id: []const u8,
-    /// 10 to 600 seconds, or 0 for the server default (10).
-    ack_deadline_seconds: u32 = 10,
+    /// 10 to 600 seconds, or 0 for Pub/Sub's default: 10, or 60 with
+    /// exactly-once delivery.
+    ack_deadline_seconds: u32 = 0,
     enable_message_ordering: bool = false,
+    /// A message acknowledged before its deadline is never delivered
+    /// again, and an acknowledgement that comes too late is refused rather
+    /// than taken, so a subscriber can tell which of its acks held. Pull
+    /// subscriptions only.
+    enable_exactly_once_delivery: bool = false,
 };
 
 pub const SubscriptionInfo = struct {
@@ -104,6 +110,25 @@ pub const SubscriptionInfo = struct {
     topic: []const u8,
     ack_deadline_seconds: u32,
     enable_message_ordering: bool,
+    enable_exactly_once_delivery: bool,
+};
+
+/// What became of one ack id sent to `acknowledge` or `modifyAckDeadline`.
+pub const AckResult = enum {
+    /// The server took it.
+    ok,
+    /// Refused for good: the lease had lapsed, the message was already
+    /// acknowledged, or the id is not one this subscription gave. Only a
+    /// subscription with exactly-once delivery refuses these; the message
+    /// may be delivered again.
+    invalid_ack_id,
+    /// Refused for now, and still refused when the call's retries ran out.
+    /// Sending it again later may succeed.
+    transient,
+    /// Refused for another reason, or its request failed as a whole with an
+    /// answer that says nothing about single ids. `Diagnostics` has the
+    /// server's words.
+    other,
 };
 
 pub const SubscriptionPage = struct {

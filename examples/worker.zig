@@ -113,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
         while (idle_ms < 5_000) {
             try init.io.sleep(.fromMilliseconds(250), .awake);
             const now = subscriber.stats();
-            const drained = now.received == now.acked + now.nacked;
+            const drained = now.received == now.acked + now.ack_failed + now.nacked + now.receipt_refused;
             idle_ms = if (drained and now.received == last.received) idle_ms + 250 else 0;
             last = now;
         }

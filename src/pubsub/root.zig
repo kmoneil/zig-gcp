@@ -39,6 +39,7 @@ pub const TopicPage = @import("types.zig").TopicPage;
 pub const SubscriptionConfig = @import("types.zig").SubscriptionConfig;
 pub const SubscriptionInfo = @import("types.zig").SubscriptionInfo;
 pub const SubscriptionPage = @import("types.zig").SubscriptionPage;
+pub const AckResult = @import("types.zig").AckResult;
 
 /// Parses a `publish_time` (RFC 3339) to nanoseconds since the Unix epoch.
 pub const parseTimestamp = core.timestamp.parse;
