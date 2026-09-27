@@ -1899,11 +1899,13 @@ test "Subscriber: acknowledgements go out promptly, not at the lease tick" {
         }
     };
     const acked = try waitUntil(1_000, &h.fake, Acked.one);
-    const counts = h.subscriber.stats();
     h.subscriber.stop();
     try running.await(testing.io);
     try testing.expect(acked);
-    try testing.expectEqual(1, counts.acked);
+    // Counted once run has returned: the fake records the ack before the
+    // janitor has the answer and counts it, so a count read at once raced
+    // it, and lost under load in a ReleaseSafe run.
+    try testing.expectEqual(1, h.subscriber.stats().acked);
 }
 
 test "Subscriber: an ack refused for now is sent again later, and given up at the limit" {
