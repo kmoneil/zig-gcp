@@ -148,10 +148,18 @@ const SubscriptionBody = struct {
         try jw.beginObject();
         try jw.objectField("topic");
         try jw.write(self.topic_name);
-        try jw.objectField("ackDeadlineSeconds");
-        try jw.write(self.config.ack_deadline_seconds);
+        // Left out, 0 lets Pub/Sub choose: 10 s, or 60 s with exactly-once
+        // delivery, which a 10 sent here would override.
+        if (self.config.ack_deadline_seconds != 0) {
+            try jw.objectField("ackDeadlineSeconds");
+            try jw.write(self.config.ack_deadline_seconds);
+        }
         try jw.objectField("enableMessageOrdering");
         try jw.write(self.config.enable_message_ordering);
+        if (self.config.enable_exactly_once_delivery) {
+            try jw.objectField("enableExactlyOnceDelivery");
+            try jw.write(true);
+        }
         try jw.endObject();
     }
 };
@@ -265,6 +273,7 @@ const WireSubscription = struct {
     topic: ?[]const u8 = null,
     ackDeadlineSeconds: ?u32 = null,
     enableMessageOrdering: ?bool = null,
+    enableExactlyOnceDelivery: ?bool = null,
 };
 
 const WireSubscriptionList = struct {
@@ -329,6 +338,7 @@ fn subscriptionFromWire(w: WireSubscription) types.SubscriptionInfo {
         .topic = w.topic orelse "",
         .ack_deadline_seconds = w.ackDeadlineSeconds orelse 0,
         .enable_message_ordering = w.enableMessageOrdering orelse false,
+        .enable_exactly_once_delivery = w.enableExactlyOnceDelivery orelse false,
     };
 }
 
@@ -445,6 +455,15 @@ test "golden: pull, ack, modifyAckDeadline, create bodies" {
             .ack_deadline_seconds = 30,
             .enable_message_ordering = true,
         }),
+    );
+    // The defaults leave the deadline to Pub/Sub; exactly-once is sent only when on.
+    try testing.expectEqualStrings(
+        "{\"topic\":\"projects/p/topics/t\",\"enableMessageOrdering\":false}",
+        try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t" }),
+    );
+    try testing.expectEqualStrings(
+        "{\"topic\":\"projects/p/topics/t\",\"enableMessageOrdering\":false,\"enableExactlyOnceDelivery\":true}",
+        try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .enable_exactly_once_delivery = true }),
     );
     try testing.expectEqualStrings("{}", try encodeTopic(a, .{}));
 }
@@ -604,6 +623,16 @@ test "decode topics, subscriptions and pages" {
     try testing.expectEqualStrings("projects/test/topics/smoke", sub.topic);
     try testing.expectEqual(10, sub.ack_deadline_seconds);
     try testing.expectEqual(false, sub.enable_message_ordering);
+    try testing.expectEqual(false, sub.enable_exactly_once_delivery);
+
+    // As production answers for an exactly-once subscription made without
+    // a deadline: 60 s, its default.
+    const exactly_once = try decodeSubscription(a,
+        \\{"name":"projects/p/subscriptions/eod","topic":"projects/p/topics/t","pushConfig":{},
+        \\"ackDeadlineSeconds":60,"messageRetentionDuration":"604800s","enableExactlyOnceDelivery":true,"state":"ACTIVE"}
+    );
+    try testing.expect(exactly_once.enable_exactly_once_delivery);
+    try testing.expectEqual(60, exactly_once.ack_deadline_seconds);
 
     const subs = try decodeSubscriptionPage(a,
         \\{"subscriptions":[{"name":"n","enableMessageOrdering":true}],"nextPageToken":"t"}

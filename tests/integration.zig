@@ -683,15 +683,23 @@ const Worker = struct {
     want: usize = 0,
     fail_first: bool = false,
     sleep_ms: i64 = 0,
+    /// Sleep this long on a body's first delivery only.
+    sleep_first_ms: i64 = 0,
     mutex: std.Io.Mutex = .init,
     /// Body -> deliveries seen (successes and failures).
     deliveries: std.StringHashMapUnmanaged(usize) = .empty,
+    /// Body -> handler calls started, counted before any sleep, so that a
+    /// redelivery arriving while the first delivery sleeps is the second.
+    starts: std.StringHashMapUnmanaged(usize) = .empty,
     distinct_done: usize = 0,
 
     fn deinit(w: *Worker) void {
         var it = w.deliveries.keyIterator();
         while (it.next()) |key| w.gpa.free(key.*);
         w.deliveries.deinit(w.gpa);
+        var started = w.starts.keyIterator();
+        while (started.next()) |key| w.gpa.free(key.*);
+        w.starts.deinit(w.gpa);
     }
 
     fn handler(w: *Worker) pubsub.Subscriber.Handler {
@@ -700,7 +708,19 @@ const Worker = struct {
 
     fn handle(ptr: *anyopaque, io: std.Io, message: pubsub.ReceivedMessage) anyerror!void {
         const w: *Worker = @ptrCast(@alignCast(ptr));
+        const start = s: {
+            w.mutex.lockUncancelable(io);
+            defer w.mutex.unlock(io);
+            const entry = try w.starts.getOrPut(w.gpa, message.data);
+            if (!entry.found_existing) {
+                entry.key_ptr.* = try w.gpa.dupe(u8, message.data);
+                entry.value_ptr.* = 0;
+            }
+            entry.value_ptr.* += 1;
+            break :s entry.value_ptr.*;
+        };
         if (w.sleep_ms > 0) try io.sleep(.fromMilliseconds(w.sleep_ms), .awake);
+        if (start == 1 and w.sleep_first_ms > 0) try io.sleep(.fromMilliseconds(w.sleep_first_ms), .awake);
         w.mutex.lockUncancelable(io);
         defer w.mutex.unlock(io);
         const entry = try w.deliveries.getOrPut(w.gpa, message.data);
@@ -723,9 +743,14 @@ const Worker = struct {
     }
 };
 
+const SubscriberKnobs = struct {
+    extension_period_s: ?u32 = null,
+    max_extension_s: u32 = 600,
+};
+
 /// Builds a subscriber against the fixture's server and runs it under
 /// `worker`'s control, failing rather than hanging if it never finishes.
-fn runSubscriber(f: *Fixture, sub: pubsub.Subscription, worker: *Worker, concurrency: u16, timeout_s: i64) !pubsub.Subscriber.Stats {
+fn runSubscriber(f: *Fixture, sub: pubsub.Subscription, worker: *Worker, concurrency: u16, timeout_s: i64, knobs: SubscriberKnobs) !pubsub.Subscriber.Stats {
     const io = testing.io;
     var subscriber: pubsub.Subscriber = try .init(testing.allocator, io, .{
         .subscription_id = sub.id,
@@ -735,6 +760,8 @@ fn runSubscriber(f: *Fixture, sub: pubsub.Subscription, worker: *Worker, concurr
             .token_provider = if (f.production) f.token.provider() else null,
         },
         .concurrency = concurrency,
+        .extension_period_s = knobs.extension_period_s,
+        .max_extension_s = knobs.max_extension_s,
     });
     defer subscriber.deinit();
     worker.subscriber = &subscriber;
@@ -771,10 +798,10 @@ test "subscriber: concurrent handlers process every message, then ack it away" {
 
     var worker: Worker = .{ .gpa = testing.allocator, .want = 40 };
     defer worker.deinit();
-    const counts = try runSubscriber(&f, sub, &worker, 4, f.patience());
+    const counts = try runSubscriber(&f, sub, &worker, 4, f.patience(), .{});
     try testing.expectEqual(40, worker.deliveries.count());
     try testing.expect(counts.acked >= 40);
-    try testing.expectEqual(counts.received, counts.acked + counts.nacked);
+    try testing.expectEqual(counts.received, counts.acked + counts.ack_failed + counts.nacked + counts.receipt_refused);
     try expectNoMessages(&f, sub);
 }
 
@@ -791,7 +818,7 @@ test "subscriber: a failing handler sees the message again, and nothing is lost"
 
     var worker: Worker = .{ .gpa = testing.allocator, .want = 10, .fail_first = true };
     defer worker.deinit();
-    const counts = try runSubscriber(&f, sub, &worker, 2, 2 * f.patience());
+    const counts = try runSubscriber(&f, sub, &worker, 2, 2 * f.patience(), .{});
     try testing.expectEqual(10, worker.deliveries.count());
     try testing.expect(counts.handler_failures >= 10);
     try testing.expect(counts.acked >= 10);
@@ -810,11 +837,71 @@ test "subscriber: lease extension carries a handler past the ack deadline" {
     // must keep the message leased, so it is handled exactly once.
     var worker: Worker = .{ .gpa = testing.allocator, .want = 1, .sleep_ms = 15_000 };
     defer worker.deinit();
-    const counts = try runSubscriber(&f, sub, &worker, 1, 30 + f.patience());
+    const counts = try runSubscriber(&f, sub, &worker, 1, 30 + f.patience(), .{});
     try testing.expectEqual(1, worker.deliveries.count());
     try testing.expectEqual(1, worker.deliveries.get("hold me past the deadline").?);
     try testing.expect(counts.extended >= 1);
     try testing.expectEqual(1, counts.acked);
+    try expectNoMessages(&f, sub);
+}
+
+test "subscriber: on an exactly-once subscription, an ack that comes too late is counted, and the loop runs on" {
+    // Regression: the refused ack stopped the whole subscriber.
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("eod");
+    const sub = try f.createSubscription("eod-sub", .{
+        .topic_id = topic.id,
+        .ack_deadline_seconds = 10,
+        .enable_exactly_once_delivery = true,
+    });
+    _ = try publishOne(&f, topic, .{ .data = "outlives its lease" }, .{});
+
+    // The first delivery sleeps past its lease, which is never extended
+    // (max_extension_s is 1 s, the first extension comes at 5 s), so the
+    // message comes again and a second handler acks it. The first
+    // handler's ack is then refused.
+    var worker: Worker = .{ .gpa = testing.allocator, .want = 1, .sleep_first_ms = 15_000 };
+    defer worker.deinit();
+    const counts = try runSubscriber(&f, sub, &worker, 2, 30 + f.patience(), .{ .extension_period_s = 10, .max_extension_s = 1 });
+    try testing.expectEqual(2, worker.starts.get("outlives its lease").?);
+    try testing.expectEqual(1, counts.acked);
+    try testing.expectEqual(1, counts.ack_failed);
+    try testing.expectEqual(counts.received, counts.acked + counts.ack_failed + counts.nacked + counts.receipt_refused);
+    try expectNoMessages(&f, sub);
+}
+
+test "ackWithResults: a lapsed id and a live one in the same request" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("eodres");
+    const sub = try f.createSubscription("eodres-sub", .{
+        .topic_id = topic.id,
+        .ack_deadline_seconds = 10,
+        .enable_exactly_once_delivery = true,
+    });
+    _ = try publishOne(&f, topic, .{ .data = "lapses" }, .{});
+    var first = Collector.init();
+    defer first.deinit();
+    try pullUntil(&f, sub, 1, f.patience(), &first, false);
+    // Past the 10 s lease: the message comes again under a new ack id.
+    try testing.io.sleep(.fromSeconds(12), .awake);
+    var again = Collector.init();
+    defer again.deinit();
+    try pullUntil(&f, sub, 1, f.patience(), &again, false);
+
+    var results: [2]pubsub.AckResult = undefined;
+    sub.ackWithResults(&.{ first.messages.items[0].ack_id, again.messages.items[0].ack_id }, &results) catch |err| return f.fail(err);
+    if (f.production) {
+        // Production names the lapsed id and takes the live one.
+        try testing.expectEqualSlices(pubsub.AckResult, &.{ .invalid_ack_id, .ok }, &results);
+    } else {
+        // The emulator refuses the request with no word per id, though it
+        // too takes the live one.
+        try testing.expectEqualSlices(pubsub.AckResult, &.{ .other, .other }, &results);
+    }
     try expectNoMessages(&f, sub);
 }
 

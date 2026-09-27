@@ -140,6 +140,83 @@ pub fn decodeErrorBody(arena: Allocator, body: []const u8) Allocator.Error!?Erro
     return .{ .status = e.status orelse reason orelse "", .message = e.message orelse "" };
 }
 
+/// One `google.rpc.ErrorInfo` from an error body's `details`: why a call
+/// failed, in words a program can match, with facts about it in
+/// `metadata`, such as which ack ids Pub/Sub refused.
+pub const ErrorInfo = struct {
+    /// Such as "EXACTLY_ONCE_ACKID_FAILURE"; "" when absent.
+    reason: []const u8,
+    /// Such as "pubsub.googleapis.com"; "" when absent.
+    domain: []const u8,
+    /// The entries of `metadata` whose values are strings, as sent.
+    metadata: []const Entry,
+
+    pub const Entry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+};
+
+const error_info_type = "type.googleapis.com/google.rpc.ErrorInfo";
+
+const WireDetails = struct {
+    @"error": ?struct {
+        details: ?[]const std.json.Value = null,
+    } = null,
+};
+
+/// Every `google.rpc.ErrorInfo` in an error body's `details`, in order,
+/// skipping every other kind of detail. Empty when there is none, or when
+/// `body` is not Google's JSON error shape. Running out of memory is an
+/// error, as it is for `decodeErrorBody`.
+pub fn decodeErrorInfos(arena: Allocator, body: []const u8) Allocator.Error![]const ErrorInfo {
+    const wire = std.json.parseFromSliceLeaky(WireDetails, arena, body, .{
+        .ignore_unknown_fields = true,
+        // Proto3 JSON parsers keep the last duplicate rather than failing.
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_if_needed,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return &.{},
+    };
+    const e = wire.@"error" orelse return &.{};
+    const details = e.details orelse return &.{};
+    var infos: std.ArrayList(ErrorInfo) = .empty;
+    for (details) |detail| {
+        const fields = switch (detail) {
+            .object => |o| o,
+            else => continue,
+        };
+        const type_url = stringOf(fields.get("@type")) orelse continue;
+        if (!std.mem.eql(u8, type_url, error_info_type)) continue;
+        var metadata: std.ArrayList(ErrorInfo.Entry) = .empty;
+        if (fields.get("metadata")) |value| switch (value) {
+            .object => |entries| {
+                try metadata.ensureTotalCapacity(arena, entries.count());
+                var it = entries.iterator();
+                while (it.next()) |entry| {
+                    const text = stringOf(entry.value_ptr.*) orelse continue;
+                    metadata.appendAssumeCapacity(.{ .key = entry.key_ptr.*, .value = text });
+                }
+            },
+            else => {},
+        };
+        try infos.append(arena, .{
+            .reason = stringOf(fields.get("reason")) orelse "",
+            .domain = stringOf(fields.get("domain")) orelse "",
+            .metadata = metadata.items,
+        });
+    }
+    return infos.items;
+}
+
+fn stringOf(value: ?std.json.Value) ?[]const u8 {
+    return switch (value orelse return null) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
 /// Details of the most recent failed call. Zig errors carry no payload, so
 /// pass `&diagnostics` in a client's options, such as Pub/Sub's
 /// `Client.Options`, and read it after a call fails. A call that succeeds
@@ -416,5 +493,211 @@ test "fuzz decodeErrorBody: arbitrary bodies never crash" {
         "{\"error\":{\"message\":\"\\ud800\"}}",
         "{\"error\":null}",
         "<html>502 Bad Gateway</html>",
+    } });
+}
+
+test "decodeErrorInfos: Pub/Sub's refusal of late acks, as production sent it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Captured from an exactly-once subscription on 2026-09-27, with the
+    // ack ids shortened and a second entry added.
+    const body =
+        \\{"error":{"code":400,"message":"Some acknowledgement ids in the request were invalid. This could be because the acknowledgement ids have expired or the acknowledgement ids were malformed.","status":"INVALID_ARGUMENT",
+        \\"details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"EXACTLY_ONCE_ACKID_FAILURE","domain":"pubsub.googleapis.com",
+        \\"metadata":{"NkIDDwQhIT4w":"PERMANENT_FAILURE_INVALID_ACK_ID","QgMPBCEhPjA-":"TRANSIENT_FAILURE_ACK_ID"}}]}}
+    ;
+    const infos = try decodeErrorInfos(a, body);
+    try testing.expectEqual(1, infos.len);
+    try testing.expectEqualStrings("EXACTLY_ONCE_ACKID_FAILURE", infos[0].reason);
+    try testing.expectEqualStrings("pubsub.googleapis.com", infos[0].domain);
+    try testing.expectEqual(2, infos[0].metadata.len);
+    try testing.expectEqualStrings("NkIDDwQhIT4w", infos[0].metadata[0].key);
+    try testing.expectEqualStrings("PERMANENT_FAILURE_INVALID_ACK_ID", infos[0].metadata[0].value);
+    try testing.expectEqualStrings("QgMPBCEhPjA-", infos[0].metadata[1].key);
+    try testing.expectEqualStrings("TRANSIENT_FAILURE_ACK_ID", infos[0].metadata[1].value);
+    // The status and the message read as they always did.
+    const e = (try decodeErrorBody(a, body)).?;
+    try testing.expectEqualStrings("INVALID_ARGUMENT", e.status);
+}
+
+test "decodeErrorInfos: other details are skipped, and every ErrorInfo is kept in order" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const infos = try decodeErrorInfos(arena.allocator(),
+        \\{"error":{"code":403,"details":[
+        \\{"@type":"type.googleapis.com/google.rpc.DebugInfo","detail":"x","reason":"NOT_THIS"},
+        \\{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"iam.googleapis.com","reason":"IAM_PERMISSION_DENIED",
+        \\"metadata":{"permission":"pubsub.subscriptions.get","count":3,"nothing":null,"list":["a"],"nested":{"k":"v"},"esc\"aped":"line\nbreak \u00e9"}},
+        \\"a string, not an object",
+        \\{"@type":"type.googleapis.com/google.rpc.Help","links":[]},
+        \\{"reason":"no type at all"},
+        \\{"@type":"type.googleapis.com/google.rpc.ErrorInfo"}
+        \\]}}
+    );
+    try testing.expectEqual(2, infos.len);
+    try testing.expectEqualStrings("IAM_PERMISSION_DENIED", infos[0].reason);
+    try testing.expectEqualStrings("iam.googleapis.com", infos[0].domain);
+    // Only the string entries, unescaped.
+    try testing.expectEqual(2, infos[0].metadata.len);
+    try testing.expectEqualStrings("permission", infos[0].metadata[0].key);
+    try testing.expectEqualStrings("pubsub.subscriptions.get", infos[0].metadata[0].value);
+    try testing.expectEqualStrings("esc\"aped", infos[0].metadata[1].key);
+    try testing.expectEqualStrings("line\nbreak \u{e9}", infos[0].metadata[1].value);
+    // An ErrorInfo with nothing in it still counts, with empty fields.
+    try testing.expectEqualStrings("", infos[1].reason);
+    try testing.expectEqualStrings("", infos[1].domain);
+    try testing.expectEqual(0, infos[1].metadata.len);
+}
+
+test "decodeErrorInfos: a body without one gives none" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "",
+        "Not Found",
+        "<html>502 Bad Gateway</html>",
+        "{}",
+        "{\"error\":null}",
+        "{\"error\":\"string\"}",
+        "{\"error\":{\"code\":400,\"message\":\"no details\"}}",
+        "{\"error\":{\"details\":null}}",
+        "{\"error\":{\"details\":[]}}",
+        "{\"error\":{\"details\":\"not a list\"}}",
+        "{\"error\":{\"details\":[{\"@type\":7}]}}",
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfoX\"}]}}",
+    }) |body| try testing.expectEqual(0, (try decodeErrorInfos(a, body)).len);
+}
+
+fn decodeErrorInfosWith(gpa: Allocator, body: []const u8) !void {
+    // An arena per call: one that an earlier call grew would serve this
+    // one from spare room, and the sweep would miss allocations.
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const infos = try decodeErrorInfos(arena.allocator(), body);
+    try testing.expectEqual(2, infos.len);
+}
+
+test "decodeErrorInfos: every allocation failure is OutOfMemory without leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, decodeErrorInfosWith, .{
+        \\{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[
+        \\{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"R\u00e9","domain":"d",
+        \\"metadata":{"a\"1":"PERMANENT_FAILURE_INVALID_ACK_ID","b":"TRANSIENT_FAILURE_ACK_ID","c":5}},
+        \\{"@type":"type.googleapis.com/google.rpc.DebugInfo"},
+        \\{"@type":"type.googleapis.com/google.rpc.ErrorInfo","metadata":{}}]}}
+        ,
+    });
+}
+
+fn decodeErrorInfosArbitrary(_: void, input: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // Total: any body decodes to some list, never a crash, and the error
+    // body decoder agrees that a body with an ErrorInfo is an error body.
+    const infos = try decodeErrorInfos(arena.allocator(), input);
+    if (infos.len > 0) try testing.expect((try decodeErrorBody(arena.allocator(), input)) != null);
+}
+
+test "fuzz decodeErrorInfos: arbitrary bodies never crash" {
+    try test_util.fuzzBytes({}, decodeErrorInfosArbitrary, .{ .corpus = &.{
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"metadata\":{\"a\":\"b\"}}]}}",
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"metadata\":[1]}]}}",
+        "{\"error\":{\"details\":[[],{},null,1,\"x\"]}}",
+        "{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"metadata\":{\"\\ud800\":\"x\"}}]}}",
+    } });
+}
+
+/// Writes a Google error body whose `details` mix drawn ErrorInfos with
+/// other kinds of detail, and checks that exactly the ErrorInfos come
+/// back, each field and each string entry as written.
+fn errorInfoRoundTrip(_: void, input: []const u8) !void {
+    var g: test_util.ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var expected: std.ArrayList(ErrorInfo) = .empty;
+    var out: std.Io.Writer.Allocating = .init(a);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    try jw.beginObject();
+    try jw.objectField("error");
+    try jw.beginObject();
+    try jw.objectField("code");
+    try jw.write(@as(u16, 400));
+    try jw.objectField("details");
+    try jw.beginArray();
+    for (0..g.intRange(u8, 0, 5)) |_| switch (g.intRange(u8, 0, 3)) {
+        0 => try jw.write(@as(u16, 7)),
+        1 => {
+            // Shaped like an ErrorInfo, but of another type.
+            try jw.beginObject();
+            try jw.objectField("@type");
+            try jw.write("type.googleapis.com/google.rpc.DebugInfo");
+            try jw.objectField("reason");
+            try jw.write("NOT_THIS");
+            try jw.endObject();
+        },
+        else => {
+            var reason_buf: [40]u8 = undefined;
+            var domain_buf: [40]u8 = undefined;
+            const reason = try a.dupe(u8, g.utf8(&reason_buf, reason_buf.len));
+            const has_domain = g.boolean();
+            const domain = try a.dupe(u8, g.utf8(&domain_buf, domain_buf.len));
+            var entries: std.ArrayList(ErrorInfo.Entry) = .empty;
+            try jw.beginObject();
+            try jw.objectField("reason");
+            try jw.write(reason);
+            try jw.objectField("@type");
+            try jw.write(error_info_type);
+            if (has_domain) {
+                try jw.objectField("domain");
+                try jw.write(domain);
+            }
+            if (g.boolean()) {
+                try jw.objectField("metadata");
+                try jw.beginObject();
+                for (0..g.intRange(u8, 0, 4)) |k| {
+                    var key_buf: [32]u8 = undefined;
+                    var value_buf: [48]u8 = undefined;
+                    // The digit keeps every key distinct.
+                    const key = try std.fmt.allocPrint(a, "{d}{s}", .{ k, g.utf8(&key_buf, key_buf.len) });
+                    try jw.objectField(key);
+                    if (g.intRange(u8, 0, 3) == 0) {
+                        try jw.write(null);
+                    } else {
+                        const value = try a.dupe(u8, g.utf8(&value_buf, value_buf.len));
+                        try jw.write(value);
+                        try entries.append(a, .{ .key = key, .value = value });
+                    }
+                }
+                try jw.endObject();
+            }
+            try jw.endObject();
+            try expected.append(a, .{ .reason = reason, .domain = if (has_domain) domain else "", .metadata = entries.items });
+        },
+    };
+    try jw.endArray();
+    try jw.endObject();
+    try jw.endObject();
+
+    const got = try decodeErrorInfos(a, out.written());
+    try testing.expectEqual(expected.items.len, got.len);
+    for (expected.items, got) |want, have| {
+        try testing.expectEqualStrings(want.reason, have.reason);
+        try testing.expectEqualStrings(want.domain, have.domain);
+        try testing.expectEqual(want.metadata.len, have.metadata.len);
+        for (want.metadata, have.metadata) |w, h| {
+            try testing.expectEqualStrings(w.key, h.key);
+            try testing.expectEqualStrings(w.value, h.value);
+        }
+    }
+}
+
+test "fuzz decodeErrorInfos: ErrorInfos written with std's JSON come back exactly" {
+    try test_util.fuzzBytes({}, errorInfoRoundTrip, .{ .corpus = &.{
+        "",
+        "\x03\x02\x02\x05R\x01\x03d\x01\x02\x00\x02\x01k\x05\x04value",
+        "\x05\x00\x01\x02\x00\x00\x00\x02\x01\x01\x7f\x00\x00\x00\x03",
     } });
 }

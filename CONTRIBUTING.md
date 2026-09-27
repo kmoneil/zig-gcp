@@ -92,10 +92,10 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   <what>: …` instead, so the module's job skips it, and it gets a job of
   its own in `.github/workflows/ci.yml`, filtered by its name. One that
   builds a client and a fake server every run, a millisecond or more, is a
-  `heavy property <what>: …`, and storage's run in a job of their own. A
-  `fault property` drives whole transfers through injected faults, costs
-  more still, and is not fuzzed nightly; every test run still runs it,
-  under that run's seed. `--fuzz=N`
+  `heavy property <what>: …`, and storage's and pubsub's run in jobs of
+  their own. A `fault property` drives whole transfers through injected
+  faults, costs more still, and is not fuzzed nightly; every test run
+  still runs it, under that run's seed. `--fuzz=N`
   runs every matching property N times, so size a job from its
   properties' costs on CI: run the workflow by hand twice, with
   `fuzz_iterations` at two counts such as 2K and 20K, and each job's

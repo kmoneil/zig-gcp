@@ -46,6 +46,13 @@ pub const Call = struct {
     /// attempt's response memory is freed at once rather than kept for the
     /// next attempt, so an arena over a `WipingAllocator` wipes it then.
     wipe: bool = false,
+    /// When the call fails with a response, pointed at that response's
+    /// body, which stays in `response` until the caller resets it, for a
+    /// caller that reads more of an error than `Diagnostics` keeps, such as
+    /// the `ErrorInfo` details `errors.decodeErrorInfos` finds. Null when
+    /// the call succeeds or its last attempt got no response, and always
+    /// null from `executeDiscard`, which frees the response as it returns.
+    error_body_out: ?*?[]const u8 = null,
 };
 
 /// One streaming request, as a service module describes it: the body from
@@ -154,6 +161,9 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             var reauthenticated = false;
             var attempt: u32 = 1;
             while (true) : (attempt += 1) {
+                // Each attempt starts over: a reset arena no longer holds
+                // the previous attempt's body.
+                if (call.error_body_out) |out| out.* = null;
                 const bearer = try self.bearerToken(scratch.allocator());
                 const started = std.Io.Clock.awake.now(self.io);
                 const outcome = self.transport.send(.{
@@ -176,6 +186,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                         if (self.diagnostics) |d| d.clear();
                         return res.body;
                     }
+                    if (call.error_body_out) |out| out.* = res.body;
                     break :e self.failure(scratch.allocator(), res, null);
                 } else |err| e: {
                     log.debug("{t} {s} -> {t} in {d} ms (attempt {d} of {d})", .{
@@ -352,7 +363,11 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             var wiping: WipingAllocator = .init(self.gpa);
             var response: std.heap.ArenaAllocator = .init(if (call.wipe) wiping.allocator() else self.gpa);
             defer response.deinit();
-            _ = try self.execute(&response, call);
+            // The response goes before this returns, and a failed body with it.
+            var discarding = call;
+            if (discarding.error_body_out) |out| out.* = null;
+            discarding.error_body_out = null;
+            _ = try self.execute(&response, discarding);
         }
 
         /// Clears the failed attempt's body. A call that carries secrets
@@ -360,6 +375,8 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
         /// every other call keeps it for the next attempt.
         fn resetResponse(self: Self, response: *std.heap.ArenaAllocator, call: Call) void {
             _ = self;
+            // The body it pointed at goes with the reset.
+            if (call.error_body_out) |out| out.* = null;
             _ = response.reset(if (call.wipe) .free_all else .retain_capacity);
         }
 
@@ -1087,4 +1104,65 @@ test "executeStream: retry off means one attempt" {
     }));
     try testing.expectEqual(1, h.fake.stream_requests.items.len);
     try testing.expectEqual(0, h.clock.sleep_count);
+}
+
+test "error_body_out: the last failed response's body, null on success and with no response" {
+    const refused: Reply = .{ .respond = .{
+        .status = 400,
+        .body = "{\"error\":{\"code\":400,\"status\":\"INVALID_ARGUMENT\",\"details\":[]}}",
+    } };
+    var h: Harness = undefined;
+    h.init(&.{ ok, refused, unavailable, ok, unavailable, .{ .fail = error.ConnectionResetByPeer }, unavailable, refused });
+    defer h.deinit();
+    const e = h.engine();
+    var body: ?[]const u8 = "stale";
+
+    // A first attempt that succeeds leaves nothing from before.
+    _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/first", .error_body_out = &body });
+    try testing.expectEqual(null, body);
+    body = "stale";
+    _ = h.arena.reset(.retain_capacity);
+
+    // A refusal is not retried, and its body stays readable in the arena.
+    try testing.expectError(error.InvalidArgument, e.execute(&h.arena, .{ .method = .GET, .path = "/v1/a", .error_body_out = &body }));
+    try testing.expectEqualStrings(refused.respond.body, body.?);
+
+    // A retried failure that then succeeds leaves nothing behind.
+    _ = h.arena.reset(.retain_capacity);
+    _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/b", .error_body_out = &body });
+    try testing.expectEqual(null, body);
+
+    // A 503 and then no response: the body of the last attempt, which is none.
+    _ = h.arena.reset(.retain_capacity);
+    var no_retry = e;
+    no_retry.retry = .{ .max_attempts = 2 };
+    try testing.expectError(error.ConnectionResetByPeer, no_retry.execute(&h.arena, .{ .method = .GET, .path = "/v1/c", .error_body_out = &body }));
+    try testing.expectEqual(null, body);
+
+    // A 503 and then a refusal: the refusal's.
+    _ = h.arena.reset(.retain_capacity);
+    try testing.expectError(error.InvalidArgument, no_retry.execute(&h.arena, .{ .method = .GET, .path = "/v1/d", .error_body_out = &body }));
+    try testing.expectEqualStrings(refused.respond.body, body.?);
+}
+
+test "error_body_out: executeDiscard frees the response, so it leaves the body null" {
+    const refused: Reply = .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"status\":\"NOT_FOUND\"}}" } };
+    var h: Harness = undefined;
+    h.init(&.{refused});
+    defer h.deinit();
+    var body: ?[]const u8 = "stale";
+    try testing.expectError(error.NotFound, h.engine().executeDiscard(.{ .method = .DELETE, .path = "/v1/a", .error_body_out = &body }));
+    try testing.expectEqual(null, body);
+}
+
+test "error_body_out: a backoff that is canceled leaves no body behind" {
+    var h: Harness = undefined;
+    h.init(&.{unavailable});
+    defer h.deinit();
+    // The 503 is retryable, so the arena is reset and the loop sleeps; the
+    // sleep is canceled. The body went with the reset.
+    h.clock.cancel_sleep = true;
+    var body: ?[]const u8 = "stale";
+    try testing.expectError(error.Canceled, h.engine().execute(&h.arena, .{ .method = .GET, .path = "/v1/a", .error_body_out = &body }));
+    try testing.expectEqual(null, body);
 }

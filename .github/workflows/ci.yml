@@ -256,14 +256,20 @@ jobs:
         # heavy-storage 73 ms. A Mac measured storage at 2.6 ms and
         # heavy-storage at 25 ms: take counts from CI, not from a local run.
         # A job's cost also moves from night to night, by up to twice, so
-        # the timeout is the margin.
+        # the timeout is the margin. Two counts are not measured yet: the
+        # Subscriber property's exactly-once half waits out real leases, and
+        # made a local run about 1.5 times as long, so slow-subscriber drops
+        # from 105K to 75K; and heavy-pubsub, pubsub's per-id ack answers,
+        # builds a client and a fake server each run, about 2 ms locally.
+        # Re-size both from the first nightly that runs them.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 1250K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
           - { job: slow-auth, module: auth, filter: slow property, iterations: 50K }
           - { job: pubsub, module: pubsub, filter: fuzz, iterations: 750K }
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1M }
-          - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 105K }
+          - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 75K }
+          - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 250K }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
           - { job: storage, module: storage, filter: fuzz, iterations: 1200K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 3800K }

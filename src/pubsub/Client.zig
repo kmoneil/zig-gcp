@@ -400,6 +400,6 @@ test "domain-scoped project ids keep their colon in paths and bodies" {
         0,
         .PUT,
         "http://localhost:8085/v1/projects/example.com:proj/subscriptions/work",
-        "{\"topic\":\"projects/example.com:proj/topics/orders\",\"ackDeadlineSeconds\":10,\"enableMessageOrdering\":false}",
+        "{\"topic\":\"projects/example.com:proj/topics/orders\",\"enableMessageOrdering\":false}",
     );
 }

@@ -4,6 +4,45 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.24.0 (unreleased)
+
+- pubsub: `Subscriber` no longer stops when the server refuses single
+  messages. On a subscription with exactly-once delivery the server
+  refuses an acknowledgement or lease extension that comes after the
+  lease lapsed, with HTTP 400, and the subscriber took that for a fatal
+  error: one handler that outlived its lease stopped it. Now such a
+  refusal is counted and its message may come again; only `NotFound`,
+  `PermissionDenied` and `Unauthenticated` still stop the loop. Under
+  exactly-once delivery the subscriber extends leases by at least 60 s,
+  extends each pulled message's lease once before a handler sees it and
+  drops those the server refuses there, and sends again, for up to 10
+  minutes, acks refused only for now. `run` no longer needs
+  `pubsub.subscriptions.get`, which `roles/pubsub.subscriber` does not
+  grant: a refused read is logged and leases go 60 s. Acknowledgements go
+  out within 100 ms of a handler returning, where they waited for the
+  lease tick, half the lease period. `Stats` gains `ack_failed` and
+  `receipt_refused`, and `acked` now counts acks the server took, not
+  handlers that returned. New `Subscription.ackWithResults`,
+  `modifyAckDeadlineWithResults` and `nackWithResults` give a
+  `pubsub.AckResult` per id, read from the `ErrorInfo` Pub/Sub sends with
+  an exactly-once refusal; `ack`, `modifyAckDeadline` and `nack` send
+  every id even after a refused request, resend only the ids refused for
+  now, and then fail with the first refusal's error.
+  `SubscriptionConfig.enable_exactly_once_delivery` creates such a
+  subscription, and `SubscriptionInfo.enable_exactly_once_delivery` reads
+  it back. Breaking: `SubscriptionConfig.ack_deadline_seconds` defaults
+  to 0, which lets Pub/Sub choose (10 s, or 60 s with exactly-once
+  delivery), where it sent 10; code that builds a `SubscriptionInfo`
+  itself must give `enable_exactly_once_delivery`; and a drain check that
+  compared `received` with `acked + nacked` must add `ack_failed` and
+  `receipt_refused`.
+- core: `errors.decodeErrorInfos` reads the `google.rpc.ErrorInfo`
+  entries of an error body, and `rpc.Call.error_body_out` hands a failed
+  response's body back to the caller. Not breaking.
+- examples: `worker` counts refused acks when it checks for a drained
+  subscription.
+- auth, secret_manager, storage: unchanged.
+
 ## 0.23.0 (2026-09-27)
 
 - storage: uploads can compress. `UploadOptions.gzip` (`storage.Gzip`,
