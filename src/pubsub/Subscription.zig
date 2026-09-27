@@ -24,20 +24,50 @@ client: *Client,
 id: []const u8,
 
 /// Creates the subscription on `config.topic_id` in the same project.
-/// Messages published before this call are not delivered to it.
+/// Messages published before this call are not delivered to it. Every
+/// setting is checked first, including the rules the emulator does not
+/// enforce, so what works there does not fail in production.
 pub fn create(self: Subscription, config: types.SubscriptionConfig) Error!Owned(types.SubscriptionInfo) {
     const c = self.client;
     rpc.begin(c);
     try rpc.checkId(c, "subscription", self.id);
     try rpc.checkId(c, "topic", config.topic_id);
-    try validate.subscriptionDeadline(config.ack_deadline_seconds, c.diagnostics);
+    try validate.subscriptionConfig(config, c.diagnostics);
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
     const path = try url.resourcePath(a, c.project_id, .subscriptions, self.id, "");
     const topic_name = try url.resourceName(a, c.project_id, .topics, config.topic_id);
-    const body = try codec.encodeSubscription(a, topic_name, config);
+    const dead_letter: ?[]const u8 = if (config.dead_letter_policy) |policy| try topicName(a, c, policy.topic) else null;
+    const body = try codec.encodeSubscription(a, topic_name, config, dead_letter);
     return fetch(c, .{ .method = .PUT, .path = path, .body = body });
+}
+
+/// Changes what `changes` names, and nothing else, and returns the
+/// subscription as it is then. A policy is replaced whole, and labels as a
+/// set. The topic, the ordering and the filter are fixed at creation.
+pub fn update(self: Subscription, changes: types.SubscriptionUpdate) Error!Owned(types.SubscriptionInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "subscription", self.id);
+    try validate.subscriptionUpdate(changes, c.diagnostics);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try url.resourcePath(a, c.project_id, .subscriptions, self.id, "");
+    const dead_letter: ?[]const u8 = switch (changes.dead_letter_policy) {
+        .set => |policy| try topicName(a, c, policy.topic),
+        .keep, .clear => null,
+    };
+    const body = try codec.encodeSubscriptionUpdate(a, changes, dead_letter);
+    return fetch(c, .{ .method = .PATCH, .path = path, .body = body });
+}
+
+/// A dead-letter topic as the server takes it: a full name as given, or an
+/// id in the client's project.
+fn topicName(arena: Allocator, c: *Client, topic: []const u8) Allocator.Error![]const u8 {
+    if (validate.isTopicName(topic)) return topic;
+    return url.resourceName(arena, c.project_id, .topics, topic);
 }
 
 pub fn get(self: Subscription) Error!Owned(types.SubscriptionInfo) {
@@ -990,4 +1020,83 @@ test "heavy property ack outcomes: every id ends as its last answer says, and wh
             "",
         },
     });
+}
+
+test "golden: create with settings, and update" {
+    const info_body =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/orders","ackDeadlineSeconds":30,
+        \\"deadLetterPolicy":{"deadLetterTopic":"projects/p/topics/orders-dead","maxDeliveryAttempts":5},"labels":{"team":"zig"}}
+    ;
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .respond = .{ .body = info_body } }, .{ .respond = .{ .body = info_body } } }, .{});
+    defer h.deinit();
+    const work = h.client.subscription("work");
+
+    // A dead-letter topic given as an id is named in the client's project.
+    var created = try work.create(.{
+        .topic_id = "orders",
+        .dead_letter_policy = .{ .topic = "orders-dead" },
+        .labels = &.{.{ .key = "team", .value = "zig" }},
+    });
+    defer created.deinit();
+    try h.expectRequest(0, .PUT, base_url,
+        \\{"topic":"projects/p/topics/orders","enableMessageOrdering":false,"deadLetterPolicy":{"deadLetterTopic":"projects/p/topics/orders-dead","maxDeliveryAttempts":5},"labels":{"team":"zig"}}
+    );
+    try testing.expectEqualStrings("zig", created.value.label("team").?);
+
+    var updated = try work.update(.{ .ack_deadline_seconds = 30, .dead_letter_policy = .clear });
+    defer updated.deinit();
+    try h.expectRequest(1, .PATCH, base_url, "{\"subscription\":{\"ackDeadlineSeconds\":30},\"updateMask\":\"ackDeadlineSeconds,deadLetterPolicy\"}");
+    try testing.expectEqual(30, updated.value.ack_deadline_seconds);
+
+    // Refused before any request: nothing to change, a label the server
+    // would refuse, a filter over its limit.
+    try testing.expectError(error.InvalidArgument, work.update(.{}));
+    try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .labels = &.{.{ .key = "Bad", .value = "" }} }));
+    try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .filter = "x" ** 257 }));
+    try testing.expectError(error.InvalidResourceId, h.client.subscription("s").update(.{ .ack_deadline_seconds = 10 }));
+    try h.expectRequestCount(2);
+}
+
+test "create and update with settings: every allocation failure is OutOfMemory without leaks" {
+    const Reply = test_util.FakeTransport.Reply;
+    // Escapes in the answer make std.json allocate for them, so the sweep
+    // reaches those allocations too.
+    const answer =
+        \\{"name":"projects/p/subscriptions/work","topic":"projects/p/topics/t","filter":"attributes.k = \"\u00e9\"",
+        \\"labels":{"t\u0065am":"z\u0069g"},"deadLetterPolicy":{"deadLetterTopic":"projects/p/topics/d\u0065ad"},
+        \\"retryPolicy":{"minimumBackoff":"1.5s"},"expirationPolicy":{"ttl":"86400s"},"messageRetentionDuration":"600s"}
+    ;
+    const script = [_]Reply{ .{ .respond = .{ .body = answer } }, .{ .respond = .{ .body = answer } } };
+    const Run = struct {
+        fn run(gpa: Allocator, replies: []const Reply) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, replies);
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: core.StaticToken = .{ .token = "ya29.token" };
+            var client: Client = try .init(gpa, clock.io(), .{
+                .project_id = "p",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+            const work = client.subscription("work");
+            var created = try work.create(.{
+                .topic_id = "orders",
+                .filter = "attributes.k = \"\u{e9}\"",
+                .dead_letter_policy = .{ .topic = "orders-dead" },
+                .retry_policy = .{ .minimum = .fromMilliseconds(1500) },
+                .message_retention = .fromSeconds(600),
+                .expiration = .{ .after = .fromSeconds(86400) },
+                .labels = &.{.{ .key = "team", .value = "zig" }},
+            });
+            defer created.deinit();
+            try testing.expectEqualStrings("zig", created.value.label("team").?);
+            var updated = try work.update(.{ .labels = &.{.{ .key = "team", .value = "zag" }}, .retry_policy = .clear });
+            defer updated.deinit();
+            try testing.expectEqualStrings("projects/p/topics/dead", updated.value.dead_letter_policy.?.topic);
+            try testing.expectEqual(replies.len, fake.requests.items.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{@as([]const Reply, &script)});
 }

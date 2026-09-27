@@ -905,6 +905,186 @@ test "ackWithResults: a lapsed id and a live one in the same request" {
     try expectNoMessages(&f, sub);
 }
 
+// Settings and updates.
+
+fn attributeOf(attrs: []const pubsub.Attribute, key: []const u8) ?[]const u8 {
+    for (attrs) |a| {
+        if (std.mem.eql(u8, a.key, key)) return a.value;
+    }
+    return null;
+}
+
+test "subscription settings: every setting reads back as it was made" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("set");
+    const dead = try f.createTopic("set-dead");
+    const sub = try f.createSubscription("set-sub", .{
+        .topic_id = topic.id,
+        .ack_deadline_seconds = 20,
+        .enable_message_ordering = true,
+        .enable_exactly_once_delivery = true,
+        .filter = "attributes.kind = \"a\"",
+        .dead_letter_policy = .{ .topic = dead.id, .max_delivery_attempts = 7 },
+        .retry_policy = .{ .minimum = .fromMilliseconds(1500), .maximum = .fromSeconds(30) },
+        .message_retention = .fromSeconds(1200),
+        .retain_acked_messages = true,
+        .expiration = .{ .after = .fromSeconds(2 * 24 * 60 * 60) },
+        .labels = &.{ .{ .key = "team", .value = "zig" }, .{ .key = "suite", .value = "integration" } },
+    });
+    var got = sub.get() catch |err| return f.fail(err);
+    defer got.deinit();
+    const s = got.value;
+    try testing.expectEqual(20, s.ack_deadline_seconds);
+    try testing.expect(s.enable_message_ordering and s.enable_exactly_once_delivery and s.retain_acked_messages);
+    try testing.expectEqualStrings("attributes.kind = \"a\"", s.filter);
+    try testing.expect(std.mem.endsWith(u8, s.dead_letter_policy.?.topic, dead.id));
+    try testing.expectEqual(7, s.dead_letter_policy.?.max_delivery_attempts);
+    try testing.expectEqual(std.Io.Duration.fromMilliseconds(1500), s.retry_policy.?.minimum);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(30), s.retry_policy.?.maximum);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(1200), s.message_retention.?);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(2 * 24 * 60 * 60), s.expiration.after);
+    try testing.expectEqualStrings("zig", s.label("team").?);
+    try testing.expectEqualStrings("integration", s.label("suite").?);
+    try testing.expectEqual(.active, s.state);
+}
+
+test "subscription update: settings change, and clear back to their defaults" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("upd");
+    const dead = try f.createTopic("upd-dead");
+    const sub = try f.createSubscription("upd-sub", .{ .topic_id = topic.id });
+
+    var changed = sub.update(.{
+        .ack_deadline_seconds = 30,
+        .enable_exactly_once_delivery = true,
+        .dead_letter_policy = .{ .set = .{ .topic = dead.id } },
+        .retry_policy = .{ .set = .{ .minimum = .fromSeconds(1), .maximum = .fromSeconds(5) } },
+        .message_retention = .{ .set = .fromSeconds(3600) },
+        .retain_acked_messages = true,
+    }) catch |err| return f.fail(err);
+    defer changed.deinit();
+    try testing.expectEqual(30, changed.value.ack_deadline_seconds);
+    try testing.expect(changed.value.enable_exactly_once_delivery and changed.value.retain_acked_messages);
+    try testing.expect(std.mem.endsWith(u8, changed.value.dead_letter_policy.?.topic, dead.id));
+    try testing.expectEqual(std.Io.Duration.fromSeconds(5), changed.value.retry_policy.?.maximum);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(3600), changed.value.message_retention.?);
+
+    var cleared = sub.update(.{
+        .enable_exactly_once_delivery = false,
+        .dead_letter_policy = .clear,
+        .retry_policy = .clear,
+        .message_retention = .clear,
+    }) catch |err| return f.fail(err);
+    defer cleared.deinit();
+    try testing.expect(!cleared.value.enable_exactly_once_delivery);
+    try testing.expectEqual(null, cleared.value.dead_letter_policy);
+    try testing.expectEqual(null, cleared.value.retry_policy);
+    // Cleared retention is Pub/Sub's default, 7 days.
+    try testing.expectEqual(std.Io.Duration.fromSeconds(7 * 24 * 60 * 60), cleared.value.message_retention.?);
+    // Untouched by either update.
+    try testing.expectEqual(30, cleared.value.ack_deadline_seconds);
+
+    // The emulator cannot update labels or expiration; production can.
+    if (!f.production) return;
+    var labelled = sub.update(.{ .labels = &.{.{ .key = "team", .value = "zig" }}, .expiration = .never }) catch |err| return f.fail(err);
+    defer labelled.deinit();
+    try testing.expectEqualStrings("zig", labelled.value.label("team").?);
+    try testing.expectEqual(.never, std.meta.activeTag(labelled.value.expiration));
+    var unlabelled = sub.update(.{ .labels = &.{}, .expiration = .default }) catch |err| return f.fail(err);
+    defer unlabelled.deinit();
+    try testing.expectEqual(0, unlabelled.value.labels.len);
+    try testing.expect(std.meta.activeTag(unlabelled.value.expiration) != .never);
+}
+
+test "dead-lettering: after the last attempt, a message moves on, marked with where it came from" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    // Production forwards only once Pub/Sub's service agent may publish to
+    // the dead-letter topic and acknowledge here, which takes IAM grants.
+    if (f.production) return error.SkipZigTest;
+    const topic = try f.createTopic("dlq");
+    const dead = try f.createTopic("dlq-dead");
+    const dead_sub = try f.createSubscription("dlq-dead-sub", .{ .topic_id = dead.id });
+    const sub = try f.createSubscription("dlq-sub", .{
+        .topic_id = topic.id,
+        .dead_letter_policy = .{ .topic = dead.id, .max_delivery_attempts = 5 },
+    });
+    _ = try publishOne(&f, topic, .{ .data = "doomed" }, .{});
+
+    // Released after each of its five deliveries, it then goes.
+    for (0..5) |_| {
+        var batch = Collector.init();
+        defer batch.deinit();
+        try pullUntil(&f, sub, 1, f.patience(), &batch, false);
+        sub.nack(&.{batch.messages.items[0].ack_id}) catch |err| return f.fail(err);
+    }
+    // The emulator forwards when the source is pulled next; nothing more
+    // is delivered there.
+    try expectNoMessages(&f, sub);
+    var forwarded = Collector.init();
+    defer forwarded.deinit();
+    try pullUntil(&f, dead_sub, 1, f.patience(), &forwarded, true);
+    const m = forwarded.messages.items[0];
+    try testing.expectEqualStrings("doomed", m.data);
+    try testing.expectEqualStrings("5", attributeOf(m.attributes, "CloudPubSubDeadLetterSourceDeliveryCount").?);
+    try testing.expectEqualStrings(sub.id, attributeOf(m.attributes, "CloudPubSubDeadLetterSourceSubscription").?);
+}
+
+test "filter: only messages whose attributes match are delivered" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("flt");
+    const sub = try f.createSubscription("flt-sub", .{ .topic_id = topic.id, .filter = "attributes.kind = \"keep\"" });
+    _ = try publishOne(&f, topic, .{ .data = "kept", .attributes = &.{.{ .key = "kind", .value = "keep" }} }, .{});
+    _ = try publishOne(&f, topic, .{ .data = "dropped", .attributes = &.{.{ .key = "kind", .value = "drop" }} }, .{});
+    var got = Collector.init();
+    defer got.deinit();
+    try pullUntil(&f, sub, 1, f.patience(), &got, true);
+    try testing.expectEqualStrings("kept", got.messages.items[0].data);
+    try expectNoMessages(&f, sub);
+}
+
+test "topic settings: labels and retention read back, and retention changes and clears" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = f.client.topic(f.id("tset"));
+    try f.topics.append(testing.allocator, topic.id);
+    var created = topic.create(.{
+        .labels = &.{.{ .key = "suite", .value = "integration" }},
+        .message_retention = .fromSeconds(3600),
+    }) catch |err| return f.fail(err);
+    created.deinit();
+    var got = topic.get() catch |err| return f.fail(err);
+    defer got.deinit();
+    try testing.expectEqualStrings("integration", got.value.label("suite").?);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(3600), got.value.message_retention.?);
+
+    var longer = topic.update(.{ .message_retention = .{ .set = .fromSeconds(7200) } }) catch |err| return f.fail(err);
+    defer longer.deinit();
+    try testing.expectEqual(std.Io.Duration.fromSeconds(7200), longer.value.message_retention.?);
+    var none = topic.update(.{ .message_retention = .clear }) catch |err| return f.fail(err);
+    defer none.deinit();
+    if (f.production) {
+        try testing.expectEqual(null, none.value.message_retention);
+    } else {
+        // The emulator answers a cleared retention with its longest, 31 days.
+        try testing.expectEqual(std.Io.Duration.fromSeconds(31 * 24 * 60 * 60), none.value.message_retention.?);
+    }
+
+    // The emulator cannot update a topic's labels; production can.
+    if (!f.production) return;
+    var relabelled = topic.update(.{ .labels = &.{.{ .key = "suite", .value = "updated" }} }) catch |err| return f.fail(err);
+    defer relabelled.deinit();
+    try testing.expectEqualStrings("updated", relabelled.value.label("suite").?);
+}
+
 // Publisher.
 
 const Publisher = pubsub.Publisher;

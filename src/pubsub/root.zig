@@ -40,6 +40,14 @@ pub const SubscriptionConfig = @import("types.zig").SubscriptionConfig;
 pub const SubscriptionInfo = @import("types.zig").SubscriptionInfo;
 pub const SubscriptionPage = @import("types.zig").SubscriptionPage;
 pub const AckResult = @import("types.zig").AckResult;
+pub const Label = @import("types.zig").Label;
+pub const Change = @import("types.zig").Change;
+pub const MessageStoragePolicy = @import("types.zig").MessageStoragePolicy;
+pub const TopicUpdate = @import("types.zig").TopicUpdate;
+pub const DeadLetterPolicy = @import("types.zig").DeadLetterPolicy;
+pub const Backoff = @import("types.zig").Backoff;
+pub const Expiration = @import("types.zig").Expiration;
+pub const SubscriptionUpdate = @import("types.zig").SubscriptionUpdate;
 
 /// Parses a `publish_time` (RFC 3339) to nanoseconds since the Unix epoch.
 pub const parseTimestamp = core.timestamp.parse;
