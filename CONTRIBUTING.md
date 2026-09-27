@@ -97,8 +97,12 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   more still, and is not fuzzed nightly; every test run still runs it,
   under that run's seed. `--fuzz=N`
   runs every matching property N times, so size a job from its
-  properties' costs: time two runs of different N with the same filter,
-  so the build is cached, and aim at about half the job's 180 minutes.
+  properties' costs on CI: run the workflow by hand twice, with
+  `fuzz_iterations` at two counts such as 2K and 20K, and each job's
+  cost per run is the difference in its fuzzing step's time over the
+  difference in runs, the build cancelled out. Aim at about half the
+  job's 180 minutes. A local run can be three times faster than CI, so
+  it only compares properties with each other.
   `zig build test` runs both kinds alike.
 - User-visible changes go in `CHANGELOG.md`. Until 1.0, minor versions may
   break the API; say how in the changelog entry.
