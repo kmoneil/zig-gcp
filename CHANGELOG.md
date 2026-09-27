@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.23.0 (unreleased)
+## 0.23.0 (2026-09-27)
 
 - storage: uploads can compress. `UploadOptions.gzip` (`storage.Gzip`,
   level 1 to 9, 6 by default) gzip-compresses the data on its way up with
