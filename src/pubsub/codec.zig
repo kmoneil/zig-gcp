@@ -14,6 +14,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Stringify = std.json.Stringify;
 const base64 = @import("core").base64;
+const duration = @import("core").duration;
 const types = @import("types.zig");
 const test_util = @import("test_util.zig");
 
@@ -131,43 +132,318 @@ const AckBody = struct {
     }
 };
 
-/// The `subscriptions.create` body. `topic_name` is the full resource name.
+/// The `subscriptions.create` body. `topic_name` is the full resource name,
+/// and so is `dead_letter_topic`, which the caller resolves from the
+/// policy's id or name.
 pub fn encodeSubscription(
     arena: Allocator,
     topic_name: []const u8,
     config: types.SubscriptionConfig,
+    dead_letter_topic: ?[]const u8,
 ) Allocator.Error![]u8 {
-    return render(arena, SubscriptionBody{ .topic_name = topic_name, .config = config });
+    return render(arena, SubscriptionBody{ .topic_name = topic_name, .config = config, .dead_letter_topic = dead_letter_topic });
 }
 
 const SubscriptionBody = struct {
     topic_name: []const u8,
     config: types.SubscriptionConfig,
+    dead_letter_topic: ?[]const u8,
 
     fn write(self: SubscriptionBody, jw: *Stringify) Stringify.Error!void {
+        const c = self.config;
         try jw.beginObject();
         try jw.objectField("topic");
         try jw.write(self.topic_name);
         // Left out, 0 lets Pub/Sub choose: 10 s, or 60 s with exactly-once
         // delivery, which a 10 sent here would override.
-        if (self.config.ack_deadline_seconds != 0) {
+        if (c.ack_deadline_seconds != 0) {
             try jw.objectField("ackDeadlineSeconds");
-            try jw.write(self.config.ack_deadline_seconds);
+            try jw.write(c.ack_deadline_seconds);
         }
         try jw.objectField("enableMessageOrdering");
-        try jw.write(self.config.enable_message_ordering);
-        if (self.config.enable_exactly_once_delivery) {
+        try jw.write(c.enable_message_ordering);
+        if (c.enable_exactly_once_delivery) {
             try jw.objectField("enableExactlyOnceDelivery");
             try jw.write(true);
+        }
+        if (c.filter.len > 0) {
+            try jw.objectField("filter");
+            try jw.write(c.filter);
+        }
+        if (c.dead_letter_policy) |policy| {
+            try jw.objectField("deadLetterPolicy");
+            try writeDeadLetter(jw, self.dead_letter_topic.?, policy.max_delivery_attempts);
+        }
+        if (c.retry_policy) |b| {
+            try jw.objectField("retryPolicy");
+            try writeBackoff(jw, b);
+        }
+        if (c.message_retention) |r| {
+            try jw.objectField("messageRetentionDuration");
+            try writeDuration(jw, r);
+        }
+        if (c.retain_acked_messages) {
+            try jw.objectField("retainAckedMessages");
+            try jw.write(true);
+        }
+        if (c.expiration != .default) {
+            try jw.objectField("expirationPolicy");
+            try writeExpiration(jw, c.expiration);
+        }
+        if (c.labels.len > 0) {
+            try jw.objectField("labels");
+            try writeLabels(jw, c.labels);
         }
         try jw.endObject();
     }
 };
 
-/// The `topics.create` body. `TopicConfig` has no fields yet.
+/// The `subscriptions.patch` body: the fields `update` sets, and a mask
+/// naming them, and the ones it clears, which the body leaves out. Only
+/// top-level fields are named; a policy is replaced whole.
+pub fn encodeSubscriptionUpdate(
+    arena: Allocator,
+    update: types.SubscriptionUpdate,
+    dead_letter_topic: ?[]const u8,
+) Allocator.Error![]u8 {
+    return render(arena, SubscriptionUpdateBody{ .update = update, .dead_letter_topic = dead_letter_topic });
+}
+
+const SubscriptionUpdateBody = struct {
+    update: types.SubscriptionUpdate,
+    dead_letter_topic: ?[]const u8,
+
+    fn write(self: SubscriptionUpdateBody, jw: *Stringify) Stringify.Error!void {
+        const u = self.update;
+        var mask: Mask = .{};
+        try jw.beginObject();
+        try jw.objectField("subscription");
+        try jw.beginObject();
+        if (u.ack_deadline_seconds) |s| {
+            mask.add("ackDeadlineSeconds");
+            try jw.objectField("ackDeadlineSeconds");
+            try jw.write(s);
+        }
+        if (u.enable_exactly_once_delivery) |on| {
+            mask.add("enableExactlyOnceDelivery");
+            try jw.objectField("enableExactlyOnceDelivery");
+            try jw.write(on);
+        }
+        switch (u.dead_letter_policy) {
+            .keep => {},
+            .clear => mask.add("deadLetterPolicy"),
+            .set => |policy| {
+                mask.add("deadLetterPolicy");
+                try jw.objectField("deadLetterPolicy");
+                try writeDeadLetter(jw, self.dead_letter_topic.?, policy.max_delivery_attempts);
+            },
+        }
+        switch (u.retry_policy) {
+            .keep => {},
+            .clear => mask.add("retryPolicy"),
+            .set => |b| {
+                mask.add("retryPolicy");
+                try jw.objectField("retryPolicy");
+                try writeBackoff(jw, b);
+            },
+        }
+        switch (u.message_retention) {
+            .keep => {},
+            .clear => mask.add("messageRetentionDuration"),
+            .set => |r| {
+                mask.add("messageRetentionDuration");
+                try jw.objectField("messageRetentionDuration");
+                try writeDuration(jw, r);
+            },
+        }
+        if (u.retain_acked_messages) |on| {
+            mask.add("retainAckedMessages");
+            try jw.objectField("retainAckedMessages");
+            try jw.write(on);
+        }
+        if (u.expiration) |e| {
+            mask.add("expirationPolicy");
+            // The default is named and left out, which restores it.
+            if (e != .default) {
+                try jw.objectField("expirationPolicy");
+                try writeExpiration(jw, e);
+            }
+        }
+        if (u.labels) |labels| {
+            mask.add("labels");
+            try jw.objectField("labels");
+            try writeLabels(jw, labels);
+        }
+        try jw.endObject();
+        try jw.objectField("updateMask");
+        try mask.write(jw);
+        try jw.endObject();
+    }
+};
+
+/// The `topics.create` body: `{}` when nothing is set.
 pub fn encodeTopic(arena: Allocator, config: types.TopicConfig) Allocator.Error![]u8 {
-    _ = config;
-    return arena.dupe(u8, "{}");
+    return render(arena, TopicBody{ .config = config });
+}
+
+const TopicBody = struct {
+    config: types.TopicConfig,
+
+    fn write(self: TopicBody, jw: *Stringify) Stringify.Error!void {
+        const c = self.config;
+        try jw.beginObject();
+        if (c.labels.len > 0) {
+            try jw.objectField("labels");
+            try writeLabels(jw, c.labels);
+        }
+        if (c.message_retention) |r| {
+            try jw.objectField("messageRetentionDuration");
+            try writeDuration(jw, r);
+        }
+        if (c.kms_key_name) |k| {
+            try jw.objectField("kmsKeyName");
+            try jw.write(k);
+        }
+        if (c.message_storage_policy) |policy| {
+            try jw.objectField("messageStoragePolicy");
+            try writeStoragePolicy(jw, policy);
+        }
+        try jw.endObject();
+    }
+};
+
+/// The `topics.patch` body, as for subscriptions.
+pub fn encodeTopicUpdate(arena: Allocator, update: types.TopicUpdate) Allocator.Error![]u8 {
+    return render(arena, TopicUpdateBody{ .update = update });
+}
+
+const TopicUpdateBody = struct {
+    update: types.TopicUpdate,
+
+    fn write(self: TopicUpdateBody, jw: *Stringify) Stringify.Error!void {
+        const u = self.update;
+        var mask: Mask = .{};
+        try jw.beginObject();
+        try jw.objectField("topic");
+        try jw.beginObject();
+        if (u.labels) |labels| {
+            mask.add("labels");
+            try jw.objectField("labels");
+            try writeLabels(jw, labels);
+        }
+        switch (u.message_retention) {
+            .keep => {},
+            .clear => mask.add("messageRetentionDuration"),
+            .set => |r| {
+                mask.add("messageRetentionDuration");
+                try jw.objectField("messageRetentionDuration");
+                try writeDuration(jw, r);
+            },
+        }
+        switch (u.kms_key_name) {
+            .keep => {},
+            .clear => mask.add("kmsKeyName"),
+            .set => |k| {
+                mask.add("kmsKeyName");
+                try jw.objectField("kmsKeyName");
+                try jw.write(k);
+            },
+        }
+        switch (u.message_storage_policy) {
+            .keep => {},
+            .clear => mask.add("messageStoragePolicy"),
+            .set => |policy| {
+                mask.add("messageStoragePolicy");
+                try jw.objectField("messageStoragePolicy");
+                try writeStoragePolicy(jw, policy);
+            },
+        }
+        try jw.endObject();
+        try jw.objectField("updateMask");
+        try mask.write(jw);
+        try jw.endObject();
+    }
+};
+
+/// An update mask: the camelCase paths an update names, comma-separated in
+/// one JSON string, as the REST API takes a `FieldMask`.
+const Mask = struct {
+    paths: [8][]const u8 = undefined,
+    len: usize = 0,
+
+    fn add(m: *Mask, path: []const u8) void {
+        m.paths[m.len] = path;
+        m.len += 1;
+    }
+
+    fn write(m: *const Mask, jw: *Stringify) Stringify.Error!void {
+        // Paths are fixed ASCII names, so the string needs no escaping.
+        try jw.beginWriteRaw();
+        try jw.writer.writeByte('"');
+        for (m.paths[0..m.len], 0..) |path, i| {
+            if (i > 0) try jw.writer.writeByte(',');
+            try jw.writer.writeAll(path);
+        }
+        try jw.writer.writeByte('"');
+        jw.endWriteRaw();
+    }
+};
+
+fn writeDuration(jw: *Stringify, d: std.Io.Duration) Stringify.Error!void {
+    var buf: [duration.max_len]u8 = undefined;
+    try jw.write(duration.format(&buf, d));
+}
+
+fn writeLabels(jw: *Stringify, labels: []const types.Label) Stringify.Error!void {
+    try jw.beginObject();
+    for (labels) |l| {
+        try jw.objectField(l.key);
+        try jw.write(l.value);
+    }
+    try jw.endObject();
+}
+
+fn writeDeadLetter(jw: *Stringify, topic_name: []const u8, attempts: u8) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("deadLetterTopic");
+    try jw.write(topic_name);
+    try jw.objectField("maxDeliveryAttempts");
+    try jw.write(attempts);
+    try jw.endObject();
+}
+
+fn writeBackoff(jw: *Stringify, b: types.Backoff) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("minimumBackoff");
+    try writeDuration(jw, b.minimum);
+    try jw.objectField("maximumBackoff");
+    try writeDuration(jw, b.maximum);
+    try jw.endObject();
+}
+
+/// `{}` never expires; a ttl expires after it. The default is left out
+/// entirely by the caller: absent and `{}` differ on the wire.
+fn writeExpiration(jw: *Stringify, e: types.Expiration) Stringify.Error!void {
+    try jw.beginObject();
+    switch (e) {
+        .default, .never => {},
+        .after => |ttl| {
+            try jw.objectField("ttl");
+            try writeDuration(jw, ttl);
+        },
+    }
+    try jw.endObject();
+}
+
+fn writeStoragePolicy(jw: *Stringify, policy: types.MessageStoragePolicy) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("allowedPersistenceRegions");
+    try jw.write(policy.allowed_persistence_regions);
+    if (policy.enforce_in_transit) {
+        try jw.objectField("enforceInTransit");
+        try jw.write(true);
+    }
+    try jw.endObject();
 }
 
 /// Runs `body.write` into a fresh buffer. The only way an allocating writer
@@ -259,13 +535,37 @@ const parse_options: std.json.ParseOptions = .{
     .allocate = .alloc_if_needed,
 };
 
+const WireStoragePolicy = struct {
+    allowedPersistenceRegions: ?[]const []const u8 = null,
+    enforceInTransit: ?bool = null,
+};
+
 const WireTopic = struct {
     name: ?[]const u8 = null,
+    labels: ?std.json.ArrayHashMap(?[]const u8) = null,
+    messageRetentionDuration: ?[]const u8 = null,
+    kmsKeyName: ?[]const u8 = null,
+    messageStoragePolicy: ?WireStoragePolicy = null,
+    state: ?[]const u8 = null,
 };
 
 const WireTopicList = struct {
     topics: ?[]const WireTopic = null,
     nextPageToken: ?[]const u8 = null,
+};
+
+const WireDeadLetter = struct {
+    deadLetterTopic: ?[]const u8 = null,
+    maxDeliveryAttempts: ?u32 = null,
+};
+
+const WireBackoff = struct {
+    minimumBackoff: ?[]const u8 = null,
+    maximumBackoff: ?[]const u8 = null,
+};
+
+const WireExpiration = struct {
+    ttl: ?[]const u8 = null,
 };
 
 const WireSubscription = struct {
@@ -274,6 +574,16 @@ const WireSubscription = struct {
     ackDeadlineSeconds: ?u32 = null,
     enableMessageOrdering: ?bool = null,
     enableExactlyOnceDelivery: ?bool = null,
+    filter: ?[]const u8 = null,
+    deadLetterPolicy: ?WireDeadLetter = null,
+    retryPolicy: ?WireBackoff = null,
+    messageRetentionDuration: ?[]const u8 = null,
+    retainAckedMessages: ?bool = null,
+    expirationPolicy: ?WireExpiration = null,
+    labels: ?std.json.ArrayHashMap(?[]const u8) = null,
+    detached: ?bool = null,
+    state: ?[]const u8 = null,
+    topicMessageRetentionDuration: ?[]const u8 = null,
 };
 
 const WireSubscriptionList = struct {
@@ -319,39 +629,107 @@ fn nonEmpty(text: ?[]const u8) ?[]const u8 {
     return if (t.len == 0) null else t;
 }
 
+fn topicFromWire(arena: Allocator, w: WireTopic) DecodeError!types.TopicInfo {
+    return .{
+        .name = w.name orelse "",
+        .labels = try labelsFromWire(arena, w.labels),
+        .message_retention = try optionalDuration(w.messageRetentionDuration),
+        .kms_key_name = nonEmpty(w.kmsKeyName),
+        .message_storage_policy = if (w.messageStoragePolicy) |policy| .{
+            .allowed_persistence_regions = policy.allowedPersistenceRegions orelse &.{},
+            .enforce_in_transit = policy.enforceInTransit orelse false,
+        } else null,
+        .state = topicState(w.state),
+    };
+}
+
 pub fn decodeTopic(arena: Allocator, body: []const u8) DecodeError!types.TopicInfo {
-    const wire = try parseWire(WireTopic, arena, body);
-    return .{ .name = wire.name orelse "" };
+    return topicFromWire(arena, try parseWire(WireTopic, arena, body));
 }
 
 pub fn decodeTopicPage(arena: Allocator, body: []const u8) DecodeError!types.TopicPage {
     const wire = try parseWire(WireTopicList, arena, body);
     const list = wire.topics orelse &.{};
     const topics = try arena.alloc(types.TopicInfo, list.len);
-    for (list, topics) |t, *out| out.* = .{ .name = t.name orelse "" };
+    for (list, topics) |t, *out| out.* = try topicFromWire(arena, t);
     return .{ .topics = topics, .next_page_token = nonEmpty(wire.nextPageToken) };
 }
 
-fn subscriptionFromWire(w: WireSubscription) types.SubscriptionInfo {
+fn subscriptionFromWire(arena: Allocator, w: WireSubscription) DecodeError!types.SubscriptionInfo {
     return .{
         .name = w.name orelse "",
         .topic = w.topic orelse "",
         .ack_deadline_seconds = w.ackDeadlineSeconds orelse 0,
         .enable_message_ordering = w.enableMessageOrdering orelse false,
         .enable_exactly_once_delivery = w.enableExactlyOnceDelivery orelse false,
+        .filter = w.filter orelse "",
+        .dead_letter_policy = if (w.deadLetterPolicy) |policy| .{
+            .topic = policy.deadLetterTopic orelse "",
+            // 0 means Pub/Sub's default, which is 5.
+            .max_delivery_attempts = switch (policy.maxDeliveryAttempts orelse 0) {
+                0 => 5,
+                1...std.math.maxInt(u8) => |n| @intCast(n),
+                else => return error.InvalidResponse,
+            },
+        } else null,
+        // Each bound the server leaves out is its default.
+        .retry_policy = if (w.retryPolicy) |b| .{
+            .minimum = if (b.minimumBackoff) |text| try parseDuration(text) else .fromSeconds(10),
+            .maximum = if (b.maximumBackoff) |text| try parseDuration(text) else .fromSeconds(600),
+        } else null,
+        .message_retention = try optionalDuration(w.messageRetentionDuration),
+        .retain_acked_messages = w.retainAckedMessages orelse false,
+        // Absent is the 31-day default; `{}` never expires.
+        .expiration = if (w.expirationPolicy) |e|
+            (if (e.ttl) |ttl| .{ .after = try parseDuration(ttl) } else .never)
+        else
+            .default,
+        .labels = try labelsFromWire(arena, w.labels),
+        .detached = w.detached orelse false,
+        .state = subscriptionState(w.state),
+        .topic_message_retention = try optionalDuration(w.topicMessageRetentionDuration),
     };
 }
 
 pub fn decodeSubscription(arena: Allocator, body: []const u8) DecodeError!types.SubscriptionInfo {
-    return subscriptionFromWire(try parseWire(WireSubscription, arena, body));
+    return subscriptionFromWire(arena, try parseWire(WireSubscription, arena, body));
 }
 
 pub fn decodeSubscriptionPage(arena: Allocator, body: []const u8) DecodeError!types.SubscriptionPage {
     const wire = try parseWire(WireSubscriptionList, arena, body);
     const list = wire.subscriptions orelse &.{};
     const subscriptions = try arena.alloc(types.SubscriptionInfo, list.len);
-    for (list, subscriptions) |s, *out| out.* = subscriptionFromWire(s);
+    for (list, subscriptions) |s, *out| out.* = try subscriptionFromWire(arena, s);
     return .{ .subscriptions = subscriptions, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+fn parseDuration(text: []const u8) DecodeError!std.Io.Duration {
+    return duration.parse(text) catch error.InvalidResponse;
+}
+
+fn optionalDuration(text: ?[]const u8) DecodeError!?std.Io.Duration {
+    return if (text) |t| try parseDuration(t) else null;
+}
+
+fn labelsFromWire(arena: Allocator, wire: ?std.json.ArrayHashMap(?[]const u8)) Allocator.Error![]const types.Label {
+    const map = (wire orelse return &.{}).map;
+    const out = try arena.alloc(types.Label, map.count());
+    for (map.keys(), map.values(), out) |k, v, *l| l.* = .{ .key = k, .value = v orelse "" };
+    return out;
+}
+
+fn topicState(text: ?[]const u8) types.TopicInfo.State {
+    const s = text orelse return .active;
+    if (std.mem.eql(u8, s, "ACTIVE") or std.mem.eql(u8, s, "STATE_UNSPECIFIED")) return .active;
+    if (std.mem.eql(u8, s, "INGESTION_RESOURCE_ERROR")) return .ingestion_resource_error;
+    return .unknown;
+}
+
+fn subscriptionState(text: ?[]const u8) types.SubscriptionInfo.State {
+    const s = text orelse return .active;
+    if (std.mem.eql(u8, s, "ACTIVE") or std.mem.eql(u8, s, "STATE_UNSPECIFIED")) return .active;
+    if (std.mem.eql(u8, s, "RESOURCE_ERROR")) return .resource_error;
+    return .unknown;
 }
 
 /// The publish response must hold one id per published message.
@@ -454,16 +832,16 @@ test "golden: pull, ack, modifyAckDeadline, create bodies" {
             .topic_id = "t%41",
             .ack_deadline_seconds = 30,
             .enable_message_ordering = true,
-        }),
+        }, null),
     );
     // The defaults leave the deadline to Pub/Sub; exactly-once is sent only when on.
     try testing.expectEqualStrings(
         "{\"topic\":\"projects/p/topics/t\",\"enableMessageOrdering\":false}",
-        try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t" }),
+        try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t" }, null),
     );
     try testing.expectEqualStrings(
         "{\"topic\":\"projects/p/topics/t\",\"enableMessageOrdering\":false,\"enableExactlyOnceDelivery\":true}",
-        try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .enable_exactly_once_delivery = true }),
+        try encodeSubscription(a, "projects/p/topics/t", .{ .topic_id = "t", .enable_exactly_once_delivery = true }, null),
     );
     try testing.expectEqualStrings("{}", try encodeTopic(a, .{}));
 }
@@ -1020,4 +1398,343 @@ test "fuzz AckChunks: covers every id, respects limits, stays greedy" {
         "\x01\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x05",
         "\x00",
     } });
+}
+
+test "golden: subscription create body with every setting" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "{\"topic\":\"projects/p/topics/orders\",\"ackDeadlineSeconds\":20,\"enableMessageOrdering\":true," ++
+            "\"enableExactlyOnceDelivery\":true,\"filter\":\"attributes.kind = \\\"a\\\"\"," ++
+            "\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/dead\",\"maxDeliveryAttempts\":7}," ++
+            "\"retryPolicy\":{\"minimumBackoff\":\"1.500s\",\"maximumBackoff\":\"600s\"}," ++
+            "\"messageRetentionDuration\":\"1200s\",\"retainAckedMessages\":true," ++
+            "\"expirationPolicy\":{\"ttl\":\"86400s\"},\"labels\":{\"team\":\"zig\",\"env\":\"prod\"}}",
+        try encodeSubscription(a, "projects/p/topics/orders", .{
+            .topic_id = "orders",
+            .ack_deadline_seconds = 20,
+            .enable_message_ordering = true,
+            .enable_exactly_once_delivery = true,
+            .filter = "attributes.kind = \"a\"",
+            .dead_letter_policy = .{ .topic = "dead", .max_delivery_attempts = 7 },
+            .retry_policy = .{ .minimum = .fromMilliseconds(1500) },
+            .message_retention = .fromSeconds(1200),
+            .retain_acked_messages = true,
+            .expiration = .{ .after = .fromSeconds(86400) },
+            .labels = &.{ .{ .key = "team", .value = "zig" }, .{ .key = "env", .value = "prod" } },
+        }, "projects/p/topics/dead"),
+    );
+    // Never expiring is `{}`, where the default is left out.
+    try testing.expectEqualStrings(
+        "{\"topic\":\"t\",\"enableMessageOrdering\":false,\"expirationPolicy\":{}}",
+        try encodeSubscription(a, "t", .{ .topic_id = "t", .expiration = .never }, null),
+    );
+}
+
+test "golden: subscription update bodies name what they set and what they clear" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "{\"subscription\":{\"ackDeadlineSeconds\":30,\"enableExactlyOnceDelivery\":false," ++
+            "\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/o/topics/dead\",\"maxDeliveryAttempts\":5}," ++
+            "\"retainAckedMessages\":true,\"expirationPolicy\":{},\"labels\":{}}," ++
+            "\"updateMask\":\"ackDeadlineSeconds,enableExactlyOnceDelivery,deadLetterPolicy,retryPolicy,messageRetentionDuration,retainAckedMessages,expirationPolicy,labels\"}",
+        try encodeSubscriptionUpdate(a, .{
+            .ack_deadline_seconds = 30,
+            .enable_exactly_once_delivery = false,
+            .dead_letter_policy = .{ .set = .{ .topic = "projects/o/topics/dead" } },
+            .retry_policy = .clear,
+            .message_retention = .clear,
+            .retain_acked_messages = true,
+            .expiration = .never,
+            .labels = &.{},
+        }, "projects/o/topics/dead"),
+    );
+    // Back to the default expiration: named, and left out.
+    try testing.expectEqualStrings(
+        "{\"subscription\":{\"retryPolicy\":{\"minimumBackoff\":\"0s\",\"maximumBackoff\":\"2s\"}},\"updateMask\":\"retryPolicy,expirationPolicy\"}",
+        try encodeSubscriptionUpdate(a, .{
+            .retry_policy = .{ .set = .{ .minimum = .zero, .maximum = .fromSeconds(2) } },
+            .expiration = .default,
+        }, null),
+    );
+}
+
+test "golden: topic create and update bodies" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "{\"labels\":{\"env\":\"test\"},\"messageRetentionDuration\":\"3600s\"," ++
+            "\"kmsKeyName\":\"projects/p/locations/l/keyRings/r/cryptoKeys/k\"," ++
+            "\"messageStoragePolicy\":{\"allowedPersistenceRegions\":[\"europe-west1\",\"europe-west4\"],\"enforceInTransit\":true}}",
+        try encodeTopic(a, .{
+            .labels = &.{.{ .key = "env", .value = "test" }},
+            .message_retention = .fromSeconds(3600),
+            .kms_key_name = "projects/p/locations/l/keyRings/r/cryptoKeys/k",
+            .message_storage_policy = .{ .allowed_persistence_regions = &.{ "europe-west1", "europe-west4" }, .enforce_in_transit = true },
+        }),
+    );
+    try testing.expectEqualStrings(
+        "{\"topic\":{\"labels\":{\"env\":\"prod\"},\"messageStoragePolicy\":{\"allowedPersistenceRegions\":[\"us-east1\"]}}," ++
+            "\"updateMask\":\"labels,messageRetentionDuration,kmsKeyName,messageStoragePolicy\"}",
+        try encodeTopicUpdate(a, .{
+            .labels = &.{.{ .key = "env", .value = "prod" }},
+            .message_retention = .clear,
+            .kms_key_name = .clear,
+            .message_storage_policy = .{ .set = .{ .allowed_persistence_regions = &.{"us-east1"} } },
+        }),
+    );
+}
+
+test "decode a subscription with every setting, as the emulator echoes it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const s = try decodeSubscription(arena.allocator(),
+        \\{"name":"projects/test/subscriptions/full","topic":"projects/test/topics/t","pushConfig":{},
+        \\"ackDeadlineSeconds":20,"retainAckedMessages":true,"messageRetentionDuration":"1200s",
+        \\"labels":{"team":"zig"},"enableMessageOrdering":true,"expirationPolicy":{"ttl":"86400s"},
+        \\"filter":"attributes.kind = \"a\"","deadLetterPolicy":{"deadLetterTopic":"projects/test/topics/dlt","maxDeliveryAttempts":5},
+        \\"retryPolicy":{"minimumBackoff":"1.500s","maximumBackoff":"2s"},"enableExactlyOnceDelivery":true,
+        \\"state":"ACTIVE","detached":false,"topicMessageRetentionDuration":"3600s"}
+    );
+    try testing.expectEqual(20, s.ack_deadline_seconds);
+    try testing.expect(s.retain_acked_messages);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(1200), s.message_retention.?);
+    try testing.expectEqualStrings("zig", s.label("team").?);
+    try testing.expectEqual(null, s.label("absent"));
+    try testing.expect(s.enable_message_ordering and s.enable_exactly_once_delivery);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(86400), s.expiration.after);
+    try testing.expectEqualStrings("attributes.kind = \"a\"", s.filter);
+    try testing.expectEqualStrings("projects/test/topics/dlt", s.dead_letter_policy.?.topic);
+    try testing.expectEqual(5, s.dead_letter_policy.?.max_delivery_attempts);
+    try testing.expectEqual(std.Io.Duration.fromMilliseconds(1500), s.retry_policy.?.minimum);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(2), s.retry_policy.?.maximum);
+    try testing.expectEqual(.active, s.state);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(3600), s.topic_message_retention.?);
+}
+
+test "decode subscription settings: absent, empty and odd values" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Absent: the defaults. The expiration default and `{}` differ.
+    const bare = try decodeSubscription(a, "{\"name\":\"n\"}");
+    try testing.expectEqual(.default, std.meta.activeTag(bare.expiration));
+    try testing.expectEqual(null, bare.retry_policy);
+    try testing.expectEqual(null, bare.dead_letter_policy);
+    try testing.expectEqual(null, bare.message_retention);
+    try testing.expectEqualStrings("", bare.filter);
+    try testing.expectEqual(0, bare.labels.len);
+    const never = try decodeSubscription(a, "{\"expirationPolicy\":{},\"retryPolicy\":{},\"deadLetterPolicy\":{\"deadLetterTopic\":\"d\"}}");
+    try testing.expectEqual(.never, std.meta.activeTag(never.expiration));
+    // Bounds left out are Pub/Sub's defaults, 10 s and 600 s; attempts 5.
+    try testing.expectEqual(std.Io.Duration.fromSeconds(10), never.retry_policy.?.minimum);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(600), never.retry_policy.?.maximum);
+    try testing.expectEqual(5, never.dead_letter_policy.?.max_delivery_attempts);
+    // A state this client does not know, and one it does.
+    try testing.expectEqual(.unknown, (try decodeSubscription(a, "{\"state\":\"SOMETHING_NEW\"}")).state);
+    try testing.expectEqual(.resource_error, (try decodeSubscription(a, "{\"state\":\"RESOURCE_ERROR\"}")).state);
+    try testing.expect((try decodeSubscription(a, "{\"detached\":true}")).detached);
+    // What cannot be a duration, or attempts, is an invalid response.
+    try testing.expectError(error.InvalidResponse, decodeSubscription(a, "{\"messageRetentionDuration\":\"7 days\"}"));
+    try testing.expectError(error.InvalidResponse, decodeSubscription(a, "{\"expirationPolicy\":{\"ttl\":\"1\"}}"));
+    try testing.expectError(error.InvalidResponse, decodeSubscription(a, "{\"retryPolicy\":{\"minimumBackoff\":10}}"));
+    try testing.expectError(error.InvalidResponse, decodeSubscription(a, "{\"deadLetterPolicy\":{\"maxDeliveryAttempts\":256}}"));
+}
+
+test "decode a topic with every setting" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = try decodeTopic(a,
+        \\{"name":"projects/p/topics/t","labels":{"env":"test","empty":""},"messageRetentionDuration":"3600s",
+        \\"kmsKeyName":"projects/p/locations/l/keyRings/r/cryptoKeys/k",
+        \\"messageStoragePolicy":{"allowedPersistenceRegions":["europe-west1"],"enforceInTransit":true},
+        \\"state":"INGESTION_RESOURCE_ERROR","satisfiesPzs":false}
+    );
+    try testing.expectEqualStrings("test", t.label("env").?);
+    try testing.expectEqualStrings("", t.label("empty").?);
+    try testing.expectEqual(std.Io.Duration.fromSeconds(3600), t.message_retention.?);
+    try testing.expectEqualStrings("projects/p/locations/l/keyRings/r/cryptoKeys/k", t.kms_key_name.?);
+    try testing.expectEqualStrings("europe-west1", t.message_storage_policy.?.allowed_persistence_regions[0]);
+    try testing.expect(t.message_storage_policy.?.enforce_in_transit);
+    try testing.expectEqual(.ingestion_resource_error, t.state);
+    const bare = try decodeTopic(a, "{\"name\":\"n\",\"kmsKeyName\":\"\"}");
+    try testing.expectEqual(null, bare.kms_key_name);
+    try testing.expectEqual(null, bare.message_storage_policy);
+    try testing.expectEqual(.active, bare.state);
+}
+
+/// Draws settings the checks accept, as a caller might write them.
+fn genSubscriptionConfig(g: *ByteGen, arena: Allocator) !types.SubscriptionConfig {
+    var config: types.SubscriptionConfig = .{ .topic_id = "t" };
+    config.ack_deadline_seconds = if (g.boolean()) 0 else g.intRange(u32, 10, 600);
+    config.enable_message_ordering = g.boolean();
+    config.enable_exactly_once_delivery = g.boolean();
+    if (g.boolean()) {
+        var buf: [256]u8 = undefined;
+        config.filter = try arena.dupe(u8, g.utf8(&buf, 256));
+    }
+    if (g.boolean()) config.dead_letter_policy = .{ .topic = "projects/p/topics/dead", .max_delivery_attempts = g.intRange(u8, 5, 100) };
+    if (g.boolean()) {
+        const lo: i64 = g.intRange(u16, 0, 600);
+        config.retry_policy = .{
+            .minimum = .fromMilliseconds(lo * 1000 - @as(i64, if (lo > 0) g.intRange(u16, 0, 999) else 0)),
+            .maximum = .fromSeconds(g.intRange(u16, @intCast(lo), 600)),
+        };
+    }
+    const retention_s: ?i64 = if (g.boolean()) g.intRange(u32, 600, 31 * 24 * 3600) else null;
+    if (retention_s) |r| config.message_retention = .fromSeconds(r);
+    config.expiration = switch (g.intRange(u8, 0, 2)) {
+        0 => .default,
+        1 => .never,
+        else => .{ .after = .fromSeconds(@max(retention_s orelse 0, 86400) + g.intRange(u32, 0, 1_000_000)) },
+    };
+    const labels = try arena.alloc(types.Label, g.intRange(u8, 0, 4));
+    for (labels, 0..) |*l, i| l.* = .{
+        .key = try std.fmt.allocPrint(arena, "k{d}{s}", .{ i, g.pick([]const u8, &.{ "", "_x", "-y", "z9" }) }),
+        .value = g.pick([]const u8, &.{ "", "v", "prod", "a-b_c" }),
+    };
+    config.labels = labels;
+    return config;
+}
+
+fn subscriptionRoundTrip(_: void, input: []const u8) !void {
+    var g: ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const config = try genSubscriptionConfig(&g, a);
+    try @import("validate.zig").subscriptionConfig(config, null);
+    // The create body is a subscription resource: read back as one, it
+    // says what was asked.
+    const dead: ?[]const u8 = if (config.dead_letter_policy) |p| p.topic else null;
+    const info = try decodeSubscription(a, try encodeSubscription(a, "projects/p/topics/t", config, dead));
+    try testing.expectEqualStrings("projects/p/topics/t", info.topic);
+    try testing.expectEqual(config.ack_deadline_seconds, info.ack_deadline_seconds);
+    try testing.expectEqual(config.enable_message_ordering, info.enable_message_ordering);
+    try testing.expectEqual(config.enable_exactly_once_delivery, info.enable_exactly_once_delivery);
+    try testing.expectEqualStrings(config.filter, info.filter);
+    try testing.expectEqual(config.dead_letter_policy == null, info.dead_letter_policy == null);
+    if (config.dead_letter_policy) |p| {
+        try testing.expectEqualStrings(p.topic, info.dead_letter_policy.?.topic);
+        try testing.expectEqual(p.max_delivery_attempts, info.dead_letter_policy.?.max_delivery_attempts);
+    }
+    try testing.expectEqual(config.retry_policy, info.retry_policy);
+    try testing.expectEqual(config.message_retention, info.message_retention);
+    try testing.expectEqual(config.retain_acked_messages, info.retain_acked_messages);
+    try testing.expectEqual(config.expiration, info.expiration);
+    try testing.expectEqual(config.labels.len, info.labels.len);
+    for (config.labels, info.labels) |want, have| {
+        try testing.expectEqualStrings(want.key, have.key);
+        try testing.expectEqualStrings(want.value, have.value);
+    }
+}
+
+test "fuzz subscription settings: a create body reads back as the settings it was made from" {
+    try test_util.fuzzBytes({}, subscriptionRoundTrip, .{ .corpus = &.{ "", "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" } });
+}
+
+fn updateMaskProperty(_: void, input: []const u8) !void {
+    var g: ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: types.SubscriptionUpdate = .{};
+    var want: std.ArrayList([]const u8) = .empty;
+    var body_fields: std.ArrayList([]const u8) = .empty;
+    if (g.boolean()) {
+        u.ack_deadline_seconds = g.intRange(u32, 10, 600);
+        try want.append(a, "ackDeadlineSeconds");
+        try body_fields.append(a, "ackDeadlineSeconds");
+    }
+    if (g.boolean()) {
+        u.enable_exactly_once_delivery = g.boolean();
+        try want.append(a, "enableExactlyOnceDelivery");
+        try body_fields.append(a, "enableExactlyOnceDelivery");
+    }
+    switch (g.intRange(u8, 0, 2)) {
+        0 => {},
+        1 => {
+            u.dead_letter_policy = .clear;
+            try want.append(a, "deadLetterPolicy");
+        },
+        else => {
+            u.dead_letter_policy = .{ .set = .{ .topic = "d" } };
+            try want.append(a, "deadLetterPolicy");
+            try body_fields.append(a, "deadLetterPolicy");
+        },
+    }
+    switch (g.intRange(u8, 0, 2)) {
+        0 => {},
+        1 => {
+            u.retry_policy = .clear;
+            try want.append(a, "retryPolicy");
+        },
+        else => {
+            u.retry_policy = .{ .set = .{} };
+            try want.append(a, "retryPolicy");
+            try body_fields.append(a, "retryPolicy");
+        },
+    }
+    switch (g.intRange(u8, 0, 2)) {
+        0 => {},
+        1 => {
+            u.message_retention = .clear;
+            try want.append(a, "messageRetentionDuration");
+        },
+        else => {
+            u.message_retention = .{ .set = .fromSeconds(3600) };
+            try want.append(a, "messageRetentionDuration");
+            try body_fields.append(a, "messageRetentionDuration");
+        },
+    }
+    if (g.boolean()) {
+        u.retain_acked_messages = g.boolean();
+        try want.append(a, "retainAckedMessages");
+        try body_fields.append(a, "retainAckedMessages");
+    }
+    switch (g.intRange(u8, 0, 3)) {
+        0 => {},
+        1 => {
+            u.expiration = .default;
+            try want.append(a, "expirationPolicy");
+        },
+        2 => {
+            u.expiration = .never;
+            try want.append(a, "expirationPolicy");
+            try body_fields.append(a, "expirationPolicy");
+        },
+        else => {
+            u.expiration = .{ .after = .fromSeconds(86400) };
+            try want.append(a, "expirationPolicy");
+            try body_fields.append(a, "expirationPolicy");
+        },
+    }
+    if (g.boolean()) {
+        u.labels = if (g.boolean()) &.{} else &.{.{ .key = "k", .value = "v" }};
+        try want.append(a, "labels");
+        try body_fields.append(a, "labels");
+    }
+    const body = try encodeSubscriptionUpdate(a, u, "projects/p/topics/d");
+    const Parsed = struct { subscription: std.json.ArrayHashMap(std.json.Value), updateMask: []const u8 };
+    const parsed = try std.json.parseFromSliceLeaky(Parsed, a, body, .{});
+    // The mask names exactly what the update sets or clears, and the body
+    // carries exactly what it sets.
+    var mask: std.ArrayList([]const u8) = .empty;
+    if (parsed.updateMask.len > 0) {
+        var it = std.mem.splitScalar(u8, parsed.updateMask, ',');
+        while (it.next()) |path| try mask.append(a, path);
+    }
+    try testing.expectEqual(want.items.len, mask.items.len);
+    for (want.items, mask.items) |w, m| try testing.expectEqualStrings(w, m);
+    try testing.expectEqual(body_fields.items.len, parsed.subscription.map.count());
+    for (body_fields.items) |field| try testing.expect(parsed.subscription.map.contains(field));
+}
+
+test "fuzz subscription update: the mask names what the update sets or clears, and the body carries what it sets" {
+    try test_util.fuzzBytes({}, updateMaskProperty, .{ .corpus = &.{ "", "\x01\x1f\x01\x01\x02\x02\x02\x01\x01\x03\x01\x00" } });
 }

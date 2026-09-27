@@ -20,17 +20,33 @@ client: *Client,
 id: []const u8,
 
 /// Creates the topic. If a lost first attempt already created it, the retry
-/// reports `error.AlreadyExists`.
+/// reports `error.AlreadyExists`. Every setting is checked first.
 pub fn create(self: Topic, config: types.TopicConfig) Error!Owned(types.TopicInfo) {
     const c = self.client;
     rpc.begin(c);
     try rpc.checkId(c, "topic", self.id);
+    try validate.topicConfig(config, c.diagnostics);
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
     const path = try url.resourcePath(a, c.project_id, .topics, self.id, "");
     const body = try codec.encodeTopic(a, config);
     return fetch(c, .{ .method = .PUT, .path = path, .body = body });
+}
+
+/// Changes what `changes` names, and nothing else, and returns the topic as
+/// it is then. A storage policy is replaced whole, and labels as a set.
+pub fn update(self: Topic, changes: types.TopicUpdate) Error!Owned(types.TopicInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "topic", self.id);
+    try validate.topicUpdate(changes, c.diagnostics);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try url.resourcePath(a, c.project_id, .topics, self.id, "");
+    const body = try codec.encodeTopicUpdate(a, changes);
+    return fetch(c, .{ .method = .PATCH, .path = path, .body = body });
 }
 
 pub fn get(self: Topic) Error!Owned(types.TopicInfo) {
@@ -293,4 +309,28 @@ test "every allocation failure is reported as OutOfMemory without leaks" {
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.publish, .{});
+}
+
+test "golden: create a topic with settings, and update it" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"labels\":{\"env\":\"test\"},\"messageRetentionDuration\":\"3600s\"}" } },
+        .{ .respond = .{ .body = "{\"name\":\"projects/p/topics/orders\",\"labels\":{\"env\":\"prod\"}}" } },
+    }, .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+    var created = try orders.create(.{ .labels = &.{.{ .key = "env", .value = "test" }}, .message_retention = .fromSeconds(3600) });
+    defer created.deinit();
+    try h.expectRequest(0, .PUT, "http://localhost:8085/v1/projects/p/topics/orders", "{\"labels\":{\"env\":\"test\"},\"messageRetentionDuration\":\"3600s\"}");
+    try testing.expectEqual(std.Io.Duration.fromSeconds(3600), created.value.message_retention.?);
+
+    var updated = try orders.update(.{ .labels = &.{.{ .key = "env", .value = "prod" }}, .message_retention = .clear });
+    defer updated.deinit();
+    try h.expectRequest(1, .PATCH, "http://localhost:8085/v1/projects/p/topics/orders", "{\"topic\":{\"labels\":{\"env\":\"prod\"}},\"updateMask\":\"labels,messageRetentionDuration\"}");
+    try testing.expectEqualStrings("prod", updated.value.label("env").?);
+    try testing.expectEqual(null, updated.value.message_retention);
+
+    try testing.expectError(error.InvalidArgument, orders.update(.{}));
+    try testing.expectError(error.InvalidArgument, orders.create(.{ .kms_key_name = "not a key" }));
+    try h.expectRequestCount(2);
 }

@@ -75,18 +75,112 @@ pub const ReceivedMessage = struct {
     }
 };
 
-/// Topic settings. Empty in v1; fields arrive when someone needs them.
-pub const TopicConfig = struct {};
+/// A label on a topic or subscription.
+pub const Label = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// What an update does to a setting that can be taken away.
+pub fn Change(comptime T: type) type {
+    return union(enum) {
+        /// Not part of the update: stays as it is.
+        keep,
+        set: T,
+        /// Taken away, or back to Pub/Sub's default: each field says which.
+        clear,
+    };
+}
+
+/// Where a topic's messages may be stored.
+pub const MessageStoragePolicy = struct {
+    /// Region ids, such as `europe-west1`. At least one.
+    allowed_persistence_regions: []const []const u8,
+    /// Refuse publishes and pulls in other regions instead of routing them.
+    enforce_in_transit: bool = false,
+};
+
+/// Topic settings.
+pub const TopicConfig = struct {
+    /// At most 64. Keys: 1 to 63 characters, lowercase letters, digits,
+    /// `_`, `-` or international characters, starting with a letter or an
+    /// international character. Values: up to 63 of the same.
+    labels: []const Label = &.{},
+    /// Keep every message, acknowledged or not, for 10 minutes to 31 days,
+    /// so subscriptions can replay them. Null: none.
+    message_retention: ?std.Io.Duration = null,
+    /// `projects/{p}/locations/{l}/keyRings/{r}/cryptoKeys/{k}`: encrypt
+    /// messages with this Cloud KMS key. Null: Google's own keys.
+    kms_key_name: ?[]const u8 = null,
+    /// Null: the organization's policy.
+    message_storage_policy: ?MessageStoragePolicy = null,
+};
 
 pub const TopicInfo = struct {
     /// Full resource name: `projects/{project}/topics/{id}`.
     name: []const u8,
+    labels: []const Label = &.{},
+    message_retention: ?std.Io.Duration = null,
+    kms_key_name: ?[]const u8 = null,
+    message_storage_policy: ?MessageStoragePolicy = null,
+    state: State = .active,
+
+    /// An unrecognized value from the server is `.unknown`.
+    pub const State = enum { active, ingestion_resource_error, unknown };
+
+    /// The value of the label named `key`, or null.
+    pub fn label(self: TopicInfo, key: []const u8) ?[]const u8 {
+        return findLabel(self.labels, key);
+    }
+};
+
+/// What `Topic.update` changes. A field left at its default stays as it is.
+pub const TopicUpdate = struct {
+    /// Replaces every label; `&.{}` removes them all.
+    labels: ?[]const Label = null,
+    /// `.clear`: the topic keeps nothing itself.
+    message_retention: Change(std.Io.Duration) = .keep,
+    /// `.clear`: back to Google's own keys. Messages already stored keep
+    /// the key they were written with.
+    kms_key_name: Change([]const u8) = .keep,
+    /// `.clear`: back to the organization's policy.
+    message_storage_policy: Change(MessageStoragePolicy) = .keep,
 };
 
 pub const TopicPage = struct {
     topics: []const TopicInfo,
     /// Pass as `page_token` to get the next page. Null on the last page.
     next_page_token: ?[]const u8,
+};
+
+/// Where a message goes after too many deliveries.
+pub const DeadLetterPolicy = struct {
+    /// A topic id in this project, or `projects/{project}/topics/{id}` for
+    /// another project's. It must exist, and Pub/Sub's service agent must
+    /// be allowed to publish to it and to acknowledge on this subscription,
+    /// or nothing is forwarded (see the README).
+    topic: []const u8,
+    /// 5 to 100.
+    max_delivery_attempts: u8 = 5,
+};
+
+/// Pub/Sub's retry policy, named apart from `pubsub.RetryPolicy`, which is
+/// this client's own: how long Pub/Sub waits before delivering a message
+/// again after a release or a lapsed deadline.
+pub const Backoff = struct {
+    /// 0 to 600 seconds.
+    minimum: std.Io.Duration = .fromSeconds(10),
+    /// `minimum` to 600 seconds.
+    maximum: std.Io.Duration = .fromSeconds(600),
+};
+
+/// When a subscription nobody uses is deleted.
+pub const Expiration = union(enum) {
+    /// After 31 days, Pub/Sub's default.
+    default,
+    never,
+    /// At least a day, and at least the subscription's message retention.
+    after: std.Io.Duration,
 };
 
 pub const SubscriptionConfig = struct {
@@ -101,6 +195,21 @@ pub const SubscriptionConfig = struct {
     /// than taken, so a subscriber can tell which of its acks held. Pull
     /// subscriptions only.
     enable_exactly_once_delivery: bool = false,
+    /// Delivers only messages whose attributes match, such as
+    /// `attributes.kind = "order"`; the rest are acknowledged unseen. At
+    /// most 256 bytes; "" delivers everything. Fixed once created.
+    filter: []const u8 = "",
+    dead_letter_policy: ?DeadLetterPolicy = null,
+    /// Null delivers again as soon as possible.
+    retry_policy: ?Backoff = null,
+    /// How long unacknowledged messages are kept: 10 minutes to 31 days.
+    /// Null means Pub/Sub's default, 7 days.
+    message_retention: ?std.Io.Duration = null,
+    /// Keep acknowledged messages for the retention too, for replay.
+    retain_acked_messages: bool = false,
+    expiration: Expiration = .default,
+    /// As for `TopicConfig.labels`.
+    labels: []const Label = &.{},
 };
 
 pub const SubscriptionInfo = struct {
@@ -110,8 +219,56 @@ pub const SubscriptionInfo = struct {
     topic: []const u8,
     ack_deadline_seconds: u32,
     enable_message_ordering: bool,
-    enable_exactly_once_delivery: bool,
+    enable_exactly_once_delivery: bool = false,
+    /// "" when there is none.
+    filter: []const u8 = "",
+    /// Its topic is a full name.
+    dead_letter_policy: ?DeadLetterPolicy = null,
+    retry_policy: ?Backoff = null,
+    /// Null when the server says nothing, as the emulator may not.
+    message_retention: ?std.Io.Duration = null,
+    retain_acked_messages: bool = false,
+    expiration: Expiration = .default,
+    labels: []const Label = &.{},
+    /// Detached from its topic: pulls fail and nothing more is delivered.
+    detached: bool = false,
+    state: State = .active,
+    /// Set when the topic keeps messages itself.
+    topic_message_retention: ?std.Io.Duration = null,
+
+    /// An unrecognized value from the server is `.unknown`.
+    pub const State = enum { active, resource_error, unknown };
+
+    /// The value of the label named `key`, or null.
+    pub fn label(self: SubscriptionInfo, key: []const u8) ?[]const u8 {
+        return findLabel(self.labels, key);
+    }
 };
+
+/// What `Subscription.update` changes. A field left at its default stays as
+/// it is. The topic, the ordering and the filter cannot be changed.
+pub const SubscriptionUpdate = struct {
+    /// 10 to 600.
+    ack_deadline_seconds: ?u32 = null,
+    enable_exactly_once_delivery: ?bool = null,
+    /// `.clear`: no dead-lettering.
+    dead_letter_policy: Change(DeadLetterPolicy) = .keep,
+    /// `.clear`: deliver again as soon as possible.
+    retry_policy: Change(Backoff) = .keep,
+    /// `.clear`: back to 7 days.
+    message_retention: Change(std.Io.Duration) = .keep,
+    retain_acked_messages: ?bool = null,
+    expiration: ?Expiration = null,
+    /// Replaces every label; `&.{}` removes them all.
+    labels: ?[]const Label = null,
+};
+
+fn findLabel(labels: []const Label, key: []const u8) ?[]const u8 {
+    for (labels) |l| {
+        if (std.mem.eql(u8, l.key, key)) return l.value;
+    }
+    return null;
+}
 
 /// What became of one ack id sent to `acknowledge` or `modifyAckDeadline`.
 pub const AckResult = enum {

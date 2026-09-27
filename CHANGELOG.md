@@ -30,15 +30,33 @@ including the ones that did not change.
   now, and then fail with the first refusal's error.
   `SubscriptionConfig.enable_exactly_once_delivery` creates such a
   subscription, and `SubscriptionInfo.enable_exactly_once_delivery` reads
-  it back. Breaking: `SubscriptionConfig.ack_deadline_seconds` defaults
-  to 0, which lets Pub/Sub choose (10 s, or 60 s with exactly-once
-  delivery), where it sent 10; code that builds a `SubscriptionInfo`
-  itself must give `enable_exactly_once_delivery`; and a drain check that
-  compared `received` with `acked + nacked` must add `ack_failed` and
-  `receipt_refused`.
+  it back.
+- pubsub: subscriptions and topics take their settings, and can change
+  them. `SubscriptionConfig` gains `filter`, `dead_letter_policy`
+  (`pubsub.DeadLetterPolicy`), `retry_policy` (`pubsub.Backoff`),
+  `message_retention`, `retain_acked_messages`, `expiration`
+  (`pubsub.Expiration`) and `labels` (`pubsub.Label`); `TopicConfig`
+  gains `labels`, `message_retention`, `kms_key_name` and
+  `message_storage_policy` (`pubsub.MessageStoragePolicy`).
+  `SubscriptionInfo` and `TopicInfo` read every one back, with each
+  resource's `state`, and a subscription's `detached` and the topic's
+  retention. New `Subscription.update` and `Topic.update` change what a
+  `pubsub.SubscriptionUpdate` or `pubsub.TopicUpdate` names, through
+  `pubsub.Change(T)` for a setting that can be taken away, and nothing
+  else. Durations are `std.Io.Duration`. Every rule is checked before
+  sending, including the ones the emulator does not enforce.
+- pubsub, breaking: `SubscriptionConfig.ack_deadline_seconds` defaults to
+  0, which lets Pub/Sub choose (10 s, or 60 s with exactly-once
+  delivery), where it sent 10; and a drain check that compared
+  `received` with `acked + nacked` must add `ack_failed` and
+  `receipt_refused`. Every new field of `SubscriptionInfo`,
+  `TopicInfo`, `SubscriptionConfig` and `TopicConfig` has a default, so
+  code that builds them itself goes on compiling.
 - core: `errors.decodeErrorInfos` reads the `google.rpc.ErrorInfo`
   entries of an error body, and `rpc.Call.error_body_out` hands a failed
-  response's body back to the caller. Not breaking.
+  response's body back to the caller. New `core.duration` reads and
+  writes durations as Google's JSON APIs do (`600s`, `1.500s`). Not
+  breaking.
 - examples: `worker` counts refused acks when it checks for a drained
   subscription.
 - auth, secret_manager, storage: unchanged.

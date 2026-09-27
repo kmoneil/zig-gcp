@@ -65,6 +65,8 @@ pub const logging = @import("logging.zig");
 
 /// RFC 3339 timestamps, as Google's APIs send them.
 pub const timestamp = @import("timestamp.zig");
+/// Durations, as Google's JSON APIs write them: `600s`, `1.500s`.
+pub const duration = @import("duration.zig");
 
 /// Fakes and property-test helpers, for tests only.
 pub const testing = @import("testing.zig");
@@ -89,5 +91,6 @@ test {
     _ = @import("retry.zig");
     _ = @import("testing.zig");
     _ = @import("timestamp.zig");
+    _ = @import("duration.zig");
     _ = @import("transport.zig");
 }
