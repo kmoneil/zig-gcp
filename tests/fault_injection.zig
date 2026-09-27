@@ -38,6 +38,9 @@ const FaultProxy = struct {
     /// one fault that never forwards.
     forwarded: usize = 0,
     connections: usize = 0,
+    /// Keep every request as it arrived, head and body, in `recorded`.
+    record: bool = false,
+    recorded: std.ArrayList([]u8) = .empty,
 
     const Fault = union(enum) {
         /// Forward the request and the whole response.
@@ -79,7 +82,16 @@ const FaultProxy = struct {
     }
 
     fn deinit(p: *FaultProxy, io: std.Io) void {
+        for (p.recorded.items) |request| p.gpa.free(request);
+        p.recorded.deinit(p.gpa);
         p.server.deinit(io);
+    }
+
+    /// The body of recorded request `index`, after its head.
+    fn recordedBody(p: *const FaultProxy, index: usize) []const u8 {
+        const request = p.recorded.items[index];
+        const end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return "";
+        return request[end + 4 ..];
     }
 
     /// Serves until canceled, each connection on a task of its own, since
@@ -134,6 +146,7 @@ const FaultProxy = struct {
             const fault = f: {
                 p.mutex.lockUncancelable(io);
                 defer p.mutex.unlock(io);
+                if (p.record) try p.recorded.append(p.gpa, try p.gpa.dupe(u8, request.written()));
                 defer p.requests += 1;
                 break :f if (p.requests < p.plan.len) p.plan[p.requests] else .pass;
             };
@@ -638,6 +651,35 @@ test "publish: a swallowed response is retried, and the message is stored twice"
     defer sent.deinit();
     try testing.expectEqual(1, sent.value.message_ids.len);
     try testing.expectEqual(2, f.proxy.forwarded);
+
+    const got = try f.pullData(sub, 2, 30);
+    try testing.expectEqual(2, got.len);
+    for (got) |copy| try testing.expectEqualStrings(data, copy);
+}
+
+test "publish: a compressed publish answered 503 is resent byte for byte, and stored twice" {
+    var f: Fixture = undefined;
+    const unavailable = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 66\r\n\r\n{\"error\":{\"code\":503,\"message\":\"injected\",\"status\":\"UNAVAILABLE\"}}";
+    if (!try f.init(&.{ .{ .replace = unavailable }, .pass }, .{})) return error.SkipZigTest;
+    defer f.deinit();
+    f.proxy.record = true;
+    try f.startProxy();
+
+    const topic = try f.directTopic("gzip");
+    const sub = try f.directSubscription("gzip-sub", .{ .topic_id = topic.id });
+
+    // The server stored the first attempt, and the proxy answered for it
+    // with a 503 of its own: the retry sends the same compressed bytes.
+    const data = "a compressed publish, sent twice. " ** 20;
+    var sent = f.proxied.topic(topic.id).publish(&.{.{ .data = data }}, .{ .compression = .{} }) catch |err| return f.fail(err);
+    defer sent.deinit();
+    try testing.expectEqual(2, f.proxy.forwarded);
+    try testing.expectEqual(2, f.proxy.recorded.items.len);
+    for (f.proxy.recorded.items) |request| {
+        try testing.expect(std.ascii.indexOfIgnoreCase(request, "\r\ncontent-encoding: gzip\r\n") != null);
+    }
+    try testing.expectEqualSlices(u8, f.proxy.recordedBody(0), f.proxy.recordedBody(1));
+    try testing.expect(f.proxy.recordedBody(0).len < data.len);
 
     const got = try f.pullData(sub, 2, 30);
     try testing.expectEqual(2, got.len);

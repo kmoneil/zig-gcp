@@ -13,6 +13,7 @@ const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
+const types = @import("types.zig");
 const validate = @import("validate.zig");
 const Error = errors.Error;
 const isRetryable = core.isRetryable;
@@ -72,6 +73,26 @@ pub fn isPublishRetryable(err: anyerror, http_status: u16) bool {
         error.Aborted, error.ServerCancelled => true,
         error.Unknown => http_status >= 500 and http_status < 600,
         else => isRetryable(err),
+    };
+}
+
+/// The header a gzip-compressed request body goes with.
+pub const gzip_headers: []const core.transport.Header = &.{.{ .name = "Content-Encoding", .value = "gzip" }};
+
+/// `body` gzip-compressed as `compression` asks, for the caller to free with
+/// `gpa`, or null to send it as it is: no compression asked, a body under
+/// the threshold, or a compressed body that failed its check, which is
+/// logged. A failed check is a compressor bug, and compressing only saves
+/// bandwidth, so it never stops the publish.
+pub fn compressBody(gpa: Allocator, body: []const u8, compression: ?types.Compression) Allocator.Error!?[]u8 {
+    const c = compression orelse return null;
+    if (body.len < c.min_bytes) return null;
+    return core.gzip.compress(gpa, body, c.level) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.CheckFailed => {
+            logging.warn("a publish of {d} bytes did not decompress to itself after compressing; sending it uncompressed", .{body.len});
+            return null;
+        },
     };
 }
 

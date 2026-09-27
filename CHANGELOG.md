@@ -45,6 +45,19 @@ including the ones that did not change.
   `pubsub.Change(T)` for a setting that can be taken away, and nothing
   else. Durations are `std.Io.Duration`. Every rule is checked before
   sending, including the ones the emulator does not enforce.
+- pubsub: publishes can compress. `Publisher.Options.compression` and
+  `PublishOptions.compression` (`pubsub.Compression`) gzip a request body
+  of at least `min_bytes` (240) at `level` (1 to 9, 6 by default) and
+  send it with `Content-Encoding: gzip`, as Google's Java, Go, C++, .NET,
+  Ruby and PHP libraries can. Off by default. Pub/Sub bills messages
+  uncompressed, so this saves bandwidth and the publisher's egress, not
+  Pub/Sub's charges. A body is compressed once, so a retry sends the same
+  bytes, and decompressed again, to give back exactly the request; one
+  that does not goes uncompressed, with a warning in the log. Batch
+  sizes, the caps and the 10,485,760-byte check count the request before
+  compression, as Google's libraries do. A level outside 1 to 9 is
+  refused, with `error.InvalidArgument` from `publish` and
+  `error.InvalidOptions` from `Publisher.init`.
 - pubsub, breaking: `SubscriptionConfig.ack_deadline_seconds` defaults to
   0, which lets Pub/Sub choose (10 s, or 60 s with exactly-once
   delivery), where it sent 10; and a drain check that compared
@@ -55,8 +68,11 @@ including the ones that did not change.
 - core: `errors.decodeErrorInfos` reads the `google.rpc.ErrorInfo`
   entries of an error body, and `rpc.Call.error_body_out` hands a failed
   response's body back to the caller. New `core.duration` reads and
-  writes durations as Google's JSON APIs do (`600s`, `1.500s`). Not
-  breaking.
+  writes durations as Google's JSON APIs do (`600s`, `1.500s`). New
+  `core.gzip` gzip-compresses a body held in memory and checks the result
+  by decompressing it again, `rpc.Call.headers` adds request headers, and
+  `core.testing.RefuseOver` refuses only allocations over a size, for
+  tests of what code does when one large allocation fails. Not breaking.
 - examples: `worker` counts refused acks when it checks for a drained
   subscription.
 - auth, secret_manager, storage: unchanged.

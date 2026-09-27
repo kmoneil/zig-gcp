@@ -970,6 +970,73 @@ pub const WipeChecker = struct {
     }
 };
 
+/// An allocator that refuses any block over `limit` bytes and passes the
+/// rest to `child`. `std.testing.checkAllAllocationFailures` fails every
+/// allocation after the first one it fails, so a later allocation always
+/// reports `OutOfMemory`, and code that swallows the first failure passes
+/// the sweep. This fails only the large blocks, such as a compressor's
+/// state, and lets everything else through.
+pub const RefuseOver = struct {
+    child: Allocator,
+    limit: usize,
+    /// Allocations refused so far.
+    refused: usize = 0,
+
+    pub fn allocator(self: *RefuseOver) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn fromPtr(ptr: *anyopaque) *RefuseOver {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
+        const self = fromPtr(ptr);
+        if (len > self.limit) {
+            self.refused += 1;
+            return null;
+        }
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    // Growing past the limit is refused too; the caller then allocates,
+    // and that is counted.
+    fn resize(ptr: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+        const self = fromPtr(ptr);
+        if (new_len > self.limit) return false;
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ptr: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self = fromPtr(ptr);
+        if (new_len > self.limit) return null;
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ptr: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
+        fromPtr(ptr).child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "RefuseOver: refuses blocks over the limit, and only those" {
+    var refuse: RefuseOver = .{ .child = std.testing.allocator, .limit = 64 };
+    const a = refuse.allocator();
+    const small = try a.alloc(u8, 64);
+    defer a.free(small);
+    try std.testing.expectError(error.OutOfMemory, a.alloc(u8, 65));
+    // Growing past it is refused as well, and small blocks still come.
+    const block = try a.alloc(u8, 32);
+    defer a.free(block);
+    try std.testing.expect(!a.resize(block, 65));
+    try std.testing.expectEqual(null, a.remap(block, 65));
+    try std.testing.expectEqual(1, refuse.refused);
+}
+
 /// An `Io` whose clock, sleep and randomness are simulated. Every other
 /// operation fails, as in `std.Io.failing`, so a test cannot touch the network.
 pub const FakeClock = struct {

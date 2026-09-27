@@ -32,6 +32,7 @@ const Client = @import("Client.zig");
 const resumable = @import("resumable.zig");
 const types = @import("types.zig");
 const Error = @import("errors.zig").Error;
+const levelOptions = core.gzip.levelOptions;
 
 /// Where the data comes from.
 pub const Input = union(enum) {
@@ -524,21 +525,6 @@ pub const Stream = struct {
         }
     };
 };
-
-fn levelOptions(level: u4) flate.Compress.Options {
-    return switch (level) {
-        1 => .level_1,
-        2 => .level_2,
-        3 => .level_3,
-        4 => .level_4,
-        5 => .level_5,
-        6 => .level_6,
-        7 => .level_7,
-        8 => .level_8,
-        9 => .level_9,
-        else => unreachable,
-    };
-}
 
 /// Uploads the stream through the resumable protocol, one chunk buffer of
 /// memory, with the compressed bytes' checksum on the finishing request.

@@ -72,7 +72,8 @@ pub fn delete(self: Topic) Error!void {
 }
 
 /// Publishes `messages` in one HTTP request. The returned ids match the order
-/// of `messages`. Limits are checked first (`error.InvalidMessage`).
+/// of `messages`. Limits are checked first (`error.InvalidMessage`), on the
+/// request as it is before any compression.
 /// A retried publish can store messages twice; see `Client.Options.retry_publish`.
 pub fn publish(
     self: Topic,
@@ -83,18 +84,24 @@ pub fn publish(
     rpc.begin(c);
     try rpc.checkId(c, "topic", self.id);
     try validate.publish(messages, options.ordering_key, c.diagnostics);
+    if (options.compression) |compression| try validate.compression(compression, c.diagnostics);
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
     const path = try url.resourcePath(a, c.project_id, .topics, self.id, ":publish");
     const body = try codec.encodePublish(a, messages, options.ordering_key);
+    // Compressed once: a retry sends the same bytes. Apart from the arena,
+    // so the compressor's memory is back before the request goes.
+    const compressed = try rpc.compressBody(c.gpa, body, options.compression);
+    defer if (compressed) |bytes| c.gpa.free(bytes);
 
     var result: Owned(types.PublishResult) = try .init(c.gpa);
     errdefer result.deinit();
     const response = try rpc.execute(c, result.arena, .{
         .method = .POST,
         .path = path,
-        .body = body,
+        .body = compressed orelse body,
+        .headers = if (compressed != null) rpc.gzip_headers else &.{},
         .retry = c.retry_publish,
         .retryable = rpc.isPublishRetryable,
     });
@@ -333,4 +340,166 @@ test "golden: create a topic with settings, and update it" {
     try testing.expectError(error.InvalidArgument, orders.update(.{}));
     try testing.expectError(error.InvalidArgument, orders.create(.{ .kms_key_name = "not a key" }));
     try h.expectRequestCount(2);
+}
+
+const core = @import("core");
+const logging = @import("logging.zig");
+const FakeReply = test_util.FakeTransport.Reply;
+
+/// The body a publish of `messages` sends before any compression.
+fn plainBody(messages: []const types.Message) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    return testing.allocator.dupe(u8, try codec.encodePublish(arena.allocator(), messages, null));
+}
+
+/// A gzip body decompressed, as Pub/Sub decompresses one.
+fn gunzip(body: []const u8) ![]u8 {
+    var in: std.Io.Reader = .fixed(body);
+    var window: [core.flate.max_window_len]u8 = undefined;
+    var inflate: core.flate.Decompress = .init(&in, .gzip, &window);
+    return inflate.reader.allocRemaining(testing.allocator, .unlimited);
+}
+
+test "publish: compression gzips a body of min_bytes or more, marked Content-Encoding: gzip" {
+    var h: Harness = undefined;
+    try h.init(&(.{FakeReply{ .respond = .{ .body = "{\"messageIds\":[\"1\",\"2\",\"3\",\"4\",\"5\"]}" } }} ** 5), .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+    const messages: []const types.Message = &.{
+        .{ .data = "{\"order\":1001,\"customer\":\"c-0042\",\"items\":3,\"status\":\"paid\"}" },
+        .{ .data = "{\"order\":1002,\"customer\":\"c-0977\",\"items\":1,\"status\":\"shipped\"}" },
+        .{ .data = "{\"order\":1003,\"customer\":\"c-0042\",\"items\":12,\"status\":\"refunded\"}" },
+        .{ .data = "{\"order\":1004,\"customer\":\"c-0513\",\"items\":2,\"status\":\"paid\"}" },
+        .{ .data = "{\"order\":1005,\"customer\":\"c-0977\",\"items\":7,\"status\":\"pending\"}" },
+    };
+    const plain = try plainBody(messages);
+    defer testing.allocator.free(plain);
+    const len: u32 = @intCast(plain.len);
+    try testing.expect(len >= 240);
+    // Levels 1 and 6 make different bytes of it, so the golden shows which
+    // level was used.
+    const fast = try core.gzip.compress(testing.allocator, plain, 1);
+    defer testing.allocator.free(fast);
+    const default = try core.gzip.compress(testing.allocator, plain, 6);
+    defer testing.allocator.free(default);
+    try testing.expect(!std.mem.eql(u8, fast, default));
+
+    // The defaults (level 6, from 240 bytes), a body of exactly
+    // min_bytes, and another level.
+    for ([_]types.Compression{ .{}, .{ .min_bytes = len }, .{ .level = 1, .min_bytes = len } }, 0..) |compression, i| {
+        var sent = try orders.publish(messages, .{ .compression = compression });
+        sent.deinit();
+        const r = try h.fake.request(i);
+        try testing.expectEqualStrings("gzip", r.header("content-encoding").?);
+        const made = try core.gzip.compress(testing.allocator, plain, compression.level);
+        defer testing.allocator.free(made);
+        try testing.expectEqualSlices(u8, made, r.body.?);
+        const back = try gunzip(r.body.?);
+        defer testing.allocator.free(back);
+        try testing.expectEqualStrings(plain, back);
+    }
+    // A byte short of min_bytes, and no compression at all: as it is.
+    for ([_]?types.Compression{ .{ .min_bytes = len + 1 }, null }, 3..) |compression, i| {
+        var sent = try orders.publish(messages, .{ .compression = compression });
+        sent.deinit();
+        const r = try h.fake.request(i);
+        try testing.expectEqual(null, r.header("content-encoding"));
+        try testing.expectEqualStrings(plain, r.body.?);
+    }
+    try h.expectRequestCount(5);
+}
+
+test "publish: a compression level outside 1 to 9 fails before any request" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+    // Even for a body too short to be compressed.
+    for ([_]u4{ 0, 10, 15 }) |level| {
+        try testing.expectError(error.InvalidArgument, orders.publish(&.{.{ .data = "x" }}, .{ .compression = .{ .level = level } }));
+    }
+    try testing.expectEqualStrings("compression level 15 is outside 1 to 9", h.diag.message());
+    try h.expectRequestCount(0);
+}
+
+test "publish: a compressed body that fails its check goes uncompressed, with a warning" {
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } }}, .{});
+    defer h.deinit();
+    const messages: []const types.Message = &.{.{ .data = "x" ** 300 }};
+    const plain = try plainBody(messages);
+    defer testing.allocator.free(plain);
+    core.gzip.test_corrupt_trailer = true;
+    defer core.gzip.test_corrupt_trailer = false;
+    logging.capture.reset();
+    var sent = try h.client.topic("orders").publish(messages, .{ .compression = .{} });
+    sent.deinit();
+    const r = try h.fake.request(0);
+    try testing.expectEqual(null, r.header("content-encoding"));
+    try testing.expectEqualStrings(plain, r.body.?);
+    try testing.expect(std.mem.indexOf(u8, logging.capture.text(), "did not decompress to itself") != null);
+}
+
+test "publish: running out of memory while compressing fails the publish, rather than sending it uncompressed" {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{.{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } }});
+    defer fake.deinit();
+    var clock: test_util.FakeClock = .{};
+    // The compressor's state is over 200 KiB; nothing else here comes near.
+    var refuse: core.testing.RefuseOver = .{ .child = testing.allocator, .limit = 128 * 1024 };
+    var client = try Client.init(refuse.allocator(), clock.io(), .{
+        .project_id = "p",
+        .endpoint = .{ .url = "localhost:8085", .emulator = true },
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const orders = client.topic("orders");
+    try testing.expectError(error.OutOfMemory, orders.publish(&.{.{ .data = "compress me " ** 40 }}, .{ .compression = .{} }));
+    try testing.expect(refuse.refused > 0);
+    try testing.expectEqual(0, fake.requests.items.len);
+    // Uncompressed, the same publish needs no such block.
+    var sent = try orders.publish(&.{.{ .data = "compress me " ** 40 }}, .{});
+    sent.deinit();
+}
+
+test "publish: a compressed publish is retried with the same bytes and the same header" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .body = "{\"error\":{\"status\":\"UNAVAILABLE\"}}" } },
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } },
+    }, .{});
+    defer h.deinit();
+    var sent = try h.client.topic("orders").publish(&.{.{ .data = "retried " ** 50 }}, .{ .compression = .{} });
+    sent.deinit();
+    try h.expectRequestCount(3);
+    const first = try h.fake.request(0);
+    for (1..3) |i| {
+        const again = try h.fake.request(i);
+        try testing.expectEqualStrings("gzip", again.header("content-encoding").?);
+        try testing.expectEqualSlices(u8, first.body.?, again.body.?);
+    }
+}
+
+test "publish: every allocation failure with compression is OutOfMemory without leaks" {
+    const Run = struct {
+        fn publish(gpa: std.mem.Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                .{ .respond = .{ .status = 503, .body = "{\"error\":{\"status\":\"UNAVAILABLE\"}}" } },
+                .{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } },
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "p",
+                .endpoint = .{ .url = "localhost:8085", .emulator = true },
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+            var sent = try client.topic("orders").publish(&.{.{ .data = "compress me " ** 40 }}, .{ .compression = .{} });
+            sent.deinit();
+            try testing.expectEqualStrings("gzip", (try fake.request(1)).header("content-encoding").?);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.publish, .{});
 }

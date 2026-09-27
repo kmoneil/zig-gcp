@@ -88,6 +88,7 @@ retry: RetryPolicy,
 retry_publish: bool,
 /// The clients' own limit on one request; 0 means none.
 request_timeout_ms: u32,
+compression: ?types.Compression,
 /// Where `init` and `run` report their failures. Borrowed.
 caller_diag: ?*Diagnostics,
 
@@ -154,6 +155,11 @@ pub const Options = struct {
     /// included. Transient failures are retried until then; a batch still
     /// unsent then fails with `error.TimedOut`.
     publish_timeout_ms: u32 = 60_000,
+    /// gzip for every request body of at least `min_bytes`, compressed once
+    /// per batch, so a retry sends the same bytes. Batch sizes and the
+    /// caps above count the bytes before compression, as Google's clients
+    /// count them. Null sends every body as it is.
+    compression: ?types.Compression = null,
 };
 
 pub const WhenFull = enum {
@@ -385,6 +391,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Publisher {
         .retry = options.client.retry,
         .retry_publish = options.client.retry_publish,
         .request_timeout_ms = options.client.request_timeout_ms,
+        .compression = options.compression,
         .caller_diag = diag,
         .mutex = .init,
         .cond = .init,
@@ -422,6 +429,7 @@ fn optionsProblem(options: Options) ?[]const u8 {
     if (options.max_outstanding_bytes < options.max_batch_bytes) {
         return "max_outstanding_bytes must hold at least one full batch, max_batch_bytes";
     }
+    if (options.compression) |c| if (c.level < 1 or c.level > 9) return "compression.level must be 1 to 9";
     return null;
 }
 
@@ -985,6 +993,9 @@ fn sendBatch(self: *Publisher, client: *Client, diag: *Diagnostics, batch: *Batc
     const io = self.io;
     // Room for the tail was kept with every message added.
     batch.body.appendSliceAssumeCapacity(codec.publish_body_tail);
+    // Compressed once: every attempt sends the same bytes.
+    const compressed = try rpc.compressBody(self.gpa, batch.body.items, self.compression);
+    defer if (compressed) |bytes| self.gpa.free(bytes);
     var result: types.Owned(types.PublishResult) = try .init(self.gpa);
     errdefer result.deinit();
 
@@ -1002,7 +1013,8 @@ fn sendBatch(self: *Publisher, client: *Client, diag: *Diagnostics, batch: *Batc
         const sent = rpc.execute(client, result.arena, .{
             .method = .POST,
             .path = self.path,
-            .body = batch.body.items,
+            .body = compressed orelse batch.body.items,
+            .headers = if (compressed != null) rpc.gzip_headers else &.{},
             // This loop retries, by time; each call makes one attempt.
             .retry = false,
         });
@@ -1112,6 +1124,10 @@ const FakeTopic = struct {
         timeout_ms: u32,
         /// When it arrived, on the fake's clock.
         at_ns: i96,
+        /// It came gzip-compressed, `Content-Encoding: gzip`.
+        gzipped: bool = false,
+        /// The CRC-32C of the body as it was sent, compressed or not.
+        sent_crc: u32 = 0,
     };
 
     const Answer = union(enum) {
@@ -1208,7 +1224,12 @@ const FakeTopic = struct {
     fn send(ptr: *anyopaque, req: Request, arena: Allocator) TransportError!Response {
         const f: *FakeTopic = @ptrCast(@alignCast(ptr));
         const io = f.io;
-        const body = req.body orelse return error.HttpProtocolError;
+        const sent = req.body orelse return error.HttpProtocolError;
+        var gzipped = false;
+        for (req.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "content-encoding") and std.mem.eql(u8, h.value, "gzip")) gzipped = true;
+        }
+        const body = if (gzipped) try gunzip(arena, sent) else sent;
         // The arena is the publisher's, so it can run out of memory under an
         // allocation-failure sweep, and that must read as what it is.
         const wire = std.json.parseFromSliceLeaky(Wire, arena, body, .{ .ignore_unknown_fields = true }) catch |err|
@@ -1221,6 +1242,8 @@ const FakeTopic = struct {
             f.mutex.lockUncancelable(io);
             defer f.mutex.unlock(io);
             try f.record(wire, body.len, req.timeout_ms);
+            f.requests.items[f.requests.items.len - 1].gzipped = gzipped;
+            f.requests.items[f.requests.items.len - 1].sent_crc = core.crc32c.hash(sent);
             const seen = f.requests.items[f.requests.items.len - 1];
             try f.countKey(seen.key, 1);
             f.in_flight += 1;
@@ -1275,6 +1298,19 @@ const FakeTopic = struct {
             w.writeAll("]}") catch return error.OutOfMemory;
         }
         return .{ .status = 200, .body = out.written() };
+    }
+
+    /// A gzip body decompressed, as Pub/Sub decompresses one.
+    fn gunzip(arena: Allocator, body: []const u8) TransportError![]u8 {
+        var in: std.Io.Reader = .fixed(body);
+        const window = try arena.alloc(u8, core.flate.max_window_len);
+        var inflate: core.flate.Decompress = .init(&in, .gzip, window);
+        var out: std.Io.Writer.Allocating = .init(arena);
+        _ = inflate.reader.streamRemaining(&out.writer) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            error.ReadFailed => error.HttpProtocolError,
+        };
+        return out.written();
     }
 
     fn errorResponse(arena: Allocator, code: u16, status: []const u8) TransportError!Response {
@@ -1342,6 +1378,7 @@ const TestOptions = struct {
     retry: RetryPolicy = .{ .initial_backoff_ms = 100, .max_backoff_ms = 1_000 },
     retry_publish: bool = true,
     request_timeout_ms: u32 = 180_000,
+    compression: ?types.Compression = null,
 };
 
 fn testOptions(transport: Transport, o: TestOptions) Options {
@@ -1364,6 +1401,7 @@ fn testOptions(transport: Transport, o: TestOptions) Options {
         .max_outstanding_bytes = o.max_outstanding_bytes,
         .when_full = o.when_full,
         .enable_message_ordering = o.enable_message_ordering,
+        .compression = o.compression,
     };
 }
 
@@ -1832,6 +1870,11 @@ test "init refuses what cannot work, and says why" {
     o = base;
     o.max_outstanding_bytes = o.max_batch_bytes - 1;
     try expectRefused(o, error.InvalidOptions, "max_outstanding_bytes must hold");
+    for ([_]u4{ 0, 10 }) |level| {
+        o = base;
+        o.compression = .{ .level = level };
+        try expectRefused(o, error.InvalidOptions, "compression.level must be 1 to 9");
+    }
 }
 
 test "flow control: .fail refuses at the message cap, says why, and lets in again once a batch resolves" {
@@ -1888,6 +1931,62 @@ test "flow control: a message bigger than the byte cap gets in when nothing else
     defer small.release();
 }
 
+test "compression: off unless asked for" {
+    const options: Options = .{ .topic_id = "orders", .client = .{ .project_id = "p" } };
+    try testing.expectEqual(null, options.compression);
+}
+
+test "compression: a batch of min_bytes or more goes gzip, and every retry sends the same bytes" {
+    var s: Solo = undefined;
+    try s.init(.{ .max_batch_messages = 4, .compression = .{} });
+    defer s.deinit();
+    s.fake.script = &.{ .{ .status = .{ 503, "UNAVAILABLE" } }, .{ .fail = error.ConnectionResetByPeer }, .ok };
+    var receipts: [4]Receipt = undefined;
+    for (&receipts, 0..) |*r, i| {
+        var buf: [64]u8 = undefined;
+        r.* = try s.publishText(try std.fmt.bufPrint(&buf, "message {d} of a batch big enough to compress", .{i}));
+    }
+    defer for (receipts) |r| r.release();
+    try s.publisher.sendDue();
+    for (receipts) |r| _ = try idOf(r);
+    // Alone, a short message goes as it is.
+    const short = try s.publishText("short");
+    defer short.release();
+    s.advance(10);
+    try s.publisher.sendDue();
+    _ = try idOf(short);
+
+    s.fake.mutex.lockUncancelable(s.fake.io);
+    defer s.fake.mutex.unlock(s.fake.io);
+    const seen = s.fake.requests.items;
+    try testing.expectEqual(4, seen.len);
+    for (seen[0..3]) |attempt| {
+        try testing.expect(attempt.gzipped);
+        try testing.expectEqual(seen[0].sent_crc, attempt.sent_crc);
+        try testing.expectEqual(4, attempt.data.len);
+    }
+    try testing.expect(!seen[3].gzipped);
+    try testing.expectEqualStrings("short", seen[3].data[0]);
+}
+
+test "compression: running out of memory while compressing fails the batch, which is sent neither way" {
+    var clock: test_util.FakeClock = .{};
+    var fake: FakeTopic = .{ .gpa = testing.allocator, .io = clock.io() };
+    defer fake.deinit();
+    // The compressor's state is over 200 KiB; nothing else here comes near.
+    var refuse: core.testing.RefuseOver = .{ .child = testing.allocator, .limit = 128 * 1024 };
+    var publisher: Publisher = try .init(refuse.allocator(), clock.io(), testOptions(fake.transport(), .{ .compression = .{} }));
+    defer publisher.deinit();
+    const receipt = try publisher.publish(.{ .data = "a message big enough to compress " ** 10 }, .{});
+    defer receipt.release();
+    publisher.stop();
+    try publisher.sendDue();
+    try testing.expectError(error.OutOfMemory, idOf(receipt));
+    try testing.expect(refuse.refused > 0);
+    try testing.expectEqual(0, fake.requestCount());
+    try testing.expectEqual(1, publisher.stats().failed);
+}
+
 test "init and deinit: every allocation failure is OutOfMemory without leaks" {
     const Run = struct {
         fn initDeinit(gpa: Allocator) !void {
@@ -1902,14 +2001,17 @@ test "init and deinit: every allocation failure is OutOfMemory without leaks" {
 
 test "publish, send and resolve: every allocation failure is OutOfMemory without leaks" {
     const Run = struct {
-        fn wholePath(gpa: Allocator) !void {
+        fn wholePath(gpa: Allocator, compression: ?types.Compression) !void {
             var clock: test_util.FakeClock = .{};
             // The fake server allocates from the backing allocator: only the
             // publisher's allocations fail.
             var fake: FakeTopic = .{ .gpa = testing.allocator, .io = clock.io() };
             defer fake.deinit();
             fake.script = &.{ .{ .status = .{ 503, "UNAVAILABLE" } }, .ok, .ok };
-            var publisher: Publisher = try .init(gpa, clock.io(), testOptions(fake.transport(), .{ .max_batch_messages = 2 }));
+            var publisher: Publisher = try .init(gpa, clock.io(), testOptions(fake.transport(), .{
+                .max_batch_messages = 2,
+                .compression = compression,
+            }));
             defer publisher.deinit();
             var receipts: [3]?Receipt = @splat(null);
             defer for (receipts) |r| if (r) |receipt| receipt.release();
@@ -1925,9 +2027,12 @@ test "publish, send and resolve: every allocation failure is OutOfMemory without
             // A batch the publisher could not send for want of memory fails
             // with OutOfMemory, and that is what this reports.
             for (receipts) |r| _ = try r.?.wait();
+            for (fake.requests.items) |seen| try testing.expectEqual(compression != null, seen.gzipped);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.wholePath, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, Run.wholePath, .{null});
+    // Every body compressed, however short.
+    try testing.checkAllAllocationFailures(testing.allocator, Run.wholePath, .{@as(?types.Compression, .{ .min_bytes = 0 })});
 }
 
 test "keys: a key needs enable_message_ordering, an empty key is none, and a bad key is refused" {
@@ -2659,8 +2764,9 @@ const script_keys = [_][]const u8{ "", "a", "b", "c" };
 /// and a stop, run on one task against a fake clock, and checked against
 /// what the publisher promises: every receipt resolves; the counts balance;
 /// no request mixes keys or breaks a threshold; the caps hold at every
-/// step; each key's stored messages are in publish order; and after a
-/// key's message fails, none published after it is stored until a resume.
+/// step; each key's stored messages are in publish order; after a key's
+/// message fails, none published after it is stored until a resume; and a
+/// compressing publisher sends every attempt compressed.
 fn scriptProperty(_: void, input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
     var answers: [12]FakeTopic.Answer = undefined;
@@ -2687,6 +2793,13 @@ fn scriptProperty(_: void, input: []const u8) !void {
         .enable_message_ordering = true,
         .retry_publish = g.intRange(u8, 0, 3) != 0,
         .retry = .{ .initial_backoff_ms = 10, .max_backoff_ms = 100 },
+        // A quarter of the scripts compress every body, at any level. Read
+        // from the last byte rather than drawn, so the corpus below keeps
+        // its meaning.
+        .compression = if (input.len > 0 and input[input.len - 1] % 4 == 0)
+            .{ .level = @intCast(1 + input[input.len - 1] % 9), .min_bytes = 0 }
+        else
+            null,
     };
 
     var s: Solo = undefined;
@@ -2758,9 +2871,12 @@ fn scriptProperty(_: void, input: []const u8) !void {
     try testing.expectEqual(0, final.outstanding);
     try testing.expectEqual(0, final.outstanding_bytes);
     try testing.expect(!s.fake.anyMixed());
+    // The fake measures bodies decompressed, so the threshold holds
+    // before compression.
     for (s.fake.requests.items) |seen| {
         try testing.expect(seen.data.len <= batch_messages);
         if (seen.data.len > 1) try testing.expect(seen.bytes <= batch_bytes);
+        try testing.expectEqual(options.compression != null, seen.gzipped);
     }
     // Only paused keys keep a record.
     var records = p.keys.valueIterator();
