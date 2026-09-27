@@ -247,17 +247,16 @@ jobs:
       matrix:
         # `--fuzz=N` runs every matching property N times, so a job takes N
         # times the sum of its properties' costs per run. Each count aims at
-        # about 90 of the job's 180 minutes. The 2026-09-27 nightly cost per
-        # run: core 4.2 ms, auth 7.2 ms, slow-auth 31 ms, pubsub 3.2 ms,
-        # slow-pubsub 1.6 ms, the Subscriber property 30 ms,
-        # secret_manager 1.4 ms, slow-storage 1.4 ms; storage ran out of
-        # time at 5M. Measured on a Mac the same day under the fuzz runner:
-        # storage 2.6 ms (21 properties from 0.005 to 0.3 ms each; the gzip
-        # download property, 0.8 ms more, moved to heavy-storage), and
-        # heavy-storage 25 ms. A job runs from as fast as the Mac to 1.5
-        # times slower, and from night to night by up to twice, so the
-        # timeout is the margin. Take a count from a nightly rather than
-        # from a local run when there is one.
+        # about 90 of the job's 180 minutes, from what each job cost per run
+        # on CI on 2026-09-27, measured as the difference between two manual
+        # runs of 2K and 20K (runs 36323099676 and 36323660737), which
+        # cancels the build: core 2.9 ms, auth 8.0 ms, slow-auth 26 ms,
+        # pubsub 3.3 ms, slow-pubsub 2.2 ms, the Subscriber property 32 ms,
+        # secret_manager 2.3 ms, storage 4.6 ms, slow-storage 1.4 ms and
+        # heavy-storage 73 ms. A Mac measured storage at 2.6 ms and
+        # heavy-storage at 25 ms: take counts from CI, not from a local run.
+        # A job's cost also moves from night to night, by up to twice, so
+        # the timeout is the margin.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 1250K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
@@ -266,9 +265,9 @@ jobs:
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1M }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 105K }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
-          - { job: storage, module: storage, filter: fuzz, iterations: 1500K }
+          - { job: storage, module: storage, filter: fuzz, iterations: 1200K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 3800K }
-          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 150K }
+          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 75K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
