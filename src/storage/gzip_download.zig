@@ -942,7 +942,10 @@ fn anyStoredBytes(_: void, input: []const u8) !void {
     } else |err| try testing.expectEqual(error.DecompressionFailed, err);
 }
 
-test "fuzz gzip: any stored bytes decompress or fail with DecompressionFailed" {
+// A client and a fake server every run, about 0.8 ms: named out of the
+// storage job's "fuzz" filter, whose millions of runs it made overrun
+// (2026-09-27), into the heavy-storage job.
+test "heavy property gzip download: any stored bytes decompress or fail with DecompressionFailed" {
     try test_util.fuzzBytes({}, anyStoredBytes, .{
         .corpus = &.{
             "",

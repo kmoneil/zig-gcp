@@ -90,7 +90,12 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   fuzzes it. A property that costs more than a few milliseconds a run,
   such as one that signs with RSA every time, is named `slow property
   <what>: …` instead, so the module's job skips it, and it gets a job of
-  its own in `.github/workflows/ci.yml`, filtered by its name. `--fuzz=N`
+  its own in `.github/workflows/ci.yml`, filtered by its name. One that
+  builds a client and a fake server every run, a millisecond or more, is a
+  `heavy property <what>: …`, and storage's run in a job of their own. A
+  `fault property` drives whole transfers through injected faults, costs
+  more still, and is not fuzzed nightly; every test run still runs it,
+  under that run's seed. `--fuzz=N`
   runs every matching property N times, so size a job from its
   properties' costs: time two runs of different N with the same filter,
   so the build is cached, and aim at about half the job's 180 minutes.
