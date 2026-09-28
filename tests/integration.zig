@@ -3,7 +3,10 @@
 //! - Emulator: set PUBSUB_EMULATOR_HOST (and optionally PUBSUB_PROJECT_ID,
 //!   default "test").
 //! - Production: set PUBSUB_TEST_PROJECT and PUBSUB_TEST_TOKEN, for example
-//!   `PUBSUB_TEST_TOKEN=$(gcloud auth print-access-token)`.
+//!   `PUBSUB_TEST_TOKEN=$(gcloud auth print-access-token)`. With
+//!   PUBSUB_TEST_PROJECT_NUMBER too, the dead-letter test grants Pub/Sub's
+//!   service agent what it needs on that test's own topic and subscription;
+//!   without it, that test skips in production.
 //!
 //! With neither set, every test skips. Each test creates uniquely named
 //! resources (prefix `zigps-`) and deletes them, even when it fails.
@@ -113,6 +116,29 @@ const Fixture = struct {
     /// receiving, a redelivery happens. Production needs longer.
     fn patience(f: *const Fixture) i64 {
         return if (f.production) 90 else 30;
+    }
+
+    /// Grants Pub/Sub's service agent `role` on one of this test's own
+    /// topics or subscriptions, whose policy starts empty, by replacing that
+    /// policy. The grant goes when the test deletes the resource. The
+    /// client has no IAM calls, so this goes through its transport.
+    fn grantServiceAgent(f: *Fixture, project_number: []const u8, kind: []const u8, id_: []const u8, role: []const u8) !void {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const url = try std.fmt.allocPrint(a, "{s}/v1/projects/{s}/{s}/{s}:setIamPolicy", .{ f.client.base_url, f.client.project_id, kind, id_ });
+        const body = try std.fmt.allocPrint(
+            a,
+            "{{\"policy\":{{\"bindings\":[{{\"role\":\"{s}\",\"members\":[\"serviceAccount:service-{s}@gcp-sa-pubsub.iam.gserviceaccount.com\"]}}]}}}}",
+            .{ role, project_number },
+        );
+        var http: pubsub.transport.HttpTransport = .init(testing.allocator, testing.io, "zig-pubsub-integration/0.1");
+        defer http.deinit();
+        const res = try http.transport().send(.{ .method = .POST, .url = url, .bearer = f.token.token, .body = body, .timeout_ms = 30_000 }, a);
+        if (res.status != 200) {
+            std.debug.print("setIamPolicy on {s}/{s}: HTTP {d}: {s}\n", .{ kind, id_, res.status, res.body });
+            return error.TestGrantRefused;
+        }
     }
 };
 
@@ -1032,8 +1058,10 @@ test "dead-lettering: after the last attempt, a message moves on, marked with wh
     if (!try f.init()) return error.SkipZigTest;
     defer f.deinit();
     // Production forwards only once Pub/Sub's service agent may publish to
-    // the dead-letter topic and acknowledge here, which takes IAM grants.
-    if (f.production) return error.SkipZigTest;
+    // the dead-letter topic and acknowledge here, and the agent is named by
+    // the project's number.
+    const project_number: ?[]const u8 = if (f.production) f.env.get("PUBSUB_TEST_PROJECT_NUMBER") orelse
+        return error.SkipZigTest else null;
     const topic = try f.createTopic("dlq");
     const dead = try f.createTopic("dlq-dead");
     const dead_sub = try f.createSubscription("dlq-dead-sub", .{ .topic_id = dead.id });
@@ -1041,6 +1069,10 @@ test "dead-lettering: after the last attempt, a message moves on, marked with wh
         .topic_id = topic.id,
         .dead_letter_policy = .{ .topic = dead.id, .max_delivery_attempts = 5 },
     });
+    if (project_number) |number| {
+        try f.grantServiceAgent(number, "topics", dead.id, "roles/pubsub.publisher");
+        try f.grantServiceAgent(number, "subscriptions", sub.id, "roles/pubsub.subscriber");
+    }
     _ = try publishOne(&f, topic, .{ .data = "doomed" }, .{});
 
     // Released after each of its five deliveries, it then goes.
@@ -1050,8 +1082,8 @@ test "dead-lettering: after the last attempt, a message moves on, marked with wh
         try pullUntil(&f, sub, 1, f.patience(), &batch, false);
         sub.nack(&.{batch.messages.items[0].ack_id}) catch |err| return f.fail(err);
     }
-    // The emulator forwards when the source is pulled next; nothing more
-    // is delivered there.
+    // The emulator forwards when the source is pulled next, production on
+    // its own within seconds; either way nothing more is delivered there.
     try expectNoMessages(&f, sub);
     var forwarded = Collector.init();
     defer forwarded.deinit();
