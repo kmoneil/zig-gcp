@@ -1446,18 +1446,28 @@ test "publisher: after its topic is deleted, receipts fail with NotFound and the
     defer before.release();
     _ = try waitReceipt(before, 30);
     topic.delete() catch |err| return f.fail(err);
+    const deleted = nowMs();
 
-    // The deletion can take a moment to reach publishing.
-    const deadline = nowMs() + f.patience() * 1000;
+    // The deletion can take a while to reach publishing. The emulator
+    // refuses the next publish; production took 0.7 to 14 s in nine runs
+    // on 2026-09-28, and once over 90 s.
+    const patience_s: i64 = if (f.production) 300 else f.patience();
+    const deadline = deleted + patience_s * 1000;
     var failures: usize = 0;
+    var taken: usize = 0;
     while (failures < 2) {
-        if (nowMs() > deadline) return error.TestTimedOut;
+        if (nowMs() > deadline) {
+            std.debug.print("publishes still taken {d} ms after the topic was deleted ({d} taken)\n", .{ nowMs() - deleted, taken });
+            return error.TestTimedOut;
+        }
         const after = try live.publisher.publish(.{ .data = "after" }, .{});
         defer after.release();
         if (waitReceipt(after, 30)) |_| {
+            taken += 1;
             try testing.io.sleep(.fromMilliseconds(500), .awake);
         } else |err| {
             try testing.expectEqual(error.NotFound, err);
+            if (failures == 0) std.debug.print("publishing failed {d} ms after the topic was deleted, {d} taken before\n", .{ nowMs() - deleted, taken });
             failures += 1;
         }
     }

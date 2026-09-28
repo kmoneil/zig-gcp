@@ -256,25 +256,24 @@ jobs:
         # heavy-storage 73 ms. A Mac measured storage at 2.6 ms and
         # heavy-storage at 25 ms: take counts from CI, not from a local run.
         # A job's cost also moves from night to night, by up to twice, so
-        # the timeout is the margin. Two counts are not measured yet: the
-        # Subscriber property's exactly-once half waits out real leases, and
-        # made a local run about 1.5 times as long, so slow-subscriber drops
-        # from 105K to 75K; and heavy-pubsub, pubsub's per-id ack answers,
-        # builds a client and a fake server each run, about 2 ms locally.
-        # Re-size both from the first nightly that runs them. core's two
-        # gzip properties, added since, cost 1.8 ms a run locally against
-        # 3.4 ms for the rest of core, so core drops from 1250K to 1000K
-        # until a nightly measures it too. The Publisher property now
-        # compresses a quarter of its scripts, about 30% more a run
-        # locally, which slow-pubsub's 1M still fits.
+        # the timeout is the margin. Four jobs changed since, and the
+        # nightly of 2026-09-28 (run 36405111801) timed each one's fuzzing
+        # step, its build included. core, with two gzip properties, took
+        # 100 minutes at 1000K, about 5.8 ms a run, so it drops to 900K.
+        # The Subscriber property's exactly-once half waits out real
+        # leases: slow-subscriber took 90 minutes at 75K, on target. The
+        # Publisher property compresses a quarter of its scripts:
+        # slow-pubsub took 75 minutes at 1M. heavy-pubsub, pubsub's per-id
+        # ack answers, took 3 minutes at 250K, so it rises to 5M until a
+        # nightly times that.
         include:
-          - { job: core, module: core, filter: fuzz, iterations: 1000K }
+          - { job: core, module: core, filter: fuzz, iterations: 900K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
           - { job: slow-auth, module: auth, filter: slow property, iterations: 50K }
           - { job: pubsub, module: pubsub, filter: fuzz, iterations: 750K }
           - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1M }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 75K }
-          - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 250K }
+          - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 5M }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
           - { job: storage, module: storage, filter: fuzz, iterations: 1200K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 3800K }
