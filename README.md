@@ -206,7 +206,8 @@ defer created.deinit();
   `roles/pubsub.publisher` on the dead-letter topic and
   `roles/pubsub.subscriber` on this subscription, or nothing is forwarded:
   without them, production went on delivering a message past its last
-  attempt, and the dead-letter topic got nothing.
+  attempt, and the dead-letter topic got nothing; with them, it forwarded
+  the message about 3 s after its fifth delivery was released.
   `ReceivedMessage.delivery_attempt` counts deliveries only on a
   subscription with a dead-letter policy.
 - **`retry_policy`**: how long Pub/Sub waits before delivering a message
@@ -1713,7 +1714,11 @@ gcloud beta emulators pubsub start --project=test --host-port=127.0.0.1:8085
 PUBSUB_EMULATOR_HOST=127.0.0.1:8085 zig build test-integration
 
 # Or a real project. Every test creates zigps-* resources and deletes them.
+# With the project's number, the dead-letter test grants Pub/Sub's service
+# agent the roles it needs on its own topic and subscription; without it,
+# that test skips. The grants go with the resources.
 PUBSUB_TEST_PROJECT=my-project PUBSUB_TEST_TOKEN=$(gcloud auth print-access-token) \
+    PUBSUB_TEST_PROJECT_NUMBER=$(gcloud projects describe my-project --format='value(projectNumber)') \
     zig build test-integration
 
 # auth against Google's token endpoint, with the file gcloud's login wrote,
