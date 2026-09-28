@@ -204,7 +204,9 @@ defer created.deinit();
   Pub/Sub's service agent,
   `service-{project number}@gcp-sa-pubsub.iam.gserviceaccount.com`, needs
   `roles/pubsub.publisher` on the dead-letter topic and
-  `roles/pubsub.subscriber` on this subscription, or nothing is forwarded.
+  `roles/pubsub.subscriber` on this subscription, or nothing is forwarded:
+  without them, production went on delivering a message past its last
+  attempt, and the dead-letter topic got nothing.
   `ReceivedMessage.delivery_attempt` counts deliveries only on a
   subscription with a dead-letter policy.
 - **`retry_policy`**: how long Pub/Sub waits before delivering a message
@@ -251,6 +253,12 @@ The emulator cannot update a subscription's labels, filter or expiration,
 or a topic's labels, KMS key or storage policy. It answers a cleared topic
 retention with 31 days, and forwards a message to its dead-letter topic
 only when the source subscription is pulled again.
+
+Production, measured on 2026-09-28, refuses every rule above with a
+message that names it, refuses to change the filter, the ordering or the
+topic ("not mutable"), and answers each update as described here: a
+cleared expiration goes back to 31 days, `.never` to none, a cleared
+retention to 7 days, and a cleared topic retention to none.
 
 ### Publishing at volume
 
@@ -371,8 +379,12 @@ Level 1 made the JSON a fifth bigger than level 6 in four fifths of the
 time, and level 9 made it 3% smaller in a quarter more. Even random bytes
 shrink by more than a third, to within 5% of the data itself: base64
 writes 6 bits of data in each 8-bit character, and gzip takes that back,
-along with the repeated attributes. Production took a compressed publish
-on 2026-09-21, and the emulator takes them too.
+along with the repeated attributes.
+
+Production takes compressed publishes, and holds the 10,485,760-byte limit
+to the body decompressed: 10.8 MB of JSON, sent as 10,566 bytes of gzip,
+was refused. The emulator takes them too. Pull answers already come back
+compressed: the transport accepts gzip, and production gzips them.
 
 ### Production credentials
 
@@ -593,12 +605,13 @@ answers from a script and records every request, and
 ### The emulator is not production
 
 These differences were measured with emulator 0.8.35, and the exactly-once
-ones with 0.8.36. The client's own checks catch the ones marked *checked*, so
-code tested against the emulator does not fail later in production.
+ones and the deleted topic with 0.8.36. The client's own checks catch the
+ones marked *checked*, so code tested against the emulator does not fail
+later in production.
 
 | Behavior | Emulator | Production |
 | --- | --- | --- |
-| Publish size limit | none | 10,485,760-byte request body (*checked*) |
+| Publish size limit | none | 10,485,760-byte request body, counted decompressed (*checked*) |
 | Empty or `goog...` attribute keys | accepted | rejected (*checked*) |
 | Ids starting with `GOOG` | accepted | rejected (*checked*) |
 | Ordering key over 1,024 bytes | accepted | rejected (*checked*) |
@@ -608,6 +621,7 @@ code tested against the emulator does not fail later in production.
 | Exactly-once: a late ack's refusal | names no id | names each refused id |
 | Exactly-once: a late lease extension | taken | refused |
 | Exactly-once: a second ack of an acknowledged message | refused | taken |
+| Publishing to a deleted topic | refused at once | taken for 0.7 to 14 s in nine runs, and once for over 90 s |
 
 ## Secret Manager
 
