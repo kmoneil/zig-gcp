@@ -96,16 +96,10 @@ pub const Label = struct {
     value: []const u8,
 };
 
-/// What an update does to a setting that can be taken away.
-pub fn Change(comptime T: type) type {
-    return union(enum) {
-        /// Not part of the update: stays as it is.
-        keep,
-        set: T,
-        /// Taken away, or back to Pub/Sub's default: each field says which.
-        clear,
-    };
-}
+/// What an update does to a setting that can be taken away: `.keep`,
+/// `.set`, or `.clear`, which takes it away or puts back Pub/Sub's
+/// default, as each field says. Core's, shared with the other modules.
+pub const Change = @import("core").Change;
 
 /// Where a topic's messages may be stored.
 pub const MessageStoragePolicy = struct {

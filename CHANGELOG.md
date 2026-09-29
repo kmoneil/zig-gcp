@@ -4,6 +4,39 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.25.0 (unreleased)
+
+- storage: buckets take their settings, and can change them.
+  `BucketConfig` gains `versioning`, `soft_delete_retention_s`,
+  `requester_pays`, `default_kms_key_name`, `labels` (`storage.Label`),
+  `lifecycle` (`storage.LifecycleRule`), `uniform_bucket_level_access` and
+  `public_access_prevention` (`storage.PublicAccessPrevention`), and a
+  create with every default sends the same body as before. `BucketInfo`
+  reads each one back, with the bucket's metageneration, generation,
+  project number, location type and update time, and `BucketInfo.label`
+  finds a label. New `Bucket.update` patches what a `storage.BucketUpdate`
+  names and nothing else: labels merge through `storage.LabelEdit`,
+  lifecycle rules are replaced whole, the default key goes through
+  `storage.Change`, and it is retried only under `if_metageneration_match`
+  or with `retry_unconditional_writes`. Every rule Cloud Storage enforced
+  when measured is checked before sending, with the new
+  `error.InvalidBucketSettings`: label syntax, and length in characters
+  and bytes; at most 64 labels; soft delete off or 7 to 90 days; a
+  condition in every lifecycle rule, only age and name conditions on the
+  abort action, a class to set, days below 2^31, sizes up to 5 TiB, dates
+  that exist, and at most 1,000 prefixes and suffixes, each 1 to 1,024
+  bytes; a key's name; and an update that changes nothing. A lifecycle rule read
+  with an action or a condition this library does not know is marked
+  `unrecognized`, and never sent back without it. Soft delete is turned
+  off with a retention of 0, since `"softDeletePolicy": null` puts the
+  7-day default back, and an empty label change sends nothing, since
+  `"labels": {}` removes every label. `storage.limits` gains the limits.
+  Not breaking: every new field has a default.
+- core: `Change(T)` moves here from pubsub, for every module to share.
+  Not breaking.
+- pubsub: `pubsub.Change` is core's `Change`, the same as before.
+- auth, secret_manager, examples: unchanged.
+
 ## 0.24.0 (2026-09-28)
 
 - pubsub: `Subscriber` no longer stops when the server refuses single

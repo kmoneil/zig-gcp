@@ -1,5 +1,6 @@
-//! A cheap handle on one bucket: create, get, delete and list its objects,
-//! and hand out `Object` handles. Making one sends nothing.
+//! A cheap handle on one bucket: create it, read and change its settings,
+//! delete it, list its objects, and hand out `Object` handles. Making one
+//! sends nothing.
 
 const Bucket = @This();
 
@@ -8,6 +9,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const Object = @import("Object.zig");
+const bucket_settings = @import("bucket_settings.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
@@ -23,16 +25,19 @@ client: *Client,
 name: []const u8,
 
 /// Creates the bucket in the client's project, which `Options.project_id`
-/// must name. Safe to retry: a lost first success shows up as
-/// `error.AlreadyExists`.
+/// must name, with the settings `config` gives. Every setting Cloud
+/// Storage would refuse is refused here first, with
+/// `error.InvalidBucketSettings`. Safe to retry: a lost first success
+/// shows up as `error.AlreadyExists`.
 pub fn create(self: Bucket, config: types.BucketConfig) Error!types.Owned(types.BucketInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
+    try bucket_settings.checkConfig(self.client.diagnostics, config);
     const project = try rpc.requireProject(self.client);
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
     const path = try names.bucketsPath(scratch.allocator(), project, .{});
-    const body = try codec.encodeBucket(scratch.allocator(), self.name, config);
+    const body = try bucket_settings.encodeConfig(scratch.allocator(), self.name, config);
 
     var result: types.Owned(types.BucketInfo) = try .init(self.client.gpa);
     errdefer result.deinit();
@@ -58,8 +63,29 @@ pub fn get(self: Bucket) Error!types.Owned(types.BucketInfo) {
     return result;
 }
 
+/// Changes the settings `changes` names, and nothing else, and returns the
+/// bucket as it now is. Labels merge as `changes.labels` says, lifecycle
+/// rules are replaced as a whole, and every other setting is replaced
+/// alone. Every value Cloud Storage would refuse, and an update that
+/// changes nothing, is refused here first, with
+/// `error.InvalidBucketSettings`. A bucket takes about one update a
+/// second, and a change can take 30 seconds to apply everywhere.
+///
+/// Retried only under `changes.if_metageneration_match`, or with
+/// `Options.retry_unconditional_writes`: a repeat of an update that
+/// landed and lost its answer would undo whatever another writer changed
+/// in between. Under the condition, such a repeat fails with
+/// `error.FailedPrecondition` instead: `get` the bucket to see which.
+pub fn update(self: Bucket, changes: types.BucketUpdate) Error!types.Owned(types.BucketInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return bucket_settings.update(self.client, self.name, changes);
+}
+
 /// Deletes the bucket, which must be empty. Safe to retry: a lost first
-/// success shows up as `error.NotFound`.
+/// success shows up as `error.NotFound`. A bucket that ever had soft
+/// delete on is kept, restorable, for the longest retention it had, even
+/// one turned off since.
 pub fn delete(self: Bucket) Error!void {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);

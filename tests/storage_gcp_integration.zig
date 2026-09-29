@@ -34,6 +34,13 @@
 //! Faults come from `core.testing.FaultTransport` around the real HTTP
 //! transport: it closes real connections partway through real bodies, so
 //! every recovery here is a recovery against Google.
+//!
+//! The bucket tests make buckets of their own, named `zigps-` plus random
+//! hex, in the project GCP_TEST_PROJECT names, and delete them when they
+//! end; they skip without it. They need storage.buckets.create, get,
+//! update and delete there, which Storage Admin grants. Their buckets
+//! start with soft delete off and never turn it on: a bucket that ever had
+//! it is kept, soft-deleted, for as long as the longest retention it had.
 
 const std = @import("std");
 const core = @import("core");
@@ -3253,4 +3260,246 @@ test "48. gzip uploads, for later: what a request body sent with Content-Encodin
     std.debug.print("resumable, one chunk compressed in transit, range in the data's bytes: HTTP {d}\n", .{c.status});
     try printStored(&f, session_obj, "  resumable");
     if (c.status >= 300) _ = raw(&f, .DELETE, session["https://storage.googleapis.com".len..], &.{}, null, null) catch {};
+}
+
+/// A bucket of the test's own, in GCP_TEST_PROJECT, deleted at the end.
+const BucketFixture = struct {
+    env: std.process.Environ.Map,
+    token: storage.StaticToken,
+    diag: storage.Diagnostics,
+    http: core.transport.HttpTransport,
+    client: storage.Client,
+    /// Borrowed from `env`.
+    project: []const u8,
+    /// "zigps-settings-" plus 8 random hex digits.
+    name: [23]u8,
+
+    /// Returns false when no project is configured; the test should skip.
+    fn init(f: *BucketFixture) !bool {
+        const gpa = testing.allocator;
+        f.env = try testing.environ.createMap(gpa);
+        errdefer f.env.deinit();
+        const project = f.env.get("GCP_TEST_PROJECT") orelse return f.skip();
+        const token = f.env.get("GCP_TEST_TOKEN") orelse return f.skip();
+        f.token = .{ .token = std.mem.trim(u8, token, &std.ascii.whitespace) };
+        f.project = std.mem.trim(u8, project, &std.ascii.whitespace);
+        f.diag = .{};
+        var random: [4]u8 = undefined;
+        testing.io.random(&random);
+        _ = try std.fmt.bufPrint(&f.name, "zigps-settings-{x}", .{random});
+        f.http = .init(gpa, testing.io, Fixture.user_agent);
+        errdefer f.http.deinit();
+        f.client = try .init(gpa, testing.io, .{
+            .project_id = f.project,
+            .token_provider = f.token.provider(),
+            .transport = f.http.transport(),
+            .diagnostics = &f.diag,
+            .user_agent = Fixture.user_agent,
+        });
+        return true;
+    }
+
+    fn skip(f: *BucketFixture) bool {
+        f.env.deinit();
+        return false;
+    }
+
+    /// Deletes the bucket, if the test made it, then frees the fixture.
+    fn deinit(f: *BucketFixture) void {
+        f.bucket().delete() catch |err| switch (err) {
+            error.NotFound => {},
+            else => std.debug.print("cleanup: could not delete bucket {s}: {t}\n", .{ &f.name, err }),
+        };
+        f.client.deinit();
+        f.http.deinit();
+        f.env.deinit();
+    }
+
+    fn bucket(f: *BucketFixture) storage.Bucket {
+        return f.client.bucket(&f.name);
+    }
+
+    /// Changes the bucket, a second after the last change at the least:
+    /// Cloud Storage takes about one update of a bucket a second.
+    fn update(f: *BucketFixture, changes: storage.BucketUpdate) !storage.Owned(storage.BucketInfo) {
+        try testing.io.sleep(.fromMilliseconds(1100), .awake);
+        return f.bucket().update(changes) catch |err| {
+            std.debug.print("update: error.{t} (HTTP {d} {s}): {s}\n", .{ err, f.diag.http_status, f.diag.status(), f.diag.message() });
+            return err;
+        };
+    }
+};
+
+test "49. bucket settings: each setting at create, each changed alone, and all taken away" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+
+    const rules = [_]storage.LifecycleRule{
+        .{ .action = .abort_incomplete_multipart_upload, .condition = .{ .age_days = 7 } },
+        .{ .action = .delete, .condition = .{ .age_days = 30, .matches_prefix = &.{"tmp/"} } },
+    };
+    var created = f.bucket().create(.{
+        .location = "us-central1",
+        .versioning = true,
+        .soft_delete_retention_s = 0,
+        .requester_pays = true,
+        .labels = &.{ .{ .key = "env", .value = "test" }, .{ .key = "team", .value = "zig" } },
+        .lifecycle = &rules,
+        .uniform_bucket_level_access = true,
+        .public_access_prevention = .enforced,
+    }) catch |err| {
+        std.debug.print("create: error.{t} (HTTP {d}): {s}\n", .{ err, f.diag.http_status, f.diag.message() });
+        return err;
+    };
+    defer created.deinit();
+    const c = created.value;
+    try testing.expectEqualStrings(&f.name, c.name);
+    try testing.expectEqualStrings("US-CENTRAL1", c.location);
+    try testing.expectEqualStrings("region", c.location_type.?);
+    try testing.expectEqual(1, c.metageneration);
+    try testing.expect(c.generation != null);
+    try testing.expect(c.project_number != null);
+    try testing.expect(c.versioning);
+    try testing.expectEqual(null, c.soft_delete);
+    try testing.expect(c.requester_pays);
+    try testing.expectEqualStrings("zig", c.label("team").?);
+    try testing.expectEqual(2, c.lifecycle.len);
+    try testing.expectEqualStrings("tmp/", c.lifecycle[1].condition.matches_prefix[0]);
+    try testing.expect(c.uniform_bucket_level_access);
+    try testing.expectEqual(.enforced, c.public_access_prevention);
+
+    // One setting alone leaves the rest, nested ones included.
+    var prevention = try f.update(.{ .public_access_prevention = .inherited });
+    defer prevention.deinit();
+    try testing.expectEqual(.inherited, prevention.value.public_access_prevention);
+    try testing.expect(prevention.value.uniform_bucket_level_access);
+    try testing.expect(prevention.value.versioning);
+    try testing.expectEqual(2, prevention.value.labels.len);
+
+    // Labels merge: one changed, one removed, one added, empty.
+    var labels = try f.update(.{ .labels = .{ .change = &.{
+        .{ .key = "env", .value = "prod" },
+        .{ .key = "team", .value = null },
+        .{ .key = "tier", .value = "" },
+    } } });
+    defer labels.deinit();
+    try testing.expectEqual(2, labels.value.labels.len);
+    try testing.expectEqualStrings("prod", labels.value.label("env").?);
+    try testing.expectEqualStrings("", labels.value.label("tier").?);
+
+    // An empty label change beside other settings leaves the labels be,
+    // where `{"labels":{}}` would have removed them all.
+    var flags = try f.update(.{ .versioning = false, .requester_pays = false, .labels = .{ .change = &.{} } });
+    defer flags.deinit();
+    try testing.expect(!flags.value.versioning);
+    try testing.expect(!flags.value.requester_pays);
+    try testing.expectEqual(2, flags.value.labels.len);
+
+    // Every action and condition, as the server writes them back.
+    const every = [_]storage.LifecycleRule{
+        .{ .action = .{ .set_storage_class = "NEARLINE" }, .condition = .{ .age_days = 60, .matches_storage_class = &.{"STANDARD"} } },
+        .{ .action = .delete, .condition = .{
+            .created_before = "2026-01-01",
+            .custom_time_before = "2026-01-02",
+            .days_since_custom_time = 10,
+            .days_since_noncurrent_time = 5,
+            .is_live = false,
+            .matches_suffix = &.{".tmp"},
+            .noncurrent_time_before = "2026-01-03",
+            .num_newer_versions = 3,
+            .size_above_bytes = 1000,
+            .size_below_bytes = 5 * 1024 * 1024 * 1024 * 1024,
+        } },
+    };
+    var lifecycle = try f.update(.{ .lifecycle = &every });
+    defer lifecycle.deinit();
+    const got = lifecycle.value.lifecycle;
+    try testing.expectEqual(2, got.len);
+    try testing.expectEqualStrings("NEARLINE", got[0].action.set_storage_class);
+    try testing.expectEqual(5 * 1024 * 1024 * 1024 * 1024, got[1].condition.size_below_bytes.?);
+    try testing.expectEqualStrings("2026-01-03", got[1].condition.noncurrent_time_before.?);
+    try testing.expectEqual(false, got[1].condition.is_live.?);
+    for (got) |rule| try testing.expect(!rule.unrecognized);
+
+    // The metageneration conditions, as the server holds them.
+    const at = lifecycle.value.metageneration;
+    try testing.io.sleep(.fromMilliseconds(1100), .awake);
+    try testing.expectError(error.FailedPrecondition, f.bucket().update(.{ .storage_class = "NEARLINE", .if_metageneration_match = at - 1 }));
+    try testing.expectError(error.NotModified, f.bucket().update(.{ .storage_class = "NEARLINE", .if_metageneration_not_match = at }));
+    var class = try f.update(.{ .storage_class = "NEARLINE", .if_metageneration_match = at });
+    defer class.deinit();
+    try testing.expectEqualStrings("NEARLINE", class.value.storage_class);
+    try testing.expectEqual(at + 1, class.value.metageneration);
+
+    // Everything that can be taken away, taken away.
+    var cleared = try f.update(.{
+        .labels = .clear,
+        .lifecycle = &.{},
+        .default_kms_key_name = .clear,
+        .uniform_bucket_level_access = false,
+    });
+    defer cleared.deinit();
+    try testing.expectEqual(0, cleared.value.labels.len);
+    try testing.expectEqual(0, cleared.value.lifecycle.len);
+    try testing.expectEqual(null, cleared.value.default_kms_key_name);
+    try testing.expect(!cleared.value.uniform_bucket_level_access);
+
+    var read = try f.bucket().get();
+    defer read.deinit();
+    try testing.expectEqual(cleared.value.metageneration, read.value.metageneration);
+    try testing.expectEqual(null, read.value.soft_delete);
+
+    try f.bucket().delete();
+    try testing.expectError(error.NotFound, f.bucket().get());
+}
+
+test "50. bucket settings: what Cloud Storage refuses, the library refuses first" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{ .location = "us-central1", .soft_delete_retention_s = 0 });
+    defer created.deinit();
+
+    // Refused here, and nothing sent: the metageneration stands still.
+    const refused = [_]storage.BucketUpdate{
+        .{ .labels = .{ .change = &.{.{ .key = "Env", .value = "x" }} } },
+        .{ .labels = .{ .change = &.{.{ .key = "k", .value = "日" ** 43 }} } },
+        .{ .soft_delete_retention_s = 604_799 },
+        .{ .soft_delete_retention_s = 7_776_001 },
+        .{ .lifecycle = &.{.{ .action = .delete, .condition = .{} }} },
+        .{ .lifecycle = &.{.{ .action = .abort_incomplete_multipart_upload, .condition = .{ .is_live = true } }} },
+        .{ .lifecycle = &.{.{ .action = .delete, .condition = .{ .created_before = "2026-02-29" } }} },
+        .{ .lifecycle = &.{.{ .action = .delete, .condition = .{ .size_above_bytes = 5 * 1024 * 1024 * 1024 * 1024 + 1 } }} },
+        .{ .default_kms_key_name = .{ .set = "not-a-key" } },
+        .{},
+    };
+    for (refused) |changes| try testing.expectError(error.InvalidBucketSettings, f.bucket().update(changes));
+    var read = try f.bucket().get();
+    defer read.deinit();
+    try testing.expectEqual(1, read.value.metageneration);
+
+    // And what only the server knows: the count after an edit, and keys
+    // that do not exist.
+    var many: [64]storage.LabelChange = undefined;
+    var keys: [64][4]u8 = undefined;
+    for (&many, &keys, 0..) |*l, *k, i| l.* = .{ .key = std.fmt.bufPrint(k, "k{d}", .{i}) catch unreachable, .value = "" };
+    var full = try f.update(.{ .labels = .{ .change = &many } });
+    full.deinit();
+    try testing.io.sleep(.fromMilliseconds(1100), .awake);
+    try testing.expectError(error.InvalidArgument, f.bucket().update(.{ .labels = .{ .change = &.{.{ .key = "one-more", .value = "" }} } }));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "65 labels") != null);
+    // In the test's own project, a key that does not exist cannot be told
+    // from one the service agent may not use: 403, "Permission denied on
+    // Cloud KMS key".
+    var buffer: [256]u8 = undefined;
+    const missing = try std.fmt.bufPrint(&buffer, "projects/{s}/locations/us-central1/keyRings/zigps-none/cryptoKeys/none", .{f.project});
+    try testing.io.sleep(.fromMilliseconds(1100), .awake);
+    try testing.expectError(error.PermissionDenied, f.bucket().update(.{ .default_kms_key_name = .{ .set = missing } }));
+    // In a project that does not exist: 400, "Cannot find the requested
+    // Cloud KMS encryption key".
+    try testing.io.sleep(.fromMilliseconds(1100), .awake);
+    try testing.expectError(error.InvalidArgument, f.bucket().update(.{
+        .default_kms_key_name = .{ .set = "projects/zigps-none/locations/us-central1/keyRings/none/cryptoKeys/none" },
+    }));
 }

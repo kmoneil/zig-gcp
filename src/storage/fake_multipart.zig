@@ -22,6 +22,10 @@
 //! is at least `min_part_size`, and a finish or part for an upload that is
 //! gone answers 404 `NoSuchUpload`. Finishing replaces any object of the
 //! name, with a new generation.
+//!
+//! Buckets, their settings and the rules on them are `FakeBuckets`'s,
+//! served through here so that the same transport, fault plan and lock
+//! cover them.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -29,6 +33,7 @@ const core = @import("core");
 const Header = core.transport.Header;
 const Method = core.transport.Method;
 const xml = @import("xml.zig");
+const FakeBuckets = @import("fake_buckets.zig").FakeBuckets;
 
 pub const FakeMultipart = struct {
     gpa: Allocator,
@@ -37,6 +42,9 @@ pub const FakeMultipart = struct {
     uploads: std.ArrayList(Upload) = .empty,
     sessions: std.ArrayList(Session) = .empty,
     objects: std.ArrayList(Stored) = .empty,
+    /// Buckets and their settings, apart from the objects above, which
+    /// belong to whatever bucket a request names.
+    buckets: FakeBuckets,
     next_upload: u32 = 1,
     next_session: u32 = 1,
     next_generation: u64 = 1_000,
@@ -83,7 +91,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket };
 
     pub const Fault = enum {
         none,
@@ -181,7 +189,7 @@ pub const FakeMultipart = struct {
     };
 
     pub fn init(gpa: Allocator, io: std.Io) FakeMultipart {
-        return .{ .gpa = gpa, .io = io };
+        return .{ .gpa = gpa, .io = io, .buckets = .init(gpa) };
     }
 
     pub fn deinit(self: *FakeMultipart) void {
@@ -191,6 +199,7 @@ pub const FakeMultipart = struct {
         self.sessions.deinit(self.gpa);
         for (self.objects.items) |*o| freeStored(self.gpa, o);
         self.objects.deinit(self.gpa);
+        self.buckets.deinit();
         self.* = undefined;
     }
 
@@ -352,6 +361,7 @@ pub const FakeMultipart = struct {
             .move => if (method == .POST) .move else return error.HttpProtocolError,
             .resumable => if (method == .POST) .session_start else return error.HttpProtocolError,
             .insert => if (method == .POST) .insert else return error.HttpProtocolError,
+            .bucket => .bucket,
             .session => switch (method) {
                 .PUT => .session_put,
                 .DELETE => .session_cancel,
@@ -372,7 +382,7 @@ pub const FakeMultipart = struct {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
             .session => if (kind == .session_put) sessionPart(headers) else 0,
-            .move, .resumable, .insert => 0,
+            .move, .resumable, .insert, .bucket => 0,
         };
         // Cloud Storage and fake-gcs-server take a request body sent with
         // `Content-Encoding: gzip` apart and store it plain. This library
@@ -420,6 +430,10 @@ pub const FakeMultipart = struct {
             .move => |m| try self.moveObject(m, fault, arena),
             .resumable => |r| try self.sessionStart(r, content_type, headers, body, arena),
             .insert => |t| try self.insertObject(t, content_type, body, arena),
+            .bucket => |t| bucket: {
+                const r = try self.buckets.serve(method, t, body, arena);
+                break :bucket Reply{ .status = r.status, .body = r.body };
+            },
             .session => |id| if (kind == .session_put)
                 try self.sessionPut(id, headers, body, fault, arena)
             else
@@ -641,7 +655,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket => unreachable,
         }
     }
 
@@ -1292,6 +1306,7 @@ const InsertTarget = struct {
 };
 
 const Target = union(enum) {
+    bucket: FakeBuckets.Target,
     json: JsonTarget,
     xml: XmlTarget,
     move: MoveTarget,
@@ -1330,6 +1345,12 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         if (multipart_type) return .{ .insert = .{ .bucket = bucket, .conditions = conditions } };
         if (!resumable_type) return error.HttpProtocolError;
         return .{ .resumable = .{ .bucket = bucket, .conditions = conditions, .origin = url[0..path_start] } };
+    }
+    if (std.mem.eql(u8, path, "/storage/v1/b")) return .{ .bucket = try bucketTarget(arena, null, query) };
+    if (std.mem.startsWith(u8, path, "/storage/v1/b/") and
+        std.mem.indexOfScalar(u8, path["/storage/v1/b/".len..], '/') == null)
+    {
+        return .{ .bucket = try bucketTarget(arena, try decode(arena, path["/storage/v1/b/".len..]), query) };
     }
     if (std.mem.startsWith(u8, path, "/storage/v1/b/")) {
         const after = path["/storage/v1/b/".len..];
@@ -1397,6 +1418,27 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         .max_parts = max_parts,
         .marker = marker,
     } };
+}
+
+/// A bucket request's query: only what this library sends.
+fn bucketTarget(arena: Allocator, name: ?[]const u8, query: []const u8) core.transport.Error!FakeBuckets.Target {
+    var target: FakeBuckets.Target = .{ .name = name };
+    if (query.len == 0) return target;
+    var params = std.mem.splitScalar(u8, query, '&');
+    while (params.next()) |param| {
+        if (std.mem.startsWith(u8, param, "project=")) {
+            target.project = try decode(arena, param["project=".len..]);
+        } else if (std.mem.eql(u8, param, "projection=noAcl")) {
+            // What every bucket answer here leaves out anyway.
+        } else if (std.mem.startsWith(u8, param, "ifMetagenerationMatch=")) {
+            target.if_metageneration_match = std.fmt.parseInt(u64, param["ifMetagenerationMatch=".len..], 10) catch
+                return error.HttpProtocolError;
+        } else if (std.mem.startsWith(u8, param, "ifMetagenerationNotMatch=")) {
+            target.if_metageneration_not_match = std.fmt.parseInt(u64, param["ifMetagenerationNotMatch=".len..], 10) catch
+                return error.HttpProtocolError;
+        } else return error.HttpProtocolError;
+    }
+    return target;
 }
 
 fn decode(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {

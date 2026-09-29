@@ -1174,7 +1174,7 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-23:
 
 | Call | What it does |
 | --- | --- |
-| `client.bucket(name).create(config)`, `.get()`, `.delete()` | A bucket, in the project `Options.project_id` names |
+| `client.bucket(name).create(config)`, `.get()`, `.update(changes)`, `.delete()` | A bucket and its settings, in the project `Options.project_id` names |
 | `client.listBuckets(page)` | One page of the project's buckets |
 | `bucket.listObjects(options)` | One page of objects, with `prefix`, a `delimiter` for folders, and paging |
 | `bucket.object(name).get(options)`, `.exists()`, `.delete(options)` | An object's metadata, whether it exists, and deleting it or one generation of it |
@@ -1190,10 +1190,94 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-23:
 | `.postPolicy(signer, options)`, `bucket.postPolicy(signer, options)` | A V4 POST policy, which lets a plain HTML form upload what the policy allows, without credentials, until it expires |
 
 The default OAuth scope is `devstorage.read_write`; `Options.scope` picks
-`.read_only` or `.cloud_platform` instead. Not in this version: `update`
-(PUT, which replaces a whole resource where `patch` merges), parallel
-composite uploads, requester pays, customer-supplied encryption keys,
-listing old versions or soft-deleted objects, and gRPC.
+`.read_only` or `.cloud_platform` instead. Not in this version: the JSON
+API's PUT, which replaces a whole resource (`updateMetadata` and
+`Bucket.update` patch, which merges), parallel composite uploads,
+requester pays, customer-supplied encryption keys, listing old versions
+or soft-deleted objects, and gRPC.
+
+### Bucket settings
+
+`create` takes a bucket's settings, and `update` changes them later,
+sending only what it names:
+
+```zig
+const archive = gcs.bucket("my-archive");
+var created = try archive.create(.{
+    .location = "europe-west3",
+    .versioning = true,
+    .soft_delete_retention_s = 0, // off; see below
+    .labels = &.{.{ .key = "team", .value = "data" }},
+    .lifecycle = &.{
+        .{ .action = .{ .set_storage_class = "COLDLINE" }, .condition = .{ .age_days = 90 } },
+        .{ .action = .delete, .condition = .{ .is_live = false, .num_newer_versions = 3 } },
+    },
+    .uniform_bucket_level_access = true,
+    .public_access_prevention = .enforced,
+});
+defer created.deinit();
+
+var changed = try archive.update(.{
+    .labels = .{ .change = &.{
+        .{ .key = "team", .value = "platform" },
+        .{ .key = "draft", .value = null }, // null removes the label
+    } },
+    // Safe to retry: a repeat of an update that landed fails instead.
+    .if_metageneration_match = created.value.metageneration,
+});
+defer changed.deinit();
+```
+
+| Setting | What it does | In an update |
+| --- | --- | --- |
+| `versioning` | Keeps every version an overwrite or a delete replaces | On or off |
+| `soft_delete_retention_s` | How long a deleted object stays restorable: 0 (off), or 604,800 to 7,776,000 s (7 to 90 days) | The same |
+| `requester_pays` | Bills requests to the requester's project | On or off |
+| `default_kms_key_name` | The Cloud KMS key for objects written without one | `.set` or `.clear` |
+| `labels` | At most 64 | `.change` merges, `.clear` removes every label |
+| `lifecycle` | Rules Cloud Storage applies about once a day | Replaces every rule; `&.{}` removes them all |
+| `uniform_bucket_level_access` | IAM alone decides access, never object ACLs | Off again only within its first 90 days |
+| `public_access_prevention` | `.enforced` refuses grants to `allUsers` | `.inherited` or `.enforced` |
+| `storage_class` | The class of objects written without one | The same |
+
+A setting an update leaves out keeps its value, and one it names is
+replaced alone: changing public access prevention leaves uniform access as
+it was. Every value Cloud Storage refuses is refused before sending, with
+`error.InvalidBucketSettings` and the reason in `Diagnostics`, as is an
+update that changes nothing, since the emulator checks none of them. Only
+the server judges two things: how many labels a bucket holds after an
+edit, and letters beyond ASCII in labels, which it takes unless they are
+uppercase. A bucket takes about one update a second.
+
+Every new bucket has soft delete on unless its settings say otherwise:
+deleted objects stay restorable, and billed as stored, for 7 days, or
+what the organization's default says. Measured against Cloud Storage on
+2026-09-29:
+
+- A bucket that ever had soft delete on is soft-deleted itself when it
+  is deleted, and kept, empty and unbilled, for the longest retention it
+  ever had: turning soft delete off first does not shorten that. A bucket
+  created with a retention of 0 is deleted outright.
+- Some libraries turn soft delete off with `"softDeletePolicy": null`,
+  which puts the 7-day default back instead. This one sends a retention of
+  0.
+- `"labels": {}` removes every label, as `.clear` does, so an empty
+  `.change` sends no labels at all.
+- The documented limit of 100 lifecycle rules is not enforced: 2,000 were
+  taken. The 1,000 prefixes and suffixes across the rules are.
+- A stale `if_metageneration_match` is `error.FailedPrecondition`, and an
+  `if_metageneration_not_match` equal to the bucket's metageneration is
+  `error.NotModified`: the update changes nothing. An `If-Match` etag is
+  ignored.
+- Lifecycle dates before 1677-09-21 or after 2262-04-11 are kept as those
+  dates.
+
+A lifecycle rule read from a bucket that carries an action or a condition
+this library does not know, such as the early-access `matchesPattern`,
+comes back with `unrecognized` set, and an update that sends it back is
+refused: without the part this library could not read, the rule would act
+on objects it now leaves alone. Leave it out of the list, which removes
+it, or change the rules with gcloud.
 
 ### Metadata, after the upload
 
@@ -1392,15 +1476,16 @@ checkpoint, a later run carries the upload on, or `abandonTransfer`
 aborts it. One that dies between the finish and the move leaves an
 object under `zig-gcp-tmp/`. Lifecycle rules clean up both:
 
-```json
-{ "rule": [
-  { "action": { "type": "AbortIncompleteMultipartUpload" }, "condition": { "age": 7 } },
-  { "action": { "type": "Delete" }, "condition": { "age": 1, "matchesPrefix": ["zig-gcp-tmp/"] } }
-] }
+```zig
+var bucket = try gcs.bucket("my-bucket").update(.{ .lifecycle = &.{
+    .{ .action = .abort_incomplete_multipart_upload, .condition = .{ .age_days = 7 } },
+    .{ .action = .delete, .condition = .{ .age_days = 1, .matches_prefix = &.{"zig-gcp-tmp/"} } },
+} });
+defer bucket.deinit();
 ```
 
-`gcloud storage buckets update gs://my-bucket --lifecycle-file=rules.json`
-applies them.
+An update replaces every rule the bucket has, so to keep the ones it has,
+`get` the bucket first and send its `lifecycle` with these added.
 
 Measured from this sandbox against a real bucket on 2026-09-24, 100 MiB in
 8 MiB parts, 8 at a time, went up in 10.0 s (10 MiB/s), where one stream
@@ -1625,6 +1710,11 @@ differences it found:
   `downloadParallel` runs against it for real. To a client that takes
   gzip it serves a gzip object as stored, ranges and all, as Cloud
   Storage does, so gzip objects download verified against it too.
+- It takes every bucket setting, checks none, and keeps none but
+  versioning, which its filesystem backend refuses; a bucket update that
+  leaves versioning out turns it off. So bucket settings are tested
+  against an in-memory fake that holds Cloud Storage's rules as measured,
+  and against Cloud Storage itself.
 
 ## Zig 0.16 standard library issues handled here
 
@@ -1729,7 +1819,9 @@ AUTH_TEST_CREDENTIALS=$HOME/.config/gcloud/application_default_credentials.json 
 # Secret Manager has no emulator, so its tests need a real project. They
 # create zigps-* secrets labelled zig-gcp-test and delete them, and sweep
 # up anything a crashed run left behind. GCP_TEST_LOCATION adds the
-# regional tests.
+# regional tests. The same project runs the Cloud Storage bucket tests,
+# which make zigps-settings-* buckets with soft delete off and delete
+# them; they need Storage Admin there.
 GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
     zig build test-integration-gcp
 
