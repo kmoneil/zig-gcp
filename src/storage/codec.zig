@@ -224,6 +224,10 @@ const WireObject = struct {
     timeCreated: ?[]const u8 = null,
     updated: ?[]const u8 = null,
     metadata: ?std.json.ArrayHashMap(?[]const u8) = null,
+    timeDeleted: ?[]const u8 = null,
+    softDeleteTime: ?[]const u8 = null,
+    hardDeleteTime: ?[]const u8 = null,
+    restoreToken: ?[]const u8 = null,
 };
 
 const WireObjectPage = struct {
@@ -251,6 +255,8 @@ const WireBucket = struct {
     /// rule can be told from what it does.
     lifecycle: ?struct { rule: ?[]const std.json.Value = null } = null,
     iamConfiguration: ?WireIamConfiguration = null,
+    softDeleteTime: ?[]const u8 = null,
+    hardDeleteTime: ?[]const u8 = null,
 };
 
 const WireSoftDeletePolicy = struct {
@@ -291,6 +297,10 @@ fn objectFromWire(arena: Allocator, wire: WireObject) DecodeError!types.ObjectIn
         .time_created = wire.timeCreated orelse "",
         .updated = wire.updated orelse "",
         .metadata = try metadataFromWire(arena, wire.metadata),
+        .time_deleted = nonEmpty(wire.timeDeleted),
+        .soft_delete_time = nonEmpty(wire.softDeleteTime),
+        .hard_delete_time = nonEmpty(wire.hardDeleteTime),
+        .restore_token = nonEmpty(wire.restoreToken),
     };
 }
 
@@ -320,6 +330,78 @@ fn bucketFromWire(arena: Allocator, wire: WireBucket) DecodeError!types.BucketIn
         .lifecycle = try lifecycleFromWire(arena, if (wire.lifecycle) |l| l.rule orelse &.{} else &.{}),
         .uniform_bucket_level_access = if (iam.uniformBucketLevelAccess) |u| u.enabled orelse false else false,
         .public_access_prevention = publicAccessPreventionFromWire(iam.publicAccessPrevention),
+        .soft_delete_time = nonEmpty(wire.softDeleteTime),
+        .hard_delete_time = nonEmpty(wire.hardDeleteTime),
+    };
+}
+
+/// One long-running operation, as a bulk restore starts one.
+pub fn decodeOperation(arena: Allocator, body: []const u8) DecodeError!types.Operation {
+    return operationFromWire(try parseWire(WireOperation, arena, body));
+}
+
+/// One page of a bucket's operations.
+pub fn decodeOperationPage(arena: Allocator, body: []const u8) DecodeError!types.OperationPage {
+    const wire = try parseWire(struct {
+        operations: ?[]const WireOperation = null,
+        nextPageToken: ?[]const u8 = null,
+    }, arena, body);
+    const listed = wire.operations orelse &.{};
+    const operations = try arena.alloc(types.Operation, listed.len);
+    for (listed, operations) |w, *op| op.* = try operationFromWire(w);
+    return .{ .operations = operations, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+const WireOperation = struct {
+    /// `projects/_/buckets/{bucket}/operations/{id}`.
+    name: ?[]const u8 = null,
+    done: ?bool = null,
+    @"error": ?struct { code: ?i64 = null, message: ?[]const u8 = null } = null,
+    metadata: ?WireOperationMetadata = null,
+};
+
+/// A bulk restore's `BulkRestoreObjectsMetadata`.
+const WireOperationMetadata = struct {
+    commonMetadata: ?WireCommonMetadata = null,
+    succeededCount: ?std.json.Value = null,
+    skippedCount: ?std.json.Value = null,
+    failedCount: ?std.json.Value = null,
+};
+
+const WireCommonMetadata = struct {
+    createTime: ?[]const u8 = null,
+    updateTime: ?[]const u8 = null,
+    endTime: ?[]const u8 = null,
+    requestedCancellation: ?bool = null,
+    /// -1 while the server cannot say.
+    progressPercent: ?i64 = null,
+};
+
+/// An operation that names no id cannot be followed, so it is
+/// `InvalidResponse`.
+fn operationFromWire(wire: WireOperation) DecodeError!types.Operation {
+    const name = wire.name orelse return error.InvalidResponse;
+    const slash = std.mem.lastIndexOfScalar(u8, name, '/') orelse return error.InvalidResponse;
+    const id = name[slash + 1 ..];
+    if (id.len == 0) return error.InvalidResponse;
+    const metadata: WireOperationMetadata = wire.metadata orelse .{};
+    const common: WireCommonMetadata = metadata.commonMetadata orelse .{};
+    const progress = common.progressPercent orelse -1;
+    return .{
+        .id = id,
+        .done = wire.done orelse false,
+        .failure = if (wire.@"error") |e| .{
+            .code = std.math.cast(i32, e.code orelse 0) orelse return error.InvalidResponse,
+            .message = e.message orelse "",
+        } else null,
+        .progress_percent = if (progress < 0 or progress > 100) null else @intCast(progress),
+        .requested_cancellation = common.requestedCancellation orelse false,
+        .succeeded = try u64FromValue(metadata.succeededCount),
+        .skipped = try u64FromValue(metadata.skippedCount),
+        .failed = try u64FromValue(metadata.failedCount),
+        .create_time = nonEmpty(common.createTime),
+        .update_time = nonEmpty(common.updateTime),
+        .end_time = nonEmpty(common.endTime),
     };
 }
 
@@ -1048,6 +1130,44 @@ test "decode bucket settings that are malformed as InvalidResponse" {
     try testing.expectEqual(10, loose.lifecycle[0].condition.size_above_bytes.?);
 }
 
+test "decode operations: progress unknown, counts as strings or numbers, and malformed ones" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const op = try decodeOperation(a,
+        \\{"name":"projects/_/buckets/b/operations/abc","done":false,
+        \\ "metadata":{"commonMetadata":{"progressPercent":-1,"requestedCancellation":true},
+        \\ "succeededCount":"3","skippedCount":13,"failedCount":"0"}}
+    );
+    try testing.expectEqualStrings("abc", op.id);
+    try testing.expectEqual(null, op.progress_percent);
+    try testing.expect(op.requested_cancellation);
+    try testing.expectEqual(3, op.succeeded);
+    try testing.expectEqual(13, op.skipped);
+    // A percentage the server does give comes through; one outside 0 to
+    // 100 reads as unknown.
+    try testing.expectEqual(40, (try decodeOperation(a, "{\"name\":\"x/1\",\"metadata\":{\"commonMetadata\":{\"progressPercent\":40}}}")).progress_percent.?);
+    try testing.expectEqual(null, (try decodeOperation(a, "{\"name\":\"x/1\",\"metadata\":{\"commonMetadata\":{\"progressPercent\":101}}}")).progress_percent);
+    // Nothing but a name is still an operation, not done.
+    const bare = try decodeOperation(a, "{\"name\":\"x/1\"}");
+    try testing.expect(!bare.done);
+    try testing.expectEqual(null, bare.failure);
+    for ([_][]const u8{
+        "{}",
+        "{\"name\":\"\"}",
+        "{\"name\":\"projects/_/buckets/b/operations/\"}",
+        "{\"name\":\"x/1\",\"error\":{\"code\":4294967296}}",
+        "{\"name\":\"x/1\",\"metadata\":{\"succeededCount\":\"-1\"}}",
+        "{\"name\":\"x/1\",\"done\":\"yes\"}",
+    }) |body| {
+        errdefer std.debug.print("body: {s}\n", .{body});
+        try testing.expectError(error.InvalidResponse, decodeOperation(a, body));
+    }
+    const page = try decodeOperationPage(a, "{\"kind\":\"storage#operations\"}");
+    try testing.expectEqual(0, page.operations.len);
+    try testing.expectError(error.InvalidResponse, decodeOperationPage(a, "{\"operations\":[{}]}"));
+}
+
 fn decodeArbitrary(_: void, input: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -1058,6 +1178,8 @@ fn decodeArbitrary(_: void, input: []const u8) !void {
     _ = decodeBucket(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
     _ = decodeBucketPage(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
     _ = decodeCopySource(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
+    _ = decodeOperation(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
+    _ = decodeOperationPage(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
 }
 
 test "fuzz decoding: arbitrary bodies never crash" {
@@ -1073,6 +1195,8 @@ test "fuzz decoding: arbitrary bodies never crash" {
         bucket_with_every_condition,
         "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"age\":-1}}]}}",
         "{\"labels\":{\"k\":null},\"softDeletePolicy\":{\"retentionDurationSeconds\":\"0\"}}",
+        "{\"name\":\"projects/_/buckets/b/operations/abc\",\"done\":true,\"error\":{\"code\":1,\"message\":\"x\"}}",
+        "{\"operations\":[{\"name\":\"a/b\",\"metadata\":{\"commonMetadata\":{\"progressPercent\":-1}}}]}",
     } });
 }
 

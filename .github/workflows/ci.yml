@@ -61,9 +61,14 @@ jobs:
       - name: Start fake-gcs-server
         run: |
           # -public-host: the emulator serves the XML API's paths, which
-          # signed URLs use, only to requests for this host.
+          # signed URLs use, only to requests for this host. -backend
+          # memory: the one backend that keeps object versions (the image's
+          # default, filesystem, answers a versioned bucket with 500), and
+          # what local runs use. Pinned, so a release cannot change CI's
+          # answers unseen.
           docker run -d --name fake-gcs -p 4443:4443 \
-            fsouza/fake-gcs-server -scheme http -port 4443 -public-host 127.0.0.1:4443
+            fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef \
+            -backend memory -scheme http -port 4443 -public-host 127.0.0.1:4443
           for _ in $(seq 1 30); do
             curl -sf "http://127.0.0.1:4443/storage/v1/b?project=test" >/dev/null && exit 0
             sleep 2
@@ -268,8 +273,10 @@ jobs:
         # nightly times that. Bucket settings (2026-09-29) added about 0.5
         # ms a run to storage on a Mac, 2.6 to 3.1 ms, so storage drops to
         # 1000K, and their model property of update sequences, 4.2 ms on a
-        # Mac, went to heavy-storage, which drops to 68K. Both counts are
-        # scaled from the Mac and want re-sizing from the next nightly.
+        # Mac, went to heavy-storage, which drops to 68K. Versions and soft
+        # delete took storage to 3.4 ms on the Mac, so it drops to 900K.
+        # These counts are scaled from the Mac and want re-sizing from the
+        # next nightly.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 900K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
@@ -279,7 +286,7 @@ jobs:
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 75K }
           - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 5M }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
-          - { job: storage, module: storage, filter: fuzz, iterations: 1000K }
+          - { job: storage, module: storage, filter: fuzz, iterations: 900K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 3800K }
           - { job: heavy-storage, module: storage, filter: heavy property, iterations: 68K }
     runs-on: ubuntu-latest

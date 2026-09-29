@@ -14,6 +14,7 @@ const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
 const post_policy = @import("post_policy.zig");
+const restore_impl = @import("restore.zig");
 const rpc = @import("rpc.zig");
 const signing = @import("signing.zig");
 const types = @import("types.zig");
@@ -95,6 +96,55 @@ pub fn delete(self: Bucket) Error!void {
     try rpc.executeDiscard(self.client, .{ .method = .DELETE, .path = path });
 }
 
+/// Brings back the soft-deleted bucket of this name and `generation`, as
+/// `Client.listSoftDeletedBuckets` gives it: its settings, not its objects,
+/// which stay soft-deleted for `Object.restore` or `bulkRestore`. Refused
+/// while a live bucket has the name, which anyone may take. Needs
+/// `storage.buckets.restore` on the project.
+pub fn restore(self: Bucket, generation: u64) Error!types.Owned(types.BucketInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return restore_impl.restoreBucket(self.client, self.name, generation);
+}
+
+/// Starts restoring many soft-deleted objects at once, the newest
+/// soft-deleted generation of each name that matches, and returns the
+/// long-running operation doing it: follow it with `operation`. It can take
+/// minutes to begin, reports counts but no percentage, and blocks the
+/// bucket's delete until it ends. A bucket runs one at a time: another
+/// start meanwhile is `error.ResourceExhausted`. Each start carries a fresh
+/// idempotency token, the same on its retries, so a start whose answer was
+/// lost is not started twice. Needs `storage.buckets.restore` besides the
+/// object permissions. Time bounds that are not RFC 3339 are refused
+/// before sending, with `error.InvalidArgument`.
+pub fn bulkRestore(self: Bucket, options: types.BulkRestoreOptions) Error!types.Owned(types.Operation) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return restore_impl.bulkRestore(self.client, self.name, options);
+}
+
+/// One of the bucket's long-running operations, by `Operation.id`.
+pub fn operation(self: Bucket, id: []const u8) Error!types.Owned(types.Operation) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return restore_impl.operation(self.client, self.name, id);
+}
+
+/// Asks the server to stop an operation, which then ends with
+/// `failure.code` 1. What it restored stays restored.
+pub fn cancelOperation(self: Bucket, id: []const u8) Error!void {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return restore_impl.cancelOperation(self.client, self.name, id);
+}
+
+/// One page of the bucket's operations, finished ones included.
+pub fn listOperations(self: Bucket, page: types.PageOptions) Error!types.Owned(types.OperationPage) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return restore_impl.listOperations(self.client, self.name, page);
+}
+
 /// A handle for the object `name` in this bucket. Sends nothing. The handle
 /// borrows the client and both names, and must not outlive them.
 pub fn object(self: Bucket, name: []const u8) Object {
@@ -128,10 +178,18 @@ pub fn postPolicy(self: Bucket, signer: core.Signer, options: types.PostPolicyOp
     return post_policy.signPolicy(self.client, signer, self.name, key, options);
 }
 
-/// One page of the bucket's objects, filtered and grouped by the options.
+/// One page of the bucket's objects, filtered and grouped by the options:
+/// live objects, every version, or the soft-deleted ones. A page can come
+/// back empty with a `next_page_token` still to follow. `versions` and
+/// `soft_deleted` together are refused before sending, with
+/// `error.InvalidArgument`, as Cloud Storage refuses them.
 pub fn listObjects(self: Bucket, options: types.ListOptions) Error!types.Owned(types.ObjectPage) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
+    if (options.versions and options.soft_deleted) {
+        if (self.client.diagnostics) |d| d.print("versions and soft_deleted cannot be listed together: soft-deleted objects are no versions", .{});
+        return error.InvalidArgument;
+    }
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
     const path = try names.objectsPath(scratch.allocator(), self.name, options);
@@ -201,6 +259,131 @@ test "golden: listObjects with prefix, delimiter and paging" {
     try testing.expectEqual(12, page.value.objects[0].size);
     try testing.expectEqualStrings("reports/2026/archive/", page.value.prefixes[0]);
     try testing.expectEqualStrings("t", page.value.next_page_token.?);
+}
+
+/// Captured from Cloud Storage on 2026-09-29, two of the entries: a
+/// versioned bucket listed with `versions=true` and a `/` delimiter, where
+/// a folder that holds only noncurrent versions still gives a prefix.
+const versions_page =
+    \\{
+    \\  "kind": "storage#objects",
+    \\  "prefixes": [
+    \\    "dir/",
+    \\    "only-gone/"
+    \\  ],
+    \\  "items": [
+    \\    {
+    \\      "kind": "storage#object",
+    \\      "id": "zigps-p2-26fbba/a/1790696413690506",
+    \\      "name": "a",
+    \\      "bucket": "zigps-p2-26fbba",
+    \\      "generation": "1790696413690506",
+    \\      "metageneration": "1",
+    \\      "contentType": "application/octet-stream",
+    \\      "storageClass": "STANDARD",
+    \\      "size": "2",
+    \\      "md5Hash": "aTqf3Uwv0HAJaPug0H/zwA==",
+    \\      "crc32c": "s4fz5Q==",
+    \\      "etag": "CIr1jf2PlJcDEAE=",
+    \\      "timeCreated": "2026-09-29T15:40:13.710Z",
+    \\      "updated": "2026-09-29T15:40:13.710Z",
+    \\      "timeStorageClassUpdated": "2026-09-29T15:40:13.710Z",
+    \\      "timeFinalized": "2026-09-29T15:40:13.710Z"
+    \\    },
+    \\    {
+    \\      "kind": "storage#object",
+    \\      "id": "zigps-p2-26fbba/b/1790696413932275",
+    \\      "name": "b",
+    \\      "bucket": "zigps-p2-26fbba",
+    \\      "generation": "1790696413932275",
+    \\      "metageneration": "1",
+    \\      "contentType": "application/octet-stream",
+    \\      "storageClass": "STANDARD",
+    \\      "size": "2",
+    \\      "md5Hash": "+FH1W6GoTjfE4DQ5lU3LCQ==",
+    \\      "crc32c": "Zlsriw==",
+    \\      "etag": "CPPVnP2PlJcDEAE=",
+    \\      "timeCreated": "2026-09-29T15:40:13.938Z",
+    \\      "updated": "2026-09-29T15:40:13.938Z",
+    \\      "timeDeleted": "2026-09-29T15:40:14.128Z",
+    \\      "timeStorageClassUpdated": "2026-09-29T15:40:13.938Z",
+    \\      "timeFinalized": "2026-09-29T15:40:13.938Z"
+    \\    }
+    \\  ]
+    \\}
+;
+
+/// Captured the same day: a bucket's soft-deleted objects, listed with a
+/// `/` delimiter, which groups them into prefixes as it groups live ones.
+const soft_deleted_page =
+    \\{
+    \\  "kind": "storage#objects",
+    \\  "prefixes": [
+    \\    "s/",
+    \\    "t/"
+    \\  ],
+    \\  "items": [
+    \\    {
+    \\      "kind": "storage#object",
+    \\      "id": "zigps-p3-3f1672/u/1790696465415283",
+    \\      "name": "u",
+    \\      "bucket": "zigps-p3-3f1672",
+    \\      "generation": "1790696465415283",
+    \\      "metageneration": "1",
+    \\      "contentType": "application/octet-stream",
+    \\      "storageClass": "STANDARD",
+    \\      "size": "2",
+    \\      "md5Hash": "PjNOhZh5ryVtOCfWUbeASg==",
+    \\      "crc32c": "I/MTTw==",
+    \\      "etag": "CPP44pWQlJcDEAE=",
+    \\      "timeCreated": "2026-09-29T15:41:05.422Z",
+    \\      "updated": "2026-09-29T15:41:05.422Z",
+    \\      "softDeleteTime": "2026-09-29T15:41:06.151Z",
+    \\      "hardDeleteTime": "2026-10-06T15:41:06.151Z",
+    \\      "timeStorageClassUpdated": "2026-09-29T15:41:05.422Z",
+    \\      "timeFinalized": "2026-09-29T15:41:05.422Z"
+    \\    }
+    \\  ]
+    \\}
+;
+
+test "golden: listObjects of every version, and of soft-deleted objects" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = versions_page } },
+        .{ .respond = .{ .body = soft_deleted_page } },
+    }, .{});
+    defer h.deinit();
+    const b = h.client.bucket("zigps-p2-26fbba");
+
+    var versions = try b.listObjects(.{ .versions = true, .delimiter = "/" });
+    defer versions.deinit();
+    try h.expectRequest(0, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-p2-26fbba/o?delimiter=%2F&versions=true", null);
+    try testing.expectEqual(2, versions.value.objects.len);
+    // The live version has no time_deleted; the noncurrent one does.
+    try testing.expectEqual(null, versions.value.objects[0].time_deleted);
+    try testing.expectEqualStrings("2026-09-29T15:40:14.128Z", versions.value.objects[1].time_deleted.?);
+    try testing.expectEqual(1790696413932275, versions.value.objects[1].generation);
+    try testing.expectEqualStrings("only-gone/", versions.value.prefixes[1]);
+
+    var soft = try b.listObjects(.{ .soft_deleted = true, .match_glob = "s/**", .delimiter = "/", .page_size = 1 });
+    defer soft.deinit();
+    try h.expectRequest(1, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-p2-26fbba/o?delimiter=%2F&matchGlob=s%2F%2A%2A&softDeleted=true&maxResults=1", null);
+    const u = soft.value.objects[0];
+    try testing.expectEqualStrings("2026-09-29T15:41:06.151Z", u.soft_delete_time.?);
+    try testing.expectEqualStrings("2026-10-06T15:41:06.151Z", u.hard_delete_time.?);
+    try testing.expectEqual(null, u.time_deleted);
+    try testing.expectEqual(null, u.restore_token);
+    try testing.expectEqual(2, soft.value.prefixes.len);
+}
+
+test "listObjects: versions and soft_deleted together are refused before sending" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidArgument, h.client.bucket("b").listObjects(.{ .versions = true, .soft_deleted = true }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "cannot be listed together") != null);
+    try h.expectRequestCount(0);
 }
 
 test "create without a project, and bad bucket names, fail before sending" {

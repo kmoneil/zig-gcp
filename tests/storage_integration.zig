@@ -133,6 +133,94 @@ test "bucket settings: the emulator takes a create and an update with each setti
     try testing.expectError(error.InvalidBucketSettings, f.bucket().update(.{}));
 }
 
+/// Deletes every generation in the test's bucket, for a bucket that keeps
+/// versions, so the fixture can delete the bucket.
+fn deleteEveryVersion(f: *Fixture) !void {
+    const b = f.bucket();
+    for (0..10) |_| {
+        var page = try b.listObjects(.{ .versions = true, .page_size = 1000 });
+        defer page.deinit();
+        if (page.value.objects.len == 0) return;
+        for (page.value.objects) |info| try b.object(info.name).delete(.{ .generation = info.generation });
+    }
+    return error.TestVersionsRemain;
+}
+
+test "versions: noncurrent generations listed, read, copied back and deleted" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = f.bucket().create(.{ .versioning = true }) catch |err| switch (err) {
+        // fake-gcs-server's filesystem backend answers versioning with 500
+        // "not implemented"; CI runs the memory backend.
+        error.Internal => return error.SkipZigTest,
+        else => return err,
+    };
+    created.deinit();
+    defer deleteEveryVersion(&f) catch |err| std.debug.print("cleanup: {t}\n", .{err});
+    const b = f.bucket();
+
+    var generations: [3]u64 = undefined;
+    for (&generations, 0..) |*g, i| {
+        var info = try b.object("a").upload(&.{ 'a', '0' + @as(u8, @intCast(i)) }, .{});
+        g.* = info.value.generation;
+        info.deinit();
+    }
+    try f.upload("b", "b0");
+    try b.object("b").delete(.{});
+
+    // Every version, the noncurrent ones with the time they stopped being
+    // live, and b's only generation among them.
+    var all = try b.listObjects(.{ .versions = true, .page_size = 1000 });
+    defer all.deinit();
+    try testing.expectEqual(4, all.value.objects.len);
+    var noncurrent: usize = 0;
+    for (all.value.objects) |info| {
+        if (info.time_deleted != null) noncurrent += 1;
+    }
+    try testing.expectEqual(3, noncurrent);
+    var live = try b.listObjects(.{});
+    defer live.deinit();
+    try testing.expectEqual(1, live.value.objects.len);
+
+    // A noncurrent generation reads, downloads, and copies back.
+    var old = try b.object("a").get(.{ .generation = generations[0] });
+    defer old.deinit();
+    try testing.expect(old.value.time_deleted != null);
+    var bytes = try b.object("a").downloadAlloc(16, .{ .generation = generations[0] });
+    defer bytes.deinit();
+    try testing.expectEqualStrings("a0", bytes.value.data);
+    var back = try b.object("a").copyTo(b.object("a"), .{ .source_generation = generations[0] });
+    defer back.deinit();
+    var now = try b.object("a").downloadAlloc(16, .{});
+    defer now.deinit();
+    try testing.expectEqualStrings("a0", now.value.data);
+
+    // One noncurrent generation deleted; the rest stay.
+    try b.object("a").delete(.{ .generation = generations[1] });
+    try testing.expectError(error.NotFound, b.object("a").get(.{ .generation = generations[1] }));
+
+    // Pages as large as any name's versions. The emulator repeats a page
+    // forever when one is smaller, so a repeated token fails the test
+    // rather than hanging it.
+    var seen: usize = 0;
+    var token: ?[]u8 = null;
+    defer if (token) |t| testing.allocator.free(t);
+    for (0..10) |_| {
+        var page = try b.listObjects(.{ .versions = true, .page_size = 3, .page_token = token });
+        defer page.deinit();
+        seen += page.value.objects.len;
+        const next = page.value.next_page_token orelse break;
+        if (token) |t| {
+            if (std.mem.eql(u8, t, next)) return error.TestRepeatedPage;
+            testing.allocator.free(t);
+        }
+        token = try testing.allocator.dupe(u8, next);
+    } else return error.TestTooManyPages;
+    // a: generations 0 and 2 and the copy; b: its one.
+    try testing.expectEqual(4, seen);
+}
+
 test "objects: listing with a prefix, a delimiter, and paging" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;
