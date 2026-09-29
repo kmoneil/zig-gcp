@@ -56,6 +56,12 @@ pub const Call = struct {
     /// the call succeeds or its last attempt got no response, and always
     /// null from `executeDiscard`, which frees the response as it returns.
     error_body_out: ?*?[]const u8 = null,
+    /// The project this call bills, sent as `x-goog-user-project` in place
+    /// of the credentials' quota project, as a request to a requester pays
+    /// bucket names the project it bills. Held to the same rule as the
+    /// credentials' project. An engine that sends no quota project, or no
+    /// credentials, sends this none either.
+    quota_project: ?[]const u8 = null,
 };
 
 /// One streaming request, as a service module describes it: the body from
@@ -92,6 +98,8 @@ pub const StreamCall = struct {
     /// XML API's are not. Null reads the JSON shape. Either way a body it
     /// cannot read becomes the message whole.
     decode_error: ?*const fn (arena: Allocator, body: []const u8) Allocator.Error!?errors.ErrorBody = null,
+    /// As `Call.quota_project`.
+    quota_project: ?[]const u8 = null,
 
     pub const Body = union(enum) {
         none,
@@ -156,7 +164,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
 
             // The call's headers, plus the quota project when there is one.
             var headers: []const transport.Header = call.headers;
-            if (try self.quotaProject()) |project| {
+            if (try self.quotaProject(call.quota_project)) |project| {
                 const all = try scratch.allocator().alloc(transport.Header, call.headers.len + 1);
                 @memcpy(all[0..call.headers.len], call.headers);
                 all[call.headers.len] = .{ .name = "x-goog-user-project", .value = project };
@@ -274,7 +282,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             var headers = try scratch.allocator().alloc(transport.Header, call.headers.len + 1);
             @memcpy(headers[0..call.headers.len], call.headers);
             var header_count = call.headers.len;
-            if (try self.quotaProject()) |project| {
+            if (try self.quotaProject(call.quota_project)) |project| {
                 headers[header_count] = .{ .name = "x-goog-user-project", .value = project };
                 header_count += 1;
             }
@@ -424,17 +432,19 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             return token;
         }
 
-        /// The project to charge for quota, sent as `x-goog-user-project`.
-        /// User credentials name one; a service account bills its own
-        /// project. An unauthenticated endpoint never sees it, and
-        /// `send_quota_project` turns it off.
-        fn quotaProject(self: Self) Error!?[]const u8 {
+        /// The project to charge for quota, sent as `x-goog-user-project`:
+        /// the call's own, else the credentials'. User credentials name one;
+        /// a service account bills its own project. An unauthenticated
+        /// endpoint never sees it, and `send_quota_project` turns it off.
+        fn quotaProject(self: Self, call_project: ?[]const u8) Error!?[]const u8 {
             if (self.unauthenticated or !self.send_quota_project) return null;
-            const provider = self.token_provider orelse return null;
-            const project = provider.quotaProject() orelse return null;
+            const project = call_project orelse project: {
+                const provider = self.token_provider orelse return null;
+                break :project provider.quotaProject() orelse return null;
+            };
             if (!names.isProjectId(project)) {
                 if (self.diagnostics) |d| d.print(
-                    "invalid quota project: expected a project id, from the credentials or GOOGLE_CLOUD_QUOTA_PROJECT",
+                    "invalid quota project: expected a project id, from the call, the credentials or GOOGLE_CLOUD_QUOTA_PROJECT",
                     .{},
                 );
                 return error.InvalidResourceId;
@@ -760,6 +770,50 @@ test "quota: the credentials' project rides along, and one that is not a project
     try testing.expectError(error.InvalidResourceId, h.get());
     try testing.expectEqual(2, h.fake.requests.items.len);
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "invalid quota project") != null);
+}
+
+test "quota: a call's own project goes in place of the credentials', on both entries" {
+    var h: Harness = undefined;
+    h.init(&.{ ok, ok, ok, ok, ok });
+    defer h.deinit();
+    h.token.quota_project = "billing-project";
+    var e = h.engine();
+    _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things", .quota_project = "requester-project" });
+    const sent = try h.fake.request(0);
+    try testing.expectEqualStrings("requester-project", sent.header("x-goog-user-project").?);
+    // One header, never two.
+    var count: usize = 0;
+    for (sent.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "x-goog-user-project")) count += 1;
+    }
+    try testing.expectEqual(1, count);
+
+    // Credentials that name none still send the call's.
+    h.token.quota_project = null;
+    _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things", .quota_project = "requester-project" });
+    try testing.expectEqualStrings("requester-project", (try h.fake.request(1)).header("x-goog-user-project").?);
+    // The streaming entry too.
+    _ = try e.executeStream(&h.arena, .{ .method = .GET, .path = "/v1/things", .quota_project = "requester-project" });
+    try testing.expectEqualStrings("requester-project", (try h.fake.streamRequest(0)).header("x-goog-user-project").?);
+
+    // Off is off, even for the call's own, and an endpoint that takes no
+    // credentials gets none.
+    e.send_quota_project = false;
+    _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things", .quota_project = "requester-project" });
+    try testing.expectEqual(null, (try h.fake.request(2)).header("x-goog-user-project"));
+    e.send_quota_project = true;
+    e.unauthenticated = true;
+    _ = try e.execute(&h.arena, .{ .method = .GET, .path = "/v1/things", .quota_project = "requester-project" });
+    try testing.expectEqual(null, (try h.fake.request(3)).header("x-goog-user-project"));
+    e.unauthenticated = false;
+
+    // And held to the rule the credentials' is.
+    try testing.expectError(error.InvalidResourceId, e.execute(&h.arena, .{
+        .method = .GET,
+        .path = "/v1/things",
+        .quota_project = "a b\r\nX-Injected: 1",
+    }));
+    try testing.expectEqual(4, h.fake.requests.items.len);
 }
 
 test "timeouts: every attempt carries the caller's deadline" {

@@ -49,19 +49,17 @@ const reserved_params = [_][]const u8{
 
 /// Signs a URL for `object` in `bucket`, or for the bucket itself when
 /// `object` is null. The caller has begun the call and checked both names.
+/// A handle's billing project is signed in as `userProject`, the one way a
+/// signed request bills a project, measured against a requester pays
+/// bucket on 2026-09-29.
 pub fn signUrl(
     client: *Client,
     signer: core.Signer,
     bucket: []const u8,
     object: ?[]const u8,
-    options: types.SignedUrlOptions,
+    caller_options: types.SignedUrlOptions,
 ) Error!types.Owned([]const u8) {
     const diag = client.diagnostics;
-    try check(diag, client.base_url, bucket, object, options, signer.lifetimeS());
-    const signed_at = timestamp(std.Io.Clock.real.now(client.io)) orelse {
-        if (diag) |d| d.print("the clock reads a time a signed URL cannot carry: before 1970, or after 9999", .{});
-        return error.InvalidSignedUrlOptions;
-    };
 
     // The signature is a credential until the URL expires. The scratch
     // memory that held it is wiped; only the returned URL keeps a copy.
@@ -69,6 +67,23 @@ pub fn signUrl(
     var scratch: std.heap.ArenaAllocator = .init(wiping.allocator());
     defer scratch.deinit();
     const arena = scratch.allocator();
+
+    var options = caller_options;
+    if (client.billing_project) |project| {
+        for (caller_options.query, 0..) |param, i| if (std.mem.eql(u8, param.name, "userProject")) {
+            if (diag) |d| d.print("query parameter {d} is userProject, which the handle's billing project signs already", .{i});
+            return error.InvalidSignedUrlOptions;
+        };
+        const query = try arena.alloc(types.QueryParam, caller_options.query.len + 1);
+        @memcpy(query[0..caller_options.query.len], caller_options.query);
+        query[caller_options.query.len] = .{ .name = "userProject", .value = project };
+        options.query = query;
+    }
+    try check(diag, client.base_url, bucket, object, options, signer.lifetimeS());
+    const signed_at = timestamp(std.Io.Clock.real.now(client.io)) orelse {
+        if (diag) |d| d.print("the clock reads a time a signed URL cannot carry: before 1970, or after 9999", .{});
+        return error.InvalidSignedUrlOptions;
+    };
 
     const email = try signer.email(client.io, arena);
     if (email.len == 0) {

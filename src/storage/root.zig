@@ -118,6 +118,7 @@ test {
     _ = @import("parallel.zig");
     _ = @import("parallel_download.zig");
     _ = @import("post_policy.zig");
+    _ = @import("requester_pays.zig");
     _ = @import("restore.zig");
     _ = @import("resumable.zig");
     _ = @import("rpc.zig");

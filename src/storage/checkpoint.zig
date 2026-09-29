@@ -18,6 +18,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const core = @import("core");
 
 const mp = @import("xml_multipart.zig");
 
@@ -208,6 +209,10 @@ pub const State = union(enum) {
         if_generation_not_match: ?u64,
         if_metageneration_match: ?u64,
         if_metageneration_not_match: ?u64,
+        /// The project the upload bills, as the handle that began it named
+        /// one: `Client.abandonTransfer` has no handle, and a requester pays
+        /// bucket refuses the XML abort without it.
+        billing_project: ?[]const u8 = null,
     };
 };
 
@@ -252,6 +257,7 @@ pub fn encodeAlloc(gpa: Allocator, state: State) Allocator.Error![]u8 {
             .if_generation_not_match = s.if_generation_not_match,
             .if_metageneration_match = s.if_metageneration_match,
             .if_metageneration_not_match = s.if_metageneration_not_match,
+            .billing_project = s.billing_project,
         }) catch return error.OutOfMemory,
     }
     return out.toOwnedSlice();
@@ -281,6 +287,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
         if_metageneration_not_match: ?u64 = null,
         gzip_level: ?u8 = null,
         gzip_zig: ?[]const u8 = null,
+        billing_project: ?[]const u8 = null,
     };
     const wire = std.json.parseFromSliceLeaky(Wire, arena, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -288,6 +295,9 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
     };
     if (wire.version != 1) return error.CheckpointFailed;
     if (wire.size > mp.max_object_size) return error.CheckpointFailed;
+    // Older states name no billing project; one that is named must be one,
+    // since it goes into a header.
+    if (wire.billing_project) |project| if (!core.names.isProjectId(project)) return error.CheckpointFailed;
     // Where a state names a part size, the plan must reproduce exactly the
     // pieces the earlier run saved: a part size `plan` would grow named a
     // plan that never was.
@@ -355,6 +365,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
             .if_generation_not_match = wire.if_generation_not_match,
             .if_metageneration_match = wire.if_metageneration_match,
             .if_metageneration_not_match = wire.if_metageneration_not_match,
+            .billing_project = wire.billing_project,
         } };
     } else return error.CheckpointFailed;
 
@@ -665,6 +676,52 @@ test "upload state: the canonical encoding, both shapes, pinned byte for byte" {
         try testing.expectEqual(want.if_metageneration_not_match, got.if_metageneration_not_match);
         try testing.expectEqual(want.temp == null, got.temp == null);
         if (want.temp) |temp| try testing.expectEqualStrings(temp, got.temp.?);
+    }
+}
+
+test "upload states: the billing project, written last, older states without it, and a bad one refused" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parallel_state: State = .{ .upload_parallel = .{
+        .bucket = "b",
+        .object = "o",
+        .size = 5000,
+        .mtime = 1,
+        .upload_id = "u",
+        .part_size = 1024,
+        .temp = null,
+        .if_generation_match = null,
+        .if_generation_not_match = null,
+        .if_metageneration_match = null,
+        .if_metageneration_not_match = null,
+        .billing_project = "requester-project",
+    } };
+    const parallel_bytes = try encodeAlloc(arena, parallel_state);
+    try testing.expectEqualStrings(
+        "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5000,\"mtime\":1," ++
+            "\"upload_id\":\"u\",\"part_size\":1024,\"billing_project\":\"requester-project\"}",
+        parallel_bytes,
+    );
+    try testing.expectEqualStrings("requester-project", (try parse(arena, parallel_bytes)).upload_parallel.billing_project.?);
+
+    // An uploadFile state has none: its session URL names the project.
+    const file_state = "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5,\"mtime\":1," ++
+        "\"session\":\"https://storage.googleapis.com/upload/storage/v1/b/b/o?upload_id=x&userProject=requester-project\"";
+    _ = try parse(arena, file_state ++ "}");
+    try testing.expectError(error.CheckpointFailed, parse(arena, file_state ++ ",\"billing_project\":\"requester-project\"}"));
+
+    // A state from before the field bills as it did: nothing named.
+    const older = "{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5000,\"mtime\":1," ++
+        "\"upload_id\":\"u\",\"part_size\":1024}";
+    try testing.expectEqual(null, (try parse(arena, older)).upload_parallel.billing_project);
+
+    // A project that is not one never reaches a header.
+    for ([_][]const u8{ "", "a b", "p\\r\\nX: 1", "p/q" }) |bad| {
+        const forged = try std.fmt.allocPrint(arena, "{{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5000," ++
+            "\"mtime\":1,\"upload_id\":\"u\",\"part_size\":1024,\"billing_project\":\"{s}\"}}", .{bad});
+        errdefer std.debug.print("forged: {s}\n", .{forged});
+        try testing.expectError(error.CheckpointFailed, parse(arena, forged));
     }
 }
 

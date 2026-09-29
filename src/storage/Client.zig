@@ -52,6 +52,11 @@ transport: Transport,
 http: ?*HttpTransport,
 /// Owned copy of `Options.user_agent`.
 user_agent: []const u8,
+/// The project the current call bills, taken from the handle it came
+/// through, on a copy of the client that lives for that call: every request
+/// the call makes then carries it. Not an option; leave it null, and name a
+/// project with `Bucket.withBillingProject` or `Object.withBillingProject`.
+billing_project: ?[]const u8 = null,
 /// Tests only: lowers the multipart upload's 5 MiB part floor and a
 /// parallel download's 1 MiB range floor, and lets an emulator endpoint
 /// take the multipart path instead of the ordinary upload `uploadParallel`
@@ -261,8 +266,12 @@ pub fn abandonTransfer(self: *Client, cp: types.Checkpoint) Error!void {
     };
     switch (state) {
         .download_parallel => {},
+        // The session URL carries the billing project itself.
         .upload_file => |s| try resumable.cancelSession(self, s.session),
-        .upload_parallel => |s| try parallel.abandon(self, s),
+        .upload_parallel => |s| {
+            var billed = rpc.billed(self, s.billing_project);
+            try parallel.abandon(&billed, s);
+        },
     }
     cp.clear();
 }

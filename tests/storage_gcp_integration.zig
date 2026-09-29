@@ -44,6 +44,13 @@
 //! The one test of soft delete itself cannot avoid that, so it runs only
 //! with GCP_TEST_SOFT_DELETE=1 as well, and each run leaves its empty
 //! bucket soft-deleted for 7 days; it needs storage.buckets.restore.
+//!
+//! Of the requester pays tests, the owners' makes a bucket of its own like
+//! the others. The other runs as someone else, and skips without them:
+//! GCP_TEST_REQUESTER_BUCKET, a requester pays bucket, and
+//! GCP_TEST_REQUESTER_TOKEN, a token for an account with Storage Object
+//! Admin on it that may bill GCP_TEST_PROJECT (Service Usage Consumer
+//! there).
 
 const std = @import("std");
 const core = @import("core");
@@ -3713,4 +3720,131 @@ fn waitForOperation(f: *BucketFixture, id: []const u8, limit_s: u32) !storage.Op
         pause = @min(pause * 2, 30);
     }
     return error.TestOperationNeverEnded;
+}
+
+/// Bytes that vary, for the transfers below.
+fn requesterBytes(n: usize, seed: u8) ![]u8 {
+    const data = try testing.allocator.alloc(u8, n);
+    for (data, 0..) |*c, i| c.* = @truncate((i *% 131) +% seed +% (i >> 11));
+    return data;
+}
+
+test "53. requester pays: every call billed, as the bucket's owner, and none refused" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{ .location = "us-central1", .soft_delete_retention_s = 0, .requester_pays = true });
+    defer created.deinit();
+    try testing.expect(created.value.requester_pays);
+    defer f.deleteEveryVersion() catch |err| std.debug.print("cleanup: {t}\n", .{err});
+    const b = f.bucket().withBillingProject(f.project);
+
+    // Every upload path: one request, a resumable session, the XML API.
+    const small = try requesterBytes(1000, 1);
+    defer testing.allocator.free(small);
+    var one = try b.object("one").upload(small, .{});
+    one.deinit();
+    const big = try requesterBytes(9 * 1024 * 1024 + 7, 2);
+    defer testing.allocator.free(big);
+    var reader: std.Io.Reader = .fixed(big);
+    var streamed = try b.object("streamed").uploadFrom(&reader, .{});
+    streamed.deinit();
+    const parted = try requesterBytes(12 * 1024 * 1024, 3);
+    defer testing.allocator.free(parted);
+    var parts = try b.object("parts").uploadParallel(.{ .data = parted }, .{ .part_size = 5 * 1024 * 1024, .concurrency = 3 });
+    parts.deinit();
+
+    // And back, whole and in ranges, verified.
+    var whole = try b.object("streamed").downloadAlloc(big.len, .{});
+    defer whole.deinit();
+    try testing.expectEqualSlices(u8, big, whole.value.data);
+    try testing.expect(whole.value.result.checksum_verified);
+    const buffer = try testing.allocator.alloc(u8, parted.len);
+    defer testing.allocator.free(buffer);
+    const ranged = try b.object("parts").downloadParallel(.{ .buffer = buffer }, .{ .part_size = 4 * 1024 * 1024, .concurrency = 3 });
+    try testing.expect(ranged.checksum_verified);
+    try testing.expectEqualSlices(u8, parted, buffer);
+
+    // Server-side work, metadata, listings and the bucket.
+    var copied = try b.object("one").copyTo(b.object("copy"), .{ .storage_class = "NEARLINE" });
+    copied.deinit();
+    // Not from "copy": Cloud Storage refuses to compose sources of another
+    // storage class than the result's.
+    var composed = try b.object("composed").composeFrom(&.{ .{ .name = "one" }, .{ .name = "streamed" } }, .{});
+    composed.deinit();
+    var patched = try b.object("one").updateMetadata(.{ .content_type = "text/plain" });
+    patched.deinit();
+    var listed = try b.listObjects(.{});
+    defer listed.deinit();
+    try testing.expectEqual(5, listed.value.objects.len);
+    var settings = try b.update(.{ .labels = .{ .change = &.{.{ .key = "billed", .value = "yes" }} } });
+    settings.deinit();
+    try b.object("copy").delete(.{});
+
+    // The owner is never refused, billed or not.
+    var unbilled = try f.bucket().object("one").get(.{});
+    unbilled.deinit();
+}
+
+test "54. requester pays: another principal is refused without a project to bill, and served with one" {
+    const gpa = testing.allocator;
+    var env = try testing.environ.createMap(gpa);
+    defer env.deinit();
+    // Set by a runner that made a throwaway account and bucket: the
+    // account holds Storage Object Admin on the bucket, and may bill
+    // GCP_TEST_PROJECT and nothing else.
+    const token_text = env.get("GCP_TEST_REQUESTER_TOKEN") orelse return error.SkipZigTest;
+    const bucket_name = env.get("GCP_TEST_REQUESTER_BUCKET") orelse return error.SkipZigTest;
+    const billable = env.get("GCP_TEST_PROJECT") orelse return error.SkipZigTest;
+    var token: storage.StaticToken = .{ .token = std.mem.trim(u8, token_text, &std.ascii.whitespace) };
+    var diag: storage.Diagnostics = .{};
+    var http: core.transport.HttpTransport = .init(gpa, testing.io, Fixture.user_agent);
+    defer http.deinit();
+    var client: storage.Client = try .init(gpa, testing.io, .{
+        .token_provider = token.provider(),
+        .transport = http.transport(),
+        .diagnostics = &diag,
+        .user_agent = Fixture.user_agent,
+    });
+    defer client.deinit();
+    const plain = client.bucket(bucket_name);
+    const b = plain.withBillingProject(billable);
+
+    // Unbilled: refused, and told how to bill.
+    try testing.expectError(error.InvalidArgument, plain.object("one").upload("x", .{}));
+    try testing.expectEqualStrings("required", diag.status());
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "withBillingProject") != null);
+    try testing.expectError(error.InvalidArgument, plain.listObjects(.{}));
+    // A project that does not exist.
+    try testing.expectError(error.InvalidArgument, plain.withBillingProject("zigps-no-such-project-4d1").listObjects(.{}));
+
+    // Billed: every transfer goes through.
+    const small = try requesterBytes(1000, 4);
+    defer gpa.free(small);
+    var one = try b.object("one").upload(small, .{});
+    one.deinit();
+    const big = try requesterBytes(9 * 1024 * 1024 + 7, 5);
+    defer gpa.free(big);
+    var reader: std.Io.Reader = .fixed(big);
+    var streamed = try b.object("streamed").uploadFrom(&reader, .{});
+    streamed.deinit();
+    const parted = try requesterBytes(12 * 1024 * 1024, 6);
+    defer gpa.free(parted);
+    var parts = try b.object("parts").uploadParallel(.{ .data = parted }, .{ .part_size = 5 * 1024 * 1024, .concurrency = 3 });
+    parts.deinit();
+    var whole = try b.object("streamed").downloadAlloc(big.len, .{});
+    defer whole.deinit();
+    try testing.expectEqualSlices(u8, big, whole.value.data);
+    const buffer = try gpa.alloc(u8, parted.len);
+    defer gpa.free(buffer);
+    _ = try b.object("parts").downloadParallel(.{ .buffer = buffer }, .{ .part_size = 4 * 1024 * 1024, .concurrency = 3 });
+    try testing.expectEqualSlices(u8, parted, buffer);
+    var copied = try b.object("one").copyTo(b.object("copy"), .{});
+    copied.deinit();
+    for ([_][]const u8{ "one", "streamed", "parts", "copy" }) |name| try b.object(name).delete(.{});
+    // Unbilled, even a delete is refused.
+    var again = try b.object("again").upload("x", .{});
+    again.deinit();
+    try testing.expectError(error.InvalidArgument, plain.object("again").delete(.{}));
+    try b.object("again").delete(.{});
 }

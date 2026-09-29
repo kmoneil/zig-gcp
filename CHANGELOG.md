@@ -49,8 +49,26 @@ including the ones that did not change.
   `versions` with `soft_deleted`, a soft-deleted read without a
   generation, bulk restore bounds that are not RFC 3339, and an empty
   operation id. Not breaking.
+- storage: requester pays. New `Bucket.withBillingProject` and
+  `Object.withBillingProject` give a handle whose every request bills a
+  project: on the JSON API the `userProject` parameter and the
+  `x-goog-user-project` header, one value in both; on the XML API the
+  header; each call of a copy; the start of a resumable upload, whose
+  session URL carries it on; and a signed URL's signed query. A bucket
+  handle's objects are billed as it is, `copyTo` bills the source's
+  project or else the destination's, and a parallel upload's checkpoint
+  records it for `abandonTransfer`, written only when set, so older
+  checkpoints still load. Refused before sending: a billing project that
+  is not a project id or number, with `error.InvalidArgument`; a POST
+  policy on a billed handle, with `error.InvalidPostPolicyOptions`, since
+  no form can name one; and a signed URL's own `userProject` on a billed
+  handle, with `error.InvalidSignedUrlOptions`. A requester pays refusal
+  of an unbilled call says in `Diagnostics` how to bill one. Not
+  breaking.
 - core: `Change(T)` moves here from pubsub, for every module to share.
-  Not breaking.
+  `rpc.Call` and `rpc.StreamCall` gain `quota_project`, a project one
+  call bills in place of the credentials' quota project, held to the same
+  check. Not breaking.
 - pubsub: `pubsub.Change` is core's `Change`, the same as before.
 - auth, secret_manager, examples: unchanged.
 

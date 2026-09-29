@@ -255,6 +255,7 @@ fn saveUploadState(client: *Client, p: *const Persist, upload_id: []const u8, pa
         .if_generation_not_match = p.preconditions.if_generation_not_match,
         .if_metageneration_match = p.preconditions.if_metageneration_match,
         .if_metageneration_not_match = p.preconditions.if_metageneration_not_match,
+        .billing_project = client.billing_project,
     } };
     const bytes = try checkpoint.encodeAlloc(client.gpa, state);
     defer client.gpa.free(bytes);
