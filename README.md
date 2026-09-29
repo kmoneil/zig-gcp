@@ -13,13 +13,13 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, the `TokenProvider` and `Signer` seams, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 1184 unit, property and fuzz tests, Google's 29 V4 signing
+- Tested with 1200 unit, property and fuzz tests, Google's 29 V4 signing
   vectors among them; 28 Pub/Sub integration tests that pass against both
   the emulator and production, and 20 more through a proxy that drops,
   cuts and stalls the connection; 25 Cloud Storage tests against
-  fake-gcs-server, and 53 against real buckets, where uploads and
+  fake-gcs-server, and 55 against real buckets, where uploads and
   downloads cut off mid-body, or ended with their process, resume against
-  Google itself, plus 17 that sign URLs and POST policies for one; 12 Secret
+  Google itself, plus 18 that sign URLs and POST policies for one; 12 Secret
   Manager tests against a real project, since it has no emulator; 10 auth
   tests against Google's token, STS and IAM Credentials endpoints; and a
   run on a Compute Engine VM, where the metadata server is the one that
@@ -1191,12 +1191,13 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-23:
 | `.composeFrom(sources, options)` | Writes this object from up to 32 others in the bucket, server-side |
 | `.signedUrl(signer, options)`, `bucket.signedUrl(signer, options)` | A V4 signed URL, which lets whoever holds it make one request without credentials until it expires |
 | `.postPolicy(signer, options)`, `bucket.postPolicy(signer, options)` | A V4 POST policy, which lets a plain HTML form upload what the policy allows, without credentials, until it expires |
+| `.withBillingProject(project)`, `bucket.withBillingProject(project)` | A handle whose every request bills `project`, as a requester pays bucket needs |
 
 The default OAuth scope is `devstorage.read_write`; `Options.scope` picks
 `.read_only` or `.cloud_platform` instead. Not in this version: the JSON
 API's PUT, which replaces a whole resource (`updateMetadata` and
 `Bucket.update` patch, which merges), parallel composite uploads,
-requester pays, customer-supplied encryption keys, and gRPC.
+customer-supplied encryption keys, and gRPC.
 
 ### Bucket settings
 
@@ -1340,6 +1341,57 @@ Measured against Cloud Storage on 2026-09-29:
 - `versions` and `soft_deleted` cannot be listed together. A listing of
   versions with a delimiter still groups a folder whose every object is
   noncurrent.
+
+### Requester pays
+
+A bucket with `requester_pays` on bills each request to the project the
+request names. Its owners may name none, and their requests bill the
+bucket's project as before; anyone else who names none is refused.
+`withBillingProject` gives a handle whose every request names one:
+
+```zig
+const dataset = gcs.bucket("their-dataset").withBillingProject("my-project");
+var page = try dataset.listObjects(.{ .prefix = "2026/" });
+defer page.deinit();
+var got = try dataset.object("2026/01.csv").downloadAlloc(64 << 20, .{});
+defer got.deinit();
+```
+
+The principal needs `serviceusage.services.use` on the project it bills,
+which Service Usage Consumer grants. The project goes into every request
+a call makes:
+
+- on the JSON API, the `userProject` parameter and the
+  `x-goog-user-project` header, one value in both;
+- the header on every request of a parallel upload through the XML API;
+- each call of a copy;
+- the start of a resumable upload, whose session URL carries it on;
+- a signed URL's signed query.
+
+An object handle from a billed bucket handle is billed too. `copyTo`
+bills the source handle's project, or the destination's when the source
+names none. A checkpoint of a parallel upload records the project, so
+`abandonTransfer` bills it as well. `create` bills nothing, since there
+is no bucket yet. A POST policy on a billed handle is refused with
+`error.InvalidPostPolicyOptions`, since no form can name a project.
+
+Measured against Cloud Storage on 2026-09-29, with a throwaway account on
+a throwaway bucket:
+
+- Anyone but the owners who names no project gets
+  `error.InvalidArgument`, and `Diagnostics` says to name one with
+  `withBillingProject`. A project the principal may not bill is
+  `error.PermissionDenied`. A project that does not exist is
+  `error.InvalidArgument`, even for an owner.
+- Where the parameter and the header name different projects, the
+  parameter counts. This library always sends one project in both.
+- A signed URL is used as its signer, so the signer's account must be
+  allowed to bill the project. A URL that names none is refused when
+  used, 400 `UserProjectMissing`, and so is one naming a project that
+  does not exist, 400 `UserProjectInvalid`.
+- A form cannot name a project. A policy with an `x-goog-user-project`
+  field is refused, and a query on the form's URL makes the POST a bucket
+  create, which is refused too.
 
 ### Metadata, after the upload
 
@@ -1918,6 +1970,16 @@ GCP_TEST_BUCKET=my-bucket GCP_TEST_TOKEN=$(gcloud auth application-default print
 GCP_TEST_BUCKET=my-bucket GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
     GCP_TEST_SIGNER_KEY=key.json GCP_TEST_SIGNER_EMAIL=signer@my-project.iam.gserviceaccount.com \
     zig build test-integration-gcp
+
+# Requester pays, as someone other than the bucket's owners: a requester
+# pays bucket, and an account with Storage Object Admin on it that may bill
+# GCP_TEST_PROJECT (Service Usage Consumer there) and that the token may
+# sign as through IAM. Without them those tests skip; the owners' test
+# needs GCP_TEST_PROJECT alone.
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
+    GCP_TEST_REQUESTER_BUCKET=their-bucket GCP_TEST_REQUESTER_EMAIL=requester@my-project.iam.gserviceaccount.com \
+    GCP_TEST_REQUESTER_TOKEN=$(gcloud auth print-access-token --impersonate-service-account=requester@my-project.iam.gserviceaccount.com) \
+    zig build test-integration-gcp -Dtest-filter="requester pays"
 
 # The emulator serves the paths signed URLs use only for the host they
 # name, so those tests need -public-host, as CI passes it.

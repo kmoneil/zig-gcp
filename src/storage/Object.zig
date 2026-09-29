@@ -39,12 +39,44 @@ client: *Client,
 bucket: []const u8,
 /// Borrowed; the handle must not outlive it.
 name: []const u8,
+/// The project this handle's requests bill, as a requester pays bucket
+/// needs of anyone but its owners: a project id or number. Null bills as
+/// the credentials do. Borrowed; the handle must not outlive it.
+billing_project: ?[]const u8 = null,
+
+/// This handle, billing `project` for every request it makes: the
+/// `userProject` parameter and the `x-goog-user-project` header, one
+/// value in both. A requester pays bucket refuses anyone but its owners
+/// without one. Checked before any request.
+pub fn withBillingProject(self: Object, project: []const u8) Object {
+    var copy = self;
+    copy.billing_project = project;
+    return copy;
+}
+
+/// This handle on `copy`, a copy of its client that bills this handle's
+/// project for the call now beginning. A handle that names none keeps what
+/// its client bills already, as the handles a transfer makes for its own
+/// requests do.
+fn billing(self: Object, copy: *Client) Error!Object {
+    rpc.begin(self.client);
+    try rpc.checkBillingProject(self.client, self.billing_project);
+    copy.* = rpc.billed(self.client, self.billing_project orelse self.client.billing_project);
+    var billed_self = self;
+    billed_self.client = copy;
+    return billed_self;
+}
 
 /// The object's metadata: the live generation, or the one `options` names,
 /// a noncurrent or a soft-deleted one included. A soft-deleted generation
 /// must be named: without one, `soft_deleted` is refused before sending
 /// with `error.InvalidArgument`, as Cloud Storage refuses it.
 pub fn get(self: Object, options: types.GetOptions) Error!types.Owned(types.ObjectInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).getBilled(options);
+}
+
+fn getBilled(self: Object, options: types.GetOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -74,6 +106,11 @@ pub fn get(self: Object, options: types.GetOptions) Error!types.Owned(types.Obje
 /// The URL points at the client's endpoint, or at `options.style`'s host.
 /// It is a bearer credential until it expires, so it is never logged.
 pub fn signedUrl(self: Object, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).signedUrlBilled(signer, options);
+}
+
+fn signedUrlBilled(self: Object, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -92,6 +129,16 @@ pub fn signedUrl(self: Object, signer: core.Signer, options: types.SignedUrlOpti
 /// send `file`, last, holding the bytes. The fields are a bearer
 /// credential together until they expire, so they are never logged.
 pub fn postPolicy(self: Object, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
+    var client: Client = undefined;
+    const this = try self.billing(&client);
+    if (this.billing_project != null) {
+        if (this.client.diagnostics) |d| d.print("a POST policy cannot bill a project: an HTML form has no way to name one", .{});
+        return error.InvalidPostPolicyOptions;
+    }
+    return this.postPolicyBilled(signer, options);
+}
+
+fn postPolicyBilled(self: Object, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -116,6 +163,15 @@ pub fn composeFrom(
     sources: []const types.ComposeSource,
     options: types.ComposeOptions,
 ) Error!types.Owned(types.ObjectInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).composeFromBilled(sources, options);
+}
+
+fn composeFromBilled(
+    self: Object,
+    sources: []const types.ComposeSource,
+    options: types.ComposeOptions,
+) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -132,6 +188,11 @@ pub fn composeFrom(
 /// makes one safe to repeat: a `generation` condition says nothing here,
 /// since the generation does not move.
 pub fn updateMetadata(self: Object, options: types.MetadataUpdate) Error!types.Owned(types.ObjectInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).updateMetadataBilled(options);
+}
+
+fn updateMetadataBilled(self: Object, options: types.MetadataUpdate) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -152,6 +213,11 @@ pub fn updateMetadata(self: Object, options: types.MetadataUpdate) Error!types.O
 /// condition, such a repeat fails with `error.FailedPrecondition` instead.
 /// `.does_not_exist` restores only where no live object has the name.
 pub fn restore(self: Object, options: types.RestoreOptions) Error!types.Owned(types.ObjectInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).restoreBilled(options);
+}
+
+fn restoreBilled(self: Object, options: types.RestoreOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -175,6 +241,11 @@ pub fn exists(self: Object) Error!bool {
 /// succeeded before the connection dropped, and a blind repeat could then
 /// remove someone else's newer object.
 pub fn delete(self: Object, options: types.DeleteOptions) Error!void {
+    var client: Client = undefined;
+    return (try self.billing(&client)).deleteBilled(options);
+}
+
+fn deleteBilled(self: Object, options: types.DeleteOptions) Error!void {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -208,6 +279,11 @@ pub fn delete(self: Object, options: types.DeleteOptions) Error!void {
 /// above that, a chunk at a time through the resumable protocol, one
 /// `chunk_size` buffer of memory, and a lost session compresses it again.
 pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).uploadBilled(data, options);
+}
+
+fn uploadBilled(self: Object, data: []const u8, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -306,6 +382,11 @@ fn sendMultipart(self: Object, data: []const u8, options: types.UploadOptions, c
 /// exists: no read back, and no delete afterwards. `options.size` still
 /// counts the bytes the reader gives.
 pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).uploadFromBilled(reader, options);
+}
+
+fn uploadFromBilled(self: Object, reader: *std.Io.Reader, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -377,6 +458,11 @@ pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOpt
 /// always. Against an emulator, which has no multipart uploads, the object
 /// goes up as one ordinary upload, with the conditions applied to it.
 pub fn uploadParallel(self: Object, source: types.ParallelSource, options: types.ParallelUploadOptions) Error!types.Owned(types.ObjectInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).uploadParallelBilled(source, options);
+}
+
+fn uploadParallelBilled(self: Object, source: types.ParallelSource, options: types.ParallelUploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -400,6 +486,15 @@ pub fn uploadParallel(self: Object, source: types.ParallelSource, options: types
 /// `if_generation_match`, or the client opted into unconditional retries;
 /// follow-up calls hold a rewrite token, which makes them safe anyway.
 pub fn copyTo(self: Object, dest: Object, options: types.CopyOptions) Error!types.Owned(types.ObjectInfo) {
+    // A copy is billed to the source's bucket: the source handle's
+    // project, else the destination's.
+    var source = self;
+    source.billing_project = self.billing_project orelse dest.billing_project;
+    var client: Client = undefined;
+    return (try source.billing(&client)).copyToBilled(dest, options);
+}
+
+fn copyToBilled(self: Object, dest: Object, options: types.CopyOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -436,6 +531,11 @@ pub fn copyTo(self: Object, dest: Object, options: types.CopyOptions) Error!type
 /// began it, whose compressor another Zig may not reproduce; a checkpoint
 /// from another starts over.
 pub fn uploadFile(self: Object, file: std.Io.File, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).uploadFileBilled(file, options);
+}
+
+fn uploadFileBilled(self: Object, file: std.Io.File, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -508,6 +608,11 @@ fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void 
 /// On `error.ChecksumMismatch` the bytes are already in the writer and must
 /// be discarded.
 pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOptions) Error!types.DownloadResult {
+    var client: Client = undefined;
+    return (try self.billing(&client)).downloadBilled(writer, options);
+}
+
+fn downloadBilled(self: Object, writer: *std.Io.Writer, options: types.DownloadOptions) Error!types.DownloadResult {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -761,6 +866,11 @@ fn finishStream(
 /// finishes, or when its bytes are discredited. `storage.CheckpointFile`
 /// is the built-in store.
 pub fn downloadParallel(self: Object, destination: types.ParallelDestination, options: types.ParallelDownloadOptions) Error!types.DownloadResult {
+    var client: Client = undefined;
+    return (try self.billing(&client)).downloadParallelBilled(destination, options);
+}
+
+fn downloadParallelBilled(self: Object, destination: types.ParallelDestination, options: types.ParallelDownloadOptions) Error!types.DownloadResult {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);

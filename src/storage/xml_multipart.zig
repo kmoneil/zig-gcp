@@ -90,7 +90,7 @@ pub fn start(client: *Client, arena: Allocator, bucket: []const u8, object: []co
     // Reset between attempts, so it holds nothing but the answer.
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
-    const res = rpc.executeStream(client, &response, .{
+    const res = rpc.executeXml(client, &response, .{
         .method = .POST,
         .path = path,
         .content_type = meta.content_type,
@@ -165,7 +165,7 @@ pub fn sendPart(
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
     const res = switch (body) {
-        .bytes => |bytes| rpc.executeStream(client, &response, s: {
+        .bytes => |bytes| rpc.executeXml(client, &response, s: {
             var with_body = call;
             with_body.body = .{ .segments = &.{bytes} };
             break :s with_body;
@@ -173,7 +173,7 @@ pub fn sendPart(
             error.WriteFailed => unreachable,
             else => |e| return e,
         },
-        .stream => |source| rpc.executeStreamBody(client, &response, call, source) catch |err| switch (err) {
+        .stream => |source| rpc.executeXmlBody(client, &response, call, source) catch |err| switch (err) {
             error.WriteFailed => unreachable,
             error.EndOfStream => {
                 if (client.diagnostics) |d| d.print("the source ended before part {d} did", .{number});
@@ -222,7 +222,7 @@ pub fn finish(
     const body = try xml.encodeComplete(scratch.allocator(), parts);
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
-    const res = rpc.executeStream(client, &response, .{
+    const res = rpc.executeXml(client, &response, .{
         .method = .POST,
         .path = path,
         .content_type = "application/xml",
@@ -308,7 +308,7 @@ pub fn listParts(
         });
         var response: std.heap.ArenaAllocator = .init(client.gpa);
         defer response.deinit();
-        const res = rpc.executeStream(client, &response, .{
+        const res = rpc.executeXml(client, &response, .{
             .method = .GET,
             .path = path,
             .decode_error = xml.decodeError,
@@ -346,7 +346,7 @@ pub fn abort(client: *Client, bucket: []const u8, object: []const u8, upload_id:
     const path = try names.xmlPath(scratch.allocator(), bucket, object, .{ .upload = upload_id });
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
-    _ = rpc.executeStream(client, &response, .{
+    _ = rpc.executeXml(client, &response, .{
         .method = .DELETE,
         .path = path,
         .decode_error = xml.decodeError,

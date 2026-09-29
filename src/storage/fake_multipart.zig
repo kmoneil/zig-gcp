@@ -36,6 +36,17 @@
 //! unknown generation is 404, and with `soft_delete` off every restore is
 //! 400. Only a delete and a restore soft-delete an object here: an upload
 //! that replaces one frees it, which no test depends on.
+//!
+//! With `requester_pays` on, every request must name a project to bill,
+//! as Cloud Storage measured on 2026-09-29 holds anyone but a bucket's
+//! owners to, and only `billable` is one the caller may bill: a JSON
+//! request by the `userProject` parameter, an XML request by the
+//! `x-goog-user-project` header, and a resumable session by the URL it was
+//! given, which carries the project its start named. Without one, the
+//! answer is production's 400; with another, its 403. Whether requester
+//! pays is on or not, a `userProject` and a header that disagree, or a
+//! `userProject` named twice, fail the test that sent them: this library
+//! must never send either.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -56,6 +67,10 @@ pub const FakeMultipart = struct {
     soft_deleted: std.ArrayList(Stored) = .empty,
     /// The objects' bucket keeps deleted objects restorable.
     soft_delete: bool = false,
+    /// The objects' bucket, and every bucket served, bills the requester.
+    requester_pays: bool = false,
+    /// The one project a requester may bill.
+    billable: []const u8 = "extractctl",
     /// Buckets and their settings, apart from the objects above, which
     /// belong to whatever bucket a request names.
     buckets: FakeBuckets,
@@ -315,7 +330,7 @@ pub const FakeMultipart = struct {
 
     fn send(ptr: *anyopaque, req: core.transport.Request, arena: Allocator) core.transport.Error!core.transport.Response {
         const self = fromPtr(ptr);
-        const res = try self.handle(req.method, req.url, null, &.{}, req.body orelse "", false, arena);
+        const res = try self.handle(req.method, req.url, null, req.headers, req.body orelse "", false, arena);
         return .{ .status = res.status, .body = res.body, .headers = res.headers };
     }
 
@@ -402,6 +417,7 @@ pub const FakeMultipart = struct {
             .session => if (kind == .session_put) sessionPart(headers) else 0,
             .move, .resumable, .insert, .bucket, .restore => 0,
         };
+        if (try self.billingRefusal(target, url, headers, arena)) |refusal| return refusal;
         // Cloud Storage and fake-gcs-server take a request body sent with
         // `Content-Encoding: gzip` apart and store it plain. This library
         // never sends one: an object it compresses is stored compressed,
@@ -509,6 +525,49 @@ pub const FakeMultipart = struct {
             },
             else => unreachable,
         }
+    }
+
+    /// The answer to a request requester pays refuses, or to one this
+    /// library must never send, else null. Read before the lock: it
+    /// touches no state.
+    fn billingRefusal(self: *const FakeMultipart, target: Target, url: []const u8, headers: []const Header, arena: Allocator) Allocator.Error!?Reply {
+        const bad = "{\"error\":{\"code\":400,\"message\":\"this fake refuses what this library must never send: ";
+        var param: ?[]const u8 = null;
+        if (std.mem.indexOfScalar(u8, url, '?')) |q| {
+            var params = std.mem.splitScalar(u8, url[q + 1 ..], '&');
+            while (params.next()) |p| if (std.mem.startsWith(u8, p, "userProject=")) {
+                if (param != null) return .{ .status = 400, .body = bad ++ "userProject twice\"}}" };
+                param = try decode(arena, p["userProject=".len..]);
+            };
+        }
+        const header = headerValue(headers, "x-goog-user-project");
+        if (param != null and header != null and !std.mem.eql(u8, param.?, header.?)) {
+            return .{ .status = 400, .body = bad ++ "a userProject and an x-goog-user-project that disagree\"}}" };
+        }
+        if (!self.requester_pays) return null;
+        // A create bills no one: there is no bucket yet.
+        if (target == .bucket and target.bucket.name == null) return null;
+        const missing = "Bucket is a requester pays bucket but no user project provided.";
+        const named = switch (target) {
+            .xml => header orelse return .{
+                .status = 400,
+                .body = "<?xml version='1.0' encoding='UTF-8'?><Error><Code>UserProjectMissing</Code><Message>" ++ missing ++ "</Message></Error>",
+            },
+            // A media read's refusal is plain text.
+            .json => |j| param orelse return .{
+                .status = 400,
+                .body = if (j.media) missing else "{\"error\":{\"code\":400,\"message\":\"" ++ missing ++ "\",\"errors\":[{\"reason\":\"required\"}]}}",
+            },
+            else => param orelse return .{
+                .status = 400,
+                .body = "{\"error\":{\"code\":400,\"message\":\"" ++ missing ++ "\",\"errors\":[{\"reason\":\"required\"}]}}",
+            },
+        };
+        if (!std.mem.eql(u8, named, self.billable)) return .{
+            .status = 403,
+            .body = "{\"error\":{\"code\":403,\"message\":\"the caller does not have serviceusage.services.use access to the Google Cloud project.\",\"errors\":[{\"reason\":\"forbidden\"}]}}",
+        };
+        return null;
     }
 
     /// A soft-deleted generation's metadata, which only its generation
@@ -864,7 +923,11 @@ pub const FakeMultipart = struct {
             null;
         const metadata_crc: ?u32 = if (meta.crc32c) |text| core.crc32c.fromBase64(text) catch null else null;
         const id_text = try std.fmt.allocPrint(arena, "sess-{d}", .{self.next_session});
-        const location = try std.fmt.allocPrint(arena, "{s}/upload/session/{s}", .{ target.origin, id_text });
+        // As Google's, the session URL carries the project its start billed.
+        const location = if (target.user_project) |project|
+            try std.fmt.allocPrint(arena, "{s}/upload/session/{s}?userProject={s}", .{ target.origin, id_text, project })
+        else
+            try std.fmt.allocPrint(arena, "{s}/upload/session/{s}", .{ target.origin, id_text });
         const id = try self.gpa.dupe(u8, id_text);
         errdefer self.gpa.free(id);
         const name = try self.gpa.dupe(u8, meta.name);
@@ -1417,6 +1480,8 @@ const ResumableTarget = struct {
     conditions: Conditions,
     /// Scheme, host and port, for the session URL the answer mints.
     origin: []const u8,
+    /// The start's `userProject`, which the session URL carries on.
+    user_project: ?[]const u8 = null,
 };
 
 const InsertTarget = struct {
@@ -1457,15 +1522,17 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         var conditions: Conditions = .{};
         var resumable_type = false;
         var multipart_type = false;
+        var user_project: ?[]const u8 = null;
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
             if (try conditions.take(param)) continue;
             if (std.mem.eql(u8, param, "uploadType=resumable")) resumable_type = true;
             if (std.mem.eql(u8, param, "uploadType=multipart")) multipart_type = true;
+            if (std.mem.startsWith(u8, param, "userProject=")) user_project = try decode(arena, param["userProject=".len..]);
         }
         if (multipart_type) return .{ .insert = .{ .bucket = bucket, .conditions = conditions } };
         if (!resumable_type) return error.HttpProtocolError;
-        return .{ .resumable = .{ .bucket = bucket, .conditions = conditions, .origin = url[0..path_start] } };
+        return .{ .resumable = .{ .bucket = bucket, .conditions = conditions, .origin = url[0..path_start], .user_project = user_project } };
     }
     if (std.mem.eql(u8, path, "/storage/v1/b")) return .{ .bucket = try bucketTarget(arena, null, query) };
     if (std.mem.startsWith(u8, path, "/storage/v1/b/") and
@@ -1559,8 +1626,9 @@ fn bucketTarget(arena: Allocator, name: ?[]const u8, query: []const u8) core.tra
     while (params.next()) |param| {
         if (std.mem.startsWith(u8, param, "project=")) {
             target.project = try decode(arena, param["project=".len..]);
-        } else if (std.mem.eql(u8, param, "projection=noAcl")) {
-            // What every bucket answer here leaves out anyway.
+        } else if (std.mem.eql(u8, param, "projection=noAcl") or std.mem.startsWith(u8, param, "userProject=")) {
+            // What every bucket answer here leaves out anyway, and the
+            // project `billingRefusal` has already read.
         } else if (std.mem.startsWith(u8, param, "ifMetagenerationMatch=")) {
             target.if_metageneration_match = std.fmt.parseInt(u64, param["ifMetagenerationMatch=".len..], 10) catch
                 return error.HttpProtocolError;

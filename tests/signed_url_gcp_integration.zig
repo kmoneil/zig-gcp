@@ -15,6 +15,11 @@
 //! since a signed URL grants only what its signer may do. Without a bucket,
 //! a token and at least one signer, every test skips. Objects live under
 //! `zig-gcp-test/<random>/` and are deleted when each test ends.
+//!
+//! The requester pays test has a bucket and a signer of its own:
+//! GCP_TEST_REQUESTER_BUCKET, a requester pays bucket the token's principal
+//! owns, and GCP_TEST_REQUESTER_EMAIL, an account with Storage Object Admin
+//! on it that may bill GCP_TEST_PROJECT, and that the token may sign as.
 
 const std = @import("std");
 const core = @import("core");
@@ -845,5 +850,108 @@ test "POST policy, real bucket: an expired policy and a tampered signature are r
         try testing.expectEqualStrings(good.value.field("policy").?, try xmlText(a, echoed));
         // The untampered one still works, so the difference is the signature.
         try expectStatus(204, try postForm(a, good.value, "x.txt", hello), s.name);
+    }
+}
+
+// Requester pays. Whoever holds a signed URL or a form uses it, but Cloud
+// Storage bills as the signer, which a requester pays bucket refuses
+// without a project to bill unless it owns the bucket.
+
+test "requester pays, real bucket: a signed URL bills the project it names, and a form" {
+    const gpa = testing.allocator;
+    var env = try testing.environ.createMap(gpa);
+    defer env.deinit();
+    // Set by a runner that made a requester pays bucket and an account with
+    // Storage Object Admin on it, which may bill GCP_TEST_PROJECT.
+    // GCP_TEST_TOKEN's principal owns the bucket and holds Token Creator on
+    // the account, to sign as it through IAM.
+    const bucket_name = trim(env.get("GCP_TEST_REQUESTER_BUCKET") orelse return error.SkipZigTest);
+    const email = trim(env.get("GCP_TEST_REQUESTER_EMAIL") orelse return error.SkipZigTest);
+    const project = trim(env.get("GCP_TEST_PROJECT") orelse return error.SkipZigTest);
+    var token: storage.StaticToken = .{ .token = trim(env.get("GCP_TEST_TOKEN") orelse return error.SkipZigTest) };
+    var diag: storage.Diagnostics = .{};
+    var signer_diag: storage.Diagnostics = .{};
+    var client: storage.Client = try .init(gpa, testing.io, .{
+        .token_provider = token.provider(),
+        .diagnostics = &diag,
+        .user_agent = Fixture.user_agent,
+    });
+    defer client.deinit();
+    var iam: auth.IamSigner = try .init(gpa, testing.io, .{
+        .service_account = email,
+        .token_provider = token.provider(),
+        .diagnostics = &signer_diag,
+    });
+    defer iam.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const plain = client.bucket(bucket_name);
+    const billed = plain.withBillingProject(project);
+
+    var put = try billed.object("signed.txt").upload(hello, .{ .content_type = "text/plain" });
+    put.deinit();
+    defer for ([_][]const u8{ "signed.txt", "form-bare.txt", "form-query.txt", "form-field.txt" }) |name| {
+        billed.object(name).delete(.{}) catch |err| switch (err) {
+            error.NotFound => {},
+            else => std.debug.print("cleanup: could not delete {s}: {t}\n", .{ name, err }),
+        };
+    };
+
+    // Signed as the account: the URL names the project, signed.
+    var url = try billed.object("signed.txt").signedUrl(iam.signer(), .{ .expires_in_s = 600 });
+    defer url.deinit();
+    try testing.expect(std.mem.indexOf(u8, url.value, "userProject=") != null);
+    const served = try useUrl(a, .GET, url.value, &.{}, null);
+    try expectStatus(200, served, "billed");
+    try testing.expectEqualStrings(hello, served.body);
+
+    // Measured 2026-09-29: a URL that bills nothing is refused as a request
+    // with no signature is, and so is one billing a project that does not
+    // exist.
+    var unbilled = try plain.object("signed.txt").signedUrl(iam.signer(), .{ .expires_in_s = 600 });
+    defer unbilled.deinit();
+    const refused = try useUrl(a, .GET, unbilled.value, &.{}, null);
+    try expectStatus(400, refused, "unbilled");
+    try testing.expectEqualStrings("UserProjectMissing", refused.code());
+    var nowhere = try plain.withBillingProject("zigps-no-such-project-4d1").object("signed.txt").signedUrl(iam.signer(), .{ .expires_in_s = 600 });
+    defer nowhere.deinit();
+    const missing = try useUrl(a, .GET, nowhere.value, &.{}, null);
+    try expectStatus(400, missing, "a missing project");
+    try testing.expectEqualStrings("UserProjectInvalid", missing.code());
+
+    // A form cannot bill a project, so a billed handle's policy is refused.
+    try testing.expectError(error.InvalidPostPolicyOptions, billed.object("form-bare.txt").postPolicy(iam.signer(), .{ .expires_in_s = 600 }));
+    // Measured 2026-09-29: unbilled, the account's form is refused as its
+    // GET is.
+    var bare = try plain.object("form-bare.txt").postPolicy(iam.signer(), .{ .expires_in_s = 600 });
+    defer bare.deinit();
+    const posted = try postForm(a, bare.value, "x.txt", hello);
+    try expectStatus(400, posted, "form");
+    try testing.expectEqualStrings("UserProjectMissing", posted.code());
+    // A policy cannot name the header as a field: "Invalid exact match
+    // name: x-goog-user-project".
+    var field = try plain.object("form-field.txt").postPolicy(iam.signer(), .{
+        .expires_in_s = 600,
+        .fields = &.{.{ .name = "x-goog-user-project", .value = project }},
+    });
+    defer field.deinit();
+    const with_field = try postForm(a, field.value, "x.txt", hello);
+    try expectStatus(400, with_field, "an x-goog-user-project field");
+    try testing.expectEqualStrings("InvalidPolicyDocument", with_field.code());
+    // Nor can its URL name the parameter: with any query, in either style,
+    // the POST is no longer a form's, and is refused as a bucket create,
+    // 400 InvalidArgument, "Cannot create buckets using a POST."
+    var vhost = try plain.object("form-query.txt").postPolicy(iam.signer(), .{ .expires_in_s = 600, .style = .virtual_hosted });
+    defer vhost.deinit();
+    for ([_][]const u8{
+        try std.fmt.allocPrint(a, "{s}?userProject={s}", .{ bare.value.url, project }),
+        try std.fmt.allocPrint(a, "{s}?userProject={s}", .{ bare.value.url[0 .. bare.value.url.len - 1], project }),
+        try std.fmt.allocPrint(a, "{s}?userProject={s}", .{ vhost.value.url, project }),
+    }, [_][]const storage.PostField{ bare.value.fields, bare.value.fields, vhost.value.fields }) |url_with, fields| {
+        const answer = try postForm(a, .{ .url = url_with, .fields = fields }, "x.txt", hello);
+        try expectStatus(400, answer, url_with);
+        try testing.expectEqualStrings("InvalidArgument", answer.code());
+        try testing.expect(std.mem.indexOf(u8, answer.details(), "Cannot create buckets") != null);
     }
 }

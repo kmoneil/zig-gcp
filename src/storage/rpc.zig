@@ -5,6 +5,8 @@
 //! Cloud Storage client and holds the checks its public calls share.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Writer = std.Io.Writer;
 const core = @import("core");
 
 const Client = @import("Client.zig");
@@ -59,38 +61,131 @@ pub fn begin(client: *Client) void {
     engine(client).begin();
 }
 
-/// Sends `call` and returns the body of the first 2xx response, which lives
-/// in `response`.
+/// A copy of `client` that bills `project` for one call. Every request the
+/// call makes through this module then carries it: a JSON API request as
+/// the `userProject` parameter and the `x-goog-user-project` header, an XML
+/// API request as the header, one value in both, so they never disagree
+/// (Cloud Storage goes by the parameter where they do). The copy owns
+/// nothing, must not outlive `client`, and is never deinited.
+pub fn billed(client: *const Client, project: ?[]const u8) Client {
+    var copy = client.*;
+    copy.billing_project = project;
+    return copy;
+}
+
+/// Checks a handle's billing project before any request.
+pub fn checkBillingProject(client: *Client, project: ?[]const u8) Error!void {
+    const p = project orelse return;
+    if (core.names.isProjectId(p)) return;
+    if (client.diagnostics) |d| d.print("the billing project is not a project id or number", .{});
+    return error.InvalidArgument;
+}
+
+/// `path` with the call's billing project appended as `userProject`, in
+/// `gpa`'s memory for the caller to free, or null without one. No path
+/// sent through here names one already: a resumable session's URL, which
+/// does, goes to the transport directly, with no credentials and no
+/// header.
+fn billedPath(client: *Client, path: []const u8) Allocator.Error!?[]u8 {
+    const project = client.billing_project orelse return null;
+    var out: Writer.Allocating = .init(client.gpa);
+    errdefer out.deinit();
+    const w = &out.writer;
+    w.writeAll(path) catch return error.OutOfMemory;
+    w.writeByte(if (std.mem.indexOfScalar(u8, path, '?') == null) '?' else '&') catch return error.OutOfMemory;
+    w.writeAll("userProject=") catch return error.OutOfMemory;
+    core.query.writeValue(w, project) catch return error.OutOfMemory;
+    return try out.toOwnedSlice();
+}
+
+/// A requester pays refusal of a call that named no project to bill says
+/// how to name one.
+fn hintBilling(client: *Client, err: anyerror) void {
+    if (err != error.InvalidArgument or client.billing_project != null) return;
+    const d = client.diagnostics orelse return;
+    if (std.ascii.indexOfIgnoreCase(d.message(), "requester pays") == null) return;
+    var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
+    const status_text = d.status();
+    @memcpy(status_buf[0..status_text.len], status_text);
+    d.set(d.http_status, status_buf[0..status_text.len], "the bucket has requester pays on and this request named no project to bill: Bucket.withBillingProject or Object.withBillingProject names one");
+}
+
+/// Sends a JSON API call and returns the body of the first 2xx response,
+/// which lives in `response`.
 pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
-    return engine(client).execute(response, call);
+    const path = try billedPath(client, call.path);
+    defer if (path) |p| client.gpa.free(p);
+    var billed_call = call;
+    if (path) |p| billed_call.path = p;
+    if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
+    return engine(client).execute(response, billed_call) catch |err| {
+        hintBilling(client, err);
+        return err;
+    };
 }
 
 /// `execute` for calls whose response body is not needed.
 pub fn executeDiscard(client: *Client, call: Call) Error!void {
-    return engine(client).executeDiscard(call);
+    const path = try billedPath(client, call.path);
+    defer if (path) |p| client.gpa.free(p);
+    var billed_call = call;
+    if (path) |p| billed_call.path = p;
+    if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
+    return engine(client).executeDiscard(billed_call) catch |err| {
+        hintBilling(client, err);
+        return err;
+    };
 }
 
 pub const StreamCall = core.rpc.StreamCall;
 
-/// Sends a streaming call and returns the first 2xx response whole:
-/// status, headers, and the body, buffered or delivered to the sink.
+/// Sends a streaming JSON API call and returns the first 2xx response
+/// whole: status, headers, and the body, buffered or delivered to the sink.
 pub fn executeStream(
     client: *Client,
     response: *std.heap.ArenaAllocator,
     call: StreamCall,
 ) core.rpc.StreamCallError!core.transport.StreamResponse {
-    return engine(client).executeStream(response, call);
+    const path = try billedPath(client, call.path);
+    defer if (path) |p| client.gpa.free(p);
+    var billed_call = call;
+    if (path) |p| billed_call.path = p;
+    if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
+    return engine(client).executeStream(response, billed_call) catch |err| {
+        hintBilling(client, err);
+        return err;
+    };
 }
 
-/// `executeStream` with the body read once from a stream: a transient
-/// failure comes back for the caller to try again with a fresh reader.
-pub fn executeStreamBody(
+/// `executeStream` for the XML API, which takes the billing project as the
+/// header alone.
+pub fn executeXml(
+    client: *Client,
+    response: *std.heap.ArenaAllocator,
+    call: StreamCall,
+) core.rpc.StreamCallError!core.transport.StreamResponse {
+    var billed_call = call;
+    if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
+    return engine(client).executeStream(response, billed_call) catch |err| {
+        hintBilling(client, err);
+        return err;
+    };
+}
+
+/// `executeXml` with the body read once from a stream: a transient failure
+/// comes back for the caller to try again with a fresh reader.
+pub fn executeXmlBody(
     client: *Client,
     response: *std.heap.ArenaAllocator,
     call: StreamCall,
     body: core.rpc.StreamBody,
 ) core.rpc.StreamBodyError!core.transport.StreamResponse {
-    return engine(client).executeStreamBody(response, call, body);
+    var billed_call = call;
+    if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
+    return engine(client).executeStreamBody(response, billed_call, body) catch |err| {
+        hintBilling(client, err);
+        return err;
+    };
 }
 
 /// The wait before an attempt this module retries itself, such as a

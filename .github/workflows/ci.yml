@@ -275,8 +275,10 @@ jobs:
         # 1000K, and their model property of update sequences, 4.2 ms on a
         # Mac, went to heavy-storage, which drops to 68K. Versions and soft
         # delete took storage to 3.4 ms on the Mac, so it drops to 900K.
-        # These counts are scaled from the Mac and want re-sizing from the
-        # next nightly.
+        # Requester pays added a model property of billed and unbilled
+        # calls, 5.9 ms a run on a Mac, to heavy-storage, which drops to
+        # 56K. These counts are scaled from the Mac and want re-sizing from
+        # the next nightly.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 900K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
@@ -288,7 +290,7 @@ jobs:
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
           - { job: storage, module: storage, filter: fuzz, iterations: 900K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 3800K }
-          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 68K }
+          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 56K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:

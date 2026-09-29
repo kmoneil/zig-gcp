@@ -24,6 +24,34 @@ const Error = errors.Error;
 client: *Client,
 /// Borrowed; the handle must not outlive it.
 name: []const u8,
+/// The project this handle's requests bill, and its objects' too, as a
+/// requester pays bucket needs of anyone but its owners: a project id or
+/// number. Null bills as the credentials do. Borrowed; the handle must
+/// not outlive it.
+billing_project: ?[]const u8 = null,
+
+/// This handle, billing `project` for every request it and the object
+/// handles it hands out make: the `userProject` parameter and the
+/// `x-goog-user-project` header, one value in both. A requester pays
+/// bucket refuses anyone but its owners without one. Checked before any
+/// request; `create` bills nothing, since no bucket exists yet.
+pub fn withBillingProject(self: Bucket, project: []const u8) Bucket {
+    var copy = self;
+    copy.billing_project = project;
+    return copy;
+}
+
+/// This handle on `copy`, a copy of its client that bills this handle's
+/// project for the call now beginning. A handle that names none keeps what
+/// its client bills already.
+fn billing(self: Bucket, copy: *Client) Error!Bucket {
+    rpc.begin(self.client);
+    try rpc.checkBillingProject(self.client, self.billing_project);
+    copy.* = rpc.billed(self.client, self.billing_project orelse self.client.billing_project);
+    var billed_self = self;
+    billed_self.client = copy;
+    return billed_self;
+}
 
 /// Creates the bucket in the client's project, which `Options.project_id`
 /// must name, with the settings `config` gives. Every setting Cloud
@@ -50,6 +78,11 @@ pub fn create(self: Bucket, config: types.BucketConfig) Error!types.Owned(types.
 
 /// The bucket's metadata.
 pub fn get(self: Bucket) Error!types.Owned(types.BucketInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).getBilled();
+}
+
+fn getBilled(self: Bucket) Error!types.Owned(types.BucketInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
@@ -78,6 +111,11 @@ pub fn get(self: Bucket) Error!types.Owned(types.BucketInfo) {
 /// in between. Under the condition, such a repeat fails with
 /// `error.FailedPrecondition` instead: `get` the bucket to see which.
 pub fn update(self: Bucket, changes: types.BucketUpdate) Error!types.Owned(types.BucketInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).updateBilled(changes);
+}
+
+fn updateBilled(self: Bucket, changes: types.BucketUpdate) Error!types.Owned(types.BucketInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return bucket_settings.update(self.client, self.name, changes);
@@ -88,6 +126,11 @@ pub fn update(self: Bucket, changes: types.BucketUpdate) Error!types.Owned(types
 /// delete on is kept, restorable, for the longest retention it had, even
 /// one turned off since.
 pub fn delete(self: Bucket) Error!void {
+    var client: Client = undefined;
+    return (try self.billing(&client)).deleteBilled();
+}
+
+fn deleteBilled(self: Bucket) Error!void {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
@@ -102,6 +145,11 @@ pub fn delete(self: Bucket) Error!void {
 /// while a live bucket has the name, which anyone may take. Needs
 /// `storage.buckets.restore` on the project.
 pub fn restore(self: Bucket, generation: u64) Error!types.Owned(types.BucketInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).restoreBilled(generation);
+}
+
+fn restoreBilled(self: Bucket, generation: u64) Error!types.Owned(types.BucketInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return restore_impl.restoreBucket(self.client, self.name, generation);
@@ -118,6 +166,11 @@ pub fn restore(self: Bucket, generation: u64) Error!types.Owned(types.BucketInfo
 /// object permissions. Time bounds that are not RFC 3339 are refused
 /// before sending, with `error.InvalidArgument`.
 pub fn bulkRestore(self: Bucket, options: types.BulkRestoreOptions) Error!types.Owned(types.Operation) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).bulkRestoreBilled(options);
+}
+
+fn bulkRestoreBilled(self: Bucket, options: types.BulkRestoreOptions) Error!types.Owned(types.Operation) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return restore_impl.bulkRestore(self.client, self.name, options);
@@ -125,6 +178,11 @@ pub fn bulkRestore(self: Bucket, options: types.BulkRestoreOptions) Error!types.
 
 /// One of the bucket's long-running operations, by `Operation.id`.
 pub fn operation(self: Bucket, id: []const u8) Error!types.Owned(types.Operation) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).operationBilled(id);
+}
+
+fn operationBilled(self: Bucket, id: []const u8) Error!types.Owned(types.Operation) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return restore_impl.operation(self.client, self.name, id);
@@ -133,6 +191,11 @@ pub fn operation(self: Bucket, id: []const u8) Error!types.Owned(types.Operation
 /// Asks the server to stop an operation, which then ends with
 /// `failure.code` 1. What it restored stays restored.
 pub fn cancelOperation(self: Bucket, id: []const u8) Error!void {
+    var client: Client = undefined;
+    return (try self.billing(&client)).cancelOperationBilled(id);
+}
+
+fn cancelOperationBilled(self: Bucket, id: []const u8) Error!void {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return restore_impl.cancelOperation(self.client, self.name, id);
@@ -140,6 +203,11 @@ pub fn cancelOperation(self: Bucket, id: []const u8) Error!void {
 
 /// One page of the bucket's operations, finished ones included.
 pub fn listOperations(self: Bucket, page: types.PageOptions) Error!types.Owned(types.OperationPage) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).listOperationsBilled(page);
+}
+
+fn listOperationsBilled(self: Bucket, page: types.PageOptions) Error!types.Owned(types.OperationPage) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return restore_impl.listOperations(self.client, self.name, page);
@@ -148,13 +216,18 @@ pub fn listOperations(self: Bucket, page: types.PageOptions) Error!types.Owned(t
 /// A handle for the object `name` in this bucket. Sends nothing. The handle
 /// borrows the client and both names, and must not outlive them.
 pub fn object(self: Bucket, name: []const u8) Object {
-    return .{ .client = self.client, .bucket = self.name, .name = name };
+    return .{ .client = self.client, .bucket = self.name, .name = name, .billing_project = self.billing_project };
 }
 
 /// A V4 signed URL for the bucket itself, through the XML API: a GET lists
 /// its objects as XML, with `prefix` and `delimiter` as signed query
 /// parameters. Everything else is as `Object.signedUrl` says.
 pub fn signedUrl(self: Bucket, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).signedUrlBilled(signer, options);
+}
+
+fn signedUrlBilled(self: Bucket, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return signing.signUrl(self.client, signer, self.name, null, options);
@@ -166,6 +239,16 @@ pub fn signedUrl(self: Bucket, signer: core.Signer, options: types.SignedUrlOpti
 /// `.{ .starts_with = "" }` allows any name in the bucket. Everything else
 /// is as `Object.postPolicy` says.
 pub fn postPolicy(self: Bucket, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
+    var client: Client = undefined;
+    const this = try self.billing(&client);
+    if (this.billing_project != null) {
+        if (this.client.diagnostics) |d| d.print("a POST policy cannot bill a project: an HTML form has no way to name one", .{});
+        return error.InvalidPostPolicyOptions;
+    }
+    return this.postPolicyBilled(signer, options);
+}
+
+fn postPolicyBilled(self: Bucket, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     const key = options.key orelse {
@@ -184,6 +267,11 @@ pub fn postPolicy(self: Bucket, signer: core.Signer, options: types.PostPolicyOp
 /// `soft_deleted` together are refused before sending, with
 /// `error.InvalidArgument`, as Cloud Storage refuses them.
 pub fn listObjects(self: Bucket, options: types.ListOptions) Error!types.Owned(types.ObjectPage) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).listObjectsBilled(options);
+}
+
+fn listObjectsBilled(self: Bucket, options: types.ListOptions) Error!types.Owned(types.ObjectPage) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     if (options.versions and options.soft_deleted) {
