@@ -24,6 +24,16 @@ pub fn bucketPath(arena: Allocator, bucket: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice();
 }
 
+/// `/storage/v1/b/{bucket}?projection=noAcl` with metageneration
+/// conditions: a bucket patch. The ACLs stay out of the answer, since
+/// reading them takes more than changing the settings does.
+pub fn bucketPatchPath(arena: Allocator, bucket: []const u8, preconditions: types.Preconditions) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{ .bucket = bucket, .no_acl = true, .preconditions = preconditions }) catch
+        return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
 /// `/storage/v1/b/{bucket}/o` with listing options.
 pub fn objectsPath(arena: Allocator, bucket: []const u8, options: types.ListOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
@@ -277,6 +287,8 @@ const Parts = struct {
     object: ?[]const u8 = null,
     list_objects: bool = false,
     alt_media: bool = false,
+    /// `projection=noAcl`.
+    no_acl: bool = false,
     project: ?[]const u8 = null,
     generation: ?u64 = null,
     preconditions: types.Preconditions = .{},
@@ -302,6 +314,7 @@ fn write(w: *Writer, parts: Parts) Writer.Error!void {
     }
     var params: query.Params = .init(w);
     if (parts.alt_media) try params.add("alt", "media");
+    if (parts.no_acl) try params.add("projection", "noAcl");
     try params.addOptional("project", parts.project);
     if (parts.generation) |g| try params.addInt("generation", g);
     try writePreconditions(&params, parts.preconditions);
@@ -334,6 +347,11 @@ test "bucket paths" {
     );
     try expectPath("/storage/v1/b/my-bucket", try bucketPath(gpa, "my-bucket"));
     try expectPath("/storage/v1/b/b%25c", try bucketPath(gpa, "b%c"));
+    try expectPath("/storage/v1/b/my-bucket?projection=noAcl", try bucketPatchPath(gpa, "my-bucket", .{}));
+    try expectPath(
+        "/storage/v1/b/b%25c?projection=noAcl&ifMetagenerationMatch=3&ifMetagenerationNotMatch=4",
+        try bucketPatchPath(gpa, "b%c", .{ .if_metageneration_match = 3, .if_metageneration_not_match = 4 }),
+    );
 }
 
 test "object paths encode the name as one segment" {

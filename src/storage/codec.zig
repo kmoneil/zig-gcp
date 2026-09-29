@@ -77,25 +77,6 @@ fn writeUploadMetadata(
     try jw.endObject();
 }
 
-/// The `buckets.insert` body.
-pub fn encodeBucket(arena: Allocator, name: []const u8, config: types.BucketConfig) Allocator.Error![]u8 {
-    var out: Writer.Allocating = .init(arena);
-    var jw: Stringify = .{ .writer = &out.writer };
-    writeBucket(&jw, name, config) catch return error.OutOfMemory;
-    return out.toOwnedSlice();
-}
-
-fn writeBucket(jw: *Stringify, name: []const u8, config: types.BucketConfig) Stringify.Error!void {
-    try jw.beginObject();
-    try jw.objectField("name");
-    try jw.write(name);
-    try jw.objectField("location");
-    try jw.write(config.location);
-    try jw.objectField("storageClass");
-    try jw.write(config.storage_class);
-    try jw.endObject();
-}
-
 // Responses
 
 /// One Object resource.
@@ -209,7 +190,7 @@ const WireRewrite = struct {
 
 /// One Bucket resource.
 pub fn decodeBucket(arena: Allocator, body: []const u8) DecodeError!types.BucketInfo {
-    return bucketFromWire(try parseWire(WireBucket, arena, body));
+    return bucketFromWire(arena, try parseWire(WireBucket, arena, body));
 }
 
 /// One page of `buckets.list`.
@@ -217,7 +198,7 @@ pub fn decodeBucketPage(arena: Allocator, body: []const u8) DecodeError!types.Bu
     const wire = try parseWire(WireBucketPage, arena, body);
     const listed = wire.items orelse &.{};
     const buckets = try arena.alloc(types.BucketInfo, listed.len);
-    for (listed, buckets) |w, *info| info.* = bucketFromWire(w);
+    for (listed, buckets) |w, *info| info.* = try bucketFromWire(arena, w);
     return .{
         .buckets = buckets,
         .next_page_token = nonEmpty(wire.nextPageToken),
@@ -256,6 +237,30 @@ const WireBucket = struct {
     location: ?[]const u8 = null,
     storageClass: ?[]const u8 = null,
     timeCreated: ?[]const u8 = null,
+    metageneration: ?std.json.Value = null,
+    generation: ?std.json.Value = null,
+    projectNumber: ?std.json.Value = null,
+    locationType: ?[]const u8 = null,
+    updated: ?[]const u8 = null,
+    versioning: ?struct { enabled: ?bool = null } = null,
+    softDeletePolicy: ?WireSoftDeletePolicy = null,
+    billing: ?struct { requesterPays: ?bool = null } = null,
+    encryption: ?struct { defaultKmsKeyName: ?[]const u8 = null } = null,
+    labels: ?std.json.ArrayHashMap(?[]const u8) = null,
+    /// Each rule whole, so that what this library does not know about a
+    /// rule can be told from what it does.
+    lifecycle: ?struct { rule: ?[]const std.json.Value = null } = null,
+    iamConfiguration: ?WireIamConfiguration = null,
+};
+
+const WireSoftDeletePolicy = struct {
+    retentionDurationSeconds: ?std.json.Value = null,
+    effectiveTime: ?[]const u8 = null,
+};
+
+const WireIamConfiguration = struct {
+    uniformBucketLevelAccess: ?struct { enabled: ?bool = null } = null,
+    publicAccessPrevention: ?[]const u8 = null,
 };
 
 const WireBucketPage = struct {
@@ -289,13 +294,171 @@ fn objectFromWire(arena: Allocator, wire: WireObject) DecodeError!types.ObjectIn
     };
 }
 
-fn bucketFromWire(wire: WireBucket) types.BucketInfo {
+fn bucketFromWire(arena: Allocator, wire: WireBucket) DecodeError!types.BucketInfo {
+    const policy: WireSoftDeletePolicy = wire.softDeletePolicy orelse .{};
+    const retention = try u64FromValue(policy.retentionDurationSeconds);
+    const iam: WireIamConfiguration = wire.iamConfiguration orelse .{};
     return .{
         .name = wire.name orelse "",
         .location = wire.location orelse "",
         .storage_class = wire.storageClass orelse "",
         .time_created = wire.timeCreated orelse "",
+        .metageneration = try u64FromValue(wire.metageneration),
+        .generation = try optionalU64FromValue(wire.generation),
+        .project_number = try optionalU64FromValue(wire.projectNumber),
+        .location_type = nonEmpty(wire.locationType),
+        .updated = nonEmpty(wire.updated),
+        .versioning = if (wire.versioning) |v| v.enabled orelse false else false,
+        // A retention of 0 is soft delete turned off.
+        .soft_delete = if (retention == 0) null else .{
+            .retention_s = std.math.cast(u32, retention) orelse return error.InvalidResponse,
+            .effective_time = nonEmpty(policy.effectiveTime),
+        },
+        .requester_pays = if (wire.billing) |b| b.requesterPays orelse false else false,
+        .default_kms_key_name = if (wire.encryption) |e| nonEmpty(e.defaultKmsKeyName) else null,
+        .labels = try labelsFromWire(arena, wire.labels),
+        .lifecycle = try lifecycleFromWire(arena, if (wire.lifecycle) |l| l.rule orelse &.{} else &.{}),
+        .uniform_bucket_level_access = if (iam.uniformBucketLevelAccess) |u| u.enabled orelse false else false,
+        .public_access_prevention = publicAccessPreventionFromWire(iam.publicAccessPrevention),
     };
+}
+
+fn labelsFromWire(arena: Allocator, wire: ?std.json.ArrayHashMap(?[]const u8)) Allocator.Error![]const types.Label {
+    const map = (wire orelse return &.{}).map;
+    const out = try arena.alloc(types.Label, map.count());
+    for (map.keys(), map.values(), out) |k, v, *label| label.* = .{ .key = k, .value = v orelse "" };
+    return out;
+}
+
+/// "unspecified" is the old name of "inherited", which the server still
+/// takes, and answers as "inherited".
+fn publicAccessPreventionFromWire(text: ?[]const u8) types.PublicAccessPrevention {
+    const t = text orelse return .inherited;
+    if (std.mem.eql(u8, t, "inherited") or std.mem.eql(u8, t, "unspecified")) return .inherited;
+    if (std.mem.eql(u8, t, "enforced")) return .enforced;
+    return .unknown;
+}
+
+fn lifecycleFromWire(arena: Allocator, rules: []const std.json.Value) DecodeError![]const types.LifecycleRule {
+    const out = try arena.alloc(types.LifecycleRule, rules.len);
+    for (rules, out) |value, *rule| rule.* = try ruleFromWire(arena, value);
+    return out;
+}
+
+/// A rule whose action, condition, or anything else about it this library
+/// does not know is `unrecognized`: sent back without that part, it would
+/// no longer be the rule the bucket has.
+fn ruleFromWire(arena: Allocator, value: std.json.Value) DecodeError!types.LifecycleRule {
+    const fields = objectOf(value) orelse return error.InvalidResponse;
+    var rule: types.LifecycleRule = .{ .action = .unknown, .condition = .{} };
+    var it = fields.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "action")) {
+            rule.action = try actionFromWire(entry.value_ptr.*, &rule.unrecognized);
+        } else if (std.mem.eql(u8, key, "condition")) {
+            rule.condition = try conditionFromWire(arena, entry.value_ptr.*, &rule.unrecognized);
+        } else {
+            rule.unrecognized = true;
+        }
+    }
+    if (rule.action == .unknown) rule.unrecognized = true;
+    return rule;
+}
+
+fn actionFromWire(value: std.json.Value, unrecognized: *bool) DecodeError!types.LifecycleRule.Action {
+    const fields = objectOf(value) orelse return error.InvalidResponse;
+    var kind: ?[]const u8 = null;
+    var class: ?[]const u8 = null;
+    var it = fields.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "type")) {
+            kind = try stringFromValue(entry.value_ptr.*);
+        } else if (std.mem.eql(u8, key, "storageClass")) {
+            class = try stringFromValue(entry.value_ptr.*);
+        } else {
+            unrecognized.* = true;
+        }
+    }
+    const k = kind orelse return .unknown;
+    if (std.mem.eql(u8, k, "Delete")) return .delete;
+    if (std.mem.eql(u8, k, "SetStorageClass")) return .{ .set_storage_class = class orelse "" };
+    if (std.mem.eql(u8, k, "AbortIncompleteMultipartUpload")) return .abort_incomplete_multipart_upload;
+    return .unknown;
+}
+
+fn conditionFromWire(
+    arena: Allocator,
+    value: std.json.Value,
+    unrecognized: *bool,
+) DecodeError!types.LifecycleRule.Condition {
+    const fields = objectOf(value) orelse return error.InvalidResponse;
+    var c: types.LifecycleRule.Condition = .{};
+    var it = fields.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const v = entry.value_ptr.*;
+        // A condition sent as null is a condition not set.
+        if (v == .null) continue;
+        if (std.mem.eql(u8, key, "age")) {
+            c.age_days = try u32FromValue(v);
+        } else if (std.mem.eql(u8, key, "createdBefore")) {
+            c.created_before = try stringFromValue(v);
+        } else if (std.mem.eql(u8, key, "customTimeBefore")) {
+            c.custom_time_before = try stringFromValue(v);
+        } else if (std.mem.eql(u8, key, "daysSinceCustomTime")) {
+            c.days_since_custom_time = try u32FromValue(v);
+        } else if (std.mem.eql(u8, key, "daysSinceNoncurrentTime")) {
+            c.days_since_noncurrent_time = try u32FromValue(v);
+        } else if (std.mem.eql(u8, key, "isLive")) {
+            c.is_live = switch (v) {
+                .bool => |b| b,
+                else => return error.InvalidResponse,
+            };
+        } else if (std.mem.eql(u8, key, "matchesPrefix")) {
+            c.matches_prefix = try stringsFromValue(arena, v);
+        } else if (std.mem.eql(u8, key, "matchesSuffix")) {
+            c.matches_suffix = try stringsFromValue(arena, v);
+        } else if (std.mem.eql(u8, key, "matchesStorageClass")) {
+            c.matches_storage_class = try stringsFromValue(arena, v);
+        } else if (std.mem.eql(u8, key, "noncurrentTimeBefore")) {
+            c.noncurrent_time_before = try stringFromValue(v);
+        } else if (std.mem.eql(u8, key, "numNewerVersions")) {
+            c.num_newer_versions = try u32FromValue(v);
+        } else if (std.mem.eql(u8, key, "sizeAboveBytes")) {
+            c.size_above_bytes = try u64FromValue(v);
+        } else if (std.mem.eql(u8, key, "sizeBelowBytes")) {
+            c.size_below_bytes = try u64FromValue(v);
+        } else {
+            unrecognized.* = true;
+        }
+    }
+    return c;
+}
+
+fn objectOf(value: std.json.Value) ?std.json.ObjectMap {
+    return switch (value) {
+        .object => |o| o,
+        else => null,
+    };
+}
+
+fn stringFromValue(value: std.json.Value) DecodeError![]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        else => error.InvalidResponse,
+    };
+}
+
+fn stringsFromValue(arena: Allocator, value: std.json.Value) DecodeError![]const []const u8 {
+    const items = switch (value) {
+        .array => |a| a.items,
+        else => return error.InvalidResponse,
+    };
+    const out = try arena.alloc([]const u8, items.len);
+    for (items, out) |item, *text| text.* = try stringFromValue(item);
+    return out;
 }
 
 fn metadataFromWire(
@@ -316,6 +479,17 @@ fn u64FromValue(value: ?std.json.Value) DecodeError!u64 {
         .integer => |n| if (n >= 0) @intCast(n) else error.InvalidResponse,
         else => error.InvalidResponse,
     };
+}
+
+/// `u64FromValue`, but absent reads as null.
+fn optionalU64FromValue(value: ?std.json.Value) DecodeError!?u64 {
+    if (value == null) return null;
+    return try u64FromValue(value);
+}
+
+/// An int32 field, which the API sends as a JSON number.
+fn u32FromValue(value: std.json.Value) DecodeError!u32 {
+    return std.math.cast(u32, try u64FromValue(value)) orelse error.InvalidResponse;
 }
 
 fn crc32cFromWire(text: ?[]const u8) DecodeError!?u32 {
@@ -533,19 +707,345 @@ test "decode buckets" {
     try testing.expectEqual(null, empty.next_page_token);
 }
 
-test "encode the bucket create body" {
+/// Captured from Cloud Storage on 2026-09-29: a bucket made with only a
+/// name, a location and a class, as `create(.{})` sends.
+const bucket_made_with_defaults =
+    \\{
+    \\  "kind": "storage#bucket",
+    \\  "selfLink": "https://www.googleapis.com/storage/v1/b/zigps-p1-04a2ab-1",
+    \\  "id": "zigps-p1-04a2ab-1",
+    \\  "name": "zigps-p1-04a2ab-1",
+    \\  "projectNumber": "82150720798",
+    \\  "generation": "1790690832240124605",
+    \\  "metageneration": "1",
+    \\  "location": "US",
+    \\  "storageClass": "STANDARD",
+    \\  "etag": "CAE=",
+    \\  "timeCreated": "2026-09-29T14:07:12.505Z",
+    \\  "updated": "2026-09-29T14:07:12.505Z",
+    \\  "softDeletePolicy": {
+    \\    "retentionDurationSeconds": "604800",
+    \\    "effectiveTime": "2026-09-29T14:07:12.505Z"
+    \\  },
+    \\  "iamConfiguration": {
+    \\    "bucketPolicyOnly": {
+    \\      "enabled": false
+    \\    },
+    \\    "uniformBucketLevelAccess": {
+    \\      "enabled": false
+    \\    },
+    \\    "publicAccessPrevention": "inherited"
+    \\  },
+    \\  "locationType": "multi-region",
+    \\  "rpo": "DEFAULT"
+    \\}
+;
+
+/// Captured the same day: a bucket created with every setting this library
+/// sends but the default key, which needs Cloud KMS.
+const bucket_with_every_setting =
+    \\{
+    \\  "kind": "storage#bucket",
+    \\  "selfLink": "https://www.googleapis.com/storage/v1/b/zigps-p1-04a2ab-15",
+    \\  "id": "zigps-p1-04a2ab-15",
+    \\  "name": "zigps-p1-04a2ab-15",
+    \\  "projectNumber": "82150720798",
+    \\  "generation": "1790691121982943269",
+    \\  "metageneration": "1",
+    \\  "location": "US-CENTRAL1",
+    \\  "storageClass": "STANDARD",
+    \\  "etag": "CAE=",
+    \\  "timeCreated": "2026-09-29T14:12:02.194Z",
+    \\  "updated": "2026-09-29T14:12:02.194Z",
+    \\  "versioning": {
+    \\    "enabled": true
+    \\  },
+    \\  "lifecycle": {
+    \\    "rule": [
+    \\      {
+    \\        "action": {
+    \\          "type": "AbortIncompleteMultipartUpload"
+    \\        },
+    \\        "condition": {
+    \\          "age": 7
+    \\        }
+    \\      }
+    \\    ]
+    \\  },
+    \\  "labels": {
+    \\    "env": "test",
+    \\    "team": "zig"
+    \\  },
+    \\  "softDeletePolicy": {
+    \\    "retentionDurationSeconds": "691200",
+    \\    "effectiveTime": "2026-09-29T14:12:02.194Z"
+    \\  },
+    \\  "billing": {
+    \\    "requesterPays": true
+    \\  },
+    \\  "iamConfiguration": {
+    \\    "bucketPolicyOnly": {
+    \\      "enabled": true,
+    \\      "lockedTime": "2026-12-28T14:12:02.194Z"
+    \\    },
+    \\    "uniformBucketLevelAccess": {
+    \\      "enabled": true,
+    \\      "lockedTime": "2026-12-28T14:12:02.194Z"
+    \\    },
+    \\    "publicAccessPrevention": "enforced"
+    \\  },
+    \\  "locationType": "region",
+    \\  "satisfiesPZI": true
+    \\}
+;
+
+/// Captured the same day: every lifecycle condition, as the server writes
+/// them back, on a bucket with soft delete off.
+const bucket_with_every_condition =
+    \\{
+    \\  "kind": "storage#bucket",
+    \\  "name": "zigps-p1-04a2ab-13",
+    \\  "projectNumber": "82150720798",
+    \\  "generation": "1790690974102440408",
+    \\  "metageneration": "2",
+    \\  "location": "US",
+    \\  "storageClass": "STANDARD",
+    \\  "etag": "CAI=",
+    \\  "timeCreated": "2026-09-29T14:09:34.397Z",
+    \\  "updated": "2026-09-29T14:09:35.927Z",
+    \\  "lifecycle": {
+    \\    "rule": [
+    \\      {
+    \\        "action": {
+    \\          "type": "Delete"
+    \\        },
+    \\        "condition": {
+    \\          "age": 30
+    \\        }
+    \\      },
+    \\      {
+    \\        "action": {
+    \\          "storageClass": "NEARLINE",
+    \\          "type": "SetStorageClass"
+    \\        },
+    \\        "condition": {
+    \\          "age": 60,
+    \\          "matchesStorageClass": [
+    \\            "STANDARD"
+    \\          ]
+    \\        }
+    \\      },
+    \\      {
+    \\        "action": {
+    \\          "type": "AbortIncompleteMultipartUpload"
+    \\        },
+    \\        "condition": {
+    \\          "age": 7
+    \\        }
+    \\      },
+    \\      {
+    \\        "action": {
+    \\          "type": "Delete"
+    \\        },
+    \\        "condition": {
+    \\          "createdBefore": "2026-01-01",
+    \\          "isLive": false,
+    \\          "numNewerVersions": 3,
+    \\          "matchesStorageClass": [
+    \\            "STANDARD",
+    \\            "NEARLINE"
+    \\          ],
+    \\          "daysSinceCustomTime": 10,
+    \\          "customTimeBefore": "2026-01-02",
+    \\          "daysSinceNoncurrentTime": 5,
+    \\          "noncurrentTimeBefore": "2026-01-03",
+    \\          "matchesPrefix": [
+    \\            "logs/",
+    \\            "tmp/"
+    \\          ],
+    \\          "matchesSuffix": [
+    \\            ".tmp"
+    \\          ],
+    \\          "sizeAboveBytes": "1000",
+    \\          "sizeBelowBytes": "1000000000000"
+    \\        }
+    \\      }
+    \\    ]
+    \\  },
+    \\  "softDeletePolicy": {
+    \\    "retentionDurationSeconds": "0"
+    \\  },
+    \\  "iamConfiguration": {
+    \\    "bucketPolicyOnly": {
+    \\      "enabled": false
+    \\    },
+    \\    "uniformBucketLevelAccess": {
+    \\      "enabled": false
+    \\    },
+    \\    "publicAccessPrevention": "inherited"
+    \\  },
+    \\  "locationType": "multi-region",
+    \\  "rpo": "DEFAULT"
+    \\}
+;
+
+test "decode a bucket made with defaults, as Cloud Storage sent it" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const body = try encodeBucket(arena.allocator(), "my-bucket", .{});
-    try testing.expectEqualStrings(
-        "{\"name\":\"my-bucket\",\"location\":\"US\",\"storageClass\":\"STANDARD\"}",
-        body,
+    const b = try decodeBucket(arena.allocator(), bucket_made_with_defaults);
+    try testing.expectEqualStrings("zigps-p1-04a2ab-1", b.name);
+    try testing.expectEqual(1, b.metageneration);
+    try testing.expectEqual(1790690832240124605, b.generation.?);
+    try testing.expectEqual(82150720798, b.project_number.?);
+    try testing.expectEqualStrings("multi-region", b.location_type.?);
+    try testing.expectEqualStrings("2026-09-29T14:07:12.505Z", b.updated.?);
+    // New buckets get soft delete for 7 days, unasked.
+    try testing.expectEqual(604800, b.soft_delete.?.retention_s);
+    try testing.expectEqualStrings("2026-09-29T14:07:12.505Z", b.soft_delete.?.effective_time.?);
+    try testing.expect(!b.versioning);
+    try testing.expect(!b.requester_pays);
+    try testing.expectEqual(null, b.default_kms_key_name);
+    try testing.expectEqual(0, b.labels.len);
+    try testing.expectEqual(0, b.lifecycle.len);
+    try testing.expect(!b.uniform_bucket_level_access);
+    try testing.expectEqual(.inherited, b.public_access_prevention);
+}
+
+test "decode a bucket with every setting, as Cloud Storage sent it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const b = try decodeBucket(arena.allocator(), bucket_with_every_setting);
+    try testing.expectEqualStrings("US-CENTRAL1", b.location);
+    try testing.expectEqualStrings("region", b.location_type.?);
+    try testing.expect(b.versioning);
+    try testing.expectEqual(691200, b.soft_delete.?.retention_s);
+    try testing.expect(b.requester_pays);
+    try testing.expectEqual(2, b.labels.len);
+    try testing.expectEqualStrings("test", b.label("env").?);
+    try testing.expectEqualStrings("zig", b.label("team").?);
+    try testing.expectEqual(null, b.label("missing"));
+    try testing.expectEqual(1, b.lifecycle.len);
+    try testing.expectEqual(.abort_incomplete_multipart_upload, b.lifecycle[0].action);
+    try testing.expectEqual(7, b.lifecycle[0].condition.age_days.?);
+    try testing.expect(!b.lifecycle[0].unrecognized);
+    try testing.expect(b.uniform_bucket_level_access);
+    try testing.expectEqual(.enforced, b.public_access_prevention);
+}
+
+test "decode every lifecycle condition, as Cloud Storage sent them" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const b = try decodeBucket(arena.allocator(), bucket_with_every_condition);
+    // A retention of "0" is soft delete off.
+    try testing.expectEqual(null, b.soft_delete);
+    try testing.expectEqual(4, b.lifecycle.len);
+    for (b.lifecycle) |rule| try testing.expect(!rule.unrecognized);
+    try testing.expectEqual(.delete, b.lifecycle[0].action);
+    try testing.expectEqual(30, b.lifecycle[0].condition.age_days.?);
+    try testing.expectEqualStrings("NEARLINE", b.lifecycle[1].action.set_storage_class);
+    try testing.expectEqual(60, b.lifecycle[1].condition.age_days.?);
+    try testing.expectEqualStrings("STANDARD", b.lifecycle[1].condition.matches_storage_class[0]);
+    try testing.expectEqual(.abort_incomplete_multipart_upload, b.lifecycle[2].action);
+    const c = b.lifecycle[3].condition;
+    try testing.expectEqual(null, c.age_days);
+    try testing.expectEqualStrings("2026-01-01", c.created_before.?);
+    try testing.expectEqualStrings("2026-01-02", c.custom_time_before.?);
+    try testing.expectEqual(10, c.days_since_custom_time.?);
+    try testing.expectEqual(5, c.days_since_noncurrent_time.?);
+    try testing.expectEqual(false, c.is_live.?);
+    try testing.expectEqual(2, c.matches_prefix.len);
+    try testing.expectEqualStrings("tmp/", c.matches_prefix[1]);
+    try testing.expectEqualStrings(".tmp", c.matches_suffix[0]);
+    try testing.expectEqual(2, c.matches_storage_class.len);
+    try testing.expectEqualStrings("2026-01-03", c.noncurrent_time_before.?);
+    try testing.expectEqual(3, c.num_newer_versions.?);
+    // Sizes come as strings, days as numbers; either decodes.
+    try testing.expectEqual(1000, c.size_above_bytes.?);
+    try testing.expectEqual(1_000_000_000_000, c.size_below_bytes.?);
+}
+
+test "decode lifecycle rules with parts this library does not know" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = try decodeBucket(a,
+        \\{"lifecycle":{"rule":[
+        \\ {"action":{"type":"Delete"},"condition":{"age":30,"matchesPattern":"tmp/.*"}},
+        \\ {"action":{"type":"Archive"},"condition":{"age":1}},
+        \\ {"action":{"type":"Delete","fromTheFuture":1},"condition":{"age":2}},
+        \\ {"action":{"type":"Delete"},"condition":{"age":3},"enabled":false},
+        \\ {"condition":{"age":4}},
+        \\ {"action":{"type":"Delete"},"condition":{"age":5,"isLive":null}}
+        \\]}}
     );
-    const custom = try encodeBucket(arena.allocator(), "eu-logs", .{ .location = "europe-west3", .storage_class = "NEARLINE" });
-    try testing.expectEqualStrings(
-        "{\"name\":\"eu-logs\",\"location\":\"europe-west3\",\"storageClass\":\"NEARLINE\"}",
-        custom,
+    try testing.expectEqual(6, b.lifecycle.len);
+    // Kept, with what was understood, and marked so it is never sent back.
+    try testing.expect(b.lifecycle[0].unrecognized);
+    try testing.expectEqual(.delete, b.lifecycle[0].action);
+    try testing.expectEqual(30, b.lifecycle[0].condition.age_days.?);
+    try testing.expect(b.lifecycle[1].unrecognized);
+    try testing.expectEqual(.unknown, b.lifecycle[1].action);
+    try testing.expect(b.lifecycle[2].unrecognized);
+    try testing.expect(b.lifecycle[3].unrecognized);
+    try testing.expect(b.lifecycle[4].unrecognized);
+    try testing.expectEqual(.unknown, b.lifecycle[4].action);
+    // A condition sent as null is simply not set.
+    try testing.expect(!b.lifecycle[5].unrecognized);
+    try testing.expectEqual(null, b.lifecycle[5].condition.is_live);
+}
+
+test "decode public access prevention: old names, and ones not known yet" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { []const u8, types.PublicAccessPrevention }{
+        .{ "{}", .inherited },
+        .{ "{\"iamConfiguration\":{}}", .inherited },
+        .{ "{\"iamConfiguration\":{\"publicAccessPrevention\":\"inherited\"}}", .inherited },
+        .{ "{\"iamConfiguration\":{\"publicAccessPrevention\":\"unspecified\"}}", .inherited },
+        .{ "{\"iamConfiguration\":{\"publicAccessPrevention\":\"enforced\"}}", .enforced },
+        .{ "{\"iamConfiguration\":{\"publicAccessPrevention\":\"strict\"}}", .unknown },
+    };
+    for (cases) |case| {
+        errdefer std.debug.print("body: {s}\n", .{case[0]});
+        try testing.expectEqual(case[1], (try decodeBucket(a, case[0])).public_access_prevention);
+    }
+}
+
+test "decode bucket settings that are malformed as InvalidResponse" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "{\"metageneration\":\"x\"}",
+        "{\"generation\":-1}",
+        "{\"softDeletePolicy\":{\"retentionDurationSeconds\":\"4294967296\"}}",
+        "{\"softDeletePolicy\":{\"retentionDurationSeconds\":true}}",
+        "{\"lifecycle\":{\"rule\":[1]}}",
+        "{\"lifecycle\":{\"rule\":[{\"action\":\"Delete\"}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":1}}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"condition\":[]}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"condition\":{\"age\":-1}}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"condition\":{\"age\":4294967296}}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"condition\":{\"age\":\"x\"}}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"condition\":{\"isLive\":\"true\"}}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"condition\":{\"matchesPrefix\":\"a/\"}}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"condition\":{\"matchesPrefix\":[1]}}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"condition\":{\"createdBefore\":20260101}}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"condition\":{\"sizeAboveBytes\":\"-5\"}}]}}",
+    }) |body| {
+        errdefer std.debug.print("body: {s}\n", .{body});
+        try testing.expectError(error.InvalidResponse, decodeBucket(a, body));
+    }
+    // Emulators send numbers where Google sends strings, and the reverse.
+    const loose = try decodeBucket(a,
+        \\{"metageneration":3,"softDeletePolicy":{"retentionDurationSeconds":604800},
+        \\ "lifecycle":{"rule":[{"action":{"type":"Delete"},"condition":{"age":"7","sizeAboveBytes":10}}]}}
     );
+    try testing.expectEqual(3, loose.metageneration);
+    try testing.expectEqual(604800, loose.soft_delete.?.retention_s);
+    try testing.expectEqual(7, loose.lifecycle[0].condition.age_days.?);
+    try testing.expectEqual(10, loose.lifecycle[0].condition.size_above_bytes.?);
 }
 
 fn decodeArbitrary(_: void, input: []const u8) !void {
@@ -555,6 +1055,7 @@ fn decodeArbitrary(_: void, input: []const u8) !void {
     // Total: any body decodes or fails with InvalidResponse, never a crash.
     _ = decodeObject(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
     _ = decodeObjectPage(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
+    _ = decodeBucket(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
     _ = decodeBucketPage(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
     _ = decodeCopySource(a, input) catch |err| try testing.expectEqual(error.InvalidResponse, err);
 }
@@ -568,6 +1069,10 @@ test "fuzz decoding: arbitrary bodies never crash" {
         "{\"metadata\":{\"k\":null}}",
         "<html>502</html>",
         "{\"crc32c\":\"\\u0000\"}",
+        bucket_with_every_setting,
+        bucket_with_every_condition,
+        "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"age\":-1}}]}}",
+        "{\"labels\":{\"k\":null},\"softDeletePolicy\":{\"retentionDurationSeconds\":\"0\"}}",
     } });
 }
 

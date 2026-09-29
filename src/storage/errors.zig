@@ -74,6 +74,12 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// repeated, or a value a header cannot carry. `Diagnostics` says
     /// which. Nothing was sent.
     InvalidMetadataUpdate,
+    /// A bucket's settings break a rule Cloud Storage holds them to: a
+    /// label, a soft delete retention, a lifecycle rule, a Cloud KMS key
+    /// name, a value read from the server that cannot be sent back, or an
+    /// update that changes nothing. `Diagnostics` says which. Nothing was
+    /// sent.
+    InvalidBucketSettings,
     /// A compose breaks a rule: fewer than 1 or more than 32 sources, a
     /// name Cloud Storage would refuse, a source named twice at the same
     /// generation, or a source whose generation and precondition

@@ -36,6 +36,10 @@ pub const Diagnostics = errors.Diagnostics;
 
 pub const Owned = @import("owned.zig").Owned;
 
+/// What an update does to a setting that can be taken away: `.keep`,
+/// `.set`, or `.clear`. Service modules re-export it.
+pub const Change = @import("change.zig").Change;
+
 /// The seam through which service modules get bearer tokens.
 pub const TokenProvider = @import("TokenProvider.zig");
 pub const StaticToken = @import("StaticToken.zig");
@@ -81,6 +85,7 @@ test {
     _ = @import("TokenProvider.zig");
     _ = @import("WipingAllocator.zig");
     _ = @import("base64.zig");
+    _ = @import("change.zig");
     _ = @import("crc32c.zig");
     _ = @import("flate.zig");
     _ = @import("endpoint.zig");

@@ -417,18 +417,213 @@ pub const CopyOptions = struct {
     preconditions: Preconditions = .{},
 };
 
-/// What `Bucket.create` sends. Everything else stays at the server default.
+/// What an update does to a setting that can be taken away: `.keep`,
+/// `.set`, or `.clear`. Core's, shared with the other modules.
+pub const Change = core.Change;
+
+/// A bucket's label: a key and a value that describe it for billing
+/// reports, searches and policies. Keys are 1 to 63 characters and values
+/// up to 63, each at most 128 bytes, of lowercase letters, digits, `_` and
+/// `-`, and a key starts with a lowercase letter. Letters beyond ASCII
+/// count too, uppercase ones excepted.
+pub const Label = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// One label an update sets or removes.
+pub const LabelChange = struct {
+    key: []const u8,
+    /// Null removes the label.
+    value: ?[]const u8,
+};
+
+/// What an update does to a bucket's labels.
+pub const LabelEdit = union(enum) {
+    /// Every label keeps its value.
+    keep,
+    /// Set the labels that carry a value, remove those that carry none,
+    /// and leave every other label as it was. An empty list changes
+    /// nothing and sends nothing: Cloud Storage takes an empty set of
+    /// labels for "remove them all".
+    change: []const LabelChange,
+    /// Remove every label.
+    clear,
+};
+
+/// Whether a bucket's objects may ever be made public.
+pub const PublicAccessPrevention = enum {
+    /// As the organization's policy says, which allows it unless the
+    /// policy enforces prevention.
+    inherited,
+    /// Never: an ACL or IAM grant to `allUsers` or `allAuthenticatedUsers`
+    /// is refused, and existing ones stop working.
+    enforced,
+    /// A value the server sent that this library does not know. Never
+    /// sent: a config or update carrying it is refused.
+    unknown,
+};
+
+/// A rule Cloud Storage applies to a bucket's objects, about once a day:
+/// the action, taken on every object that meets every condition.
+pub const LifecycleRule = struct {
+    action: Action,
+    condition: Condition,
+    /// Set on a rule read from a bucket that carries an action or a
+    /// condition this library does not know, such as the early-access
+    /// `matchesPattern`. Such a rule is never sent: without what this
+    /// library could not read, it would act on objects the bucket's own
+    /// rule leaves alone, so a config or update that carries it is refused.
+    unrecognized: bool = false,
+
+    pub const Action = union(enum) {
+        delete,
+        /// Such as "NEARLINE".
+        set_storage_class: []const u8,
+        /// Cancels XML multipart uploads left unfinished, as parallel
+        /// uploads can leave them. Takes only `age_days`, `matches_prefix`
+        /// and `matches_suffix`.
+        abort_incomplete_multipart_upload,
+        /// An action this library does not know, on a rule read from a
+        /// bucket, which is then `unrecognized`.
+        unknown,
+    };
+
+    /// Every field set must hold for the action to apply, and at least
+    /// one must be set; an empty list counts as not set. Dates are
+    /// `YYYY-MM-DD`, midnight UTC. Days and counts are at most
+    /// 2,147,483,647, and sizes at most 5 TiB.
+    pub const Condition = struct {
+        /// Days since the object was created.
+        age_days: ?u32 = null,
+        /// Objects created before this date.
+        created_before: ?[]const u8 = null,
+        /// Objects whose custom time is before this date.
+        custom_time_before: ?[]const u8 = null,
+        days_since_custom_time: ?u32 = null,
+        /// Days since a version became noncurrent.
+        days_since_noncurrent_time: ?u32 = null,
+        /// True: live objects only. False: noncurrent versions only.
+        is_live: ?bool = null,
+        /// Names starting with any of these. Every prefix and suffix is 1
+        /// to 1,024 bytes, and a bucket's rules name at most 1,000 of them
+        /// together.
+        matches_prefix: []const []const u8 = &.{},
+        /// Names ending with any of these.
+        matches_suffix: []const []const u8 = &.{},
+        /// Objects in any of these classes, such as "STANDARD".
+        matches_storage_class: []const []const u8 = &.{},
+        /// Versions that became noncurrent before this date.
+        noncurrent_time_before: ?[]const u8 = null,
+        /// Noncurrent versions with at least this many newer versions,
+        /// the live one included.
+        num_newer_versions: ?u32 = null,
+        size_above_bytes: ?u64 = null,
+        size_below_bytes: ?u64 = null,
+    };
+};
+
+/// What `Bucket.create` sends. Everything left at its default stays at
+/// Cloud Storage's default, and a config with every default sends only
+/// the name, the location and the class.
 pub const BucketConfig = struct {
     location: []const u8 = "US",
     storage_class: []const u8 = "STANDARD",
+    /// Keep every version an overwrite or a delete replaces.
+    versioning: bool = false,
+    /// How long a deleted object stays restorable: 0 turns soft delete
+    /// off, else 604,800 to 7,776,000 seconds (7 to 90 days). Null:
+    /// Cloud Storage's default, 7 days unless the organization sets
+    /// another. A bucket that ever had soft delete on is itself kept,
+    /// soft-deleted, after it is deleted, for the longest retention it
+    /// ever had; one created with 0 and never changed goes outright.
+    soft_delete_retention_s: ?u32 = null,
+    /// Bill requests to the requester's project, not the bucket's.
+    requester_pays: bool = false,
+    /// `projects/P/locations/L/keyRings/R/cryptoKeys/K`, in the bucket's
+    /// location and granted to Cloud Storage's service agent: the Cloud
+    /// KMS key that encrypts objects written without a key of their own.
+    default_kms_key_name: ?[]const u8 = null,
+    /// At most 64, each key once.
+    labels: []const Label = &.{},
+    lifecycle: []const LifecycleRule = &.{},
+    /// Null: as the organization's policy says.
+    uniform_bucket_level_access: ?bool = null,
+    /// Null: `.inherited`.
+    public_access_prevention: ?PublicAccessPrevention = null,
 };
 
+/// A bucket, as `create`, `get`, `update` and `listBuckets` return it.
 pub const BucketInfo = struct {
     name: []const u8,
     location: []const u8,
     storage_class: []const u8,
     /// RFC 3339, as sent by the server.
     time_created: []const u8,
+    /// Changes with every update: what `BucketUpdate.if_metageneration_match`
+    /// compares.
+    metageneration: u64 = 0,
+    /// Which bucket of this name this is: a name deleted and created again
+    /// is a new generation.
+    generation: ?u64 = null,
+    project_number: ?u64 = null,
+    /// Such as "region", "dual-region" or "multi-region".
+    location_type: ?[]const u8 = null,
+    /// RFC 3339, when the settings last changed.
+    updated: ?[]const u8 = null,
+    versioning: bool = false,
+    /// Null: no soft delete.
+    soft_delete: ?SoftDelete = null,
+    requester_pays: bool = false,
+    default_kms_key_name: ?[]const u8 = null,
+    /// In no particular order: Cloud Storage's changes between reads.
+    labels: []const Label = &.{},
+    lifecycle: []const LifecycleRule = &.{},
+    uniform_bucket_level_access: bool = false,
+    public_access_prevention: PublicAccessPrevention = .inherited,
+
+    pub const SoftDelete = struct {
+        retention_s: u32,
+        /// RFC 3339: since when this policy, or one with a longer
+        /// retention, has been in force.
+        effective_time: ?[]const u8 = null,
+    };
+
+    /// The value of the label named `key`, or null.
+    pub fn label(self: BucketInfo, key: []const u8) ?[]const u8 {
+        for (self.labels) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) return entry.value;
+        }
+        return null;
+    }
+};
+
+/// What `Bucket.update` changes. A field left at its default stays as it
+/// is, and an update that changes nothing is refused.
+pub const BucketUpdate = struct {
+    versioning: ?bool = null,
+    /// 0 turns soft delete off, else 604,800 to 7,776,000 seconds. What is
+    /// already soft-deleted keeps the retention it was deleted under, and
+    /// a deleted bucket is kept for the longest retention it ever had.
+    soft_delete_retention_s: ?u32 = null,
+    requester_pays: ?bool = null,
+    /// `.clear`: objects written without a key of their own get Google's.
+    default_kms_key_name: Change([]const u8) = .keep,
+    labels: LabelEdit = .keep,
+    /// Replaces every rule, as Cloud Storage keeps them as one list;
+    /// `&.{}` removes them all. Changes can take 24 hours to act.
+    lifecycle: ?[]const LifecycleRule = null,
+    /// Once on for 90 days, it cannot be turned off.
+    uniform_bucket_level_access: ?bool = null,
+    public_access_prevention: ?PublicAccessPrevention = null,
+    /// The class new objects get when they name none, such as "NEARLINE".
+    storage_class: ?[]const u8 = null,
+    /// Change the bucket only while its metageneration is this: what makes
+    /// the update safe to retry.
+    if_metageneration_match: ?u64 = null,
+    /// Change it only while its metageneration is not this. When it is,
+    /// the answer is `error.NotModified` and nothing changes.
+    if_metageneration_not_match: ?u64 = null,
 };
 
 pub const PageOptions = struct {

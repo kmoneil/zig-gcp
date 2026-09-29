@@ -9,6 +9,28 @@ const types = @import("types.zig");
 /// The documented ceiling on an object name's length, in bytes of UTF-8.
 pub const max_object_name_len = 1024;
 
+// Bucket settings, as Cloud Storage enforced them on 2026-09-29. The
+// emulator enforces none of them, so they are checked before sending.
+
+/// Labels on a bucket.
+pub const max_labels = 64;
+/// Characters in a label key or value, and bytes of UTF-8.
+pub const max_label_chars = 63;
+pub const max_label_bytes = 128;
+/// A soft delete retention other than 0, which turns soft delete off: 7 to
+/// 90 days, both included.
+pub const min_soft_delete_retention_s = 604_800;
+pub const max_soft_delete_retention_s = 7_776_000;
+/// Prefixes and suffixes across all of a bucket's lifecycle rules, and
+/// bytes in each. The documented limit of 100 rules is not enforced.
+pub const max_lifecycle_affixes = 1000;
+pub const max_lifecycle_affix_bytes = 1024;
+/// Days, ages and version counts in a lifecycle condition: a signed
+/// 32-bit integer.
+pub const max_lifecycle_days = std.math.maxInt(i32);
+/// Sizes in a lifecycle condition: the largest object, 5 TiB.
+pub const max_lifecycle_size_bytes = 5 * 1024 * 1024 * 1024 * 1024;
+
 /// Object names are 1 to 1,024 bytes of valid UTF-8, without carriage
 /// return or line feed, and are not `.` or `..`, which the XML API reserves
 /// and Google's guidance rules out. Everything else, slashes included, is

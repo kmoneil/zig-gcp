@@ -102,6 +102,37 @@ test "buckets: create, get, find in the list, delete" {
     try testing.expectError(error.NotFound, f.bucket().delete());
 }
 
+test "bucket settings: the emulator takes a create and an update with each setting" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+
+    // fake-gcs-server takes every setting and keeps almost none of them,
+    // so this checks only that it takes what the library sends. What the
+    // settings do is checked against Cloud Storage's rules in the unit
+    // tests. Versioning is left out: the filesystem backend refuses it.
+    var created = try f.bucket().create(.{
+        .soft_delete_retention_s = 0,
+        .labels = &.{.{ .key = "env", .value = "test" }},
+        .lifecycle = &.{.{ .action = .abort_incomplete_multipart_upload, .condition = .{ .age_days = 7 } }},
+        .uniform_bucket_level_access = true,
+        .public_access_prevention = .enforced,
+    });
+    defer created.deinit();
+    try testing.expectEqualStrings(&f.bucket_name, created.value.name);
+
+    var updated = try f.bucket().update(.{
+        .labels = .{ .change = &.{ .{ .key = "env", .value = "prod" }, .{ .key = "team", .value = null } } },
+        .lifecycle = &.{},
+        .soft_delete_retention_s = 0,
+        .requester_pays = false,
+        .public_access_prevention = .inherited,
+    });
+    defer updated.deinit();
+    try testing.expectEqualStrings(&f.bucket_name, updated.value.name);
+    try testing.expectError(error.InvalidBucketSettings, f.bucket().update(.{}));
+}
+
 test "objects: listing with a prefix, a delimiter, and paging" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;
