@@ -26,6 +26,16 @@
 //! Buckets, their settings and the rules on them are `FakeBuckets`'s,
 //! served through here so that the same transport, fault plan and lock
 //! cover them.
+//!
+//! With `soft_delete` on, the objects' bucket keeps what a delete removes,
+//! as Cloud Storage measured on 2026-09-29 does: a soft-deleted generation
+//! reads only by its generation, never as bytes, and a restore makes a new
+//! live generation of it with its metadata, leaves it restorable again,
+//! and moves the live object it replaces into soft delete itself. A
+//! restore is held to its conditions against the live object; a live or
+//! unknown generation is 404, and with `soft_delete` off every restore is
+//! 400. Only a delete and a restore soft-delete an object here: an upload
+//! that replaces one frees it, which no test depends on.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -42,6 +52,10 @@ pub const FakeMultipart = struct {
     uploads: std.ArrayList(Upload) = .empty,
     sessions: std.ArrayList(Session) = .empty,
     objects: std.ArrayList(Stored) = .empty,
+    /// Generations deleted while `soft_delete` was on.
+    soft_deleted: std.ArrayList(Stored) = .empty,
+    /// The objects' bucket keeps deleted objects restorable.
+    soft_delete: bool = false,
     /// Buckets and their settings, apart from the objects above, which
     /// belong to whatever bucket a request names.
     buckets: FakeBuckets,
@@ -78,6 +92,7 @@ pub const FakeMultipart = struct {
         /// none for an answer that was lost.
         media_bytes: u64 = 0,
         moves: u32 = 0,
+        restores: u32 = 0,
         session_starts: u32 = 0,
         session_puts: u32 = 0,
         session_cancels: u32 = 0,
@@ -91,7 +106,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore };
 
     pub const Fault = enum {
         none,
@@ -199,6 +214,8 @@ pub const FakeMultipart = struct {
         self.sessions.deinit(self.gpa);
         for (self.objects.items) |*o| freeStored(self.gpa, o);
         self.objects.deinit(self.gpa);
+        for (self.soft_deleted.items) |*o| freeStored(self.gpa, o);
+        self.soft_deleted.deinit(self.gpa);
         self.buckets.deinit();
         self.* = undefined;
     }
@@ -362,6 +379,7 @@ pub const FakeMultipart = struct {
             .resumable => if (method == .POST) .session_start else return error.HttpProtocolError,
             .insert => if (method == .POST) .insert else return error.HttpProtocolError,
             .bucket => .bucket,
+            .restore => if (method == .POST) .restore else return error.HttpProtocolError,
             .session => switch (method) {
                 .PUT => .session_put,
                 .DELETE => .session_cancel,
@@ -382,7 +400,7 @@ pub const FakeMultipart = struct {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
             .session => if (kind == .session_put) sessionPart(headers) else 0,
-            .move, .resumable, .insert, .bucket => 0,
+            .move, .resumable, .insert, .bucket, .restore => 0,
         };
         // Cloud Storage and fake-gcs-server take a request body sent with
         // `Content-Encoding: gzip` apart and store it plain. This library
@@ -434,6 +452,7 @@ pub const FakeMultipart = struct {
                 const r = try self.buckets.serve(method, t, body, arena);
                 break :bucket Reply{ .status = r.status, .body = r.body };
             },
+            .restore => |t| try self.restoreObject(t, arena),
             .session => |id| if (kind == .session_put)
                 try self.sessionPut(id, headers, body, fault, arena)
             else
@@ -454,6 +473,7 @@ pub const FakeMultipart = struct {
         switch (kind) {
             .read => {
                 self.counts.reads += 1;
+                if (target.soft_deleted) return self.readSoftDeleted(target, arena);
                 const o = &self.objects.items[index orelse return not_found];
                 switch (target.conditions.check(o)) {
                     .hold => {},
@@ -478,12 +498,62 @@ pub const FakeMultipart = struct {
             .delete => {
                 self.counts.deletes += 1;
                 const i = index orelse return not_found;
+                if (self.soft_delete) try self.soft_deleted.ensureUnusedCapacity(self.gpa, 1);
                 var removed = self.objects.orderedRemove(i);
-                freeStored(self.gpa, &removed);
+                if (self.soft_delete) {
+                    self.soft_deleted.appendAssumeCapacity(removed);
+                } else {
+                    freeStored(self.gpa, &removed);
+                }
                 return .{ .status = 204 };
             },
             else => unreachable,
         }
+    }
+
+    /// A soft-deleted generation's metadata, which only its generation
+    /// reads.
+    fn readSoftDeleted(self: *FakeMultipart, target: JsonTarget, arena: Allocator) Allocator.Error!Reply {
+        const generation = target.generation orelse return .{
+            .status = 400,
+            .body = "{\"error\":{\"code\":400,\"message\":\"You must specify a generation.\",\"errors\":[{\"reason\":\"required\"}]}}",
+        };
+        for (self.soft_deleted.items) |*o| if (std.mem.eql(u8, o.name, target.name) and o.generation == generation) {
+            return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false) };
+        };
+        return .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
+    }
+
+    /// `objects.restore`: a new live generation made from a soft-deleted
+    /// one, which stays where it is.
+    fn restoreObject(self: *FakeMultipart, target: RestoreTarget, arena: Allocator) Allocator.Error!Reply {
+        self.counts.restores += 1;
+        if (!self.soft_delete) return .{
+            .status = 400,
+            .body = "{\"error\":{\"code\":400,\"message\":\"bucket soft delete policy must be set.\",\"errors\":[{\"reason\":\"invalid\"}]}}",
+        };
+        const generation = target.generation orelse return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Required parameter: generation\"}}" };
+        const source_index = for (self.soft_deleted.items, 0..) |o, i| {
+            if (std.mem.eql(u8, o.name, target.name) and o.generation == generation) break i;
+        } else return .{
+            .status = 404,
+            .body = try std.fmt.allocPrint(arena, "{{\"error\":{{\"code\":404,\"message\":\"No such object: {s}/{s}\",\"errors\":[{{\"reason\":\"notFound\"}}]}}}}", .{ target.bucket, target.name }),
+        };
+        const live = self.liveIndex(target.name);
+        const holds = if (live) |i| target.conditions.check(&self.objects.items[i]) == .hold else target.conditions.checkAbsent();
+        if (!holds) return condition_failed;
+
+        // Everything that can fail first: once the lists change, nothing
+        // may.
+        var copy = try copyStored(self.gpa, &self.soft_deleted.items[source_index], self.next_generation);
+        errdefer freeStored(self.gpa, &copy);
+        const reply_body = try objectJson(arena, &copy, copy.name, copy.generation, target.bucket, false);
+        try self.objects.ensureUnusedCapacity(self.gpa, 1);
+        try self.soft_deleted.ensureUnusedCapacity(self.gpa, 1);
+        self.next_generation += 1;
+        if (live) |i| self.soft_deleted.appendAssumeCapacity(self.objects.orderedRemove(i));
+        self.objects.appendAssumeCapacity(copy);
+        return .{ .status = 200, .body = reply_body };
     }
 
     /// `objects.move`: the source, pinned to its generation, renamed to the
@@ -655,7 +725,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore => unreachable,
         }
     }
 
@@ -1013,6 +1083,25 @@ fn replyHeaders(arena: Allocator, headers: []const Header) Allocator.Error![]con
     return arena.dupe(Header, headers);
 }
 
+fn dupeHeaders(gpa: Allocator, headers: []const Header) Allocator.Error![]Header {
+    const out = try gpa.alloc(Header, headers.len);
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |h| {
+            gpa.free(h.name);
+            gpa.free(h.value);
+        }
+        gpa.free(out);
+    }
+    for (headers, out) |h, *copy| {
+        const name = try gpa.dupe(u8, h.name);
+        errdefer gpa.free(name);
+        copy.* = .{ .name = name, .value = try gpa.dupe(u8, h.value) };
+        done += 1;
+    }
+    return out;
+}
+
 fn freeHeaders(gpa: Allocator, headers: []Header) void {
     for (headers) |h| {
         gpa.free(h.name);
@@ -1220,6 +1309,27 @@ fn gunzipOrEmpty(gpa: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice();
 }
 
+/// A deep copy of `o` at another generation.
+fn copyStored(gpa: Allocator, o: *const FakeMultipart.Stored, generation: u64) Allocator.Error!FakeMultipart.Stored {
+    const name = try gpa.dupe(u8, o.name);
+    errdefer gpa.free(name);
+    const bytes = try gpa.dupe(u8, o.bytes);
+    errdefer gpa.free(bytes);
+    const content_type = try gpa.dupe(u8, o.content_type);
+    errdefer gpa.free(content_type);
+    const metadata = try dupeHeaders(gpa, o.metadata);
+    errdefer freeHeaders(gpa, metadata);
+    const served = if (o.served) |s| try gpa.dupe(u8, s) else null;
+    return .{
+        .name = name,
+        .generation = generation,
+        .bytes = bytes,
+        .content_type = content_type,
+        .metadata = metadata,
+        .served = served,
+    };
+}
+
 fn freeStored(gpa: Allocator, o: *FakeMultipart.Stored) void {
     gpa.free(o.name);
     gpa.free(o.bytes);
@@ -1264,7 +1374,17 @@ const JsonTarget = struct {
     generation: ?u64,
     /// `alt=media`: the object's bytes rather than its metadata.
     media: bool = false,
+    /// `softDeleted=true`: a soft-deleted generation's metadata.
+    soft_deleted: bool = false,
     conditions: Conditions = .{},
+};
+
+const RestoreTarget = struct {
+    bucket: []const u8,
+    name: []const u8,
+    generation: ?u64,
+    /// On the live object of the name.
+    conditions: Conditions,
 };
 
 const MoveTarget = struct {
@@ -1307,6 +1427,7 @@ const InsertTarget = struct {
 
 const Target = union(enum) {
     bucket: FakeBuckets.Target,
+    restore: RestoreTarget,
     json: JsonTarget,
     xml: XmlTarget,
     move: MoveTarget,
@@ -1360,6 +1481,7 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         var generation: ?u64 = null;
         var source_generation: ?u64 = null;
         var media = false;
+        var soft_deleted = false;
         var conditions: Conditions = .{};
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
@@ -1370,8 +1492,16 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
                 source_generation = std.fmt.parseInt(u64, param["ifSourceGenerationMatch=".len..], 10) catch return error.HttpProtocolError;
             } else if (std.mem.eql(u8, param, "alt=media")) {
                 media = true;
+            } else if (std.mem.eql(u8, param, "softDeleted=true")) {
+                soft_deleted = true;
             }
         }
+        if (std.mem.endsWith(u8, object_part, "/restore")) return .{ .restore = .{
+            .bucket = bucket,
+            .name = try decode(arena, object_part[0 .. object_part.len - "/restore".len]),
+            .generation = generation,
+            .conditions = conditions,
+        } };
         // A name is one strictly encoded segment, so a slash here is the
         // move's.
         if (std.mem.indexOf(u8, object_part, "/moveTo/o/")) |at| return .{ .move = .{
@@ -1386,6 +1516,7 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
             .name = try decode(arena, object_part),
             .generation = generation,
             .media = media,
+            .soft_deleted = soft_deleted,
             .conditions = conditions,
         } };
     }

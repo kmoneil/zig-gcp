@@ -47,6 +47,18 @@ pub const ObjectInfo = struct {
     time_created: []const u8,
     updated: []const u8,
     metadata: []const Metadata,
+    /// When this version stopped being the live one, in a bucket that keeps
+    /// versions. Null for a live object.
+    time_deleted: ?[]const u8 = null,
+    /// When a soft-deleted object was deleted. Null for any other.
+    soft_delete_time: ?[]const u8 = null,
+    /// When a soft-deleted object stops being restorable. Fixed at the
+    /// delete: a later change to the bucket's retention leaves it be.
+    hard_delete_time: ?[]const u8 = null,
+    /// Tells apart soft-deleted objects of one name and generation, which
+    /// only buckets with hierarchical namespace have: what
+    /// `RestoreOptions.restore_token` takes.
+    restore_token: ?[]const u8 = null,
 
     /// The value of the custom metadata entry named `key`, or null.
     pub fn metadataValue(self: ObjectInfo, key: []const u8) ?[]const u8 {
@@ -67,6 +79,17 @@ pub const ListOptions = struct {
     page_size: u32 = 0,
     /// `next_page_token` from the previous page; null for the first page.
     page_token: ?[]const u8 = null,
+    /// Every version of every object, noncurrent ones included, by name
+    /// and then by generation. Noncurrent versions carry `time_deleted`.
+    /// A bucket that keeps no versions lists its live objects.
+    versions: bool = false,
+    /// Only soft-deleted objects, which the bucket keeps restorable for its
+    /// soft delete retention; a bucket without soft delete refuses the
+    /// listing. Not together with `versions`.
+    soft_deleted: bool = false,
+    /// Only names matching this glob, such as `logs/**/*.gz`: `*` matches
+    /// within a folder, `**` across folders.
+    match_glob: ?[]const u8 = null,
 };
 
 pub const ObjectPage = struct {
@@ -380,6 +403,12 @@ pub const GetOptions = struct {
     /// Address one specific generation instead of the live one.
     generation: ?u64 = null,
     preconditions: Preconditions = .{},
+    /// A soft-deleted generation's metadata, which `generation` must name.
+    /// Its bytes cannot be read, only restored.
+    soft_deleted: bool = false,
+    /// With `soft_deleted`, in a bucket with hierarchical namespace: which
+    /// of the soft-deleted objects of that name and generation.
+    restore_token: ?[]const u8 = null,
 };
 
 pub const DeleteOptions = struct {
@@ -581,6 +610,10 @@ pub const BucketInfo = struct {
     lifecycle: []const LifecycleRule = &.{},
     uniform_bucket_level_access: bool = false,
     public_access_prevention: PublicAccessPrevention = .inherited,
+    /// A soft-deleted bucket's: when it was deleted, and when it stops
+    /// being restorable. Null for a live one.
+    soft_delete_time: ?[]const u8 = null,
+    hard_delete_time: ?[]const u8 = null,
 
     pub const SoftDelete = struct {
         retention_s: u32,
@@ -596,6 +629,77 @@ pub const BucketInfo = struct {
         }
         return null;
     }
+};
+
+/// What `Object.restore` brings back.
+pub const RestoreOptions = struct {
+    /// The soft-deleted generation. It stays soft-deleted, and restorable
+    /// again, after the restore: a restore makes a new generation.
+    generation: u64,
+    /// Conditions on the live object of the name, which a restore replaces.
+    /// `.does_not_exist` restores only where nothing live has the name.
+    /// `if_generation_match` is what makes a restore safe to retry: a
+    /// repeat of one that landed fails, where without it the repeat makes a
+    /// second copy and pushes the first into soft delete.
+    preconditions: Preconditions = .{},
+    /// Give the new object the soft-deleted one's ACL, rather than the
+    /// bucket's default. Refused on a bucket with uniform bucket-level
+    /// access.
+    copy_source_acl: bool = false,
+    /// In a bucket with hierarchical namespace, which of the soft-deleted
+    /// objects of this name and generation: `ObjectInfo.restore_token`.
+    restore_token: ?[]const u8 = null,
+};
+
+/// What `Bucket.bulkRestore` brings back: the newest soft-deleted
+/// generation of each name that matches.
+pub const BulkRestoreOptions = struct {
+    /// Globs such as `logs/**`. Empty restores every name.
+    match_globs: []const []const u8 = &.{},
+    /// RFC 3339 bounds on when objects were soft-deleted, and on when
+    /// they were first created.
+    soft_deleted_after: ?[]const u8 = null,
+    soft_deleted_before: ?[]const u8 = null,
+    created_after: ?[]const u8 = null,
+    created_before: ?[]const u8 = null,
+    /// Replace live objects of the same name. Off, they are skipped.
+    allow_overwrite: bool = false,
+    /// Give each object its soft-deleted ACL.
+    copy_source_acl: bool = false,
+};
+
+/// A long-running operation, as a bulk restore starts one.
+pub const Operation = struct {
+    /// What `Bucket.operation` and `Bucket.cancelOperation` take.
+    id: []const u8,
+    done: bool,
+    /// Set when it ended without finishing: code 1 when it was cancelled.
+    failure: ?Failure = null,
+    /// Null while Cloud Storage cannot say, which it could not for any bulk
+    /// restore measured.
+    progress_percent: ?u8 = null,
+    requested_cancellation: bool = false,
+    /// Objects restored, skipped (a live one of the name, without
+    /// `allow_overwrite`), and failed.
+    succeeded: u64 = 0,
+    skipped: u64 = 0,
+    failed: u64 = 0,
+    /// RFC 3339.
+    create_time: ?[]const u8 = null,
+    update_time: ?[]const u8 = null,
+    end_time: ?[]const u8 = null,
+
+    pub const Failure = struct {
+        /// A `google.rpc.Code`.
+        code: i32,
+        message: []const u8,
+    };
+};
+
+pub const OperationPage = struct {
+    operations: []const Operation,
+    /// Pass as `page_token` to get the next page. Null on the last page.
+    next_page_token: ?[]const u8,
 };
 
 /// What `Bucket.update` changes. A field left at its default stays as it

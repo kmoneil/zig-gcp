@@ -13,11 +13,11 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, the `TokenProvider` and `Signer` seams, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 1062 unit, property and fuzz tests, Google's 29 V4 signing
+- Tested with 1184 unit, property and fuzz tests, Google's 29 V4 signing
   vectors among them; 28 Pub/Sub integration tests that pass against both
   the emulator and production, and 20 more through a proxy that drops,
-  cuts and stalls the connection; 23 Cloud Storage tests against
-  fake-gcs-server, and 49 against a real bucket, where uploads and
+  cuts and stalls the connection; 25 Cloud Storage tests against
+  fake-gcs-server, and 53 against real buckets, where uploads and
   downloads cut off mid-body, or ended with their process, resume against
   Google itself, plus 17 that sign URLs and POST policies for one; 12 Secret
   Manager tests against a real project, since it has no emulator; 10 auth
@@ -1176,7 +1176,7 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-23:
 | --- | --- |
 | `client.bucket(name).create(config)`, `.get()`, `.update(changes)`, `.delete()` | A bucket and its settings, in the project `Options.project_id` names |
 | `client.listBuckets(page)` | One page of the project's buckets |
-| `bucket.listObjects(options)` | One page of objects, with `prefix`, a `delimiter` for folders, and paging |
+| `bucket.listObjects(options)` | One page of objects, with `prefix`, a `delimiter` for folders, a `match_glob`, and paging: live ones, every version, or the soft-deleted ones |
 | `bucket.object(name).get(options)`, `.exists()`, `.delete(options)` | An object's metadata, whether it exists, and deleting it or one generation of it |
 | `.upload(data, options)`, `.uploadFrom(reader, options)` | Bytes in memory, or any reader |
 | `.uploadFile(file, options)` | A file, read at offsets, resumable in a later process with `options.checkpoint` |
@@ -1185,6 +1185,9 @@ What Cloud Storage answers, measured against a real bucket on 2026-09-23:
 | `.download(writer, options)`, `.downloadAlloc(max_bytes, options)` | Into any writer, or into memory up to a cap |
 | `.copyTo(dest, options)` | A server-side copy, across buckets too |
 | `.updateMetadata(options)` | Changes what an object says about itself, leaving its bytes alone |
+| `.restore(options)` | Brings back a soft-deleted generation as the live one |
+| `bucket.bulkRestore(options)`, `.operation(id)`, `.cancelOperation(id)`, `.listOperations(page)` | Restores many soft-deleted objects at once, and follows the operation doing it |
+| `client.listSoftDeletedBuckets(page)`, `bucket.restore(generation)` | Deleted buckets, and one brought back |
 | `.composeFrom(sources, options)` | Writes this object from up to 32 others in the bucket, server-side |
 | `.signedUrl(signer, options)`, `bucket.signedUrl(signer, options)` | A V4 signed URL, which lets whoever holds it make one request without credentials until it expires |
 | `.postPolicy(signer, options)`, `bucket.postPolicy(signer, options)` | A V4 POST policy, which lets a plain HTML form upload what the policy allows, without credentials, until it expires |
@@ -1193,8 +1196,7 @@ The default OAuth scope is `devstorage.read_write`; `Options.scope` picks
 `.read_only` or `.cloud_platform` instead. Not in this version: the JSON
 API's PUT, which replaces a whole resource (`updateMetadata` and
 `Bucket.update` patch, which merges), parallel composite uploads,
-requester pays, customer-supplied encryption keys, listing old versions
-or soft-deleted objects, and gRPC.
+requester pays, customer-supplied encryption keys, and gRPC.
 
 ### Bucket settings
 
@@ -1278,6 +1280,66 @@ comes back with `unrecognized` set, and an update that sends it back is
 refused: without the part this library could not read, the rule would act
 on objects it now leaves alone. Leave it out of the list, which removes
 it, or change the rules with gcloud.
+
+### Versions and soft delete
+
+A bucket with `versioning` keeps every generation an overwrite or a
+delete replaces, as a noncurrent version. One with soft delete keeps what
+is deleted restorable, and billed, for its retention, and so do the
+buckets themselves.
+
+```zig
+// Every version; the noncurrent ones carry the time they stopped being live.
+var versions = try bucket.listObjects(.{ .versions = true, .prefix = "reports/" });
+defer versions.deinit();
+
+// An older version back as the live one: a copy onto its own name.
+const q3 = bucket.object("reports/q3.csv");
+var back = try q3.copyTo(q3, .{ .source_generation = older_generation });
+defer back.deinit();
+
+// What soft delete keeps, and one of them restored.
+var deleted = try bucket.listObjects(.{ .soft_deleted = true, .match_glob = "reports/**" });
+defer deleted.deinit();
+var restored = try q3.restore(.{
+    .generation = deleted.value.objects[0].generation,
+    .preconditions = .does_not_exist, // where nothing live has the name; safe to retry
+});
+defer restored.deinit();
+```
+
+`bulkRestore` restores the newest soft-deleted generation of every name
+that matches, as a long-running operation that `operation`,
+`cancelOperation` and `listOperations` follow. `listSoftDeletedBuckets`
+lists deleted buckets with the generation `Bucket.restore` takes.
+Measured against Cloud Storage on 2026-09-29:
+
+- A restore makes a new generation, with the soft-deleted one's metadata,
+  custom time and storage class, and leaves the soft-deleted one where it
+  is. Each restore of it makes another copy, and the copy it replaces goes
+  into soft delete. The idempotency token Google recommends does not stop
+  a repeat, so `restore` is retried only under `if_generation_match`, as
+  `.does_not_exist` is.
+- Under `.does_not_exist`, a restore over a live object is
+  `error.FailedPrecondition`. A live generation, or one never
+  soft-deleted, is `error.NotFound`. A bucket without soft delete refuses
+  restores and soft-deleted listings with `error.InvalidArgument`.
+- A soft-deleted object's metadata reads only by its generation, and its
+  bytes not at all.
+- A bulk restore took three minutes to restore three objects, and
+  reported counts but never a percentage. A bucket runs one at a time:
+  another start meanwhile is `error.ResourceExhausted`, and the bucket
+  cannot be deleted until it ends. A start repeated with the same token
+  gets the same operation, so `bulkRestore` retries with one token per
+  call. A cancel ends one with `failure.code` 1, and a finished one
+  cannot be cancelled.
+- A restored bucket comes back with its settings and none of its objects,
+  which stay soft-deleted and restorable. While another bucket has the
+  name, the restore is `error.AlreadyExists`, and a repeat of one that
+  landed is `error.NotFound`.
+- `versions` and `soft_deleted` cannot be listed together. A listing of
+  versions with a delimiter still groups a folder whose every object is
+  noncurrent.
 
 ### Metadata, after the upload
 
@@ -1715,6 +1777,11 @@ differences it found:
   leaves versioning out turns it off. So bucket settings are tested
   against an in-memory fake that holds Cloud Storage's rules as measured,
   and against Cloud Storage itself.
+- Its memory backend keeps versions, which CI runs, pinned to 1.56.1, but
+  a listing of versions in pages smaller than one name's versions repeats
+  a page forever. It has no soft delete at all: `softDeleted=true` lists
+  live objects, a restore is taken for an update of an object named
+  `{name}/restore`, and bulk and bucket restores do not exist.
 
 ## Zig 0.16 standard library issues handled here
 
@@ -1825,9 +1892,9 @@ AUTH_TEST_CREDENTIALS=$HOME/.config/gcloud/application_default_credentials.json 
 GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth application-default print-access-token) \
     zig build test-integration-gcp
 
-# Cloud Storage against fake-gcs-server. Every test creates a zigps-*
-# bucket and deletes it.
-docker run -d -p 4443:4443 fsouza/fake-gcs-server -scheme http -port 4443
+# Cloud Storage against fake-gcs-server, on its memory backend, the one
+# that keeps versions. Every test creates a zigps-* bucket and deletes it.
+docker run -d -p 4443:4443 fsouza/fake-gcs-server:1.56.1 -backend memory -scheme http -port 4443
 # Or without Docker: go install github.com/fsouza/fake-gcs-server@latest
 fake-gcs-server -backend memory -scheme http -port 4443
 STORAGE_EMULATOR_HOST=http://127.0.0.1:4443 zig build test-integration
@@ -1854,7 +1921,7 @@ GCP_TEST_BUCKET=my-bucket GCP_TEST_TOKEN=$(gcloud auth application-default print
 
 # The emulator serves the paths signed URLs use only for the host they
 # name, so those tests need -public-host, as CI passes it.
-docker run -d -p 4443:4443 fsouza/fake-gcs-server -scheme http -port 4443 \
+docker run -d -p 4443:4443 fsouza/fake-gcs-server:1.56.1 -backend memory -scheme http -port 4443 \
     -public-host 127.0.0.1:4443
 ```
 

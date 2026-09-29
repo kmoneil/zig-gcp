@@ -41,6 +41,9 @@
 //! update and delete there, which Storage Admin grants. Their buckets
 //! start with soft delete off and never turn it on: a bucket that ever had
 //! it is kept, soft-deleted, for as long as the longest retention it had.
+//! The one test of soft delete itself cannot avoid that, so it runs only
+//! with GCP_TEST_SOFT_DELETE=1 as well, and each run leaves its empty
+//! bucket soft-deleted for 7 days; it needs storage.buckets.restore.
 
 const std = @import("std");
 const core = @import("core");
@@ -3273,6 +3276,8 @@ const BucketFixture = struct {
     project: []const u8,
     /// "zigps-settings-" plus 8 random hex digits.
     name: [23]u8,
+    /// The test turned soft delete on: GCP_TEST_SOFT_DELETE was set.
+    soft_delete: bool,
 
     /// Returns false when no project is configured; the test should skip.
     fn init(f: *BucketFixture) !bool {
@@ -3283,6 +3288,7 @@ const BucketFixture = struct {
         const token = f.env.get("GCP_TEST_TOKEN") orelse return f.skip();
         f.token = .{ .token = std.mem.trim(u8, token, &std.ascii.whitespace) };
         f.project = std.mem.trim(u8, project, &std.ascii.whitespace);
+        f.soft_delete = f.env.get("GCP_TEST_SOFT_DELETE") != null;
         f.diag = .{};
         var random: [4]u8 = undefined;
         testing.io.random(&random);
@@ -3317,6 +3323,25 @@ const BucketFixture = struct {
 
     fn bucket(f: *BucketFixture) storage.Bucket {
         return f.client.bucket(&f.name);
+    }
+
+    /// Deletes every generation of every object, so the bucket can go.
+    fn deleteEveryVersion(f: *BucketFixture) !void {
+        const b = f.bucket();
+        for (0..10) |_| {
+            var page = try b.listObjects(.{ .versions = true, .page_size = 1000 });
+            defer page.deinit();
+            if (page.value.objects.len == 0) return;
+            for (page.value.objects) |info| try b.object(info.name).delete(.{ .generation = info.generation });
+        }
+        return error.TestVersionsRemain;
+    }
+
+    /// Uploads a few bytes and gives back the generation.
+    fn put(f: *BucketFixture, name: []const u8, data: []const u8) !u64 {
+        var info = try f.bucket().object(name).upload(data, .{ .metadata = &.{.{ .key = "origin", .value = "zig" }} });
+        defer info.deinit();
+        return info.value.generation;
     }
 
     /// Changes the bucket, a second after the last change at the least:
@@ -3502,4 +3527,190 @@ test "50. bucket settings: what Cloud Storage refuses, the library refuses first
     try testing.expectError(error.InvalidArgument, f.bucket().update(.{
         .default_kms_key_name = .{ .set = "projects/zigps-none/locations/us-central1/keyRings/none/cryptoKeys/none" },
     }));
+}
+
+test "51. versions: overwritten and deleted, listed, read, copied back, and deleted one by one" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{ .location = "us-central1", .versioning = true, .soft_delete_retention_s = 0 });
+    created.deinit();
+    defer f.deleteEveryVersion() catch |err| std.debug.print("cleanup: {t}\n", .{err});
+    const b = f.bucket();
+
+    var generations: [3]u64 = undefined;
+    for (&generations, 0..) |*g, i| g.* = try f.put("a", &.{ 'a', '0' + @as(u8, @intCast(i)) });
+    // Generations of one name rise with each overwrite.
+    try testing.expect(generations[0] < generations[1] and generations[1] < generations[2]);
+    _ = try f.put("gone/b", "b0");
+    try b.object("gone/b").delete(.{});
+
+    // Every version, by name and then generation; the live one alone has
+    // no time_deleted, and a folder of noncurrent versions still groups.
+    var all = try b.listObjects(.{ .versions = true, .delimiter = "/" });
+    defer all.deinit();
+    try testing.expectEqual(3, all.value.objects.len);
+    for (all.value.objects, generations) |info, g| try testing.expectEqual(g, info.generation);
+    try testing.expect(all.value.objects[0].time_deleted != null);
+    try testing.expect(all.value.objects[1].time_deleted != null);
+    try testing.expectEqual(null, all.value.objects[2].time_deleted);
+    try testing.expectEqual(1, all.value.prefixes.len);
+    try testing.expectEqualStrings("gone/", all.value.prefixes[0]);
+    // A page at a time, one version to a page.
+    var seen: usize = 0;
+    var token: ?[]u8 = null;
+    defer if (token) |t| testing.allocator.free(t);
+    for (0..10) |_| {
+        var page = try b.listObjects(.{ .versions = true, .page_size = 1, .page_token = token });
+        defer page.deinit();
+        seen += page.value.objects.len;
+        if (token) |t| testing.allocator.free(t);
+        token = null;
+        token = try testing.allocator.dupe(u8, page.value.next_page_token orelse break);
+    }
+    try testing.expectEqual(4, seen);
+
+    // A noncurrent generation reads and downloads, and a copy brings it
+    // back as the live one.
+    var old = try b.object("a").get(.{ .generation = generations[0] });
+    defer old.deinit();
+    try testing.expectEqualStrings("zig", old.value.metadataValue("origin").?);
+    var bytes = try b.object("a").downloadAlloc(16, .{ .generation = generations[0] });
+    defer bytes.deinit();
+    try testing.expectEqualStrings("a0", bytes.value.data);
+    try testing.expect(bytes.value.result.checksum_verified);
+    var back = try b.object("a").copyTo(b.object("a"), .{
+        .source_generation = generations[0],
+        .preconditions = .{ .if_generation_match = generations[2] },
+    });
+    defer back.deinit();
+    var now = try b.object("a").downloadAlloc(16, .{});
+    defer now.deinit();
+    try testing.expectEqualStrings("a0", now.value.data);
+
+    // Create-only succeeds on a name with only noncurrent versions.
+    var recreated = try b.object("gone/b").upload("b1", .{ .preconditions = .does_not_exist });
+    recreated.deinit();
+
+    try b.object("a").delete(.{ .generation = generations[1] });
+    try testing.expectError(error.NotFound, b.object("a").get(.{ .generation = generations[1] }));
+    var rest = try b.listObjects(.{ .versions = true, .prefix = "a" });
+    defer rest.deinit();
+    try testing.expectEqual(3, rest.value.objects.len);
+}
+
+test "52. soft delete: objects restored one and many at a time, and the bucket itself (GCP_TEST_SOFT_DELETE)" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    if (!f.soft_delete) return error.SkipZigTest;
+    std.debug.print("{s} stays soft-deleted for 7 days after this test\n", .{&f.name});
+    var created = try f.bucket().create(.{ .location = "us-central1", .soft_delete_retention_s = 604_800 });
+    created.deinit();
+    const b = f.bucket();
+
+    // One object: deleted, found among the soft-deleted, read, restored.
+    const original = try f.put("s/a", "a0");
+    try b.object("s/a").delete(.{});
+    var listed = try b.listObjects(.{ .soft_deleted = true, .match_glob = "s/**" });
+    defer listed.deinit();
+    try testing.expectEqual(1, listed.value.objects.len);
+    try testing.expect(listed.value.objects[0].hard_delete_time != null);
+    var soft = try b.object("s/a").get(.{ .generation = original, .soft_deleted = true });
+    defer soft.deinit();
+    try testing.expectEqualStrings("zig", soft.value.metadataValue("origin").?);
+    var restored = try b.object("s/a").restore(.{ .generation = original, .preconditions = .does_not_exist });
+    defer restored.deinit();
+    try testing.expect(restored.value.generation != original);
+    try testing.expectEqualStrings("zig", restored.value.metadataValue("origin").?);
+    var bytes = try b.object("s/a").downloadAlloc(16, .{});
+    defer bytes.deinit();
+    try testing.expectEqualStrings("a0", bytes.value.data);
+    // A second, create-only: the live one is in the way.
+    try testing.expectError(error.FailedPrecondition, b.object("s/a").restore(.{ .generation = original, .preconditions = .does_not_exist }));
+    try b.object("s/a").delete(.{});
+
+    // Many: a bulk restore, followed to its end.
+    for (0..3) |i| {
+        var name: [6]u8 = undefined;
+        const n = std.fmt.bufPrint(&name, "bulk/{d}", .{i}) catch unreachable;
+        _ = try f.put(n, "x");
+        try b.object(n).delete(.{});
+    }
+    var started = try b.bulkRestore(.{ .match_globs = &.{"bulk/**"} });
+    defer started.deinit();
+    const done = try waitForOperation(&f, started.value.id, 15 * 60);
+    try testing.expectEqual(null, done.failure);
+    try testing.expectEqual(3, done.succeeded);
+    var restored_many = try b.listObjects(.{ .prefix = "bulk/" });
+    defer restored_many.deinit();
+    try testing.expectEqual(3, restored_many.value.objects.len);
+
+    // Another, cancelled before it begins, which takes minutes.
+    for (restored_many.value.objects) |info| try b.object(info.name).delete(.{});
+    var second = try b.bulkRestore(.{ .match_globs = &.{"bulk/**"}, .allow_overwrite = true });
+    defer second.deinit();
+    try b.cancelOperation(second.value.id);
+    const cancelled = try waitForOperation(&f, second.value.id, 15 * 60);
+    std.debug.print("cancelled: failure {?any}, succeeded {d}\n", .{ cancelled.failure, cancelled.succeeded });
+    try testing.expect(cancelled.requested_cancellation);
+    var operations = try b.listOperations(.{});
+    defer operations.deinit();
+    try testing.expect(operations.value.operations.len >= 2);
+
+    // The bucket: deleted, found among the soft-deleted, restored with its
+    // settings and none of its objects, and deleted again by the fixture.
+    var live = try b.listObjects(.{});
+    defer live.deinit();
+    for (live.value.objects) |info| try b.object(info.name).delete(.{});
+    var before = try b.get();
+    const generation = before.value.generation.?;
+    before.deinit();
+    try b.delete();
+    try testing.expectError(error.NotFound, b.get());
+    var gone = try f.client.listSoftDeletedBuckets(.{});
+    defer gone.deinit();
+    var found = false;
+    for (gone.value.buckets) |info| {
+        if (std.mem.eql(u8, info.name, &f.name) and info.generation == generation) {
+            found = true;
+            try testing.expect(info.hard_delete_time != null);
+        }
+    }
+    try testing.expect(found);
+    var back = try b.restore(generation);
+    defer back.deinit();
+    try testing.expectEqual(604_800, back.value.soft_delete.?.retention_s);
+    var empty = try b.listObjects(.{});
+    defer empty.deinit();
+    try testing.expectEqual(0, empty.value.objects.len);
+    // Its objects stay soft-deleted, restorable one by one.
+    var still = try b.listObjects(.{ .soft_deleted = true });
+    defer still.deinit();
+    try testing.expect(still.value.objects.len >= 4);
+}
+
+/// Polls an operation until it is done, backing off from 5 to 30 s.
+fn waitForOperation(f: *BucketFixture, id: []const u8, limit_s: u32) !storage.Operation {
+    var waited: u32 = 0;
+    var pause: u32 = 5;
+    while (waited <= limit_s) : (waited += pause) {
+        var op = try f.bucket().operation(id);
+        defer op.deinit();
+        if (op.value.done) {
+            // Copied out: the result's memory goes with `op`.
+            return .{
+                .id = "",
+                .done = true,
+                .failure = if (op.value.failure) |fail| .{ .code = fail.code, .message = "" } else null,
+                .requested_cancellation = op.value.requested_cancellation,
+                .succeeded = op.value.succeeded,
+                .skipped = op.value.skipped,
+                .failed = op.value.failed,
+            };
+        }
+        try testing.io.sleep(.fromSeconds(pause), .awake);
+        pause = @min(pause * 2, 30);
+    }
+    return error.TestOperationNeverEnded;
 }

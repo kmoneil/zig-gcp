@@ -24,6 +24,7 @@ const names = @import("names.zig");
 const parallel = @import("parallel.zig");
 const parallel_download = @import("parallel_download.zig");
 const post_policy = @import("post_policy.zig");
+const restore_impl = @import("restore.zig");
 const resumable = @import("resumable.zig");
 const rpc = @import("rpc.zig");
 const signing = @import("signing.zig");
@@ -39,14 +40,21 @@ bucket: []const u8,
 /// Borrowed; the handle must not outlive it.
 name: []const u8,
 
-/// The object's metadata: the live generation, or the one `options` names.
+/// The object's metadata: the live generation, or the one `options` names,
+/// a noncurrent or a soft-deleted one included. A soft-deleted generation
+/// must be named: without one, `soft_deleted` is refused before sending
+/// with `error.InvalidArgument`, as Cloud Storage refuses it.
 pub fn get(self: Object, options: types.GetOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
+    if (options.soft_deleted and options.generation == null) {
+        if (self.client.diagnostics) |d| d.print("a soft-deleted object is read by its generation, and soft_deleted names none", .{});
+        return error.InvalidArgument;
+    }
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
-    const path = try names.objectPath(scratch.allocator(), self.bucket, self.name, options.generation, options.preconditions);
+    const path = try names.objectGetPath(scratch.allocator(), self.bucket, self.name, options);
 
     var result: types.Owned(types.ObjectInfo) = try .init(self.client.gpa);
     errdefer result.deinit();
@@ -128,6 +136,26 @@ pub fn updateMetadata(self: Object, options: types.MetadataUpdate) Error!types.O
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
     return metadata.update(self.client, self.bucket, self.name, options);
+}
+
+/// Brings back one soft-deleted generation of this object as a new live
+/// generation, with the soft-deleted one's metadata, custom time and
+/// storage class, and returns it. The soft-deleted generation stays
+/// restorable, so each restore of it makes another copy, and a live object
+/// of the name is replaced, into soft delete itself. The bucket must have
+/// soft delete on (else `error.InvalidArgument`), and a generation that is
+/// live or gone is `error.NotFound`.
+///
+/// Retried only under `options.preconditions.if_generation_match`, or with
+/// `Options.retry_unconditional_writes`: a repeat of a restore that landed
+/// makes a second copy, and Cloud Storage offers no way to tell. Under the
+/// condition, such a repeat fails with `error.FailedPrecondition` instead.
+/// `.does_not_exist` restores only where no live object has the name.
+pub fn restore(self: Object, options: types.RestoreOptions) Error!types.Owned(types.ObjectInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.bucket);
+    try rpc.checkObjectName(self.client, self.name);
+    return restore_impl.restoreObject(self.client, self.bucket, self.name, options);
 }
 
 /// Sugar over `get`: whether a live object has this name. `NotFound`
@@ -799,6 +827,41 @@ test "golden: get, a pinned generation, and delete" {
         "https://storage.googleapis.com/storage/v1/b/my-bucket/o/reports%2F2026%2Fq3.txt?generation=7",
         null,
     );
+}
+
+test "golden: get a noncurrent generation, and a soft-deleted one by its generation only" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"kind":"storage#object","name":"a","bucket":"zigps-p2-26fbba","generation":"1790696413216214",
+        \\ "metageneration":"1","size":"2","timeCreated":"2026-09-29T15:40:13.225Z",
+        \\ "timeDeleted":"2026-09-29T15:40:13.462Z"}
+        } },
+        .{ .respond = .{ .body =
+        \\{"kind":"storage#object","name":"u","generation":"1790696465415283","metageneration":"1",
+        \\ "softDeleteTime":"2026-09-29T15:41:06.151Z","hardDeleteTime":"2026-10-06T15:41:06.151Z"}
+        } },
+    }, .{});
+    defer h.deinit();
+    var noncurrent = try h.client.bucket("zigps-p2-26fbba").object("a").get(.{ .generation = 1790696413216214 });
+    defer noncurrent.deinit();
+    try h.expectRequest(0, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-p2-26fbba/o/a?generation=1790696413216214", null);
+    try testing.expectEqualStrings("2026-09-29T15:40:13.462Z", noncurrent.value.time_deleted.?);
+
+    var soft = try h.client.bucket("b").object("u").get(.{
+        .generation = 1790696465415283,
+        .soft_deleted = true,
+        .restore_token = "t=1",
+    });
+    defer soft.deinit();
+    try h.expectRequest(1, .GET, "https://storage.googleapis.com/storage/v1/b/b/o/u?generation=1790696465415283&softDeleted=true&restoreToken=t%3D1", null);
+    try testing.expectEqualStrings("2026-10-06T15:41:06.151Z", soft.value.hard_delete_time.?);
+
+    // Measured: Cloud Storage answers a soft-deleted read with no
+    // generation 400 "You must specify a generation."; it is refused here.
+    try testing.expectError(error.InvalidArgument, h.client.bucket("b").object("u").get(.{ .soft_deleted = true }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "by its generation") != null);
+    try h.expectRequestCount(2);
 }
 
 test "exists: found, missing, and a failure that is neither" {

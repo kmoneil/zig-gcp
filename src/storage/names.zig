@@ -34,6 +34,92 @@ pub fn bucketPatchPath(arena: Allocator, bucket: []const u8, preconditions: type
     return out.toOwnedSlice();
 }
 
+/// `/storage/v1/b?project=...&softDeleted=true` with paging: the project's
+/// soft-deleted buckets.
+pub fn softDeletedBucketsPath(arena: Allocator, project: []const u8, page: types.PageOptions) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{
+        .project = project,
+        .soft_deleted = true,
+        .page_size = page.page_size,
+        .page_token = page.page_token,
+    }) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// `/storage/v1/b/{bucket}/restore?projection=noAcl&generation=N`: brings
+/// one soft-deleted bucket back.
+pub fn bucketRestorePath(arena: Allocator, bucket: []const u8, generation: u64) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{ .bucket = bucket, .suffix = "/restore", .no_acl = true, .generation = generation }) catch
+        return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// `/storage/v1/b/{bucket}/o/{object}/restore`, with the generation, the
+/// conditions on the live object, and the restore's options.
+pub fn objectRestorePath(arena: Allocator, bucket: []const u8, object: []const u8, options: types.RestoreOptions) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{
+        .bucket = bucket,
+        .object = object,
+        .suffix = "/restore",
+        .no_acl = true,
+        .generation = options.generation,
+        .preconditions = options.preconditions,
+        .copy_source_acl = options.copy_source_acl,
+        .restore_token = options.restore_token,
+    }) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// `/storage/v1/b/{bucket}/o/bulkRestore`.
+pub fn bulkRestorePath(arena: Allocator, bucket: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{ .bucket = bucket, .list_objects = true, .suffix = "/bulkRestore" }) catch
+        return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// What an operations path asks for.
+pub const OperationRequest = union(enum) {
+    /// `/operations` with paging.
+    list: types.PageOptions,
+    /// `/operations/{id}`.
+    get: []const u8,
+    /// `/operations/{id}/cancel`.
+    cancel: []const u8,
+};
+
+/// `/storage/v1/b/{bucket}/operations`, one operation, or its cancel.
+pub fn operationsPath(arena: Allocator, bucket: []const u8, request: OperationRequest) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeOperations(&out.writer, bucket, request) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeOperations(w: *Writer, bucket: []const u8, request: OperationRequest) Writer.Error!void {
+    try w.writeAll("/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/operations");
+    switch (request) {
+        .list => |page| {
+            var params: query.Params = .init(w);
+            try params.addNonZero("maxResults", page.page_size);
+            try params.addOptional("pageToken", page.page_token);
+        },
+        .get => |id| {
+            try w.writeByte('/');
+            try query.writeStrictSegment(w, id);
+        },
+        .cancel => |id| {
+            try w.writeByte('/');
+            try query.writeStrictSegment(w, id);
+            try w.writeAll("/cancel");
+        },
+    }
+}
+
 /// `/storage/v1/b/{bucket}/o` with listing options.
 pub fn objectsPath(arena: Allocator, bucket: []const u8, options: types.ListOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
@@ -42,8 +128,26 @@ pub fn objectsPath(arena: Allocator, bucket: []const u8, options: types.ListOpti
         .list_objects = true,
         .prefix = options.prefix,
         .delimiter = options.delimiter,
+        .match_glob = options.match_glob,
+        .versions = options.versions,
+        .soft_deleted = options.soft_deleted,
         .page_size = options.page_size,
         .page_token = options.page_token,
+    }) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// `/storage/v1/b/{bucket}/o/{object}` as a metadata read addresses it:
+/// the live generation or one named, soft-deleted or not.
+pub fn objectGetPath(arena: Allocator, bucket: []const u8, object: []const u8, options: types.GetOptions) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{
+        .bucket = bucket,
+        .object = object,
+        .generation = options.generation,
+        .preconditions = options.preconditions,
+        .soft_deleted = options.soft_deleted,
+        .restore_token = options.restore_token,
     }) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
@@ -294,8 +398,15 @@ const Parts = struct {
     preconditions: types.Preconditions = .{},
     /// Appends `/compose` after the object, before the query.
     compose: bool = false,
+    /// Appended after the bucket, the object or `/o`, before the query.
+    suffix: ?[]const u8 = null,
     prefix: ?[]const u8 = null,
     delimiter: ?[]const u8 = null,
+    match_glob: ?[]const u8 = null,
+    versions: bool = false,
+    soft_deleted: bool = false,
+    copy_source_acl: bool = false,
+    restore_token: ?[]const u8 = null,
     page_size: u32 = 0,
     page_token: ?[]const u8 = null,
 };
@@ -312,6 +423,7 @@ fn write(w: *Writer, parts: Parts) Writer.Error!void {
         try query.writeStrictSegment(w, object);
         if (parts.compose) try w.writeAll("/compose");
     }
+    if (parts.suffix) |suffix| try w.writeAll(suffix);
     var params: query.Params = .init(w);
     if (parts.alt_media) try params.add("alt", "media");
     if (parts.no_acl) try params.add("projection", "noAcl");
@@ -320,6 +432,11 @@ fn write(w: *Writer, parts: Parts) Writer.Error!void {
     try writePreconditions(&params, parts.preconditions);
     try params.addOptional("prefix", parts.prefix);
     try params.addOptional("delimiter", parts.delimiter);
+    try params.addOptional("matchGlob", parts.match_glob);
+    if (parts.versions) try params.add("versions", "true");
+    if (parts.soft_deleted) try params.add("softDeleted", "true");
+    if (parts.copy_source_acl) try params.add("copySourceAcl", "true");
+    try params.addOptional("restoreToken", parts.restore_token);
     try params.addNonZero("maxResults", parts.page_size);
     try params.addOptional("pageToken", parts.page_token);
 }
@@ -348,6 +465,25 @@ test "bucket paths" {
     try expectPath("/storage/v1/b/my-bucket", try bucketPath(gpa, "my-bucket"));
     try expectPath("/storage/v1/b/b%25c", try bucketPath(gpa, "b%c"));
     try expectPath("/storage/v1/b/my-bucket?projection=noAcl", try bucketPatchPath(gpa, "my-bucket", .{}));
+    try expectPath(
+        "/storage/v1/b?project=extractctl&softDeleted=true&maxResults=5&pageToken=t",
+        try softDeletedBucketsPath(gpa, "extractctl", .{ .page_size = 5, .page_token = "t" }),
+    );
+    try expectPath("/storage/v1/b/b%25c/restore?projection=noAcl&generation=17", try bucketRestorePath(gpa, "b%c", 17));
+    try expectPath(
+        "/storage/v1/b/b/o/a%2Fb/restore?projection=noAcl&generation=7&ifGenerationMatch=0&copySourceAcl=true&restoreToken=r%2Bt",
+        try objectRestorePath(gpa, "b", "a/b", .{
+            .generation = 7,
+            .preconditions = .does_not_exist,
+            .copy_source_acl = true,
+            .restore_token = "r+t",
+        }),
+    );
+    try expectPath("/storage/v1/b/b/o/bulkRestore", try bulkRestorePath(gpa, "b"));
+    try expectPath("/storage/v1/b/b/operations?maxResults=1&pageToken=p", try operationsPath(gpa, "b", .{ .list = .{ .page_size = 1, .page_token = "p" } }));
+    try expectPath("/storage/v1/b/b/operations", try operationsPath(gpa, "b", .{ .list = .{} }));
+    try expectPath("/storage/v1/b/b/operations/CiRl%2Bx", try operationsPath(gpa, "b", .{ .get = "CiRl+x" }));
+    try expectPath("/storage/v1/b/b/operations/CiRl/cancel", try operationsPath(gpa, "b", .{ .cancel = "CiRl" }));
     try expectPath(
         "/storage/v1/b/b%25c?projection=noAcl&ifMetagenerationMatch=3&ifMetagenerationNotMatch=4",
         try bucketPatchPath(gpa, "b%c", .{ .if_metageneration_match = 3, .if_metageneration_not_match = 4 }),

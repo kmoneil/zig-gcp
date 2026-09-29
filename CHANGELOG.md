@@ -32,6 +32,23 @@ including the ones that did not change.
   7-day default back, and an empty label change sends nothing, since
   `"labels": {}` removes every label. `storage.limits` gains the limits.
   Not breaking: every new field has a default.
+- storage: versions and soft delete. `ListOptions` gains `versions`,
+  `soft_deleted` and `match_glob`; `ObjectInfo` gains `time_deleted`,
+  `soft_delete_time`, `hard_delete_time` and `restore_token`; `GetOptions`
+  gains `soft_deleted` and `restore_token`, to read a soft-deleted
+  generation's metadata. New `Object.restore` (`storage.RestoreOptions`)
+  brings back a soft-deleted generation as a new live one, retried only
+  under `if_generation_match`, since a repeat makes a second copy. New
+  `Bucket.bulkRestore` (`storage.BulkRestoreOptions`) starts a bulk
+  restore with an idempotency token, the same on its retries, and
+  `Bucket.operation`, `cancelOperation` and `listOperations` follow it
+  (`storage.Operation`, `storage.OperationPage`). New
+  `Client.listSoftDeletedBuckets` and `Bucket.restore(generation)` bring
+  back a deleted bucket, and `BucketInfo` gains `soft_delete_time` and
+  `hard_delete_time`. Refused before sending with `error.InvalidArgument`:
+  `versions` with `soft_deleted`, a soft-deleted read without a
+  generation, bulk restore bounds that are not RFC 3339, and an empty
+  operation id. Not breaking.
 - core: `Change(T)` moves here from pubsub, for every module to share.
   Not breaking.
 - pubsub: `pubsub.Change` is core's `Change`, the same as before.

@@ -283,6 +283,14 @@ pub fn listBuckets(self: *Client, page: types.PageOptions) Error!types.Owned(typ
     return result;
 }
 
+/// One page of the project's soft-deleted buckets, each with the
+/// `generation` that `Bucket.restore` takes and the time it stops being
+/// restorable. Needs `Options.project_id`.
+pub fn listSoftDeletedBuckets(self: *Client, page: types.PageOptions) Error!types.Owned(types.BucketPage) {
+    rpc.begin(self);
+    return @import("restore.zig").listSoftDeletedBuckets(self, page);
+}
+
 const testing = std.testing;
 const test_util = @import("test_util.zig");
 
