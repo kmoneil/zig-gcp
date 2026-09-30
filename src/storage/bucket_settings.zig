@@ -28,6 +28,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const idempotency = @import("idempotency.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -47,6 +48,10 @@ pub fn update(client: *Client, bucket: []const u8, changes: types.BucketUpdate) 
         .if_metageneration_not_match = changes.if_metageneration_not_match,
     });
     const body = try encodeUpdate(scratch.allocator(), changes);
+    // A repeated bucket patch runs again, as measured: the token changes no
+    // retry here.
+    var token: idempotency.Token = undefined;
+    token.init(client);
 
     var result: types.Owned(types.BucketInfo) = try .init(client.gpa);
     errdefer result.deinit();
@@ -54,6 +59,7 @@ pub fn update(client: *Client, bucket: []const u8, changes: types.BucketUpdate) 
         .method = .PATCH,
         .path = path,
         .body = body,
+        .headers = token.slice(),
         // A patch that landed and lost its answer has moved the
         // metageneration, so its repeat under that condition fails rather
         // than overwrite what another writer changed in between.

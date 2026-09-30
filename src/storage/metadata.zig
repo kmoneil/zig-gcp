@@ -23,6 +23,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const encryption = @import("encryption.zig");
+const idempotency = @import("idempotency.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -56,15 +57,21 @@ pub fn update(
     var key: encryption.KeyHeaders = undefined;
     key.init(client.encryption_key, .object);
     defer key.wipe();
+    var token: idempotency.Token = undefined;
+    token.init(client);
+    var header_storage: [4]core.transport.Header = undefined;
+    // A patch that succeeded and lost its response has already moved the
+    // metageneration, so repeating it under that condition fails rather
+    // than applying twice; with a token, the repeat is answered with the
+    // first result instead, within the window.
+    const retry = idempotency.writeRetry(client, options.preconditions.makesMetadataWriteSafe() or client.retry_unconditional_writes);
     const response = try rpc.execute(client, result.arena, .{
         .method = .PATCH,
         .path = path,
         .body = body,
-        .headers = key.slice(),
-        // A patch that succeeded and lost its response has already moved
-        // the metageneration, so repeating it under that condition fails
-        // rather than applying twice.
-        .retry = options.preconditions.makesMetadataWriteSafe() or client.retry_unconditional_writes,
+        .headers = idempotency.withToken(&header_storage, key.slice(), &token),
+        .retry = retry.retry,
+        .retry_window_ms = retry.window_ms,
     });
     result.value = codec.decodeObject(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(client, err, "object");
@@ -310,11 +317,11 @@ test "updateMetadata: a generation and every precondition reach the query" {
     );
 }
 
-test "updateMetadata: a metageneration condition is what makes it repeatable" {
+test "updateMetadata, without idempotency tokens: a metageneration condition is what makes it repeatable" {
     // Unconditional: one 503 ends the call, because a patch that lost its
     // answer may already have been applied.
     var h: test_util.Harness = undefined;
-    try h.init(&.{.{ .respond = .{ .status = 503, .body = "{}" } }}, .{});
+    try h.init(&.{.{ .respond = .{ .status = 503, .body = "{}" } }}, .{ .idempotency_tokens = false });
     defer h.deinit();
     try testing.expectError(error.Unavailable, h.client.bucket("b").object("a").updateMetadata(.{}));
     try h.expectRequestCount(1);
@@ -324,7 +331,7 @@ test "updateMetadata: a metageneration condition is what makes it repeatable" {
     try conditional.init(&.{
         .{ .respond = .{ .status = 503, .body = "{}" } },
         .{ .respond = .{ .body = object_json } },
-    }, .{});
+    }, .{ .idempotency_tokens = false });
     defer conditional.deinit();
     var info = try conditional.client.bucket("b").object("a").updateMetadata(.{
         .preconditions = .{ .if_metageneration_match = 3 },
@@ -335,7 +342,7 @@ test "updateMetadata: a metageneration condition is what makes it repeatable" {
     // A generation condition says nothing about a patch, which never
     // moves the generation.
     var generation: test_util.Harness = undefined;
-    try generation.init(&.{.{ .respond = .{ .status = 503, .body = "{}" } }}, .{});
+    try generation.init(&.{.{ .respond = .{ .status = 503, .body = "{}" } }}, .{ .idempotency_tokens = false });
     defer generation.deinit();
     try testing.expectError(error.Unavailable, generation.client.bucket("b").object("a").updateMetadata(.{
         .preconditions = .{ .if_generation_match = 7 },

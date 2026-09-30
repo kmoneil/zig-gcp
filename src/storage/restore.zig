@@ -28,6 +28,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const idempotency = @import("idempotency.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -45,10 +46,13 @@ pub fn restoreObject(
     defer scratch.deinit();
     const path = try names.objectRestorePath(scratch.allocator(), bucket, object, options);
     const repeatable = options.preconditions.makesWriteSafe() or client.retry_unconditional_writes;
+    // A repeated restore makes another copy, token or not, as measured.
+    var token: idempotency.Token = undefined;
+    token.init(client);
 
     var result: types.Owned(types.ObjectInfo) = try .init(client.gpa);
     errdefer result.deinit();
-    const response = rpc.execute(client, result.arena, .{ .method = .POST, .path = path, .retry = repeatable }) catch |err| switch (err) {
+    const response = rpc.execute(client, result.arena, .{ .method = .POST, .path = path, .headers = token.slice(), .retry = repeatable }) catch |err| switch (err) {
         error.FailedPrecondition => {
             if (repeatable) rpc.replace412(client, "the precondition failed; if this call was a retry, an earlier attempt may have restored the object: get it to see");
             return error.FailedPrecondition;
@@ -62,7 +66,8 @@ pub fn restoreObject(
 
 /// Starts a bulk restore. Its idempotency token is fresh per call and the
 /// same on every retry of it, so a start whose answer was lost is not
-/// started twice.
+/// started twice. It carries one whatever `Options.idempotency_tokens`
+/// says: its retries depend on it.
 pub fn bulkRestore(client: *Client, bucket: []const u8, options: types.BulkRestoreOptions) Error!types.Owned(types.Operation) {
     try checkBulkRestore(client.diagnostics, options);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
@@ -70,8 +75,8 @@ pub fn bulkRestore(client: *Client, bucket: []const u8, options: types.BulkResto
     const path = try names.bulkRestorePath(scratch.allocator(), bucket);
     const body = try encodeBulkRestore(scratch.allocator(), options);
     var token: [32]u8 = undefined;
-    idempotencyToken(client.io, &token);
-    const headers = [_]core.transport.Header{.{ .name = "X-Goog-Gcs-Idempotency-Token", .value = &token }};
+    idempotency.make(client.io, &token);
+    const headers = [_]core.transport.Header{.{ .name = idempotency.header_name, .value = &token }};
 
     var result: types.Owned(types.Operation) = try .init(client.gpa);
     errdefer result.deinit();
@@ -79,13 +84,6 @@ pub fn bulkRestore(client: *Client, bucket: []const u8, options: types.BulkResto
     result.value = codec.decodeOperation(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(client, err, "operation");
     return result;
-}
-
-/// 16 random bytes, in hex.
-fn idempotencyToken(io: std.Io, out: *[32]u8) void {
-    var bytes: [16]u8 = undefined;
-    io.random(&bytes);
-    out.* = std.fmt.bytesToHex(bytes, .lower);
 }
 
 /// One operation of the bucket's.
@@ -110,7 +108,9 @@ pub fn cancelOperation(client: *Client, bucket: []const u8, id: []const u8) Erro
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
     const path = try names.operationsPath(scratch.allocator(), bucket, .{ .cancel = id });
-    try rpc.executeDiscard(client, .{ .method = .POST, .path = path });
+    var token: idempotency.Token = undefined;
+    token.init(client);
+    try rpc.executeDiscard(client, .{ .method = .POST, .path = path, .headers = token.slice() });
 }
 
 /// One page of the bucket's operations, finished ones included.
@@ -148,10 +148,12 @@ pub fn restoreBucket(client: *Client, bucket: []const u8, generation: u64) Error
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
     const path = try names.bucketRestorePath(scratch.allocator(), bucket, generation);
+    var token: idempotency.Token = undefined;
+    token.init(client);
 
     var result: types.Owned(types.BucketInfo) = try .init(client.gpa);
     errdefer result.deinit();
-    const response = try rpc.execute(client, result.arena, .{ .method = .POST, .path = path });
+    const response = try rpc.execute(client, result.arena, .{ .method = .POST, .path = path, .headers = token.slice() });
     result.value = codec.decodeBucket(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(client, err, "bucket");
     return result;

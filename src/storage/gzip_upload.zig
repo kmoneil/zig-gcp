@@ -831,13 +831,15 @@ test "gzip upload: transient failures are ridden out in both protocols" {
     defer info.deinit();
     try s.expectStored("noise", noise, "application/octet-stream", info.value);
 
-    // A one-request upload retries only when a repeat is safe.
+    // A one-request upload retries: its idempotency token makes a repeat
+    // safe, conditions or not.
     faults = .{ .faults = &.{.unavailable} };
-    try testing.expectError(error.Unavailable, s.object("small").upload("small", .{ .gzip = .{} }));
+    var plain = try s.object("small").upload("small", .{ .gzip = .{} });
+    plain.deinit();
     faults = .{ .faults = &.{.unavailable} };
-    var safe = try s.object("small").upload("small", .{ .gzip = .{}, .preconditions = .does_not_exist });
+    var safe = try s.object("safe").upload("small", .{ .gzip = .{}, .preconditions = .does_not_exist });
     defer safe.deinit();
-    try s.expectStored("small", "small", "application/octet-stream", safe.value);
+    try s.expectStored("safe", "small", "application/octet-stream", safe.value);
 }
 
 test "gzip upload: options.crc32c names the data before compression, and a wrong one stores nothing" {

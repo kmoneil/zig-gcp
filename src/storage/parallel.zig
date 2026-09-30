@@ -43,6 +43,7 @@ const Object = @import("Object.zig");
 const checkpoint = @import("checkpoint.zig");
 const codec = @import("codec.zig");
 const encryption = @import("encryption.zig");
+const idempotency = @import("idempotency.zig");
 const logging = @import("logging.zig");
 const mp = @import("xml_multipart.zig");
 const names = @import("names.zig");
@@ -767,7 +768,11 @@ fn move(
         return dropTemp(client, persist, bucket, temp, generation, err);
     var result: types.Owned(types.ObjectInfo) = types.Owned(types.ObjectInfo).init(client.gpa) catch |err|
         return dropTemp(client, persist, bucket, temp, generation, err);
-    const body = rpc.execute(client, result.arena, .{ .method = .POST, .path = path }) catch |err| {
+    // A repeat of a move that landed is answered with its result, as
+    // measured, within the token's window.
+    var token: idempotency.Token = undefined;
+    token.init(client);
+    const body = rpc.execute(client, result.arena, .{ .method = .POST, .path = path, .headers = token.slice() }) catch |err| {
         result.deinit();
         return settle(client, persist, bucket, temp, object, generation, size, whole, err);
     };
@@ -1191,7 +1196,9 @@ fn deleteMismatch(
         var scratch: std.heap.ArenaAllocator = .init(client.gpa);
         defer scratch.deinit();
         if (names.objectPath(scratch.allocator(), bucket, object, g, .{})) |path| {
-            rpc.executeDiscard(client, .{ .method = .DELETE, .path = path }) catch |err| {
+            var token: idempotency.Token = undefined;
+            token.init(client);
+            rpc.executeDiscard(client, .{ .method = .DELETE, .path = path, .headers = token.slice() }) catch |err| {
                 logging.warn("deleting the mismatched upload of {s} failed with {t}", .{ object, err });
             };
             deleted = true;
@@ -1246,6 +1253,7 @@ const Setup = struct {
     const Options = struct {
         verify_checksums: bool = true,
         max_attempts: u8 = 4,
+        idempotency_tokens: bool = true,
     };
 
     fn init(s: *Setup, io: std.Io, options: Options) !void {
@@ -1258,6 +1266,7 @@ const Setup = struct {
             .transport = s.fake.transport(),
             .diagnostics = &s.diag,
             .verify_checksums = options.verify_checksums,
+            .idempotency_tokens = options.idempotency_tokens,
             .retry = .{ .max_attempts = options.max_attempts, .initial_backoff_ms = 1, .max_backoff_ms = 2 },
         });
         s.client.multipart_test = .{ .min_part_size = 1024 };
@@ -1467,6 +1476,25 @@ test "uploadParallel: a finished object with other bytes is deleted again" {
     try testing.expect(std.mem.indexOf(u8, s.diag.message(), "deleted again") != null);
     try testing.expectEqual(null, s.fake.object("o"));
     try testing.expectEqual(1, s.fake.counts.deletes);
+}
+
+test "uploadParallel: a finished object with other bytes whose delete's answer is lost goes once, its repeat answered" {
+    var rules = [_]Script.Rule{
+        .{ .kind = .finish, .fault = .corrupt },
+        .{ .kind = .delete, .fault = .lose_answer },
+    };
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 8);
+    try testing.expectError(error.ChecksumMismatch, s.object("o").uploadParallel(.{ .data = &data }, .{ .part_size = 4096 }));
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "deleted again") != null);
+    try testing.expectEqual(null, s.fake.object("o"));
+    try testing.expectEqual(1, s.fake.counts.deletes);
+    try testing.expectEqual(1, s.fake.counts.deduplicated);
 }
 
 test "uploadParallel: with checksums off, nothing is hashed or compared" {
@@ -2099,12 +2127,13 @@ test "uploadParallel with conditions: an object that appears before the move is 
     try testing.expectEqual(1, s.fake.counts.deletes);
 }
 
-test "uploadParallel with conditions: a move whose answer was lost is found by reading, whichever condition its repeat meets" {
+test "uploadParallel with conditions: without idempotency tokens, a move whose answer was lost is found by reading, whichever condition its repeat meets" {
+    // So is one repeated past the token's window.
     for ([_]bool{ false, true }) |destination_first| {
         var rules = [_]Script.Rule{.{ .kind = .move, .fault = .lose_answer }};
         var script: Script = .{ .rules = &rules };
         var s: Setup = undefined;
-        try s.init(testing.io, .{});
+        try s.init(testing.io, .{ .idempotency_tokens = false });
         defer s.deinit();
         s.fake.faults = script.plan();
         // Its repeat finds the source gone, a 404, or the destination
@@ -2125,7 +2154,7 @@ test "uploadParallel with conditions: a move whose answer was lost is found by r
     }
 }
 
-test "uploadParallel with conditions: a lost move answer with another writer's object in its place is UploadSessionLost" {
+test "uploadParallel with conditions: without idempotency tokens, a lost move answer with another writer's object in its place is UploadSessionLost" {
     // The move lands and its answer is lost; before the repeat, another
     // writer replaces the object. The temporary object is gone, and the
     // object is not this upload's.
@@ -2135,7 +2164,7 @@ test "uploadParallel with conditions: a lost move answer with another writer's o
     };
     var script: Script = .{ .rules = &rules };
     var s: Setup = undefined;
-    try s.init(testing.io, .{});
+    try s.init(testing.io, .{ .idempotency_tokens = false });
     defer s.deinit();
     s.fake.faults = script.plan();
     var data: [9000]u8 = undefined;
@@ -2203,7 +2232,7 @@ test "uploadParallel: a worker that meets Canceled stops the upload, which abort
     try testing.expectEqual(null, s.fake.object("o"));
 }
 
-test "uploadParallel with conditions: a lost move answer and a same-sized object in its place is told apart by its checksum" {
+test "uploadParallel with conditions: without idempotency tokens, a lost move answer and a same-sized object in its place is told apart by its checksum" {
     // As above, with this upload exactly as long as the other writer's
     // bytes: only the checksum says the object is not this upload's.
     var rules = [_]Script.Rule{
@@ -2212,7 +2241,7 @@ test "uploadParallel with conditions: a lost move answer and a same-sized object
     };
     var script: Script = .{ .rules = &rules };
     var s: Setup = undefined;
-    try s.init(testing.io, .{});
+    try s.init(testing.io, .{ .idempotency_tokens = false });
     defer s.deinit();
     s.fake.faults = script.plan();
     const data = "this upload's 22 bytes";
@@ -2222,6 +2251,89 @@ test "uploadParallel with conditions: a lost move answer and a same-sized object
         .preconditions = .does_not_exist,
     }));
     try testing.expectEqualStrings("another writer's bytes", s.fake.object("o").?.bytes);
+}
+
+test "uploadParallel with conditions: a move whose answer was lost is answered by its repeat with its own result" {
+    // Its token makes the repeat a repeat: Cloud Storage answers it with
+    // the first move's result and does not run it again, so the settle
+    // path never reads.
+    for ([_]bool{ false, true }) |destination_first| {
+        var rules = [_]Script.Rule{.{ .kind = .move, .fault = .lose_answer }};
+        var script: Script = .{ .rules = &rules };
+        var s: Setup = undefined;
+        try s.init(testing.io, .{});
+        defer s.deinit();
+        s.fake.faults = script.plan();
+        s.fake.move_checks_destination_first = destination_first;
+        var data: [9000]u8 = undefined;
+        fill(&data, 23);
+        var info = try s.object("o").uploadParallel(.{ .data = &data }, .{
+            .part_size = 4096,
+            .preconditions = .does_not_exist,
+        });
+        defer info.deinit();
+        try testing.expectEqualSlices(u8, &data, s.fake.object("o").?.bytes);
+        try testing.expectEqual(s.fake.object("o").?.generation, info.value.generation);
+        try testing.expectEqual(core.crc32c.hash(&data), info.value.crc32c.?);
+        try testing.expectEqual(1, s.fake.counts.moves);
+        try testing.expectEqual(1, s.fake.counts.deduplicated);
+        // The early check alone.
+        try testing.expectEqual(1, s.fake.counts.reads);
+        try testing.expectEqual(0, s.fake.counts.deletes);
+        try expectNoTemp(&s.fake);
+    }
+}
+
+test "uploadParallel with conditions: a lost move answer with another writer's object in its place is still the move's own result" {
+    // As production answers it: the move landed, and the other writer's
+    // object came after it, as it might after any upload. The repeat is
+    // answered, not run, so the other writer's object stays.
+    var rules = [_]Script.Rule{
+        .{ .kind = .move, .fault = .lose_answer },
+        .{ .kind = .move, .fault = .clobber },
+    };
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(testing.io, .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    var data: [9000]u8 = undefined;
+    fill(&data, 24);
+    var info = try s.object("o").uploadParallel(.{ .data = &data }, .{
+        .part_size = 4096,
+        .preconditions = .does_not_exist,
+    });
+    defer info.deinit();
+    try testing.expectEqual(core.crc32c.hash(&data), info.value.crc32c.?);
+    try testing.expectEqualStrings("another writer's bytes", s.fake.object("o").?.bytes);
+    try testing.expect(s.fake.object("o").?.generation > info.value.generation);
+    try testing.expectEqual(1, s.fake.counts.deduplicated);
+    try expectNoTemp(&s.fake);
+}
+
+test "uploadParallel with conditions: a lost move answer repeated after its token is forgotten is found by reading" {
+    // A repeat Cloud Storage no longer recognises runs again, and fails
+    // its conditions, as one without a token does.
+    var clock: test_util.FakeClock = .{};
+    var rules = [_]Script.Rule{.{ .kind = .move, .fault = .lose_answer }};
+    var script: Script = .{ .rules = &rules };
+    var s: Setup = undefined;
+    try s.init(clock.io(), .{});
+    defer s.deinit();
+    s.fake.faults = script.plan();
+    // Forgotten before the backoff ends.
+    s.fake.dedup_ns = 1;
+    var data: [9000]u8 = undefined;
+    fill(&data, 25);
+    var info = try s.object("o").uploadParallel(.{ .data = &data }, .{
+        .part_size = 4096,
+        .preconditions = .does_not_exist,
+    });
+    defer info.deinit();
+    try testing.expectEqualSlices(u8, &data, s.fake.object("o").?.bytes);
+    try testing.expectEqual(2, s.fake.counts.moves);
+    try testing.expectEqual(0, s.fake.counts.deduplicated);
+    try expectNoTemp(&s.fake);
 }
 
 test "uploadParallel with conditions: the cleanup runs to its end under a cancel still pending" {
@@ -2407,7 +2519,15 @@ fn runConditionalUnderFaults(io: std.Io, input: []const u8) !void {
         // "not generation 8", say, where there was no object at all.
         try testing.expect(holds or chooser.clobbered);
         try testing.expectEqual(size, info.value.size);
-        if (verify) try testing.expectEqualSlices(u8, data, s.fake.object("o").?.bytes);
+        const stored = s.fake.object("o").?;
+        if (verify and !std.mem.eql(u8, data, stored.bytes)) {
+            // A move whose answer was lost, repeated after another writer
+            // replaced its object, is answered with its own result, as
+            // production answers it: the other writer came after.
+            try testing.expect(chooser.clobbered and s.fake.counts.deduplicated > 0);
+            try testing.expectEqualStrings("another writer's bytes", stored.bytes);
+            try testing.expect(stored.generation > info.value.generation);
+        }
     } else |err| {
         errdefer std.debug.print("{t}: {s}\n", .{ err, s.diag.message() });
         try testing.expect(chooser.faulted or !holds);

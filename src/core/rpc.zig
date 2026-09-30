@@ -62,6 +62,12 @@ pub const Call = struct {
     /// credentials' project. An engine that sends no quota project, or no
     /// credentials, sends this none either.
     quota_project: ?[]const u8 = null,
+    /// No retry begins later than this many milliseconds after the first
+    /// attempt began, for a call whose repeats are safe only for so long,
+    /// as a write the server recognises by an idempotency token is. Null:
+    /// no limit but the attempts. The fresh-token retry after a 401 is not
+    /// held to it: the server refused that request before acting on it.
+    retry_window_ms: ?u32 = null,
 };
 
 /// One streaming request, as a service module describes it: the body from
@@ -100,6 +106,8 @@ pub const StreamCall = struct {
     decode_error: ?*const fn (arena: Allocator, body: []const u8) Allocator.Error!?errors.ErrorBody = null,
     /// As `Call.quota_project`.
     quota_project: ?[]const u8 = null,
+    /// As `Call.retry_window_ms`.
+    retry_window_ms: ?u32 = null,
 
     pub const Body = union(enum) {
         none,
@@ -172,6 +180,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             }
 
             var reauthenticated = false;
+            const first_started = std.Io.Clock.awake.now(self.io);
             var attempt: u32 = 1;
             while (true) : (attempt += 1) {
                 // Each attempt starts over: a reset arena no longer holds
@@ -223,6 +232,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
 
                 if (attempt >= max_attempts or !call.retryable(err, http_status)) return err;
                 const delay_ms = self.retry.backoffMs(attempt, entropy(self.io));
+                if (self.pastWindow(call.retry_window_ms, first_started, delay_ms, call.method, log_path, err)) return err;
                 log.warn("{t} {s} failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
                 });
@@ -288,6 +298,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             }
 
             var reauthenticated = false;
+            const first_started = std.Io.Clock.awake.now(self.io);
             var attempt: u32 = 1;
             while (true) : (attempt += 1) {
                 const bearer = try self.bearerToken(scratch.allocator());
@@ -363,6 +374,7 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
 
                 if (mid_body or attempt >= max_attempts or !call.retryable(err, http_status)) return err;
                 const delay_ms = self.retry.backoffMs(attempt, entropy(self.io));
+                if (self.pastWindow(call.retry_window_ms, first_started, delay_ms, call.method, log_path, err)) return err;
                 log.warn("{t} {s} failed with {t}; retrying in {d} ms (attempt {d} of {d})", .{
                     call.method, log_path, err, delay_ms, attempt + 1, max_attempts,
                 });
@@ -381,6 +393,26 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
             if (discarding.error_body_out) |out| out.* = null;
             discarding.error_body_out = null;
             _ = try self.execute(&response, discarding);
+        }
+
+        /// Whether a retry `delay_ms` from now would begin past the call's
+        /// window, counted from its first attempt; logged when it would.
+        fn pastWindow(
+            self: Self,
+            window_ms: ?u32,
+            first_started: std.Io.Timestamp,
+            delay_ms: u32,
+            method: transport.Method,
+            log_path: []const u8,
+            err: anyerror,
+        ) bool {
+            const window = window_ms orelse return false;
+            const elapsed = first_started.durationTo(std.Io.Clock.awake.now(self.io)).toMilliseconds();
+            if (elapsed + delay_ms <= window) return false;
+            log.warn("{t} {s} failed with {t}; not retried: {d} ms after its first attempt, past its {d} ms window", .{
+                method, log_path, err, elapsed + delay_ms, window,
+            });
+            return true;
         }
 
         /// Clears the failed attempt's body. A call that carries secrets
@@ -580,6 +612,57 @@ test "retry: gives up after max_attempts and reports the last failure" {
     try testing.expectEqual(503, h.diag.http_status);
     try testing.expectEqualStrings("UNAVAILABLE", h.diag.status());
     try testing.expectEqualStrings("The service is currently unavailable.", h.diag.message());
+}
+
+test "retry window: no retry begins past it, on either entry" {
+    var h: Harness = undefined;
+    h.init(&.{ unavailable, unavailable, unavailable, unavailable, unavailable, unavailable, unavailable, unavailable });
+    defer h.deinit();
+    // Every byte 0xff, and a cap of 1023 ms: each full-jitter wait is the
+    // whole cap, since 1024 divides 2^64.
+    h.clock.random_byte = 0xff;
+    var e = h.engine();
+    e.retry = .{ .max_attempts = 4, .initial_backoff_ms = 1023, .max_backoff_ms = 1023, .multiplier = 1 };
+
+    // Retries begin at 1023 and 2046 ms; the third would begin at 3069,
+    // past 2500.
+    try testing.expectError(error.Unavailable, e.execute(&h.arena, .{ .method = .POST, .path = "/v1/things", .retry_window_ms = 2500 }));
+    try testing.expectEqual(3, h.fake.requests.items.len);
+    try testing.expectEqual(2, h.clock.sleep_count);
+    try testing.expectEqual(1023, h.clock.sleepMs(0));
+
+    // The streaming entry, the same.
+    _ = h.arena.reset(.retain_capacity);
+    try testing.expectError(error.Unavailable, e.executeStream(&h.arena, .{ .method = .POST, .path = "/v1/things", .retry_window_ms = 2500 }));
+    try testing.expectEqual(3, h.fake.stream_requests.items.len);
+
+    // No window: every attempt.
+    var h2: Harness = undefined;
+    h2.init(&.{ unavailable, unavailable, unavailable, unavailable });
+    defer h2.deinit();
+    h2.clock.random_byte = 0xff;
+    var e2 = h2.engine();
+    e2.retry = e.retry;
+    try testing.expectError(error.Unavailable, e2.execute(&h2.arena, .{ .method = .POST, .path = "/v1/things" }));
+    try testing.expectEqual(4, h2.fake.requests.items.len);
+}
+
+test "retry window: a window of 0 allows no retry that waits, and the 401 retry is not held to it" {
+    const unauthenticated: Reply = .{ .respond = .{
+        .status = 401,
+        .body = "{\"error\":{\"code\":401,\"status\":\"UNAUTHENTICATED\"}}",
+    } };
+    var h: Harness = undefined;
+    h.init(&.{ unavailable, unauthenticated, ok });
+    defer h.deinit();
+    h.clock.random_byte = 0xff;
+    var e = h.engine();
+    e.retry = .{ .max_attempts = 4, .initial_backoff_ms = 1023, .max_backoff_ms = 1023, .multiplier = 1 };
+    try testing.expectError(error.Unavailable, e.execute(&h.arena, .{ .method = .POST, .path = "/v1/things", .retry_window_ms = 0 }));
+    try testing.expectEqual(1, h.fake.requests.items.len);
+    // A refused token is retried once with a fresh one, window or not.
+    _ = try e.execute(&h.arena, .{ .method = .POST, .path = "/v1/things", .retry_window_ms = 0 });
+    try testing.expectEqual(3, h.fake.requests.items.len);
 }
 
 test "retry: a non-retryable status returns at once, and an opted-out call never retries" {

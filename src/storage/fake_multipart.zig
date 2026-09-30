@@ -61,6 +61,14 @@
 //! KMS key on any request this library must never send one on fails the
 //! test that sent it: a resumable session's chunks, a delete, a move, a
 //! restore, the XML part list and abort, and every bucket request.
+//!
+//! Idempotency tokens are held to what Cloud Storage measured on
+//! 2026-09-30 does. A one-request upload, a delete or a move that succeeds
+//! with a token keeps its answer, by token and resource, for `dedup_ns` of
+//! the clock; a repeat with the token in that time gets the kept answer and
+//! is not run again, whatever changed in between. A failure is not kept. A
+//! resumable session's start runs again, as production's does. A token on
+//! a read, the XML API, or a session's chunks fails the test that sent it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -88,6 +96,11 @@ pub const FakeMultipart = struct {
     /// Cloud Storage's service agent may use every Cloud KMS key; off,
     /// none, and a write naming one is production's 403.
     kms_granted: bool = true,
+    /// Answers kept by idempotency token, oldest first.
+    kept: std.ArrayList(Kept) = .empty,
+    /// How long a kept answer answers a repeat: measured, at least 115 s
+    /// and less than 130 s.
+    dedup_ns: i96 = 120 * std.time.ns_per_s,
     /// Buckets and their settings, apart from the objects above, which
     /// belong to whatever bucket a request names.
     buckets: FakeBuckets,
@@ -127,6 +140,8 @@ pub const FakeMultipart = struct {
         restores: u32 = 0,
         session_starts: u32 = 0,
         session_puts: u32 = 0,
+        /// Repeats answered with a kept answer, and not run again.
+        deduplicated: u32 = 0,
         session_cancels: u32 = 0,
         /// One-request `uploadType=multipart` uploads.
         inserts: u32 = 0,
@@ -173,7 +188,8 @@ pub const FakeMultipart = struct {
         /// where the object has one.
         long,
         /// A move finds another writer's object put under its destination
-        /// name just before it is served.
+        /// name just before it is served; an upload of one request or a
+        /// delete, under its own name. A repeat meets it too.
         clobber,
         /// The request fails with `error.Canceled`, as a canceled task's
         /// would, though nothing canceled it.
@@ -186,6 +202,16 @@ pub const FakeMultipart = struct {
         /// number for a part, 1 plus the first byte asked for on a media
         /// read (1 for a whole object), else 0.
         decide: *const fn (ctx: ?*anyopaque, kind: Kind, part: u32) Fault,
+    };
+
+    /// A write's answer, kept by its idempotency token.
+    const Kept = struct {
+        /// The token, the kind of write and its resource, joined.
+        key: []u8,
+        at_ns: i96,
+        status: u16,
+        headers: []Header,
+        body: []u8,
     };
 
     const Upload = struct {
@@ -259,6 +285,8 @@ pub const FakeMultipart = struct {
         self.objects.deinit(self.gpa);
         for (self.soft_deleted.items) |*o| freeStored(self.gpa, o);
         self.soft_deleted.deinit(self.gpa);
+        for (self.kept.items) |*k| freeKept(self.gpa, k);
+        self.kept.deinit(self.gpa);
         self.buckets.deinit();
         self.* = undefined;
     }
@@ -447,6 +475,7 @@ pub const FakeMultipart = struct {
         };
         if (try self.billingRefusal(target, url, headers, arena)) |refusal| return refusal;
         if (try keyRefusal(kind, target, url, headers, arena)) |refusal| return refusal;
+        if (try tokenRefusal(kind, method, headers, arena)) |refusal| return refusal;
         // Cloud Storage and fake-gcs-server take a request body sent with
         // `Content-Encoding: gzip` apart and store it plain. This library
         // never sends one: an object it compresses is stored compressed,
@@ -487,6 +516,23 @@ pub const FakeMultipart = struct {
         }
         defer self.mutex.unlock(self.io);
 
+        // Another writer acts before the request arrives, whether or not
+        // it is a repeat.
+        if (fault == .clobber) if (try clobbered(arena, kind, target, content_type, body)) |name| try self.put(name, "another writer's bytes");
+        // A repeat of a write that succeeded with this token is answered
+        // with the kept answer, and not run again.
+        const kept_key = try keptKey(arena, kind, target, headers, content_type, body);
+        if (kept_key) |key| if (self.keptAnswer(key)) |answer| {
+            self.counts.deduplicated += 1;
+            const reply: Reply = .{
+                .status = answer.status,
+                .headers = try arena.dupe(Header, answer.headers),
+                .body = try arena.dupe(u8, answer.body),
+            };
+            if (fault == .lose_answer) return error.ConnectionResetByPeer;
+            return reply;
+        };
+
         const reply = switch (target) {
             .json => |j| try self.json(kind, j, headers, accept_gzip, fault, arena),
             .xml => |x| try self.multipartRequest(kind, x, content_type, headers, body, fault, arena),
@@ -503,6 +549,7 @@ pub const FakeMultipart = struct {
             else
                 self.sessionCancel(id),
         };
+        if (kept_key) |key| if (reply.status >= 200 and reply.status < 300) try self.keep(key, reply);
         if (fault == .lose_answer) return error.ConnectionResetByPeer;
         if (kind == .media and reply.status >= 200 and reply.status < 300) {
             self.counts.media_bytes += if (reply.cut) reply.body.len / 2 else reply.body.len;
@@ -605,6 +652,32 @@ pub const FakeMultipart = struct {
         return null;
     }
 
+    /// The kept answer for `key`, if one is young enough.
+    fn keptAnswer(self: *FakeMultipart, key: []const u8) ?*const Kept {
+        const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+        for (self.kept.items) |*k| {
+            if (std.mem.eql(u8, k.key, key) and now - k.at_ns <= self.dedup_ns) return k;
+        }
+        return null;
+    }
+
+    /// Keeps a successful write's answer for its repeats.
+    fn keep(self: *FakeMultipart, key: []const u8, reply: Reply) Allocator.Error!void {
+        const owned_key = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(owned_key);
+        const headers = try dupeHeaders(self.gpa, reply.headers);
+        errdefer freeHeaders(self.gpa, headers);
+        const body = try self.gpa.dupe(u8, reply.body);
+        errdefer self.gpa.free(body);
+        try self.kept.append(self.gpa, .{
+            .key = owned_key,
+            .at_ns = std.Io.Clock.awake.now(self.io).nanoseconds,
+            .status = reply.status,
+            .headers = headers,
+            .body = body,
+        });
+    }
+
     const WriteKeys = union(enum) {
         ok: struct { key_sha256: ?[32]u8, kms_key_name: ?[]const u8 },
         refused: Reply,
@@ -693,7 +766,6 @@ pub const FakeMultipart = struct {
     fn moveObject(self: *FakeMultipart, target: MoveTarget, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         self.counts.moves += 1;
         const not_found: Reply = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
-        if (fault == .clobber) try self.put(target.destination, "another writer's bytes");
         const destination_holds = if (self.liveIndex(target.destination)) |d|
             target.conditions.check(&self.objects.items[d]) == .hold
         else
@@ -1456,6 +1528,69 @@ fn keyRefusal(kind: FakeMultipart.Kind, target: Target, url: []const u8, headers
         "{{\"error\":{{\"code\":400,\"message\":\"this fake refuses what this library must never send: {s} on a {t}\"}}}}",
         .{ w, kind },
     ) };
+}
+
+/// A 400 for an idempotency token where this library sends none: on a
+/// read, the XML API, or a resumable session's chunks and cancel.
+fn tokenRefusal(kind: FakeMultipart.Kind, method: Method, headers: []const Header, arena: Allocator) Allocator.Error!?FakeMultipart.Reply {
+    if (headerValue(headers, "X-Goog-Gcs-Idempotency-Token") == null) return null;
+    const takes_token = switch (kind) {
+        .delete, .move, .insert, .session_start, .restore => true,
+        .bucket => method != .GET,
+        else => false,
+    };
+    if (takes_token) return null;
+    return .{ .status = 400, .body = try std.fmt.allocPrint(
+        arena,
+        "{{\"error\":{{\"code\":400,\"message\":\"this fake refuses what this library must never send: an idempotency token on a {t} {t}\"}}}}",
+        .{ method, kind },
+    ) };
+}
+
+/// What a write's answer is kept under: its idempotency token, its kind and
+/// its resource, or null for a request without a token, or of a kind whose
+/// repeats run again (a resumable start, compose, rewrite, restore, the
+/// XML API, buckets). Production keys on more than the token: the same
+/// token on another object name runs normally.
+fn keptKey(arena: Allocator, kind: FakeMultipart.Kind, target: Target, headers: []const Header, content_type: ?[]const u8, body: []const u8) Allocator.Error!?[]const u8 {
+    const token = headerValue(headers, "X-Goog-Gcs-Idempotency-Token") orelse return null;
+    const resource: []const u8 = switch (kind) {
+        .delete => try std.fmt.allocPrint(arena, "{s}/{s}#{?d}", .{ target.json.bucket, target.json.name, target.json.generation }),
+        .move => try std.fmt.allocPrint(arena, "{s}/{s}>{s}", .{ target.move.bucket, target.move.source, target.move.destination }),
+        .insert => try std.fmt.allocPrint(arena, "{s}/{s}", .{ target.insert.bucket, try insertedName(arena, content_type, body) orelse return null }),
+        else => return null,
+    };
+    return try std.fmt.allocPrint(arena, "{s} {t} {s}", .{ token, kind, resource });
+}
+
+/// The name a one-request upload names in its metadata, or null for a
+/// body that does not parse, which the upload itself refuses.
+fn insertedName(arena: Allocator, content_type: ?[]const u8, body: []const u8) Allocator.Error!?[]const u8 {
+    const parts = splitMultipart(arena, content_type orelse return null, body) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Malformed => return null,
+    };
+    const meta = std.json.parseFromSliceLeaky(struct { name: []const u8 = "" }, arena, parts.metadata, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return meta.name;
+}
+
+/// The name a `clobber` fault puts another writer's object under.
+fn clobbered(arena: Allocator, kind: FakeMultipart.Kind, target: Target, content_type: ?[]const u8, body: []const u8) Allocator.Error!?[]const u8 {
+    return switch (kind) {
+        .move => target.move.destination,
+        .delete => target.json.name,
+        .insert => try insertedName(arena, content_type, body),
+        else => null,
+    };
+}
+
+fn freeKept(gpa: Allocator, k: *FakeMultipart.Kept) void {
+    gpa.free(k.key);
+    freeHeaders(gpa, k.headers);
+    gpa.free(k.body);
 }
 
 fn headerValue(headers: []const Header, name: []const u8) ?[]const u8 {
