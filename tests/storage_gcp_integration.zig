@@ -3687,6 +3687,19 @@ test "52. soft delete: objects restored one and many at a time, and the bucket i
     defer operations.deinit();
     try testing.expect(operations.value.operations.len >= 2);
 
+    // Soft delete turned off and on again, by update: an object deleted
+    // while it was off is gone for good. (A soft-deleted read while it is
+    // off is refused outright, as measured.)
+    var off = try f.update(.{ .soft_delete_retention_s = 0 });
+    try testing.expectEqual(null, off.value.soft_delete);
+    off.deinit();
+    const unkept = try f.put("s/unkept", "u0");
+    try b.object("s/unkept").delete(.{});
+    var on = try f.update(.{ .soft_delete_retention_s = 604_800 });
+    try testing.expectEqual(604_800, (try some(storage.BucketInfo.SoftDelete, on.value.soft_delete)).retention_s);
+    on.deinit();
+    try testing.expectError(error.NotFound, b.object("s/unkept").get(.{ .generation = unkept, .soft_deleted = true }));
+
     // The bucket: deleted, found among the soft-deleted, restored with its
     // settings and none of its objects, and deleted again by the fixture.
     var live = try b.listObjects(.{});

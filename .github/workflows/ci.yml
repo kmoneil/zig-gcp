@@ -156,6 +156,18 @@ jobs:
           zig build example-gcs_cp -- gs://zigps-examples/dir/zipped.bin "$RUNNER_TEMP/zipped-back.bin"
           cmp "$RUNNER_TEMP/src.bin" "$RUNNER_TEMP/zipped-back.bin"
           test ! -e "$RUNNER_TEMP/zip.state"
+          # Under a customer-supplied key read from a file, and billed to a
+          # project: the emulator takes both and checks neither, so this
+          # checks that they travel. A file that holds no key is refused.
+          head -c 32 /dev/urandom | base64 > "$RUNNER_TEMP/key.b64"
+          zig build example-gcs_cp -- "$RUNNER_TEMP/src.bin" gs://zigps-examples/dir/keyed.bin --encryption-key-file "$RUNNER_TEMP/key.b64" --billing-project test --parallel 4
+          zig build example-gcs_cp -- gs://zigps-examples/dir/keyed.bin "$RUNNER_TEMP/back-keyed.bin" --encryption-key-file "$RUNNER_TEMP/key.b64" --billing-project test
+          cmp "$RUNNER_TEMP/src.bin" "$RUNNER_TEMP/back-keyed.bin"
+          zig build example-gcs_cp -- "$RUNNER_TEMP/page.txt" gs://zigps-examples/dir/kms.txt --kms-key projects/p/locations/us/keyRings/r/cryptoKeys/k
+          if zig build example-gcs_cp -- "$RUNNER_TEMP/page.txt" gs://zigps-examples/dir/bad-key.txt --encryption-key-file "$RUNNER_TEMP/page.txt"; then
+            echo "--encryption-key-file took a file that holds no key"
+            exit 1
+          fi
 
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
   # read of undefined memory, can pass in Debug and fail here.
