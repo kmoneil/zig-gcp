@@ -59,6 +59,17 @@ pub const ObjectInfo = struct {
     /// only buckets with hierarchical namespace have: what
     /// `RestoreOptions.restore_token` takes.
     restore_token: ?[]const u8 = null,
+    /// The Cloud KMS key version that encrypts the object, as
+    /// `projects/P/locations/L/keyRings/R/cryptoKeys/K/cryptoKeyVersions/N`.
+    /// Null for an object under Google's own key or a customer-supplied
+    /// one. A write may name it as it is: the version goes before sending.
+    kms_key_name: ?[]const u8 = null,
+    /// The SHA-256 of the customer-supplied key that encrypts the object,
+    /// or null for any other. Cloud Storage keeps only this, and reports it
+    /// to anyone who may read the object's metadata; `EncryptionKey.sha256`
+    /// gives the same for a key, to tell which one this is. Such an object
+    /// read without its key reports no `crc32c` and no `md5`.
+    encryption_key_sha256: ?[32]u8 = null,
 
     /// The value of the custom metadata entry named `key`, or null.
     pub fn metadataValue(self: ObjectInfo, key: []const u8) ?[]const u8 {
@@ -165,6 +176,10 @@ pub const ComposeOptions = struct {
     delete_sources: bool = false,
     /// `if_generation_match` is what makes this safe to retry.
     preconditions: Preconditions = .{},
+    /// Encrypt the composite with this Cloud KMS key instead of the
+    /// bucket's default, which a compose that names none gets, whatever
+    /// keys its sources are under.
+    kms_key_name: ?[]const u8 = null,
 };
 
 /// What a patch does to an object's custom metadata. Cloud Storage reads
@@ -240,6 +255,14 @@ pub const UploadOptions = struct {
     /// data before the upload may finish. Data already compressed, such as
     /// images, video or archives, only grows.
     gzip: ?Gzip = null,
+    /// Encrypt the object with this Cloud KMS key,
+    /// `projects/P/locations/L/keyRings/R/cryptoKeys/K`, instead of the
+    /// bucket's default key, or Google's own where the bucket has none.
+    /// The key must be in the bucket's location, and Cloud Storage's
+    /// service agent for the project, which `Client.serviceAgent` names,
+    /// must hold `roles/cloudkms.cryptoKeyEncrypterDecrypter` on it. Not
+    /// together with a customer-supplied key.
+    kms_key_name: ?[]const u8 = null,
 };
 
 /// How `UploadOptions.gzip` compresses.
@@ -305,6 +328,8 @@ pub const ParallelUploadOptions = struct {
     /// emulator endpoint ignores it, since its one ordinary upload cannot
     /// resume.
     checkpoint: ?Checkpoint = null,
+    /// As `UploadOptions.kms_key_name`.
+    kms_key_name: ?[]const u8 = null,
 };
 
 /// Where `Object.downloadParallel` writes.
@@ -444,6 +469,10 @@ pub const CopyOptions = struct {
     /// Conditions on the destination. `if_generation_match` makes the
     /// copy safe to retry.
     preconditions: Preconditions = .{},
+    /// Encrypt the copy with this Cloud KMS key. A copy that names none
+    /// gets the destination bucket's default key, else Google's own: the
+    /// source's key does not carry over, as measured.
+    kms_key_name: ?[]const u8 = null,
 };
 
 /// What an update does to a setting that can be taken away: `.keep`,
@@ -859,7 +888,85 @@ pub const SignedUrlOptions = struct {
     style: UrlStyle = .path,
 };
 
+/// A customer-supplied AES-256 key. Cloud Storage encrypts an object with
+/// it and keeps only its SHA-256, so the object cannot be read, copied or
+/// composed without it, and an object whose key is lost is lost with it.
+/// `Object.withEncryptionKey` hands one to a handle, which borrows it: the
+/// caller keeps it alive while any handle does, and wipes it when done.
+pub const EncryptionKey = struct {
+    bytes: [32]u8,
+
+    /// The 44-character base64 form that gcloud, the console and Google's
+    /// libraries use. Anything else, whitespace included, is
+    /// `error.InvalidEncryptionKey`. The text is the caller's to wipe.
+    pub fn fromBase64(text: []const u8) error{InvalidEncryptionKey}!EncryptionKey {
+        // 32 bytes are exactly 44 characters, padding included.
+        const decoder = std.base64.standard.Decoder;
+        const len = decoder.calcSizeForSlice(text) catch return error.InvalidEncryptionKey;
+        if (len != 32) return error.InvalidEncryptionKey;
+        var key: EncryptionKey = .{ .bytes = undefined };
+        // The copy returned is the only one left.
+        defer key.wipe();
+        decoder.decode(&key.bytes, text) catch return error.InvalidEncryptionKey;
+        return key;
+    }
+
+    /// What Cloud Storage reports as the object's `keySha256`, and
+    /// `ObjectInfo.encryption_key_sha256` holds.
+    pub fn sha256(self: *const EncryptionKey) [32]u8 {
+        const Sha256 = std.crypto.hash.sha2.Sha256;
+        var hasher: Sha256 = .init(.{});
+        // The hasher's buffer holds the key until it is wiped.
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&hasher));
+        hasher.update(&self.bytes);
+        return hasher.finalResult();
+    }
+
+    pub fn wipe(self: *EncryptionKey) void {
+        std.crypto.secureZero(u8, &self.bytes);
+    }
+
+    /// Writes the base64 of the key's SHA-256, never the key.
+    pub fn format(self: *const EncryptionKey, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var text: [44]u8 = undefined;
+        try w.writeAll(std.base64.standard.Encoder.encode(&text, &self.sha256()));
+    }
+};
+
 const testing = std.testing;
+
+test "EncryptionKey: the base64 form in, the SHA-256 out, and nothing else" {
+    var key: EncryptionKey = try .fromBase64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
+    for (key.bytes, 0..) |b, i| try testing.expectEqual(@as(u8, @intCast(i)), b);
+    // Computed with Python's hashlib.
+    var want: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&want, "630dcd2966c4336691125448bbb25b4ff412a49c732db2c8abc1b8581bd710dd");
+    try testing.expectEqualSlices(u8, &want, &key.sha256());
+
+    var buf: [64]u8 = undefined;
+    const shown = try std.fmt.bufPrint(&buf, "{f}", .{&key});
+    try testing.expectEqualStrings("Yw3NKWbEM2aRElRIu7JbT/QSpJxzLbLIq8G4WBvXEN0=", shown);
+
+    key.wipe();
+    try testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &key.bytes);
+
+    for ([_][]const u8{
+        "",
+        // 31 bytes, and 33.
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHg==",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8g",
+        // No padding, or whitespace around it.
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+        " AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\n",
+        // URL-safe letters, and a non-canonical last digit.
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwd_h8=",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh9=",
+    }) |bad| {
+        errdefer std.debug.print("accepted {s}\n", .{bad});
+        try testing.expectError(error.InvalidEncryptionKey, EncryptionKey.fromBase64(bad));
+    }
+}
 
 test "ObjectInfo.metadataValue finds the first match" {
     const info: ObjectInfo = .{

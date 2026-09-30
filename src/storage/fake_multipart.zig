@@ -47,6 +47,20 @@
 //! pays is on or not, a `userProject` and a header that disagree, or a
 //! `userProject` named twice, fail the test that sent them: this library
 //! must never send either.
+//!
+//! Encryption keys are held to what Cloud Storage measured on 2026-09-30
+//! does. An object stored under a customer-supplied key refuses a read or
+//! a media read without the key, or with another, with production's 400,
+//! and an object stored without one refuses a request that sends one. A
+//! read of such an object without its key leaves out `crc32c`. An XML
+//! upload begun under a key refuses a part or finish without it or with
+//! another, and its finish, like that of an upload under a Cloud KMS key,
+//! names no `x-goog-hash`. A malformed key, a key and a KMS key together,
+//! and a KMS key version are refused as production refuses them, and with
+//! `kms_granted` off, any KMS key is 403. A key, a copy-source key or a
+//! KMS key on any request this library must never send one on fails the
+//! test that sent it: a resumable session's chunks, a delete, a move, a
+//! restore, the XML part list and abort, and every bucket request.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -71,6 +85,9 @@ pub const FakeMultipart = struct {
     requester_pays: bool = false,
     /// The one project a requester may bill.
     billable: []const u8 = "extractctl",
+    /// Cloud Storage's service agent may use every Cloud KMS key; off,
+    /// none, and a write naming one is production's 403.
+    kms_granted: bool = true,
     /// Buckets and their settings, apart from the objects above, which
     /// belong to whatever bucket a request names.
     buckets: FakeBuckets,
@@ -177,6 +194,10 @@ pub const FakeMultipart = struct {
         content_type: []u8,
         metadata: []Header,
         parts: std.AutoArrayHashMapUnmanaged(u32, Part) = .empty,
+        /// The SHA-256 of the customer-supplied key its start named.
+        key_sha256: ?[32]u8 = null,
+        /// The Cloud KMS key its start named. Owned.
+        kms_key_name: ?[]u8 = null,
     };
 
     const Part = struct {
@@ -203,6 +224,9 @@ pub const FakeMultipart = struct {
         /// Cancelled before it finished: its bytes are gone, and it
         /// answers 499 to everything.
         cancelled: bool = false,
+        /// The keys its start named. The name is owned.
+        key_sha256: ?[32]u8 = null,
+        kms_key_name: ?[]u8 = null,
     };
 
     /// An object the fake holds.
@@ -216,6 +240,10 @@ pub const FakeMultipart = struct {
         /// For an object stored gzip-compressed: what a media read gets
         /// instead of `bytes`, whole, as Cloud Storage decompresses it.
         served: ?[]u8 = null,
+        /// The SHA-256 of the customer-supplied key it is stored under.
+        key_sha256: ?[32]u8 = null,
+        /// The Cloud KMS key it is stored under, without a version. Owned.
+        kms_key_name: ?[]u8 = null,
     };
 
     pub fn init(gpa: Allocator, io: std.Io) FakeMultipart {
@@ -418,6 +446,7 @@ pub const FakeMultipart = struct {
             .move, .resumable, .insert, .bucket, .restore => 0,
         };
         if (try self.billingRefusal(target, url, headers, arena)) |refusal| return refusal;
+        if (try keyRefusal(kind, target, url, headers, arena)) |refusal| return refusal;
         // Cloud Storage and fake-gcs-server take a request body sent with
         // `Content-Encoding: gzip` apart and store it plain. This library
         // never sends one: an object it compresses is stored compressed,
@@ -463,7 +492,7 @@ pub const FakeMultipart = struct {
             .xml => |x| try self.multipartRequest(kind, x, content_type, headers, body, fault, arena),
             .move => |m| try self.moveObject(m, fault, arena),
             .resumable => |r| try self.sessionStart(r, content_type, headers, body, arena),
-            .insert => |t| try self.insertObject(t, content_type, body, arena),
+            .insert => |t| try self.insertObject(t, content_type, headers, body, arena),
             .bucket => |t| bucket: {
                 const r = try self.buckets.serve(method, t, body, arena);
                 break :bucket Reply{ .status = r.status, .body = r.body };
@@ -491,6 +520,9 @@ pub const FakeMultipart = struct {
                 self.counts.reads += 1;
                 if (target.soft_deleted) return self.readSoftDeleted(target, arena);
                 const o = &self.objects.items[index orelse return not_found];
+                // A metadata read needs no key; one it is sent must fit.
+                const given = requestKey(headers, object_key_prefix);
+                if (given != .none) if (keyFault(o.key_sha256, given)) |key_fault| return jsonKeyReply(key_fault);
                 switch (target.conditions.check(o)) {
                     .hold => {},
                     .match_failed => return condition_failed,
@@ -498,7 +530,8 @@ pub const FakeMultipart = struct {
                     // as HTTP's If-None-Match is.
                     .not_match_failed => return .{ .status = 304, .body = "" },
                 }
-                return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false) };
+                // Without its key, an object under one names no checksum.
+                return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false, given != .none) };
             },
             .media => {
                 self.counts.media += 1;
@@ -509,7 +542,9 @@ pub const FakeMultipart = struct {
                     };
                     return not_found;
                 }
-                return media(&self.objects.items[index orelse return not_found], headers, accept_gzip, fault, arena);
+                const o = &self.objects.items[index orelse return not_found];
+                if (keyFault(o.key_sha256, requestKey(headers, object_key_prefix))) |key_fault| return mediaKeyReply(key_fault);
+                return media(o, headers, accept_gzip, fault, arena);
             },
             .delete => {
                 self.counts.deletes += 1;
@@ -570,6 +605,41 @@ pub const FakeMultipart = struct {
         return null;
     }
 
+    const WriteKeys = union(enum) {
+        ok: struct { key_sha256: ?[32]u8, kms_key_name: ?[]const u8 },
+        refused: Reply,
+    };
+
+    /// The keys a write names, checked as Cloud Storage checks them: a
+    /// customer key's three headers must agree, it cannot come with a KMS
+    /// key, a KMS key version is malformed, and without `kms_granted` any
+    /// KMS key is refused.
+    fn writeKeys(self: *const FakeMultipart, given: RequestKey, kms_key_name: ?[]const u8, xml_api: bool) WriteKeys {
+        const key_sha256: ?[32]u8 = switch (given) {
+            .none => null,
+            .key => |digest| digest,
+            .malformed => return .{ .refused = if (xml_api) xmlKeyReply(.malformed) else jsonKeyReply(.malformed) },
+        };
+        if (kms_key_name) |name| {
+            if (key_sha256 != null) return .{ .refused = .{
+                .status = 409,
+                .body = "{\"error\":{\"code\":409,\"message\":\"Cannot provide both a Cloud KMS key and a csk encoded encryption scheme.\",\"errors\":[{\"reason\":\"conflict\"}]}}",
+            } };
+            if (std.mem.indexOf(u8, name, "/cryptoKeyVersions/") != null) return .{ .refused = .{
+                .status = 400,
+                .body = "{\"error\":{\"code\":400,\"message\":\"Malformed Cloud KMS crypto key\",\"errors\":[{\"reason\":\"invalid\"}]}}",
+            } };
+            if (!self.kms_granted) return .{ .refused = .{
+                .status = 403,
+                .body = if (xml_api)
+                    "<?xml version='1.0' encoding='UTF-8'?><Error><Code>AccessDenied</Code><Message>Permission denied on Cloud KMS key. Please ensure that your Cloud Storage service account has been authorized to use this key.</Message></Error>"
+                else
+                    "{\"error\":{\"code\":403,\"message\":\"Permission denied on Cloud KMS key. Please ensure that your Cloud Storage service account has been authorized to use this key.\",\"errors\":[{\"reason\":\"forbidden\"}]}}",
+            } };
+        }
+        return .{ .ok = .{ .key_sha256 = key_sha256, .kms_key_name = kms_key_name } };
+    }
+
     /// A soft-deleted generation's metadata, which only its generation
     /// reads.
     fn readSoftDeleted(self: *FakeMultipart, target: JsonTarget, arena: Allocator) Allocator.Error!Reply {
@@ -578,7 +648,7 @@ pub const FakeMultipart = struct {
             .body = "{\"error\":{\"code\":400,\"message\":\"You must specify a generation.\",\"errors\":[{\"reason\":\"required\"}]}}",
         };
         for (self.soft_deleted.items) |*o| if (std.mem.eql(u8, o.name, target.name) and o.generation == generation) {
-            return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false) };
+            return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false, false) };
         };
         return .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
     }
@@ -606,7 +676,9 @@ pub const FakeMultipart = struct {
         // may.
         var copy = try copyStored(self.gpa, &self.soft_deleted.items[source_index], self.next_generation);
         errdefer freeStored(self.gpa, &copy);
-        const reply_body = try objectJson(arena, &copy, copy.name, copy.generation, target.bucket, false);
+        // A restore needs no key, and answers without the checksums of an
+        // object under one.
+        const reply_body = try objectJson(arena, &copy, copy.name, copy.generation, target.bucket, false, false);
         try self.objects.ensureUnusedCapacity(self.gpa, 1);
         try self.soft_deleted.ensureUnusedCapacity(self.gpa, 1);
         self.next_generation += 1;
@@ -635,7 +707,8 @@ pub const FakeMultipart = struct {
         // The reply and the new name first: once the objects change,
         // nothing may fail.
         const generation = self.next_generation;
-        const reply_body = try objectJson(arena, &self.objects.items[s], target.destination, generation, target.bucket, fault == .corrupt);
+        // So does a move.
+        const reply_body = try objectJson(arena, &self.objects.items[s], target.destination, generation, target.bucket, fault == .corrupt, false);
         const name = try self.gpa.dupe(u8, target.destination);
         self.next_generation += 1;
         if (self.liveIndex(target.destination)) |d| {
@@ -723,6 +796,10 @@ pub const FakeMultipart = struct {
         switch (kind) {
             .start => {
                 self.counts.starts += 1;
+                const keys = switch (self.writeKeys(requestKey(headers, object_key_prefix), headerValue(headers, "x-goog-encryption-kms-key-name"), true)) {
+                    .ok => |k| k,
+                    .refused => |reply| return reply,
+                };
                 // The reply first: once the upload is stored, nothing
                 // may fail and free what it owns.
                 const id_text = try std.fmt.allocPrint(arena, "VXBs+{d}=", .{self.next_upload});
@@ -737,7 +814,16 @@ pub const FakeMultipart = struct {
                 errdefer self.gpa.free(stored_type);
                 const metadata = try metaHeaders(self.gpa, headers);
                 errdefer freeHeaders(self.gpa, metadata);
-                try self.uploads.append(self.gpa, .{ .id = id, .name = name, .content_type = stored_type, .metadata = metadata });
+                const kms = if (keys.kms_key_name) |k| try self.gpa.dupe(u8, k) else null;
+                errdefer if (kms) |k| self.gpa.free(k);
+                try self.uploads.append(self.gpa, .{
+                    .id = id,
+                    .name = name,
+                    .content_type = stored_type,
+                    .metadata = metadata,
+                    .key_sha256 = keys.key_sha256,
+                    .kms_key_name = kms,
+                });
                 self.next_upload += 1;
                 return .{ .status = 200, .body = reply_body };
             },
@@ -746,6 +832,7 @@ pub const FakeMultipart = struct {
                 const upload_id = target.query.part.upload_id;
                 const index = self.uploadIndex(upload_id) orelse return gone;
                 if (fault == .gone) return self.drop(index, gone);
+                if (keyFault(self.uploads.items[index].key_sha256, requestKey(headers, object_key_prefix))) |key_fault| return xmlKeyReply(key_fault);
                 const number = target.query.part.number;
                 if (number < 1 or number > 10_000) return .{ .status = 400, .body = "<Error><Code>InvalidArgument</Code></Error>" };
                 const bytes = try self.gpa.dupe(u8, body);
@@ -770,6 +857,7 @@ pub const FakeMultipart = struct {
                 self.counts.finishes += 1;
                 const index = self.uploadIndex(target.query.upload) orelse return gone;
                 if (fault == .gone) return self.drop(index, gone);
+                if (keyFault(self.uploads.items[index].key_sha256, requestKey(headers, object_key_prefix))) |key_fault| return xmlKeyReply(key_fault);
                 if (fault == .error_200) return .{ .status = 200, .body = "<Error><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>" };
                 return self.finishUpload(index, body, fault, arena);
             },
@@ -850,11 +938,14 @@ pub const FakeMultipart = struct {
         const bytes = try assembled.toOwnedSlice(self.gpa);
         errdefer self.gpa.free(bytes);
         const hash = core.crc32c.toBase64(core.crc32c.hash(bytes));
-        // The reply, and room for the object, before anything changes.
-        const reply_headers = try replyHeaders(arena, &.{
-            .{ .name = "x-goog-hash", .value = try std.fmt.allocPrint(arena, "crc32c={s}", .{&hash}) },
+        // The reply, and room for the object, before anything changes. An
+        // upload under a key of either kind finishes with no checksum.
+        const keyed = u.key_sha256 != null or u.kms_key_name != null;
+        const all_headers = [_]Header{
             .{ .name = "x-goog-generation", .value = try std.fmt.allocPrint(arena, "{d}", .{generation}) },
-        });
+            .{ .name = "x-goog-hash", .value = try std.fmt.allocPrint(arena, "crc32c={s}", .{&hash}) },
+        };
+        const reply_headers = try replyHeaders(arena, all_headers[0..if (keyed) 1 else 2]);
         try self.objects.ensureUnusedCapacity(self.gpa, 1);
         self.next_generation += 1;
         // A finish replaces any object of the name.
@@ -870,10 +961,13 @@ pub const FakeMultipart = struct {
             .bytes = bytes,
             .content_type = u.content_type,
             .metadata = u.metadata,
+            .key_sha256 = u.key_sha256,
+            .kms_key_name = u.kms_key_name,
         });
         u.name = u.name[0..0];
         u.content_type = u.content_type[0..0];
         u.metadata = u.metadata[0..0];
+        u.kms_key_name = null;
         var removed = self.uploads.orderedRemove(index);
         freeUpload(self.gpa, &removed);
         return .{
@@ -906,6 +1000,10 @@ pub const FakeMultipart = struct {
     ) Allocator.Error!Reply {
         self.counts.session_starts += 1;
         _ = content_type;
+        const keys = switch (self.writeKeys(requestKey(headers, object_key_prefix), target.kms_key_name, false)) {
+            .ok => |k| k,
+            .refused => |reply| return reply,
+        };
         const meta = std.json.parseFromSliceLeaky(Meta, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"bad metadata\"}}" },
@@ -936,6 +1034,8 @@ pub const FakeMultipart = struct {
         errdefer self.gpa.free(stored_type);
         const bucket = try self.gpa.dupe(u8, target.bucket);
         errdefer self.gpa.free(bucket);
+        const kms = if (keys.kms_key_name) |k| try self.gpa.dupe(u8, k) else null;
+        errdefer if (kms) |k| self.gpa.free(k);
         try self.sessions.append(self.gpa, .{
             .id = id,
             .bucket = bucket,
@@ -944,6 +1044,8 @@ pub const FakeMultipart = struct {
             .declared = declared,
             .metadata_crc = metadata_crc,
             .gzip = meta.gzip(),
+            .key_sha256 = keys.key_sha256,
+            .kms_key_name = kms,
         });
         self.next_session += 1;
         return .{ .status = 200, .headers = try replyHeaders(arena, &.{.{ .name = "Location", .value = location }}) };
@@ -972,7 +1074,7 @@ pub const FakeMultipart = struct {
             // that object stands.
             for (self.objects.items) |*o| {
                 if (o.generation == generation and std.mem.eql(u8, o.name, s.name)) {
-                    return .{ .status = 200, .body = try objectJson(arena, o, o.name, generation, s.bucket, false) };
+                    return .{ .status = 200, .body = try objectJson(arena, o, o.name, generation, s.bucket, false, true) };
                 }
             }
             return session_not_found;
@@ -1029,10 +1131,10 @@ pub const FakeMultipart = struct {
         if (claimed) |wanted| if (wanted != actual) return mismatch;
         if (s.metadata_crc) |wanted| if (wanted != actual) return mismatch;
 
-        const o = try self.store(s.name, s.bytes.items, s.content_type, s.gzip);
+        const o = try self.store(s.name, s.bytes.items, s.content_type, s.gzip, s.key_sha256, s.kms_key_name);
         s.done = o.generation;
         s.bytes.clearAndFree(self.gpa);
-        return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, s.bucket, false) };
+        return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, s.bucket, false, true) };
     }
 
     /// Stores `bytes` as the live object `name` at the next generation,
@@ -1040,9 +1142,19 @@ pub const FakeMultipart = struct {
     /// to a request that does not take gzip as sent, as Cloud Storage
     /// transcodes it; its bytes are not checked here, and ones that do not
     /// decompress are served as nothing.
-    fn store(self: *FakeMultipart, name: []const u8, bytes: []const u8, content_type: []const u8, gzip: bool) Allocator.Error!*Stored {
+    fn store(
+        self: *FakeMultipart,
+        name: []const u8,
+        bytes: []const u8,
+        content_type: []const u8,
+        gzip: bool,
+        key_sha256: ?[32]u8,
+        kms_key_name: ?[]const u8,
+    ) Allocator.Error!*Stored {
         const owned_name = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned_name);
+        const kms = if (kms_key_name) |k| try self.gpa.dupe(u8, k) else null;
+        errdefer if (kms) |k| self.gpa.free(k);
         const owned_bytes = try self.gpa.dupe(u8, bytes);
         errdefer self.gpa.free(owned_bytes);
         const stored_type = try self.gpa.dupe(u8, content_type);
@@ -1065,6 +1177,8 @@ pub const FakeMultipart = struct {
             .content_type = stored_type,
             .metadata = metadata,
             .served = served,
+            .key_sha256 = key_sha256,
+            .kms_key_name = kms,
         });
         return &self.objects.items[self.objects.items.len - 1];
     }
@@ -1072,8 +1186,12 @@ pub const FakeMultipart = struct {
     /// A one-request `uploadType=multipart` upload: the metadata part, then
     /// the data, checked against the metadata's crc32c and the query's
     /// conditions before the object exists.
-    fn insertObject(self: *FakeMultipart, target: InsertTarget, content_type: ?[]const u8, body: []const u8, arena: Allocator) Allocator.Error!Reply {
+    fn insertObject(self: *FakeMultipart, target: InsertTarget, content_type: ?[]const u8, headers: []const Header, body: []const u8, arena: Allocator) Allocator.Error!Reply {
         self.counts.inserts += 1;
+        const keys = switch (self.writeKeys(requestKey(headers, object_key_prefix), target.kms_key_name, false)) {
+            .ok => |k| k,
+            .refused => |reply| return reply,
+        };
         const bad: Reply = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"bad multipart body\"}}" };
         const parts = splitMultipart(arena, content_type orelse return bad, body) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1096,8 +1214,8 @@ pub const FakeMultipart = struct {
                 .body = "{\"error\":{\"code\":400,\"message\":\"Provided CRC32C does not match calculated CRC32C\",\"errors\":[{\"reason\":\"invalid\"}]}}",
             };
         }
-        const o = try self.store(meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip());
-        return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false) };
+        const o = try self.store(meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip(), keys.key_sha256, keys.kms_key_name);
+        return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false, true) };
     }
 
     fn sessionCancel(self: *FakeMultipart, id: []const u8) Reply {
@@ -1179,6 +1297,7 @@ fn freePart(gpa: Allocator, part: *FakeMultipart.Part) void {
 }
 
 fn freeSession(gpa: Allocator, s: *FakeMultipart.Session) void {
+    if (s.kms_key_name) |k| gpa.free(k);
     gpa.free(s.id);
     gpa.free(s.bucket);
     gpa.free(s.name);
@@ -1232,6 +1351,113 @@ fn sessionPart(headers: []const Header) u32 {
     };
 }
 
+/// Where a customer-supplied key's three headers start.
+const object_key_prefix = "x-goog-encryption-";
+const copy_source_key_prefix = "x-goog-copy-source-encryption-";
+
+/// What a request's customer-key headers carry.
+const RequestKey = union(enum) {
+    none,
+    /// The key's SHA-256: the three headers agree.
+    key: [32]u8,
+    /// Some of the three, or three that do not agree.
+    malformed,
+};
+
+fn requestKey(headers: []const Header, comptime prefix: []const u8) RequestKey {
+    const algorithm = headerValue(headers, prefix ++ "algorithm");
+    const key_text = headerValue(headers, prefix ++ "key");
+    const sha_text = headerValue(headers, prefix ++ "key-sha256");
+    if (algorithm == null and key_text == null and sha_text == null) return .none;
+    if (!std.mem.eql(u8, algorithm orelse "", "AES256")) return .malformed;
+    const decoder = std.base64.standard.Decoder;
+    var raw: [32]u8 = undefined;
+    const k = key_text orelse return .malformed;
+    if ((decoder.calcSizeForSlice(k) catch return .malformed) != 32) return .malformed;
+    decoder.decode(&raw, k) catch return .malformed;
+    var claimed: [32]u8 = undefined;
+    const c = sha_text orelse return .malformed;
+    if ((decoder.calcSizeForSlice(c) catch return .malformed) != 32) return .malformed;
+    decoder.decode(&claimed, c) catch return .malformed;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&raw, &digest, .{});
+    if (!std.mem.eql(u8, &digest, &claimed)) return .malformed;
+    return .{ .key = digest };
+}
+
+const KeyFault = enum { missing, wrong, unexpected, malformed };
+
+/// How a request's key fails what is stored under `stored`, or null when
+/// it fits.
+fn keyFault(stored: ?[32]u8, given: RequestKey) ?KeyFault {
+    switch (given) {
+        .malformed => return .malformed,
+        .none => return if (stored != null) .missing else null,
+        .key => |digest| {
+            const want = stored orelse return .unexpected;
+            return if (std.mem.eql(u8, &want, &digest)) null else .wrong;
+        },
+    }
+}
+
+const malformed_key_message = "Missing a SHA256 hash of the encryption key, or it is not base64 encoded, or it does not match the encryption key.";
+
+fn jsonKeyReply(fault: KeyFault) FakeMultipart.Reply {
+    return .{ .status = 400, .body = switch (fault) {
+        .missing => "{\"error\":{\"code\":400,\"message\":\"The target object is encrypted by a customer-supplied encryption key.\",\"errors\":[{\"reason\":\"resourceIsEncryptedWithCustomerEncryptionKey\"}]}}",
+        .wrong => "{\"error\":{\"code\":400,\"message\":\"The provided encryption key is incorrect.\",\"errors\":[{\"reason\":\"customerEncryptionKeyIsIncorrect\"}]}}",
+        .unexpected => "{\"error\":{\"code\":400,\"message\":\"The target object is not encrypted by a customer-supplied encryption key.\",\"errors\":[{\"reason\":\"resourceNotEncryptedWithCustomerEncryptionKey\"}]}}",
+        .malformed => "{\"error\":{\"code\":400,\"message\":\"" ++ malformed_key_message ++ "\",\"errors\":[{\"reason\":\"invalid\"}]}}",
+    } };
+}
+
+/// A media read's refusals are plain text.
+fn mediaKeyReply(fault: KeyFault) FakeMultipart.Reply {
+    return .{ .status = 400, .body = switch (fault) {
+        .missing => "The target object is encrypted by a customer-supplied encryption key.",
+        .wrong => "The provided encryption key is incorrect.",
+        .unexpected => "The target object is not encrypted by a customer-supplied encryption key.",
+        .malformed => malformed_key_message,
+    } };
+}
+
+fn xmlKeyReply(fault: KeyFault) FakeMultipart.Reply {
+    const start = "<?xml version='1.0' encoding='UTF-8'?><Error>";
+    return .{ .status = 400, .body = switch (fault) {
+        .missing => start ++ "<Code>ResourceIsEncryptedWithCustomerEncryptionKey</Code><Message>The resource is encrypted with a customer encryption key.</Message><Details>The requested multipart upload is encrypted by a customer-supplied encryption key.</Details></Error>",
+        .wrong => start ++ "<Code>CustomerEncryptionKeyIsIncorrect</Code><Message>The provided encryption key is incorrect.</Message><Details>The requested multipart upload is encrypted by a different customer-supplied key.</Details></Error>",
+        .unexpected => start ++ "<Code>ResourceNotEncryptedWithCustomerEncryptionKey</Code><Message>The resource is not encrypted with a customer encryption key.</Message><Details>The requested multipart upload is not encrypted by a customer-supplied encryption key.</Details></Error>",
+        .malformed => start ++ "<Code>InvalidArgument</Code><Message>" ++ malformed_key_message ++ "</Message></Error>",
+    } };
+}
+
+/// The answer to a request carrying a key where this library must never
+/// send one, else null. Read before the lock: it touches no state.
+fn keyRefusal(kind: FakeMultipart.Kind, target: Target, url: []const u8, headers: []const Header, arena: Allocator) Allocator.Error!?FakeMultipart.Reply {
+    const takes_key = switch (kind) {
+        .start, .part, .finish, .media, .insert, .session_start => true,
+        // A soft-deleted object's metadata is read without one.
+        .read => !target.json.soft_deleted,
+        else => false,
+    };
+    const what: ?[]const u8 = if (requestKey(headers, copy_source_key_prefix) != .none)
+        "a copy-source key"
+    else if (requestKey(headers, object_key_prefix) != .none and !takes_key)
+        "a customer-supplied key"
+    else if (headerValue(headers, "x-goog-encryption-kms-key-name") != null and kind != .start)
+        "a KMS key header"
+    else if (std.mem.indexOf(u8, url, "msKeyName=") != null and kind != .insert and kind != .session_start)
+        "a KMS key parameter"
+    else
+        null;
+    const w = what orelse return null;
+    return .{ .status = 400, .body = try std.fmt.allocPrint(
+        arena,
+        "{{\"error\":{{\"code\":400,\"message\":\"this fake refuses what this library must never send: {s} on a {t}\"}}}}",
+        .{ w, kind },
+    ) };
+}
+
 fn headerValue(headers: []const Header, name: []const u8) ?[]const u8 {
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
@@ -1251,6 +1477,7 @@ fn crc32cFromHash(value: []const u8) ?u32 {
 }
 
 fn freeUpload(gpa: Allocator, u: *FakeMultipart.Upload) void {
+    if (u.kms_key_name) |k| gpa.free(k);
     gpa.free(u.id);
     gpa.free(u.name);
     gpa.free(u.content_type);
@@ -1266,11 +1493,24 @@ const condition_failed: FakeMultipart.Reply = .{
 
 /// An object's resource as the JSON API answers it, under `name` and at
 /// `generation`, which a move changes, with the checksum flipped when
-/// `wrong_crc`. Every object here is at metageneration 1.
-fn objectJson(arena: Allocator, o: *const FakeMultipart.Stored, name: []const u8, generation: u64, bucket: []const u8, wrong_crc: bool) Allocator.Error![]const u8 {
+/// `wrong_crc`. Every object here is at metageneration 1. An object under
+/// a customer-supplied key names its checksum only with `keyed_request`,
+/// a request that carried the key, and names the key's SHA-256 always; one
+/// under a Cloud KMS key names the key's first version.
+fn objectJson(
+    arena: Allocator,
+    o: *const FakeMultipart.Stored,
+    name: []const u8,
+    generation: u64,
+    bucket: []const u8,
+    wrong_crc: bool,
+    keyed_request: bool,
+) Allocator.Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
     const crc = core.crc32c.toBase64(core.crc32c.hash(o.bytes) ^ @intFromBool(wrong_crc));
+    const hashes = o.key_sha256 == null or keyed_request;
+    var sha_text: [44]u8 = undefined;
     jw.write(.{
         .name = name,
         .bucket = bucket,
@@ -1279,8 +1519,13 @@ fn objectJson(arena: Allocator, o: *const FakeMultipart.Stored, name: []const u8
         .metageneration = "1",
         .contentType = o.content_type,
         .contentEncoding = @as(?[]const u8, if (o.served != null) "gzip" else null),
-        .crc32c = &crc,
+        .crc32c = @as(?[]const u8, if (hashes) &crc else null),
         .storageClass = "STANDARD",
+        .kmsKeyName = @as(?[]const u8, if (o.kms_key_name) |k| try std.fmt.allocPrint(arena, "{s}/cryptoKeyVersions/1", .{k}) else null),
+        .customerEncryption = if (o.key_sha256) |digest| @as(?struct { encryptionAlgorithm: []const u8, keySha256: []const u8 }, .{
+            .encryptionAlgorithm = "AES256",
+            .keySha256 = std.base64.standard.Encoder.encode(&sha_text, &digest),
+        }) else null,
     }) catch return error.OutOfMemory;
     return out.written();
 }
@@ -1383,6 +1628,8 @@ fn copyStored(gpa: Allocator, o: *const FakeMultipart.Stored, generation: u64) A
     const metadata = try dupeHeaders(gpa, o.metadata);
     errdefer freeHeaders(gpa, metadata);
     const served = if (o.served) |s| try gpa.dupe(u8, s) else null;
+    errdefer if (served) |d| gpa.free(d);
+    const kms = if (o.kms_key_name) |k| try gpa.dupe(u8, k) else null;
     return .{
         .name = name,
         .generation = generation,
@@ -1390,6 +1637,8 @@ fn copyStored(gpa: Allocator, o: *const FakeMultipart.Stored, generation: u64) A
         .content_type = content_type,
         .metadata = metadata,
         .served = served,
+        .key_sha256 = o.key_sha256,
+        .kms_key_name = kms,
     };
 }
 
@@ -1399,6 +1648,7 @@ fn freeStored(gpa: Allocator, o: *FakeMultipart.Stored) void {
     gpa.free(o.content_type);
     freeHeaders(gpa, o.metadata);
     if (o.served) |served| gpa.free(served);
+    if (o.kms_key_name) |k| gpa.free(k);
 }
 
 /// The one range a `Range: bytes=a-b` or `bytes=a-` header asks for, or
@@ -1482,12 +1732,14 @@ const ResumableTarget = struct {
     origin: []const u8,
     /// The start's `userProject`, which the session URL carries on.
     user_project: ?[]const u8 = null,
+    kms_key_name: ?[]const u8 = null,
 };
 
 const InsertTarget = struct {
     bucket: []const u8,
     /// Checked against the live object the metadata names.
     conditions: Conditions,
+    kms_key_name: ?[]const u8 = null,
 };
 
 const Target = union(enum) {
@@ -1523,16 +1775,24 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         var resumable_type = false;
         var multipart_type = false;
         var user_project: ?[]const u8 = null;
+        var kms_key_name: ?[]const u8 = null;
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
             if (try conditions.take(param)) continue;
             if (std.mem.eql(u8, param, "uploadType=resumable")) resumable_type = true;
             if (std.mem.eql(u8, param, "uploadType=multipart")) multipart_type = true;
             if (std.mem.startsWith(u8, param, "userProject=")) user_project = try decode(arena, param["userProject=".len..]);
+            if (std.mem.startsWith(u8, param, "kmsKeyName=")) kms_key_name = try decode(arena, param["kmsKeyName=".len..]);
         }
-        if (multipart_type) return .{ .insert = .{ .bucket = bucket, .conditions = conditions } };
+        if (multipart_type) return .{ .insert = .{ .bucket = bucket, .conditions = conditions, .kms_key_name = kms_key_name } };
         if (!resumable_type) return error.HttpProtocolError;
-        return .{ .resumable = .{ .bucket = bucket, .conditions = conditions, .origin = url[0..path_start], .user_project = user_project } };
+        return .{ .resumable = .{
+            .bucket = bucket,
+            .conditions = conditions,
+            .origin = url[0..path_start],
+            .user_project = user_project,
+            .kms_key_name = kms_key_name,
+        } };
     }
     if (std.mem.eql(u8, path, "/storage/v1/b")) return .{ .bucket = try bucketTarget(arena, null, query) };
     if (std.mem.startsWith(u8, path, "/storage/v1/b/") and

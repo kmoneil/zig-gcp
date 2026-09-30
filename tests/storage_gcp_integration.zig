@@ -51,6 +51,11 @@
 //! GCP_TEST_REQUESTER_TOKEN, a token for an account with Storage Object
 //! Admin on it that may bill GCP_TEST_PROJECT (Service Usage Consumer
 //! there).
+//!
+//! The encryption key tests make buckets of their own like the others and
+//! draw random customer-supplied keys. The Cloud KMS test also needs
+//! GCP_TEST_KMS_KEY, a key in us-central1 whose grant to the project's
+//! Cloud Storage service agent is in place, and skips without it.
 
 const std = @import("std");
 const core = @import("core");
@@ -3351,6 +3356,23 @@ const BucketFixture = struct {
         return info.value.generation;
     }
 
+    /// Prints the server's own words when a call fails unexpectedly.
+    fn report(f: *const BucketFixture, err: anyerror) anyerror {
+        std.debug.print("error.{t}", .{err});
+        if (f.diag.http_status != 0) std.debug.print(" (HTTP {d} {s})", .{ f.diag.http_status, f.diag.status() });
+        if (f.diag.message().len != 0) std.debug.print(": {s}", .{f.diag.message()});
+        std.debug.print("\n", .{});
+        return err;
+    }
+
+    /// `obj` holds exactly `expected`, and the download verified it.
+    fn expectContent(f: *BucketFixture, obj: storage.Object, expected: []const u8) !void {
+        var got = obj.downloadAlloc(expected.len + 1, .{}) catch |err| return f.report(err);
+        defer got.deinit();
+        try testing.expectEqualSlices(u8, expected, got.value.data);
+        try testing.expect(got.value.result.checksum_verified);
+    }
+
     /// Changes the bucket, a second after the last change at the least:
     /// Cloud Storage takes about one update of a bucket a second.
     fn update(f: *BucketFixture, changes: storage.BucketUpdate) !storage.Owned(storage.BucketInfo) {
@@ -3847,4 +3869,258 @@ test "54. requester pays: another principal is refused without a project to bill
     again.deinit();
     try testing.expectError(error.InvalidArgument, plain.object("again").delete(.{}));
     try b.object("again").delete(.{});
+}
+
+/// `value`, or a failed test where it is null: a panic would skip the
+/// cleanup that deletes the test's bucket.
+fn some(comptime T: type, value: ?T) !T {
+    return value orelse error.TestExpectedValue;
+}
+
+fn firstObject(objects: []const storage.ObjectInfo) !storage.ObjectInfo {
+    if (objects.len == 0) return error.TestExpectedObject;
+    return objects[0];
+}
+
+/// A random customer-supplied key, for one test.
+fn randomKey() storage.EncryptionKey {
+    var key: storage.EncryptionKey = .{ .bytes = undefined };
+    testing.io.random(&key.bytes);
+    return key;
+}
+
+test "55. keys: every path under a customer-supplied key, a rotation by copy, and what the key refuses" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{ .location = "us-central1", .soft_delete_retention_s = 0 });
+    created.deinit();
+    defer f.deleteEveryVersion() catch |err| std.debug.print("cleanup: {t}\n", .{err});
+    var a = randomKey();
+    defer a.wipe();
+    var other = randomKey();
+    defer other.wipe();
+    const b = f.bucket();
+
+    // Every upload path: one request, a resumable session, the XML API
+    // with and without conditions, and compressed.
+    const small = try requesterBytes(1000, 21);
+    defer testing.allocator.free(small);
+    var one = b.object("one").withEncryptionKey(&a).upload(small, .{}) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, &a.sha256(), &(try some([32]u8, one.value.encryption_key_sha256)));
+    try testing.expectEqual(core.crc32c.hash(small), (try some(u32, one.value.crc32c)));
+    one.deinit();
+    const big = try requesterBytes(9 * 1024 * 1024 + 7, 22);
+    defer testing.allocator.free(big);
+    var reader: std.Io.Reader = .fixed(big);
+    var streamed = b.object("streamed").withEncryptionKey(&a).uploadFrom(&reader, .{}) catch |err| return f.report(err);
+    try testing.expectEqual(core.crc32c.hash(big), (try some(u32, streamed.value.crc32c)));
+    streamed.deinit();
+    const parted = try requesterBytes(12 * 1024 * 1024, 23);
+    defer testing.allocator.free(parted);
+    var parts = b.object("parts").withEncryptionKey(&a).uploadParallel(.{ .data = parted }, .{ .part_size = 5 * 1024 * 1024, .concurrency = 3 }) catch |err| return f.report(err);
+    try testing.expectEqual(core.crc32c.hash(parted), (try some(u32, parts.value.crc32c)));
+    parts.deinit();
+    // Measured: the move names no checksum for such an object, so the
+    // object is read back with the key.
+    var moved = b.object("created").withEncryptionKey(&a).uploadParallel(.{ .data = parted }, .{
+        .part_size = 5 * 1024 * 1024,
+        .preconditions = .does_not_exist,
+    }) catch |err| return f.report(err);
+    try testing.expectEqual(core.crc32c.hash(parted), (try some(u32, moved.value.crc32c)));
+    moved.deinit();
+    const text = "compressible " ** 400;
+    var zipped = b.object("zipped").withEncryptionKey(&a).upload(text, .{ .gzip = .{} }) catch |err| return f.report(err);
+    zipped.deinit();
+
+    // And back: whole, in ranges, a range, decompressed.
+    var whole = b.object("streamed").withEncryptionKey(&a).downloadAlloc(big.len, .{}) catch |err| return f.report(err);
+    defer whole.deinit();
+    try testing.expect(whole.value.result.checksum_verified);
+    try testing.expectEqualSlices(u8, big, whole.value.data);
+    const buffer = try testing.allocator.alloc(u8, parted.len);
+    defer testing.allocator.free(buffer);
+    const ranged = b.object("parts").withEncryptionKey(&a).downloadParallel(.{ .buffer = buffer }, .{ .part_size = 4 * 1024 * 1024, .concurrency = 3 }) catch |err| return f.report(err);
+    try testing.expect(ranged.checksum_verified);
+    try testing.expectEqualSlices(u8, parted, buffer);
+    var piece = try b.object("created").withEncryptionKey(&a).downloadAlloc(100, .{ .range = .{ .offset = 10, .length = 90 } });
+    defer piece.deinit();
+    try testing.expectEqualSlices(u8, parted[10..100], piece.value.data);
+    var unzipped = try b.object("zipped").withEncryptionKey(&a).downloadAlloc(text.len, .{});
+    defer unzipped.deinit();
+    try testing.expectEqualStrings(text, unzipped.value.data);
+
+    // Metadata: checksums with the key, the key's SHA-256 either way.
+    var keyed = try b.object("one").withEncryptionKey(&a).get(.{});
+    try testing.expectEqual(core.crc32c.hash(small), (try some(u32, keyed.value.crc32c)));
+    keyed.deinit();
+    var keyless = try b.object("one").get(.{});
+    try testing.expectEqual(null, keyless.value.crc32c);
+    try testing.expectEqualSlices(u8, &a.sha256(), &(try some([32]u8, keyless.value.encryption_key_sha256)));
+    keyless.deinit();
+    var patched = try b.object("one").withEncryptionKey(&a).updateMetadata(.{ .content_type = "text/plain" });
+    try testing.expectEqual(core.crc32c.hash(small), (try some(u32, patched.value.crc32c)));
+    patched.deinit();
+    try testing.expect(try b.object("one").withEncryptionKey(&other).exists());
+
+    // Without the key, with another, and a key for a plain object: refused.
+    try testing.expectError(error.InvalidArgument, b.object("streamed").downloadAlloc(big.len, .{}));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "withEncryptionKey") != null);
+    try testing.expectError(error.InvalidArgument, b.object("streamed").withEncryptionKey(&other).downloadAlloc(big.len, .{}));
+    std.debug.print("a download with another key: {s}\n", .{f.diag.message()});
+    var plain = try b.object("plain").upload("plain", .{});
+    plain.deinit();
+    try testing.expectError(error.InvalidArgument, b.object("plain").withEncryptionKey(&a).downloadAlloc(16, .{}));
+
+    // Server-side: a rotation in place, a copy out of the key, and a
+    // compose under it.
+    var rotated = b.object("one").withEncryptionKey(&a).copyTo(b.object("one").withEncryptionKey(&other), .{}) catch |err| return f.report(err);
+    try testing.expectEqualSlices(u8, &other.sha256(), &(try some([32]u8, rotated.value.encryption_key_sha256)));
+    rotated.deinit();
+    try f.expectContent(b.object("one").withEncryptionKey(&other), small);
+    var decrypted = try b.object("streamed").withEncryptionKey(&a).copyTo(b.object("decrypted"), .{});
+    try testing.expectEqual(null, decrypted.value.encryption_key_sha256);
+    decrypted.deinit();
+    try f.expectContent(b.object("decrypted"), big);
+    var composed = b.object("composed").withEncryptionKey(&a).composeFrom(&.{ .{ .name = "streamed" }, .{ .name = "parts" } }, .{}) catch |err| return f.report(err);
+    composed.deinit();
+    const joined = try std.mem.concat(testing.allocator, u8, &.{ big, parted });
+    defer testing.allocator.free(joined);
+    try f.expectContent(b.object("composed").withEncryptionKey(&a), joined);
+}
+
+test "56. keys: a Cloud KMS key on every kind of upload, a copy and a compose, the bucket's default, and the service agent (GCP_TEST_KMS_KEY)" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const kms_text = f.env.get("GCP_TEST_KMS_KEY") orelse return error.SkipZigTest;
+    const kms = std.mem.trim(u8, kms_text, &std.ascii.whitespace);
+    var agent = f.client.serviceAgent() catch |err| return f.report(err);
+    defer agent.deinit();
+    try testing.expect(std.mem.endsWith(u8, agent.value, "@gs-project-accounts.iam.gserviceaccount.com"));
+    var created = try f.bucket().create(.{ .location = "us-central1", .soft_delete_retention_s = 0 });
+    created.deinit();
+    defer f.deleteEveryVersion() catch |err| std.debug.print("cleanup: {t}\n", .{err});
+    const b = f.bucket();
+
+    const small = try requesterBytes(1000, 31);
+    defer testing.allocator.free(small);
+    var one = b.object("one").upload(small, .{ .kms_key_name = kms }) catch |err| return f.report(err);
+    defer one.deinit();
+    const version = (try some([]const u8, one.value.kms_key_name));
+    try testing.expect(std.mem.startsWith(u8, version, kms));
+    try testing.expect(std.mem.indexOf(u8, version, "/cryptoKeyVersions/") != null);
+    try testing.expectEqual(core.crc32c.hash(small), (try some(u32, one.value.crc32c)));
+    // The name an object reports goes back in as it is.
+    const big = try requesterBytes(9 * 1024 * 1024 + 7, 32);
+    defer testing.allocator.free(big);
+    var reader: std.Io.Reader = .fixed(big);
+    var streamed = b.object("streamed").uploadFrom(&reader, .{ .kms_key_name = version }) catch |err| return f.report(err);
+    try testing.expect(std.mem.startsWith(u8, (try some([]const u8, streamed.value.kms_key_name)), kms));
+    streamed.deinit();
+    const parted = try requesterBytes(12 * 1024 * 1024, 33);
+    defer testing.allocator.free(parted);
+    var parts = b.object("parts").uploadParallel(.{ .data = parted }, .{ .part_size = 5 * 1024 * 1024, .kms_key_name = kms }) catch |err| return f.report(err);
+    try testing.expectEqual(core.crc32c.hash(parted), (try some(u32, parts.value.crc32c)));
+    try testing.expect(std.mem.startsWith(u8, (try some([]const u8, parts.value.kms_key_name)), kms));
+    parts.deinit();
+    try f.expectContent(b.object("parts"), parted);
+
+    // A copy under the key, and a copy naming none, which gets Google's.
+    var plain = try b.object("plain").upload(small, .{});
+    plain.deinit();
+    var keyed_copy = b.object("plain").copyTo(b.object("keyed-copy"), .{ .kms_key_name = kms }) catch |err| return f.report(err);
+    try testing.expect(std.mem.startsWith(u8, (try some([]const u8, keyed_copy.value.kms_key_name)), kms));
+    keyed_copy.deinit();
+    var unkeyed_copy = try b.object("one").copyTo(b.object("unkeyed-copy"), .{});
+    try testing.expectEqual(null, unkeyed_copy.value.kms_key_name);
+    unkeyed_copy.deinit();
+    var composed = b.object("composed").composeFrom(&.{ .{ .name = "one" }, .{ .name = "plain" } }, .{ .kms_key_name = kms }) catch |err| return f.report(err);
+    try testing.expect(std.mem.startsWith(u8, (try some([]const u8, composed.value.kms_key_name)), kms));
+    composed.deinit();
+    // A listing withholds a keyed object's checksum; a get does not.
+    var listed = try b.listObjects(.{ .prefix = "one" });
+    defer listed.deinit();
+    try testing.expectEqual(null, (try firstObject(listed.value.objects)).crc32c);
+    var got = try b.object("one").get(.{});
+    try testing.expect(got.value.crc32c != null);
+    got.deinit();
+
+    // The bucket's default key, set, used, and cleared. A setting takes a
+    // while to act, so uploads go on until one lands the way it should.
+    var set = try f.update(.{ .default_kms_key_name = .{ .set = kms } });
+    set.deinit();
+    std.debug.print("the default key applied after {d} ms\n", .{try untilKeyed(b.object("defaulted"), small, kms, true)});
+    var cleared = try f.update(.{ .default_kms_key_name = .clear });
+    try testing.expectEqual(null, cleared.value.default_kms_key_name);
+    cleared.deinit();
+    std.debug.print("the clear applied after {d} ms\n", .{try untilKeyed(b.object("after"), small, kms, false)});
+}
+
+/// Uploads `data` as `obj` every two seconds, for up to two minutes, until
+/// it lands under `kms` (`keyed`) or under no KMS key, and says how long
+/// that took.
+fn untilKeyed(obj: storage.Object, data: []const u8, kms: []const u8, keyed: bool) !i64 {
+    const started = std.Io.Clock.awake.now(testing.io);
+    for (0..60) |_| {
+        var info = try obj.upload(data, .{});
+        defer info.deinit();
+        const under = if (info.value.kms_key_name) |name| std.mem.startsWith(u8, name, kms) else false;
+        if (under == keyed) return msSince(started);
+        try testing.io.sleep(.fromMilliseconds(2000), .awake);
+    }
+    return error.TestSettingNeverApplied;
+}
+
+test "57. keys: a checkpointed upload cut partway resumes under its key, and starts over under another" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{ .location = "us-central1", .soft_delete_retention_s = 0 });
+    created.deinit();
+    defer f.deleteEveryVersion() catch |err| std.debug.print("cleanup: {t}\n", .{err});
+    var a = randomKey();
+    defer a.wipe();
+    var other = randomKey();
+    defer other.wipe();
+    const size: u64 = 3 * 1024 * 1024;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try patternFile(tmp.dir, "source.bin", 57, size);
+    defer file.close(testing.io);
+
+    for ([_]*const storage.EncryptionKey{ &a, &other }) |resumer| {
+        var store: storage.CheckpointFile = .init(testing.io, tmp.dir, "source.bin.upload");
+        defer f.client.abandonTransfer(store.checkpoint()) catch {};
+        // The first run, under key A in 256 KiB chunks, dies partway
+        // through the fourth.
+        var plan = [_]FaultTransport.Fault{
+            .{ .method = .PUT, .url_contains = "upload_id=", .skip = 3, .action = .{ .cut_request_body = 100 * 1024 } },
+        };
+        var faults: FaultTransport = .{ .inner = f.http.transport(), .plan = &plan };
+        defer faults.deinit();
+        var dying: storage.Client = try .init(testing.allocator, testing.io, .{
+            .token_provider = f.token.provider(),
+            .transport = faults.transport(),
+            .diagnostics = &f.diag,
+            .chunk_size = 256 * 1024,
+            .retry = .{ .max_attempts = 1 },
+            .user_agent = Fixture.user_agent,
+        });
+        defer dying.deinit();
+        const name = if (resumer == &a) "same-key" else "other-key";
+        if (dying.bucket(&f.name).object(name).withEncryptionKey(&a).uploadFile(file, .{ .checkpoint = store.checkpoint() })) |finished| {
+            var owned = finished;
+            owned.deinit();
+            return error.TestExpectedFailure;
+        } else |err| std.debug.print("{s}: the first run: error.{t}\n", .{ name, err });
+        try testing.expect(plan[0].fired);
+        try testing.expect(try hasState(tmp.dir, "source.bin.upload"));
+
+        var info = f.bucket().object(name).withEncryptionKey(resumer).uploadFile(file, .{ .checkpoint = store.checkpoint() }) catch |err| return f.report(err);
+        defer info.deinit();
+        try testing.expectEqual(patternCrc(57, size), (try some(u32, info.value.crc32c)));
+        try testing.expectEqualSlices(u8, &resumer.sha256(), &(try some([32]u8, info.value.encryption_key_sha256)));
+        try testing.expect(!try hasState(tmp.dir, "source.bin.upload"));
+    }
 }

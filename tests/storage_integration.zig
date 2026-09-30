@@ -1121,3 +1121,44 @@ test "gzip uploads: every call stores std's gzip of the data, labelled, and it d
         try testing.expect(as_stored.checksum_verified);
     }
 }
+
+test "keys: an emulator takes a customer-supplied key and a Cloud KMS key on every path, and ignores both" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    var diag: storage.Diagnostics = .{};
+    var client = try smallChunkClient(&f, &diag);
+    defer client.deinit();
+    const bucket = client.bucket(&f.bucket_name);
+    var key: storage.EncryptionKey = try .fromBase64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
+    defer key.wipe();
+
+    const data = try testing.allocator.alloc(u8, 700 * 1024);
+    defer testing.allocator.free(data);
+    var prng: std.Random.DefaultPrng = .init(20260930);
+    prng.random().bytes(data);
+    const keyed = bucket.object("keyed.bin").withEncryptionKey(&key);
+    var one = try keyed.upload(data[0..1000], .{});
+    one.deinit();
+    var reader: std.Io.Reader = .fixed(data);
+    var streamed = try keyed.uploadFrom(&reader, .{});
+    streamed.deinit();
+    var parts = try bucket.object("parts.bin").withEncryptionKey(&key).uploadParallel(.{ .data = data }, .{});
+    parts.deinit();
+    var kms = try bucket.object("kms.bin").upload(data[0..1000], .{ .kms_key_name = "projects/p/locations/us/keyRings/r/cryptoKeys/k" });
+    kms.deinit();
+    for ([_][]const u8{ "keyed.bin", "parts.bin" }) |name| {
+        errdefer std.debug.print("{s}: {s}\n", .{ name, diag.message() });
+        var got = try bucket.object(name).withEncryptionKey(&key).downloadAlloc(data.len, .{});
+        defer got.deinit();
+        try testing.expectEqualSlices(u8, data, got.value.data);
+        try testing.expect(got.value.result.checksum_verified);
+    }
+    var copied = try keyed.copyTo(bucket.object("copy.bin").withEncryptionKey(&key), .{});
+    copied.deinit();
+    var composed = try bucket.object("composed.bin").withEncryptionKey(&key).composeFrom(&.{ .{ .name = "keyed.bin" }, .{ .name = "copy.bin" } }, .{});
+    try testing.expectEqual(2 * data.len, composed.value.size);
+    composed.deinit();
+}

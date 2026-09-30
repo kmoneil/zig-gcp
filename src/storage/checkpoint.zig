@@ -13,7 +13,9 @@
 //! An upload's state can hold a resumable session URL, which lets anyone
 //! holding it write that object for up to a week. So the built-in file is
 //! readable by its owner only, a custom store should keep the state as it
-//! keeps credentials, and nothing here is ever logged.
+//! keeps credentials, and nothing here is ever logged. A customer-supplied
+//! key is never saved, only its SHA-256, which Cloud Storage itself reports
+//! to anyone who may read the object's metadata.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -181,6 +183,13 @@ pub const State = union(enum) {
         /// makes again to resume, so both must match: the same level, and
         /// the same Zig, whose compressor another Zig may not reproduce.
         gzip: ?Gzip = null,
+        /// The base64 SHA-256 of the customer-supplied key the session
+        /// began under, or null for none: the session encrypts with it,
+        /// whatever key a resume brings, so a resume under another starts
+        /// over.
+        key_sha256: ?[]const u8 = null,
+        /// The Cloud KMS key the session began under, for the same reason.
+        kms_key_name: ?[]const u8 = null,
 
         pub const Gzip = struct {
             level: u4,
@@ -213,6 +222,12 @@ pub const State = union(enum) {
         /// one: `Client.abandonTransfer` has no handle, and a requester pays
         /// bucket refuses the XML abort without it.
         billing_project: ?[]const u8 = null,
+        /// The base64 SHA-256 of the customer-supplied key the upload began
+        /// under, or null for none, and its Cloud KMS key: the parts and
+        /// the object are under those, so a resume under others starts
+        /// over.
+        key_sha256: ?[]const u8 = null,
+        kms_key_name: ?[]const u8 = null,
     };
 };
 
@@ -242,6 +257,8 @@ pub fn encodeAlloc(gpa: Allocator, state: State) Allocator.Error![]u8 {
             .session = s.session,
             .gzip_level = if (s.gzip) |g| @as(?u8, g.level) else null,
             .gzip_zig = if (s.gzip) |g| g.zig else null,
+            .key_sha256 = s.key_sha256,
+            .kms_key_name = s.kms_key_name,
         }) catch return error.OutOfMemory,
         .upload_parallel => |s| jw.write(.{
             .version = 1,
@@ -258,6 +275,8 @@ pub fn encodeAlloc(gpa: Allocator, state: State) Allocator.Error![]u8 {
             .if_metageneration_match = s.if_metageneration_match,
             .if_metageneration_not_match = s.if_metageneration_not_match,
             .billing_project = s.billing_project,
+            .key_sha256 = s.key_sha256,
+            .kms_key_name = s.kms_key_name,
         }) catch return error.OutOfMemory,
     }
     return out.toOwnedSlice();
@@ -288,6 +307,8 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
         gzip_level: ?u8 = null,
         gzip_zig: ?[]const u8 = null,
         billing_project: ?[]const u8 = null,
+        key_sha256: ?[]const u8 = null,
+        kms_key_name: ?[]const u8 = null,
     };
     const wire = std.json.parseFromSliceLeaky(Wire, arena, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -298,6 +319,9 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
     // Older states name no billing project; one that is named must be one,
     // since it goes into a header.
     if (wire.billing_project) |project| if (!core.names.isProjectId(project)) return error.CheckpointFailed;
+    // Older states name neither; a named one is what this library writes.
+    if (wire.key_sha256) |text| if (!isSha256Text(text)) return error.CheckpointFailed;
+    if (wire.kms_key_name) |name| if (!@import("bucket_settings.zig").isKmsKeyName(name) or !core.transport.isValidHeaderValue(name)) return error.CheckpointFailed;
     // Where a state names a part size, the plan must reproduce exactly the
     // pieces the earlier run saved: a part size `plan` would grow named a
     // plan that never was.
@@ -341,6 +365,8 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
             .mtime = mtime,
             .session = session,
             .gzip = gzip,
+            .key_sha256 = wire.key_sha256,
+            .kms_key_name = wire.kms_key_name,
         } };
     } else if (std.mem.eql(u8, wire.kind, "uploadParallel")) blk: {
         const mtime = wire.mtime orelse return error.CheckpointFailed;
@@ -366,6 +392,8 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
             .if_metageneration_match = wire.if_metageneration_match,
             .if_metageneration_not_match = wire.if_metageneration_not_match,
             .billing_project = wire.billing_project,
+            .key_sha256 = wire.key_sha256,
+            .kms_key_name = wire.kms_key_name,
         } };
     } else return error.CheckpointFailed;
 
@@ -375,6 +403,17 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
     const canonical = try encodeAlloc(arena, state);
     if (!std.mem.eql(u8, canonical, bytes)) return error.CheckpointFailed;
     return state;
+}
+
+/// The base64 of 32 bytes, as `std.base64.standard` writes it.
+fn isSha256Text(text: []const u8) bool {
+    const decoder = std.base64.standard.Decoder;
+    if (text.len != 44) return false;
+    const len = decoder.calcSizeForSlice(text) catch return false;
+    if (len != 32) return false;
+    var digest: [32]u8 = undefined;
+    decoder.decode(&digest, text) catch return false;
+    return true;
 }
 
 /// How many hex digits describe `parts` ranges.

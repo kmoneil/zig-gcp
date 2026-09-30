@@ -89,7 +89,9 @@ fn transfer(
         };
     }
 
-    const source: Object = .{ .client = client, .bucket = bucket, .name = object };
+    // The key, if any, reaches the metadata read, whose checksum the whole
+    // is verified against, and every range.
+    const source: Object = .{ .client = client, .bucket = bucket, .name = object, .encryption_key = client.encryption_key };
     var info = if (saved) |s|
         source.get(.{ .generation = s.generation, .preconditions = options.preconditions }) catch |err| blk: {
             // The checkpoint's generation is gone: the object changed. The
@@ -533,7 +535,7 @@ const Worker = struct {
     fn fetch(w: *Worker, run: *Run, index: u32) Error!void {
         const offset = run.plan.offset(index);
         const len = run.plan.len(index);
-        const source: Object = .{ .client = &w.client, .bucket = run.bucket, .name = run.object };
+        const source: Object = .{ .client = &w.client, .bucket = run.bucket, .name = run.object, .encryption_key = w.client.encryption_key };
         const options: types.DownloadOptions = .{
             .generation = run.generation,
             .range = .{ .offset = offset, .length = len },
@@ -578,7 +580,7 @@ const Worker = struct {
         destination: types.ParallelDestination,
         generation: u64,
     ) Error!types.DownloadResult {
-        const source: Object = .{ .client = &w.client, .bucket = bucket, .name = object };
+        const source: Object = .{ .client = &w.client, .bucket = bucket, .name = object, .encryption_key = w.client.encryption_key };
         const options: types.DownloadOptions = .{ .generation = generation };
         switch (destination) {
             .buffer => |buffer| {

@@ -18,6 +18,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const dl = @import("download.zig");
+const encryption = @import("encryption.zig");
 const logging = @import("logging.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
@@ -266,6 +267,9 @@ const Pull = struct {
         const client = self.client;
         var response: std.heap.ArenaAllocator = .init(client.gpa);
         defer response.deinit();
+        var key: encryption.KeyHeaders = undefined;
+        key.init(client.encryption_key, .object);
+        defer key.wipe();
         var got: usize = 0;
         var attempt: u32 = 1;
         while (got < dest.len) : (attempt += 1) {
@@ -273,13 +277,14 @@ const Pull = struct {
             const start = self.fetched + got;
             const path = try names.objectMediaPath(response.allocator(), self.bucket, self.name, self.generation, .{});
             var range_buf: [64]u8 = undefined;
-            const headers = [_]core.transport.Header{.{ .name = "Range", .value = dl.formatRange(&range_buf, start, start + (dest.len - got) - 1) }};
+            const range = [_]core.transport.Header{.{ .name = "Range", .value = dl.formatRange(&range_buf, start, start + (dest.len - got) - 1) }};
+            var header_storage: [4]core.transport.Header = undefined;
             var sink: std.Io.Writer = .fixed(dest[got..]);
             const before = got;
             const outcome = rpc.executeStream(client, &response, .{
                 .method = .GET,
                 .path = path,
-                .headers = &headers,
+                .headers = encryption.withKey(&header_storage, &range, &key),
                 .sink = .{ .writer = &sink },
                 .accept_encoding = .gzip_as_sent,
                 // Resuming is this loop's business.

@@ -14,6 +14,10 @@
 //!   anything else.
 //! - Nothing is inherited: the composite's metadata is what this call
 //!   sends, and an unset content type becomes the default.
+//! - Under a customer-supplied key, the destination's key must decrypt
+//!   every source, and encrypts the composite; a source under another key,
+//!   or none, is refused. A Cloud KMS key goes as `kmsKeyName`: one in the
+//!   destination resource is ignored, as measured on 2026-09-30.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -23,6 +27,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const encryption = @import("encryption.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -34,7 +39,7 @@ const Error = @import("errors.zig").Error;
 pub const max_sources = 32;
 
 /// Writes `object` from `sources`. The caller has begun the call and
-/// checked the destination's names.
+/// checked the destination's names and the KMS key name.
 pub fn compose(
     client: *Client,
     bucket: []const u8,
@@ -45,15 +50,19 @@ pub fn compose(
     try check(client.diagnostics, sources, options);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
-    const path = try names.composePath(scratch.allocator(), bucket, object, options.preconditions);
+    const path = try names.composePath(scratch.allocator(), bucket, object, options.preconditions, options.kms_key_name);
     const body = try encode(scratch.allocator(), sources, options);
 
     var result: types.Owned(types.ObjectInfo) = try .init(client.gpa);
     errdefer result.deinit();
+    var key: encryption.KeyHeaders = undefined;
+    key.init(client.encryption_key, .object);
+    defer key.wipe();
     const response = try rpc.execute(client, result.arena, .{
         .method = .POST,
         .path = path,
         .body = body,
+        .headers = key.slice(),
         // A repeat of a compose that deletes its sources finds them gone
         // and fails for a reason that has nothing to do with the first
         // attempt, so that one needs a precondition whatever the client's

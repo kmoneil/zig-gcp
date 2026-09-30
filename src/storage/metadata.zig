@@ -22,6 +22,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const encryption = @import("encryption.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -50,10 +51,16 @@ pub fn update(
 
     var result: types.Owned(types.ObjectInfo) = try .init(client.gpa);
     errdefer result.deinit();
+    // A patch works without the object's customer-supplied key, but then
+    // answers without its checksums; with it, they come back.
+    var key: encryption.KeyHeaders = undefined;
+    key.init(client.encryption_key, .object);
+    defer key.wipe();
     const response = try rpc.execute(client, result.arena, .{
         .method = .PATCH,
         .path = path,
         .body = body,
+        .headers = key.slice(),
         // A patch that succeeded and lost its response has already moved
         // the metageneration, so repeating it under that condition fails
         // rather than applying twice.

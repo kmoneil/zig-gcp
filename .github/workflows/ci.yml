@@ -275,7 +275,10 @@ jobs:
         # versions and requester pays added properties to storage and
         # heavy-storage on 09-29, so those two are sized from 09-30 alone:
         # storage took 49 minutes at 900K, and heavy-storage, whose count
-        # was scaled from a Mac, 121 at 56K.
+        # was scaled from a Mac, 121 at 56K. Encryption keys (09-30) added
+        # a model property of calls under keys to heavy-storage, 5.9 ms a
+        # run on a Mac, about 15 ms on CI at that job's ratio of 2.6 to
+        # the Mac, so it drops from 42K to 37K.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 900K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
@@ -287,7 +290,7 @@ jobs:
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 4500K }
           - { job: storage, module: storage, filter: fuzz, iterations: 1600K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 4800K }
-          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 42K }
+          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 37K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:

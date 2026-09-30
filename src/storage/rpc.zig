@@ -110,6 +110,39 @@ fn hintBilling(client: *Client, err: anyerror) void {
     d.set(d.http_status, status_buf[0..status_text.len], "the bucket has requester pays on and this request named no project to bill: Bucket.withBillingProject or Object.withBillingProject names one");
 }
 
+/// A refusal that a customer-supplied key, or a grant on a Cloud KMS key,
+/// would have avoided says so. An object under a customer key refuses a
+/// request that carries none with 400, "The target object is encrypted by
+/// a customer-supplied encryption key." (the XML API: "The resource is
+/// encrypted with a customer encryption key."); a write under a KMS key
+/// whose grant is missing, or that does not exist, is 403 "Permission
+/// denied on Cloud KMS key".
+fn hintKeys(client: *Client, err: anyerror) void {
+    const d = client.diagnostics orelse return;
+    const message = d.message();
+    const keyless = err == error.InvalidArgument and client.encryption_key == null and
+        (std.ascii.indexOfIgnoreCase(message, "is encrypted by a customer-supplied") != null or
+            std.ascii.indexOfIgnoreCase(message, "is encrypted with a customer encryption key") != null);
+    const ungranted = err == error.PermissionDenied and std.ascii.indexOfIgnoreCase(message, "Cloud KMS key") != null;
+    const message_hint = if (keyless)
+        "the object is encrypted with a customer-supplied key, and this request carried none: Object.withEncryptionKey gives it"
+    else if (ungranted)
+        "permission denied on the Cloud KMS key: it must exist in the bucket's location, and the project's Cloud Storage service agent, which Client.serviceAgent names, needs roles/cloudkms.cryptoKeyEncrypterDecrypter on it"
+    else
+        return;
+    var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
+    const status_text = d.status();
+    @memcpy(status_buf[0..status_text.len], status_text);
+    d.set(d.http_status, status_buf[0..status_text.len], message_hint);
+}
+
+/// What a failed call's diagnostics add: how to bill a project, or which
+/// key was missing.
+fn hint(client: *Client, err: anyerror) void {
+    hintBilling(client, err);
+    hintKeys(client, err);
+}
+
 /// Sends a JSON API call and returns the body of the first 2xx response,
 /// which lives in `response`.
 pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
@@ -119,7 +152,7 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
     if (path) |p| billed_call.path = p;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
     return engine(client).execute(response, billed_call) catch |err| {
-        hintBilling(client, err);
+        hint(client, err);
         return err;
     };
 }
@@ -132,7 +165,7 @@ pub fn executeDiscard(client: *Client, call: Call) Error!void {
     if (path) |p| billed_call.path = p;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
     return engine(client).executeDiscard(billed_call) catch |err| {
-        hintBilling(client, err);
+        hint(client, err);
         return err;
     };
 }
@@ -152,7 +185,7 @@ pub fn executeStream(
     if (path) |p| billed_call.path = p;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
     return engine(client).executeStream(response, billed_call) catch |err| {
-        hintBilling(client, err);
+        hint(client, err);
         return err;
     };
 }
@@ -167,7 +200,7 @@ pub fn executeXml(
     var billed_call = call;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
     return engine(client).executeStream(response, billed_call) catch |err| {
-        hintBilling(client, err);
+        hint(client, err);
         return err;
     };
 }
@@ -183,7 +216,7 @@ pub fn executeXmlBody(
     var billed_call = call;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
     return engine(client).executeStreamBody(response, billed_call, body) catch |err| {
-        hintBilling(client, err);
+        hint(client, err);
         return err;
     };
 }
@@ -212,10 +245,11 @@ pub fn checkObjectName(client: *Client, name: []const u8) Error!void {
     return error.InvalidObjectName;
 }
 
-/// The project for bucket create and list, which address no bucket yet.
+/// The project for bucket create and list, and the service agent, which
+/// address no bucket.
 pub fn requireProject(client: *Client) Error![]const u8 {
     return client.project_id orelse {
-        if (client.diagnostics) |d| d.print("bucket create and list need Options.project_id", .{});
+        if (client.diagnostics) |d| d.print("bucket create and list, and the service agent, need Options.project_id", .{});
         return error.MissingProject;
     };
 }

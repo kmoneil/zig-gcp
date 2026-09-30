@@ -26,6 +26,13 @@
 //! Against an emulator the object goes up as one ordinary upload instead,
 //! with the conditions applied to it: fake-gcs-server has no multipart
 //! uploads, and no `objects.move`.
+//!
+//! Under a customer-supplied key the start, every part and the finish carry
+//! it, and the object is read back with it. Cloud Storage's finish names no
+//! checksum for an object under any key of its own, customer-supplied or
+//! Cloud KMS, and a move names none for one under a customer key, so both
+//! are held to the checksum sent by that read. The move and the
+//! temporary object's reads and delete carry no key: none needs one.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -35,6 +42,7 @@ const Client = @import("Client.zig");
 const Object = @import("Object.zig");
 const checkpoint = @import("checkpoint.zig");
 const codec = @import("codec.zig");
+const encryption = @import("encryption.zig");
 const logging = @import("logging.zig");
 const mp = @import("xml_multipart.zig");
 const names = @import("names.zig");
@@ -112,6 +120,10 @@ const Persist = struct {
     temp: ?[]const u8 = null,
     /// The state an earlier process saved, until it is spent.
     resumed: ?checkpoint.State.UploadParallel,
+    /// The base64 SHA-256 of the call's customer-supplied key, and its
+    /// Cloud KMS key: what the parts go up under.
+    key_sha256: ?[]const u8 = null,
+    kms_key_name: ?[]const u8 = null,
 };
 
 /// With a checkpoint, which failures still abort the upload, drop the
@@ -160,7 +172,10 @@ fn resumeOrStart(
         .mtime = try statMtime(client, file),
         .preconditions = options.preconditions,
         .resumed = try loadUploadState(client, cp, state_arena.allocator(), bucket, object),
+        .kms_key_name = options.kms_key_name,
     };
+    var sha_buf: [44]u8 = undefined;
+    persist.key_sha256 = encryption.sha256Text(client.encryption_key, &sha_buf);
     if (persist.resumed) |s| {
         if (s.size != size or s.mtime != persist.mtime) {
             logging.warn("{s}: the source file changed under the checkpoint; abandoning the old upload and starting over", .{object});
@@ -168,6 +183,12 @@ fn resumeOrStart(
             persist.resumed = null;
         } else if (!sameConditions(s, options.preconditions)) {
             logging.warn("{s}: the conditions changed since the checkpoint; abandoning the old upload and starting over", .{object});
+            abandonResumed(client, bucket, s);
+            persist.resumed = null;
+        } else if (!encryption.sameOptional(s.key_sha256, persist.key_sha256) or !encryption.sameOptional(s.kms_key_name, persist.kms_key_name)) {
+            // The parts already sent are under the keys the upload began
+            // with, and the finish would need them.
+            logging.warn("{s}: the checkpoint's upload began under another encryption key, or none; abandoning it and starting over", .{object});
             abandonResumed(client, bucket, s);
             persist.resumed = null;
         }
@@ -256,6 +277,8 @@ fn saveUploadState(client: *Client, p: *const Persist, upload_id: []const u8, pa
         .if_metageneration_match = p.preconditions.if_metageneration_match,
         .if_metageneration_not_match = p.preconditions.if_metageneration_not_match,
         .billing_project = client.billing_project,
+        .key_sha256 = p.key_sha256,
+        .kms_key_name = p.kms_key_name,
     } };
     const bytes = try checkpoint.encodeAlloc(client.gpa, state);
     defer client.gpa.free(bytes);
@@ -517,7 +540,7 @@ fn fallback(
     options: types.ParallelUploadOptions,
 ) Error!types.Owned(types.ObjectInfo) {
     logging.debug("{s}: an emulator has no multipart uploads; sending one ordinary upload", .{object});
-    const target: Object = .{ .client = client, .bucket = bucket, .name = object };
+    const target: Object = .{ .client = client, .bucket = bucket, .name = object, .encryption_key = client.encryption_key };
     const upload_options: types.UploadOptions = .{
         .content_type = options.content_type,
         .cache_control = options.cache_control,
@@ -528,6 +551,7 @@ fn fallback(
         .crc32c = options.crc32c,
         .size = size,
         .preconditions = options.preconditions,
+        .kms_key_name = options.kms_key_name,
     };
     switch (source) {
         .data => |data| return target.upload(data, upload_options),
@@ -590,6 +614,7 @@ fn join(
             .content_encoding = options.content_encoding,
             .content_language = options.content_language,
             .metadata = options.metadata,
+            .kms_key_name = options.kms_key_name,
         });
         if (persist) |p| saveUploadState(client, p, id, plan.part_size) catch |err| {
             // An upload the checkpoint never recorded would only linger:
@@ -749,6 +774,13 @@ fn move(
     errdefer result.deinit();
     result.value = codec.decodeObject(result.arena.allocator(), body) catch |err|
         return rpc.decodeFailed(client, err, "move");
+    if (whole != null and result.value.crc32c == null and result.value.size == size) {
+        // An object under a customer-supplied key moves with no checksum
+        // in the answer. Its read, with the key, names one.
+        const read = try readBack(client, bucket, object, result.value.generation, size, whole);
+        result.deinit();
+        return read;
+    }
     if (result.value.size != size or (whole != null and result.value.crc32c != whole.?)) {
         if (client.diagnostics) |d| d.print("the move answered an object of {d} bytes that is not the one sent", .{result.value.size});
         return error.InvalidResponse;
@@ -1117,7 +1149,12 @@ fn readBack(
     const path = try names.objectPath(scratch.allocator(), bucket, object, generation, .{});
     var result: types.Owned(types.ObjectInfo) = try .init(client.gpa);
     errdefer result.deinit();
-    const body = rpc.execute(client, result.arena, .{ .method = .GET, .path = path }) catch |err| {
+    // An object under a customer-supplied key names its checksum only to a
+    // read that carries the key.
+    var key: encryption.KeyHeaders = undefined;
+    key.init(client.encryption_key, .object);
+    defer key.wipe();
+    const body = rpc.execute(client, result.arena, .{ .method = .GET, .path = path, .headers = key.slice() }) catch |err| {
         if (err == error.NotFound and generation != null) {
             if (client.diagnostics) |d| d.print("the object was written, and replaced before its metadata could be read back", .{});
         }

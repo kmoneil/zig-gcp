@@ -57,6 +57,11 @@ user_agent: []const u8,
 /// the call makes then carries it. Not an option; leave it null, and name a
 /// project with `Bucket.withBillingProject` or `Object.withBillingProject`.
 billing_project: ?[]const u8 = null,
+/// The customer-supplied key of the object the current call is on, taken
+/// from its handle, on the same copy of the client: the requests that read
+/// or write that object's data carry it, and no others. Not an option;
+/// leave it null, and hand a key over with `Object.withEncryptionKey`.
+encryption_key: ?*const types.EncryptionKey = null,
 /// Tests only: lowers the multipart upload's 5 MiB part floor and a
 /// parallel download's 1 MiB range floor, and lets an emulator endpoint
 /// take the multipart path instead of the ordinary upload `uploadParallel`
@@ -289,6 +294,29 @@ pub fn listBuckets(self: *Client, page: types.PageOptions) Error!types.Owned(typ
     const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
     result.value = codec.decodeBucketPage(result.arena.allocator(), body) catch |err|
         return rpc.decodeFailed(self, err, "bucket list");
+    return result;
+}
+
+/// The Cloud Storage service agent for `Options.project_id`, as
+/// `service-NUMBER@gs-project-accounts.iam.gserviceaccount.com`: the
+/// account that encrypts and decrypts with a Cloud KMS key on the
+/// project's behalf, and so the one to grant
+/// `roles/cloudkms.cryptoKeyEncrypterDecrypter` on a key before any write
+/// names it. Without that grant, a write naming the key, and a bucket
+/// created with it as the default, are `error.PermissionDenied`. Asking
+/// creates the agent if the project has none yet.
+pub fn serviceAgent(self: *Client) Error!types.Owned([]const u8) {
+    rpc.begin(self);
+    const project = try rpc.requireProject(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const path = try names.serviceAgentPath(scratch.allocator(), project);
+
+    var result: types.Owned([]const u8) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeServiceAgent(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "service agent");
     return result;
 }
 

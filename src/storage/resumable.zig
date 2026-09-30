@@ -21,6 +21,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const checkpoint = @import("checkpoint.zig");
 const codec = @import("codec.zig");
+const encryption = @import("encryption.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
 const names = @import("names.zig");
@@ -184,7 +185,10 @@ pub fn runSession(
 /// Opens a resumable session for `object_name` and returns its URI, in
 /// `arena`. The URI is a credential: anyone holding it can write the
 /// object for up to a week. Retried like a read: an unused session
-/// expires on its own.
+/// expires on its own. The call's customer-supplied key goes here and
+/// nowhere else: Cloud Storage encrypts the whole upload with the key its
+/// start named, and ignores one on its chunks, measured on 2026-09-30.
+/// So does its Cloud KMS key.
 pub fn startSession(
     client: *Client,
     arena: Allocator,
@@ -197,7 +201,7 @@ pub fn startSession(
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
-    const path = try names.uploadResumablePath(a, bucket_name, options.preconditions);
+    const path = try names.uploadResumablePath(a, bucket_name, options.preconditions, options.kms_key_name);
     const metadata = try codec.encodeUploadMetadata(a, object_name, options, metadata_crc);
     var length_buf: [20]u8 = undefined;
     var headers: std.ArrayList(core.transport.Header) = .empty;
@@ -208,6 +212,10 @@ pub fn startSession(
             .value = std.fmt.bufPrint(&length_buf, "{d}", .{declared}) catch unreachable,
         });
     }
+    var key: encryption.KeyHeaders = undefined;
+    key.init(client.encryption_key, .object);
+    defer key.wipe();
+    try headers.appendSlice(a, key.slice());
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
     const res = rpc.executeStream(client, &response, .{

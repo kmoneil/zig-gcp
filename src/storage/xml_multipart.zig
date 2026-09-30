@@ -20,6 +20,12 @@
 //!
 //! The upload id is not a credential: every request that names it still
 //! carries the client's token.
+//!
+//! An upload under a customer-supplied key needs the key on its start,
+//! every part and the finish, and refuses a part or finish without it or
+//! with another; the part list and the abort need none. A Cloud KMS key is
+//! named on the start alone. The finish of either answers no
+//! `x-goog-hash`, though each part's still does: measured 2026-09-30.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -27,6 +33,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const dl = @import("download.zig");
+const encryption = @import("encryption.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -77,6 +84,8 @@ pub const Start = struct {
     content_encoding: ?[]const u8 = null,
     content_language: ?[]const u8 = null,
     metadata: []const types.Metadata = &.{},
+    /// The Cloud KMS key to encrypt the object under, already checked.
+    kms_key_name: ?[]const u8 = null,
 };
 
 /// Starts an upload of `object` and returns its id, which lives in
@@ -86,7 +95,10 @@ pub fn start(client: *Client, arena: Allocator, bucket: []const u8, object: []co
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
     const path = try names.xmlPath(scratch.allocator(), bucket, object, .uploads);
-    const headers = try startHeaders(scratch.allocator(), meta);
+    var key: encryption.KeyHeaders = undefined;
+    key.init(client.encryption_key, .object);
+    defer key.wipe();
+    const headers = try startHeaders(scratch.allocator(), meta, &key);
     // Reset between attempts, so it holds nothing but the answer.
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
@@ -113,8 +125,10 @@ pub fn start(client: *Client, arena: Allocator, bucket: []const u8, object: []co
     return id;
 }
 
-fn startHeaders(arena: Allocator, meta: Start) Allocator.Error![]const core.transport.Header {
+fn startHeaders(arena: Allocator, meta: Start, key: *const encryption.KeyHeaders) Allocator.Error![]const core.transport.Header {
     var headers: std.ArrayList(core.transport.Header) = .empty;
+    try headers.appendSlice(arena, key.slice());
+    if (meta.kms_key_name) |name| try headers.append(arena, .{ .name = "x-goog-encryption-kms-key-name", .value = name });
     const fixed = [_]struct { []const u8, ?[]const u8 }{
         .{ "Cache-Control", meta.cache_control },
         .{ "Content-Disposition", meta.content_disposition },
@@ -161,7 +175,10 @@ pub fn sendPart(
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
     const path = try names.xmlPath(scratch.allocator(), bucket, object, .{ .part = .{ .number = number, .upload_id = upload_id } });
-    const call: rpc.StreamCall = .{ .method = .PUT, .path = path, .decode_error = xml.decodeError };
+    var key: encryption.KeyHeaders = undefined;
+    key.init(client.encryption_key, .object);
+    defer key.wipe();
+    const call: rpc.StreamCall = .{ .method = .PUT, .path = path, .headers = key.slice(), .decode_error = xml.decodeError };
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
     const res = switch (body) {
@@ -220,12 +237,16 @@ pub fn finish(
     defer scratch.deinit();
     const path = try names.xmlPath(scratch.allocator(), bucket, object, .{ .upload = upload_id });
     const body = try xml.encodeComplete(scratch.allocator(), parts);
+    var key: encryption.KeyHeaders = undefined;
+    key.init(client.encryption_key, .object);
+    defer key.wipe();
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
     const res = rpc.executeXml(client, &response, .{
         .method = .POST,
         .path = path,
         .content_type = "application/xml",
+        .headers = key.slice(),
         .body = .{ .segments = &.{body} },
         .timeout_ms = timeout_ms,
         .decode_error = xml.decodeError,

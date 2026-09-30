@@ -14,6 +14,7 @@ const codec = @import("codec.zig");
 const compose_impl = @import("compose.zig");
 const copy_impl = @import("copy.zig");
 const dl = @import("download.zig");
+const encryption = @import("encryption.zig");
 const errors = @import("errors.zig");
 const gzip_download = @import("gzip_download.zig");
 const gzip_upload = @import("gzip_upload.zig");
@@ -43,6 +44,9 @@ name: []const u8,
 /// needs of anyone but its owners: a project id or number. Null bills as
 /// the credentials do. Borrowed; the handle must not outlive it.
 billing_project: ?[]const u8 = null,
+/// The customer-supplied key the object is encrypted with, or null.
+/// Borrowed; the handle must not outlive it.
+encryption_key: ?*const types.EncryptionKey = null,
 
 /// This handle, billing `project` for every request it makes: the
 /// `userProject` parameter and the `x-goog-user-project` header, one
@@ -54,14 +58,33 @@ pub fn withBillingProject(self: Object, project: []const u8) Object {
     return copy;
 }
 
-/// This handle on `copy`, a copy of its client that bills this handle's
-/// project for the call now beginning. A handle that names none keeps what
-/// its client bills already, as the handles a transfer makes for its own
-/// requests do.
-fn billing(self: Object, copy: *Client) Error!Object {
+/// This handle, for an object encrypted with a customer-supplied key:
+/// every request that reads or writes its data carries `key`, which Cloud
+/// Storage needs for them and keeps only the SHA-256 of. That is a read,
+/// each range and resume of it, an upload, a copy's source and
+/// destination, a compose, a metadata read or update (which otherwise
+/// leave out the checksums), and a signed URL, which signs the key's
+/// headers in for its holder to send. `exists`, `delete`, `restore` and
+/// listings carry nothing: they need no key, and a key sent for an object
+/// stored without one is refused. The handle borrows `key`, and must not
+/// outlive it. Nothing logs it, and the headers built from it are wiped
+/// when each call returns.
+pub fn withEncryptionKey(self: Object, key: *const types.EncryptionKey) Object {
+    var copy = self;
+    copy.encryption_key = key;
+    return copy;
+}
+
+/// This handle on `copy`, a copy of its client for the call now beginning,
+/// which bills this handle's project and carries its key. A handle that
+/// names no project keeps what its client bills already, as the handles a
+/// transfer makes for its own requests do. The key is the handle's own: a
+/// transfer's handles carry one only where they are given it.
+fn forCall(self: Object, copy: *Client) Error!Object {
     rpc.begin(self.client);
     try rpc.checkBillingProject(self.client, self.billing_project);
     copy.* = rpc.billed(self.client, self.billing_project orelse self.client.billing_project);
+    copy.encryption_key = self.encryption_key;
     var billed_self = self;
     billed_self.client = copy;
     return billed_self;
@@ -73,7 +96,7 @@ fn billing(self: Object, copy: *Client) Error!Object {
 /// with `error.InvalidArgument`, as Cloud Storage refuses it.
 pub fn get(self: Object, options: types.GetOptions) Error!types.Owned(types.ObjectInfo) {
     var client: Client = undefined;
-    return (try self.billing(&client)).getBilled(options);
+    return (try self.forCall(&client)).getBilled(options);
 }
 
 fn getBilled(self: Object, options: types.GetOptions) Error!types.Owned(types.ObjectInfo) {
@@ -90,7 +113,12 @@ fn getBilled(self: Object, options: types.GetOptions) Error!types.Owned(types.Ob
 
     var result: types.Owned(types.ObjectInfo) = try .init(self.client.gpa);
     errdefer result.deinit();
-    const response = try rpc.execute(self.client, result.arena, .{ .method = .GET, .path = path });
+    // With the key, the answer carries the checksums. A soft-deleted
+    // generation's metadata is read without one: it has no bytes to check.
+    var key: encryption.KeyHeaders = undefined;
+    key.init(if (options.soft_deleted) null else self.client.encryption_key, .object);
+    defer key.wipe();
+    const response = try rpc.execute(self.client, result.arena, .{ .method = .GET, .path = path, .headers = key.slice() });
     result.value = codec.decodeObject(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(self.client, err, "object");
     return result;
@@ -107,7 +135,7 @@ fn getBilled(self: Object, options: types.GetOptions) Error!types.Owned(types.Ob
 /// It is a bearer credential until it expires, so it is never logged.
 pub fn signedUrl(self: Object, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
     var client: Client = undefined;
-    return (try self.billing(&client)).signedUrlBilled(signer, options);
+    return (try self.forCall(&client)).signedUrlBilled(signer, options);
 }
 
 fn signedUrlBilled(self: Object, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
@@ -130,9 +158,13 @@ fn signedUrlBilled(self: Object, signer: core.Signer, options: types.SignedUrlOp
 /// credential together until they expire, so they are never logged.
 pub fn postPolicy(self: Object, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
     var client: Client = undefined;
-    const this = try self.billing(&client);
+    const this = try self.forCall(&client);
     if (this.billing_project != null) {
         if (this.client.diagnostics) |d| d.print("a POST policy cannot bill a project: an HTML form has no way to name one", .{});
+        return error.InvalidPostPolicyOptions;
+    }
+    if (this.encryption_key != null) {
+        if (this.client.diagnostics) |d| d.print("a POST policy cannot carry a customer-supplied key: an HTML form has no way to send one", .{});
         return error.InvalidPostPolicyOptions;
     }
     return this.postPolicyBilled(signer, options);
@@ -164,7 +196,7 @@ pub fn composeFrom(
     options: types.ComposeOptions,
 ) Error!types.Owned(types.ObjectInfo) {
     var client: Client = undefined;
-    return (try self.billing(&client)).composeFromBilled(sources, options);
+    return (try self.forCall(&client)).composeFromBilled(sources, options);
 }
 
 fn composeFromBilled(
@@ -175,7 +207,10 @@ fn composeFromBilled(
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
-    return compose_impl.compose(self.client, self.bucket, self.name, sources, options);
+    var checked = options;
+    checked.kms_key_name = try encryption.kmsKeyName(self.client, options.kms_key_name);
+    try encryption.checkOneKey(self.client, self.client.encryption_key, checked.kms_key_name);
+    return compose_impl.compose(self.client, self.bucket, self.name, sources, checked);
 }
 
 /// Changes what this object says about itself, leaving its bytes and its
@@ -189,7 +224,7 @@ fn composeFromBilled(
 /// since the generation does not move.
 pub fn updateMetadata(self: Object, options: types.MetadataUpdate) Error!types.Owned(types.ObjectInfo) {
     var client: Client = undefined;
-    return (try self.billing(&client)).updateMetadataBilled(options);
+    return (try self.forCall(&client)).updateMetadataBilled(options);
 }
 
 fn updateMetadataBilled(self: Object, options: types.MetadataUpdate) Error!types.Owned(types.ObjectInfo) {
@@ -214,7 +249,7 @@ fn updateMetadataBilled(self: Object, options: types.MetadataUpdate) Error!types
 /// `.does_not_exist` restores only where no live object has the name.
 pub fn restore(self: Object, options: types.RestoreOptions) Error!types.Owned(types.ObjectInfo) {
     var client: Client = undefined;
-    return (try self.billing(&client)).restoreBilled(options);
+    return (try self.forCall(&client)).restoreBilled(options);
 }
 
 fn restoreBilled(self: Object, options: types.RestoreOptions) Error!types.Owned(types.ObjectInfo) {
@@ -225,9 +260,13 @@ fn restoreBilled(self: Object, options: types.RestoreOptions) Error!types.Owned(
 }
 
 /// Sugar over `get`: whether a live object has this name. `NotFound`
-/// becomes false; every other failure stays an error.
+/// becomes false; every other failure stays an error. It carries no key,
+/// which it needs for no object and which one stored without a key would
+/// refuse.
 pub fn exists(self: Object) Error!bool {
-    var info = self.get(.{}) catch |err| switch (err) {
+    var keyless = self;
+    keyless.encryption_key = null;
+    var info = keyless.get(.{}) catch |err| switch (err) {
         error.NotFound => return false,
         else => |e| return e,
     };
@@ -242,7 +281,7 @@ pub fn exists(self: Object) Error!bool {
 /// remove someone else's newer object.
 pub fn delete(self: Object, options: types.DeleteOptions) Error!void {
     var client: Client = undefined;
-    return (try self.billing(&client)).deleteBilled(options);
+    return (try self.forCall(&client)).deleteBilled(options);
 }
 
 fn deleteBilled(self: Object, options: types.DeleteOptions) Error!void {
@@ -280,14 +319,14 @@ fn deleteBilled(self: Object, options: types.DeleteOptions) Error!void {
 /// `chunk_size` buffer of memory, and a lost session compresses it again.
 pub fn upload(self: Object, data: []const u8, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     var client: Client = undefined;
-    return (try self.billing(&client)).uploadBilled(data, options);
+    return (try self.forCall(&client)).uploadBilled(data, options);
 }
 
-fn uploadBilled(self: Object, data: []const u8, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
+fn uploadBilled(self: Object, data: []const u8, unchecked: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
-    try checkUploadOptions(self.client, options);
+    const options = try checkUploadOptions(self.client, unchecked);
     try refuseCheckpoint(self.client, options);
     if (options.size) |size| if (size != data.len) {
         if (self.client.diagnostics) |d| d.print("options.size says {d} bytes, the data has {d}", .{ size, data.len });
@@ -339,15 +378,19 @@ fn uploadCompressed(self: Object, input: gzip_upload.Input, options: types.Uploa
 fn sendMultipart(self: Object, data: []const u8, options: types.UploadOptions, checksum: ?[8]u8) Error!types.Owned(types.ObjectInfo) {
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
-    const path = try names.uploadMultipartPath(scratch.allocator(), self.bucket, options.preconditions);
+    const path = try names.uploadMultipartPath(scratch.allocator(), self.bucket, options.preconditions, options.kms_key_name);
     const parts = try multipart.build(scratch.allocator(), self.client.io, self.name, options, checksum);
 
     var result: types.Owned(types.ObjectInfo) = try .init(self.client.gpa);
     errdefer result.deinit();
+    var key: encryption.KeyHeaders = undefined;
+    key.init(self.client.encryption_key, .object);
+    defer key.wipe();
     const res = rpc.executeStream(self.client, result.arena, .{
         .method = .POST,
         .path = path,
         .content_type = parts.content_type,
+        .headers = key.slice(),
         .body = .{ .segments = &.{ parts.opening, data, parts.closing } },
         .retry = options.preconditions.makesWriteSafe() or self.client.retry_unconditional_writes,
     }) catch |err| switch (err) {
@@ -383,14 +426,14 @@ fn sendMultipart(self: Object, data: []const u8, options: types.UploadOptions, c
 /// counts the bytes the reader gives.
 pub fn uploadFrom(self: Object, reader: *std.Io.Reader, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     var client: Client = undefined;
-    return (try self.billing(&client)).uploadFromBilled(reader, options);
+    return (try self.forCall(&client)).uploadFromBilled(reader, options);
 }
 
-fn uploadFromBilled(self: Object, reader: *std.Io.Reader, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
+fn uploadFromBilled(self: Object, reader: *std.Io.Reader, unchecked: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
-    try checkUploadOptions(self.client, options);
+    const options = try checkUploadOptions(self.client, unchecked);
     try refuseCheckpoint(self.client, options);
     if (options.gzip) |gzip| return self.uploadCompressed(.{ .reader = .{ .r = reader, .declared = options.size } }, options, gzip);
 
@@ -459,13 +502,16 @@ fn uploadFromBilled(self: Object, reader: *std.Io.Reader, options: types.UploadO
 /// goes up as one ordinary upload, with the conditions applied to it.
 pub fn uploadParallel(self: Object, source: types.ParallelSource, options: types.ParallelUploadOptions) Error!types.Owned(types.ObjectInfo) {
     var client: Client = undefined;
-    return (try self.billing(&client)).uploadParallelBilled(source, options);
+    return (try self.forCall(&client)).uploadParallelBilled(source, options);
 }
 
-fn uploadParallelBilled(self: Object, source: types.ParallelSource, options: types.ParallelUploadOptions) Error!types.Owned(types.ObjectInfo) {
+fn uploadParallelBilled(self: Object, source: types.ParallelSource, unchecked: types.ParallelUploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
+    var options = unchecked;
+    options.kms_key_name = try encryption.kmsKeyName(self.client, unchecked.kms_key_name);
+    try encryption.checkOneKey(self.client, self.client.encryption_key, options.kms_key_name);
     return parallel.upload(self.client, self.bucket, self.name, source, options);
 }
 
@@ -491,16 +537,19 @@ pub fn copyTo(self: Object, dest: Object, options: types.CopyOptions) Error!type
     var source = self;
     source.billing_project = self.billing_project orelse dest.billing_project;
     var client: Client = undefined;
-    return (try source.billing(&client)).copyToBilled(dest, options);
+    return (try source.forCall(&client)).copyToBilled(dest, options);
 }
 
-fn copyToBilled(self: Object, dest: Object, options: types.CopyOptions) Error!types.Owned(types.ObjectInfo) {
+fn copyToBilled(self: Object, dest: Object, unchecked: types.CopyOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
     try rpc.checkBucketName(self.client, dest.bucket);
     try rpc.checkObjectName(self.client, dest.name);
-    return copy_impl.copy(self.client, self.bucket, self.name, dest.bucket, dest.name, options);
+    var options = unchecked;
+    options.kms_key_name = try encryption.kmsKeyName(self.client, unchecked.kms_key_name);
+    try encryption.checkOneKey(self.client, dest.encryption_key, options.kms_key_name);
+    return copy_impl.copy(self.client, self.bucket, self.name, dest.bucket, dest.name, options, dest.encryption_key);
 }
 
 /// Uploads the file through the resumable protocol, reading it at offsets
@@ -532,14 +581,14 @@ fn copyToBilled(self: Object, dest: Object, options: types.CopyOptions) Error!ty
 /// from another starts over.
 pub fn uploadFile(self: Object, file: std.Io.File, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     var client: Client = undefined;
-    return (try self.billing(&client)).uploadFileBilled(file, options);
+    return (try self.forCall(&client)).uploadFileBilled(file, options);
 }
 
-fn uploadFileBilled(self: Object, file: std.Io.File, options: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
+fn uploadFileBilled(self: Object, file: std.Io.File, unchecked: types.UploadOptions) Error!types.Owned(types.ObjectInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
-    try checkUploadOptions(self.client, options);
+    const options = try checkUploadOptions(self.client, unchecked);
     if (options.size != null) {
         if (self.client.diagnostics) |d| d.print("uploadFile takes its size from the file; leave options.size null", .{});
         return error.InvalidArgument;
@@ -555,7 +604,12 @@ fn refuseCheckpoint(client: *Client, options: types.UploadOptions) Error!void {
     return error.InvalidArgument;
 }
 
-fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void {
+/// Refuses what an upload could not send, and returns the options with
+/// their Cloud KMS key name as Cloud Storage takes it.
+fn checkUploadOptions(client: *Client, unchecked: types.UploadOptions) Error!types.UploadOptions {
+    var options = unchecked;
+    options.kms_key_name = try encryption.kmsKeyName(client, unchecked.kms_key_name);
+    try encryption.checkOneKey(client, client.encryption_key, options.kms_key_name);
     // The content type becomes a header line inside the multipart body.
     if (!core.transport.isValidHeaderValue(options.content_type)) {
         if (client.diagnostics) |d| d.print("invalid content type: expected a header value", .{});
@@ -590,6 +644,7 @@ fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void 
         }
         return error.InvalidArgument;
     }
+    return options;
 }
 
 /// Streams the object into `writer`, hashing the bytes as they pass and
@@ -609,7 +664,7 @@ fn checkUploadOptions(client: *Client, options: types.UploadOptions) Error!void 
 /// be discarded.
 pub fn download(self: Object, writer: *std.Io.Writer, options: types.DownloadOptions) Error!types.DownloadResult {
     var client: Client = undefined;
-    return (try self.billing(&client)).downloadBilled(writer, options);
+    return (try self.forCall(&client)).downloadBilled(writer, options);
 }
 
 fn downloadBilled(self: Object, writer: *std.Io.Writer, options: types.DownloadOptions) Error!types.DownloadResult {
@@ -655,6 +710,10 @@ fn downloadBilled(self: Object, writer: *std.Io.Writer, options: types.DownloadO
     // Set when a plain object came compressed on its way: asked again,
     // plainly.
     var plain_only = false;
+    // Every request for the bytes carries the key, resumes included.
+    var key: encryption.KeyHeaders = undefined;
+    key.init(self.client.encryption_key, .object);
+    defer key.wipe();
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
         const delivered = counting.count;
@@ -663,12 +722,14 @@ fn downloadBilled(self: Object, writer: *std.Io.Writer, options: types.DownloadO
         const wants_partial = options.range != null or resuming;
         const path = try names.objectMediaPath(scratch.allocator(), self.bucket, self.name, generation, options.preconditions);
         var range_buf: [64]u8 = undefined;
-        var header_storage: [1]core.transport.Header = undefined;
-        var headers: []const core.transport.Header = &.{};
+        var range: [1]core.transport.Header = undefined;
+        var fixed: []const core.transport.Header = &.{};
         if (wants_partial) {
-            header_storage[0] = .{ .name = "Range", .value = dl.formatRange(&range_buf, start, range_end) };
-            headers = header_storage[0..1];
+            range[0] = .{ .name = "Range", .value = dl.formatRange(&range_buf, start, range_end) };
+            fixed = range[0..1];
         }
+        var header_storage: [4]core.transport.Header = undefined;
+        const headers = encryption.withKey(&header_storage, fixed, &key);
 
         head = null;
         const tapped = tap.mode == .undecided;
@@ -867,7 +928,7 @@ fn finishStream(
 /// is the built-in store.
 pub fn downloadParallel(self: Object, destination: types.ParallelDestination, options: types.ParallelDownloadOptions) Error!types.DownloadResult {
     var client: Client = undefined;
-    return (try self.billing(&client)).downloadParallelBilled(destination, options);
+    return (try self.forCall(&client)).downloadParallelBilled(destination, options);
 }
 
 fn downloadParallelBilled(self: Object, destination: types.ParallelDestination, options: types.ParallelDownloadOptions) Error!types.DownloadResult {
