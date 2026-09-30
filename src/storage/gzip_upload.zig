@@ -1212,8 +1212,8 @@ fn uploadUnderFaultsProperty(_: void, input: []const u8) !void {
     try uploadUnderFaults(input);
 }
 
-// Compressing up to 700 KiB in Debug on every run: too slow for the nightly
-// "fuzz" filters, like the other fault properties.
+// Compressing up to 700 KiB in Debug on every run, about 85 ms: too slow
+// for the nightly's "fuzz" filters, and fuzzed by its fault-gzip job.
 test "fault property gzip upload: any data, any level, under faults, is stored as gzip of the data" {
     try test_util.fuzzBytes({}, uploadUnderFaultsProperty, .{
         .random_runs = 40,

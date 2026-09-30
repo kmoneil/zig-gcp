@@ -303,6 +303,8 @@ jobs:
           - { job: storage, module: storage, filter: fuzz, iterations: 1600K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 4800K }
           - { job: heavy-storage, module: storage, filter: heavy property, iterations: 37K }
+          - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 40K }
+          - { job: fault-gzip, module: storage, filter: fault property gzip|fault property compressed, iterations: 6K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -330,7 +332,11 @@ jobs:
           set -o pipefail
           # A failing input saved by an earlier run is not this run's.
           rm -f .zig-cache/f/crash
-          zig build test -Dfuzz-runner "-Dmodule=$MODULE" "-Dtest-filter=$FILTER" "--fuzz=$ITERATIONS" 2>&1 | tee "$RUNNER_TEMP/fuzz.log"
+          # A filter of several names, separated by |, runs each of them.
+          filters=()
+          IFS='|' read -ra parts <<< "$FILTER"
+          for f in "${parts[@]}"; do filters+=("-Dtest-filter=$f"); done
+          zig build test -Dfuzz-runner "-Dmodule=$MODULE" "${filters[@]}" "--fuzz=$ITERATIONS" 2>&1 | tee "$RUNNER_TEMP/fuzz.log"
           # A test that fails or crashes while being fuzzed does not fail
           # zig build, which still exits 0: the input it saves, and the line
           # that reports it, are the only signs. Either one fails the job.

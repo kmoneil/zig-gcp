@@ -918,8 +918,8 @@ fn roundTripProperty(_: void, input: []const u8) !void {
     try roundTripUnderFaults(input);
 }
 
-// Compressing up to 600 KiB in Debug on every run: too slow for the nightly
-// "fuzz" filters, like the other fault properties.
+// Compressing up to 600 KiB in Debug on every run, about 35 ms: too slow
+// for the nightly's "fuzz" filters, and fuzzed by its fault-gzip job.
 test "fault property gzip download: any bytes, any level, cut anywhere, come back exact and verified" {
     try test_util.fuzzBytes({}, roundTripProperty, .{
         .random_runs = 40,
