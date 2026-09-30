@@ -17,6 +17,17 @@ pub fn bucketsPath(arena: Allocator, project: []const u8, page: types.PageOption
     return out.toOwnedSlice();
 }
 
+/// `/storage/v1/projects/{project}/serviceAccount`: the project's Cloud
+/// Storage service agent.
+pub fn serviceAgentPath(arena: Allocator, project: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeAll("/storage/v1/projects/") catch return error.OutOfMemory;
+    query.writeStrictSegment(w, project) catch return error.OutOfMemory;
+    w.writeAll("/serviceAccount") catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
 /// `/storage/v1/b/{bucket}`.
 pub fn bucketPath(arena: Allocator, bucket: []const u8) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
@@ -178,6 +189,7 @@ pub fn composePath(
     bucket: []const u8,
     object: []const u8,
     preconditions: types.Preconditions,
+    kms_key_name: ?[]const u8,
 ) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
     write(&out.writer, .{
@@ -185,6 +197,7 @@ pub fn composePath(
         .object = object,
         .compose = true,
         .preconditions = preconditions,
+        .kms_key_name = kms_key_name,
     }) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
@@ -217,6 +230,8 @@ pub const RewriteParams = struct {
     if_source_metageneration_match: ?u64 = null,
     /// Conditions on the destination.
     preconditions: types.Preconditions = .{},
+    /// The Cloud KMS key that encrypts the copy.
+    destination_kms_key_name: ?[]const u8 = null,
     /// Continues an earlier call's work.
     rewrite_token: ?[]const u8 = null,
 };
@@ -257,6 +272,7 @@ fn writeRewrite(
     if (rewrite.source_generation) |g| try params.addInt("sourceGeneration", g);
     if (rewrite.if_source_metageneration_match) |m| try params.addInt("ifSourceMetagenerationMatch", m);
     try writePreconditions(&params, rewrite.preconditions);
+    try params.addOptional("destinationKmsKeyName", rewrite.destination_kms_key_name);
     try params.addOptional("rewriteToken", rewrite.rewrite_token);
 }
 
@@ -296,38 +312,32 @@ fn writeMove(
     try writePreconditions(&params, preconditions);
 }
 
-/// `/upload/storage/v1/b/{bucket}/o?uploadType=multipart`. The object name
-/// travels in the metadata part, not here.
-pub fn uploadMultipartPath(arena: Allocator, bucket: []const u8, preconditions: types.Preconditions) Allocator.Error![]u8 {
+/// `/upload/storage/v1/b/{bucket}/o?uploadType=multipart`, with the
+/// Cloud KMS key to encrypt under, if any. The object name travels in the
+/// metadata part, not here.
+pub fn uploadMultipartPath(arena: Allocator, bucket: []const u8, preconditions: types.Preconditions, kms_key_name: ?[]const u8) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
-    writeUpload(&out.writer, bucket, preconditions) catch return error.OutOfMemory;
+    writeUpload(&out.writer, bucket, "multipart", preconditions, kms_key_name) catch return error.OutOfMemory;
     return out.toOwnedSlice();
-}
-
-fn writeUpload(w: *Writer, bucket: []const u8, preconditions: types.Preconditions) Writer.Error!void {
-    try w.writeAll("/upload/storage/v1/b/");
-    try query.writeStrictSegment(w, bucket);
-    try w.writeAll("/o?uploadType=multipart");
-    var params: query.Params = .init(w);
-    params.separator = '&';
-    try writePreconditions(&params, preconditions);
 }
 
 /// `/upload/storage/v1/b/{bucket}/o?uploadType=resumable`, which opens a
-/// session. The object name travels in the metadata body.
-pub fn uploadResumablePath(arena: Allocator, bucket: []const u8, preconditions: types.Preconditions) Allocator.Error![]u8 {
+/// session, with the Cloud KMS key to encrypt under, if any. The object
+/// name travels in the metadata body.
+pub fn uploadResumablePath(arena: Allocator, bucket: []const u8, preconditions: types.Preconditions, kms_key_name: ?[]const u8) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
-    writeResumable(&out.writer, bucket, preconditions) catch return error.OutOfMemory;
+    writeUpload(&out.writer, bucket, "resumable", preconditions, kms_key_name) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn writeResumable(w: *Writer, bucket: []const u8, preconditions: types.Preconditions) Writer.Error!void {
+fn writeUpload(w: *Writer, bucket: []const u8, upload_type: []const u8, preconditions: types.Preconditions, kms_key_name: ?[]const u8) Writer.Error!void {
     try w.writeAll("/upload/storage/v1/b/");
     try query.writeStrictSegment(w, bucket);
-    try w.writeAll("/o?uploadType=resumable");
+    try w.print("/o?uploadType={s}", .{upload_type});
     var params: query.Params = .init(w);
     params.separator = '&';
     try writePreconditions(&params, preconditions);
+    try params.addOptional("kmsKeyName", kms_key_name);
 }
 
 /// Writes a bucket or object name into an XML API path, as signed URLs and
@@ -407,6 +417,7 @@ const Parts = struct {
     soft_deleted: bool = false,
     copy_source_acl: bool = false,
     restore_token: ?[]const u8 = null,
+    kms_key_name: ?[]const u8 = null,
     page_size: u32 = 0,
     page_token: ?[]const u8 = null,
 };
@@ -430,6 +441,7 @@ fn write(w: *Writer, parts: Parts) Writer.Error!void {
     try params.addOptional("project", parts.project);
     if (parts.generation) |g| try params.addInt("generation", g);
     try writePreconditions(&params, parts.preconditions);
+    try params.addOptional("kmsKeyName", parts.kms_key_name);
     try params.addOptional("prefix", parts.prefix);
     try params.addOptional("delimiter", parts.delimiter);
     try params.addOptional("matchGlob", parts.match_glob);
@@ -517,7 +529,7 @@ test "media and upload paths" {
     );
     try expectPath(
         "/upload/storage/v1/b/my-bucket/o?uploadType=multipart",
-        try uploadMultipartPath(gpa, "my-bucket", .{}),
+        try uploadMultipartPath(gpa, "my-bucket", .{}, null),
     );
 }
 
@@ -557,13 +569,23 @@ test "preconditions become their query parameters, in every position" {
     // Upload paths already carry a query; conditions append to it.
     try expectPath(
         "/upload/storage/v1/b/b/o?uploadType=multipart&ifGenerationMatch=0",
-        try uploadMultipartPath(gpa, "b", .does_not_exist),
+        try uploadMultipartPath(gpa, "b", .does_not_exist, null),
     );
     try expectPath(
         "/upload/storage/v1/b/b/o?uploadType=resumable&ifGenerationMatch=12",
-        try uploadResumablePath(gpa, "b", .{ .if_generation_match = 12 }),
+        try uploadResumablePath(gpa, "b", .{ .if_generation_match = 12 }, null),
     );
-    try expectPath("/upload/storage/v1/b/b/o?uploadType=resumable", try uploadResumablePath(gpa, "b", .{}));
+    try expectPath("/upload/storage/v1/b/b/o?uploadType=resumable", try uploadResumablePath(gpa, "b", .{}, null));
+    // A Cloud KMS key rides along as a strict query value.
+    try expectPath(
+        "/upload/storage/v1/b/b/o?uploadType=resumable&ifGenerationMatch=0&kmsKeyName=projects%2Fp%2Flocations%2Fus%2FkeyRings%2Fr%2FcryptoKeys%2Fk",
+        try uploadResumablePath(gpa, "b", .does_not_exist, "projects/p/locations/us/keyRings/r/cryptoKeys/k"),
+    );
+    try expectPath(
+        "/upload/storage/v1/b/b/o?uploadType=multipart&kmsKeyName=k%20%26x",
+        try uploadMultipartPath(gpa, "b", .{}, "k &x"),
+    );
+    try expectPath("/storage/v1/projects/my-project/serviceAccount", try serviceAgentPath(gpa, "my-project"));
 }
 
 test "XML API paths keep the name's slashes and encode the rest" {

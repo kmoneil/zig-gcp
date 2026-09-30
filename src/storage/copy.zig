@@ -25,6 +25,12 @@
 //!   versions.
 //! - Every call of the loop sends the same resource and parameters, which
 //!   the API requires of calls that carry a rewrite token.
+//! - Every call carries the source's customer-supplied key as the
+//!   `x-goog-copy-source-encryption-` headers and the destination's as the
+//!   object's own, as Google's libraries resend both with the token. A
+//!   copy that names no Cloud KMS key gets the destination bucket's
+//!   default, not the source's key, as measured. A changed copy's read of
+//!   its source carries no key: the metadata it needs comes without one.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -34,6 +40,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const encryption = @import("encryption.zig");
 const logging = @import("logging.zig");
 const metadata = @import("metadata.zig");
 const names = @import("names.zig");
@@ -54,7 +61,8 @@ const max_rounds = 100_000;
 
 /// Copies `source_object` to `dest_object`, looping over rewrite calls
 /// until the service reports done. The caller has begun the call and
-/// checked all four names.
+/// checked all four names and the KMS key name. The source's key is the
+/// client's; the destination's is `dest_key`.
 pub fn copy(
     client: *Client,
     source_bucket: []const u8,
@@ -62,6 +70,7 @@ pub fn copy(
     dest_bucket: []const u8,
     dest_object: []const u8,
     options: types.CopyOptions,
+    dest_key: ?*const types.EncryptionKey,
 ) Error!types.Owned(types.ObjectInfo) {
     try check(client.diagnostics, options);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
@@ -72,7 +81,16 @@ pub fn copy(
     var params: names.RewriteParams = .{
         .source_generation = options.source_generation,
         .preconditions = options.preconditions,
+        .destination_kms_key_name = options.kms_key_name,
     };
+    var source_key: encryption.KeyHeaders = undefined;
+    source_key.init(client.encryption_key, .copy_source);
+    defer source_key.wipe();
+    var destination_key: encryption.KeyHeaders = undefined;
+    destination_key.init(dest_key, .object);
+    defer destination_key.wipe();
+    var header_storage: [6]core.transport.Header = undefined;
+    const headers = encryption.withKey(&header_storage, source_key.slice(), &destination_key);
     var body: []const u8 = "{}";
     if (changes(options)) {
         const path = try names.objectPath(scratch.allocator(), source_bucket, source_object, options.source_generation, .{});
@@ -105,6 +123,7 @@ pub fn copy(
             .method = .POST,
             .path = path,
             .body = body,
+            .headers = headers,
             .retry = retried,
         }) catch |err| switch (err) {
             error.FailedPrecondition => {

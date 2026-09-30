@@ -84,6 +84,13 @@ pub fn decodeObject(arena: Allocator, body: []const u8) DecodeError!types.Object
     return objectFromWire(arena, try parseWire(WireObject, arena, body));
 }
 
+/// The service agent's address from `projects.serviceAccount.get`, whose
+/// one field is in snake case, unlike the rest of the API.
+pub fn decodeServiceAgent(arena: Allocator, body: []const u8) DecodeError![]const u8 {
+    const wire = try parseWire(struct { email_address: ?[]const u8 = null }, arena, body);
+    return nonEmpty(wire.email_address) orelse error.InvalidResponse;
+}
+
 /// The `size` an Object resource names, or null when it names none, which
 /// `ObjectInfo` cannot tell from an empty object.
 pub fn decodeObjectSize(arena: Allocator, body: []const u8) DecodeError!?u64 {
@@ -228,6 +235,8 @@ const WireObject = struct {
     softDeleteTime: ?[]const u8 = null,
     hardDeleteTime: ?[]const u8 = null,
     restoreToken: ?[]const u8 = null,
+    kmsKeyName: ?[]const u8 = null,
+    customerEncryption: ?struct { keySha256: ?[]const u8 = null } = null,
 };
 
 const WireObjectPage = struct {
@@ -301,6 +310,8 @@ fn objectFromWire(arena: Allocator, wire: WireObject) DecodeError!types.ObjectIn
         .soft_delete_time = nonEmpty(wire.softDeleteTime),
         .hard_delete_time = nonEmpty(wire.hardDeleteTime),
         .restore_token = nonEmpty(wire.restoreToken),
+        .kms_key_name = nonEmpty(wire.kmsKeyName),
+        .encryption_key_sha256 = if (wire.customerEncryption) |c| try sha256FromWire(c.keySha256) else null,
     };
 }
 
@@ -585,6 +596,16 @@ fn md5FromWire(text: ?[]const u8) DecodeError!?[16]u8 {
     const len = decoder.calcSizeForSlice(t) catch return error.InvalidResponse;
     if (len != 16) return error.InvalidResponse;
     var digest: [16]u8 = undefined;
+    decoder.decode(&digest, t) catch return error.InvalidResponse;
+    return digest;
+}
+
+fn sha256FromWire(text: ?[]const u8) DecodeError!?[32]u8 {
+    const t = text orelse return null;
+    const decoder = std.base64.standard.Decoder;
+    const len = decoder.calcSizeForSlice(t) catch return error.InvalidResponse;
+    if (len != 32) return error.InvalidResponse;
+    var digest: [32]u8 = undefined;
     decoder.decode(&digest, t) catch return error.InvalidResponse;
     return digest;
 }
@@ -1166,6 +1187,49 @@ test "decode operations: progress unknown, counts as strings or numbers, and mal
     const page = try decodeOperationPage(a, "{\"kind\":\"storage#operations\"}");
     try testing.expectEqual(0, page.operations.len);
     try testing.expectError(error.InvalidResponse, decodeOperationPage(a, "{\"operations\":[{}]}"));
+}
+
+test "decode: objects under a customer key and a Cloud KMS key, as production answers them" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A get without the key, measured 2026-09-30: no checksums, the key's
+    // SHA-256 always.
+    const csek = try decodeObject(arena,
+        \\{"kind":"storage#object","name":"c-multi","bucket":"zigps-keys-e7ec9f","generation":"1790770794172372",
+        \\ "metageneration":"1","contentType":"application/octet-stream","storageClass":"STANDARD","size":"1000",
+        \\ "etag":"CNSfvoillpcDEAE=","timeCreated":"2026-09-30T12:19:54.179Z","updated":"2026-09-30T12:19:54.179Z",
+        \\ "customerEncryption":{"encryptionAlgorithm":"AES256","keySha256":"BqNwOZCiaUd/2oFWpDECAXpswNQZdixo0rzhW76HHJ0="}}
+    );
+    try testing.expectEqual(null, csek.crc32c);
+    try testing.expectEqual(null, csek.md5);
+    var want: [32]u8 = undefined;
+    _ = try std.base64.standard.Decoder.decode(&want, "BqNwOZCiaUd/2oFWpDECAXpswNQZdixo0rzhW76HHJ0=");
+    try testing.expectEqualSlices(u8, &want, &csek.encryption_key_sha256.?);
+    try testing.expectEqual(null, csek.kms_key_name);
+
+    const cmek = try decodeObject(arena,
+        \\{"kind":"storage#object","name":"k-multi","bucket":"zigps-keys-e7ec9f","generation":"1790770810386787",
+        \\ "metageneration":"1","contentType":"application/octet-stream","storageClass":"STANDARD","size":"1000",
+        \\ "md5Hash":"v+DlQO/2CwP5ix3UzJKA2A==","crc32c":"RPyzdw==","etag":"COPym5CllpcDEAE=",
+        \\ "kmsKeyName":"projects/extractctl/locations/us-central1/keyRings/zigps-keys/cryptoKeys/zigps-k1/cryptoKeyVersions/1",
+        \\ "timeCreated":"2026-09-30T12:20:10.395Z","updated":"2026-09-30T12:20:10.395Z"}
+    );
+    try testing.expectEqualStrings("projects/extractctl/locations/us-central1/keyRings/zigps-keys/cryptoKeys/zigps-k1/cryptoKeyVersions/1", cmek.kms_key_name.?);
+    try testing.expectEqual(null, cmek.encryption_key_sha256);
+    try testing.expect(cmek.crc32c != null);
+
+    // A SHA-256 that is not one is a response this library cannot trust.
+    try testing.expectError(error.InvalidResponse, decodeObject(arena, "{\"customerEncryption\":{\"keySha256\":\"AAAA\"}}"));
+    // An encryption block naming no hash names none.
+    try testing.expectEqual(null, (try decodeObject(arena, "{\"customerEncryption\":{}}")).encryption_key_sha256);
+
+    try testing.expectEqualStrings(
+        "service-82150720798@gs-project-accounts.iam.gserviceaccount.com",
+        try decodeServiceAgent(arena, "{\"kind\":\"storage#serviceAccount\",\"email_address\":\"service-82150720798@gs-project-accounts.iam.gserviceaccount.com\"}"),
+    );
+    try testing.expectError(error.InvalidResponse, decodeServiceAgent(arena, "{\"email_address\":\"\"}"));
+    try testing.expectError(error.InvalidResponse, decodeServiceAgent(arena, "[]"));
 }
 
 fn decodeArbitrary(_: void, input: []const u8) !void {

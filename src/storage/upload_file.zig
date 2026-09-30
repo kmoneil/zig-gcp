@@ -17,6 +17,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const checkpoint = @import("checkpoint.zig");
+const encryption = @import("encryption.zig");
 const gzip_upload = @import("gzip_upload.zig");
 const logging = @import("logging.zig");
 const mp = @import("xml_multipart.zig");
@@ -132,12 +133,20 @@ fn resumeOrStart(
     var state_arena: std.heap.ArenaAllocator = .init(client.gpa);
     defer state_arena.deinit();
     const mtime = try statMtime(client, file);
+    // A session encrypts with the keys it began under, whatever a resume
+    // brings: only the same keys carry it on.
+    var sha_buf: [44]u8 = undefined;
+    const key_sha256 = encryption.sha256Text(client.encryption_key, &sha_buf);
     var saved = try loadState(client, cp, state_arena.allocator(), bucket, object);
-    if (saved) |s| if (!shape.matches(s) or s.mtime != mtime) {
+    if (saved) |s| if (!shape.matches(s) or s.mtime != mtime or
+        !encryption.sameOptional(s.key_sha256, key_sha256) or !encryption.sameOptional(s.kms_key_name, options.kms_key_name))
+    {
         if (s.size != shape.size or s.mtime != mtime) {
             logging.warn("{s}: the source file changed under the checkpoint; cancelling the old session and starting over", .{object});
-        } else {
+        } else if (!shape.matches(s)) {
             logging.warn("{s}: the checkpoint's upload was compressed another way, or by another Zig; cancelling the old session and starting over", .{object});
+        } else {
+            logging.warn("{s}: the checkpoint's upload began under another encryption key, or none; cancelling the old session and starting over", .{object});
         }
         resumable.dropSession(client, s.session);
         saved = null;
@@ -165,6 +174,8 @@ fn resumeOrStart(
                 .mtime = mtime,
                 .session = uri,
                 .gzip = shape.gzip,
+                .key_sha256 = key_sha256,
+                .kms_key_name = options.kms_key_name,
             } }) catch |err| {
                 // A session the checkpoint never recorded would only take
                 // writes for a week: drop it again before any data moves.

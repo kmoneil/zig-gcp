@@ -24,6 +24,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const core = @import("core");
 
 const Client = @import("Client.zig");
+const encryption = @import("encryption.zig");
 const logging = @import("logging.zig");
 const types = @import("types.zig");
 const Error = @import("errors.zig").Error;
@@ -51,7 +52,10 @@ const reserved_params = [_][]const u8{
 /// `object` is null. The caller has begun the call and checked both names.
 /// A handle's billing project is signed in as `userProject`, the one way a
 /// signed request bills a project, measured against a requester pays
-/// bucket on 2026-09-29.
+/// bucket on 2026-09-29. A handle's customer-supplied key is signed in as
+/// its three headers, which whoever holds the URL must send; they live on
+/// this call's stack and in its wiped scratch memory, and only their names
+/// reach the URL.
 pub fn signUrl(
     client: *Client,
     signer: core.Signer,
@@ -78,6 +82,17 @@ pub fn signUrl(
         @memcpy(query[0..caller_options.query.len], caller_options.query);
         query[caller_options.query.len] = .{ .name = "userProject", .value = project };
         options.query = query;
+    }
+    var key: encryption.KeyHeaders = undefined;
+    key.init(client.encryption_key, .object);
+    defer key.wipe();
+    if (client.encryption_key != null) {
+        for (caller_options.headers) |header| if (std.ascii.startsWithIgnoreCase(header.name, "x-goog-encryption-")) {
+            if (diag) |d| d.print("header {s}: the handle's encryption key signs its own headers", .{header.name});
+            return error.InvalidSignedUrlOptions;
+        };
+        const headers = try arena.alloc(types.Header, caller_options.headers.len + 3);
+        options.headers = encryption.withKey(headers, caller_options.headers, &key);
     }
     try check(diag, client.base_url, bucket, object, options, signer.lifetimeS());
     const signed_at = timestamp(std.Io.Clock.real.now(client.io)) orelse {

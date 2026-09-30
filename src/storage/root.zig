@@ -78,6 +78,7 @@ pub const UrlStyle = @import("types.zig").UrlStyle;
 pub const BucketBound = @import("types.zig").BucketBound;
 pub const QueryParam = @import("types.zig").QueryParam;
 pub const Header = @import("types.zig").Header;
+pub const EncryptionKey = @import("types.zig").EncryptionKey;
 
 /// What signs a signed URL as a service account: `auth.Credentials.signer()`
 /// for whatever the environment has, `auth.ServiceAccount.signer()` for a key
@@ -106,6 +107,7 @@ test {
     _ = @import("compose.zig");
     _ = @import("copy.zig");
     _ = @import("download.zig");
+    _ = @import("encryption.zig");
     _ = @import("gzip_download.zig");
     _ = @import("gzip_upload.zig");
     _ = @import("errors.zig");

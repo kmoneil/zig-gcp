@@ -65,6 +65,27 @@ including the ones that did not change.
   handle, with `error.InvalidSignedUrlOptions`. A requester pays refusal
   of an unbilled call says in `Diagnostics` how to bill one. Not
   breaking.
+- storage: encryption keys. New `storage.EncryptionKey` holds a
+  customer-supplied key (`fromBase64`, `sha256`, `wipe`; it formats as its
+  SHA-256), and `Object.withEncryptionKey` gives a handle that carries it
+  on every request that reads or writes the object's data: downloads, each
+  range and resume, `downloadParallel`, `upload`, the start of a resumable
+  upload, the start, parts and finish of `uploadParallel`, `get`,
+  `updateMetadata`, `composeFrom`, both sides of `copyTo`, and a signed
+  URL's signed headers. `exists`, `delete`, `restore` and listings carry
+  none. `UploadOptions`, `ParallelUploadOptions`, `CopyOptions` and
+  `ComposeOptions` gain `kms_key_name`, a Cloud KMS key, whose version is
+  dropped before sending. `ObjectInfo` gains `kms_key_name` and
+  `encryption_key_sha256`. New `Client.serviceAgent` names the account a
+  KMS key must be granted to. Upload checkpoints record the key's SHA-256,
+  never the key, and the KMS key, written only when set, so older
+  checkpoints still load; a resume under other keys starts over. Refused
+  before sending: a KMS key name that is not one, and a customer key with
+  a KMS key, with `error.InvalidArgument`; a POST policy on a keyed
+  handle, with `error.InvalidPostPolicyOptions`; and a signed URL's own
+  encryption headers on a keyed handle, with
+  `error.InvalidSignedUrlOptions`. A refusal a key or a KMS grant would
+  have avoided says so in `Diagnostics`. Not breaking.
 - core: `Change(T)` moves here from pubsub, for every module to share.
   `rpc.Call` and `rpc.StreamCall` gain `quota_project`, a project one
   call bills in place of the credentials' quota project, held to the same
