@@ -90,6 +90,10 @@ including the ones that did not change.
   `rpc.Call` and `rpc.StreamCall` gain `quota_project`, a project one
   call bills in place of the credentials' quota project, held to the same
   check. Not breaking.
+- core: `testing.FakeTransport` no longer leaves a streamed request's head
+  set, with undefined headers, when copying the head runs out of memory.
+  A test that swept allocation failures through a download could read
+  them.
 - pubsub: `pubsub.Change` is core's `Change`, the same as before.
 - auth, secret_manager, examples: unchanged.
 
