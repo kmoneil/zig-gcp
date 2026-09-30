@@ -260,37 +260,34 @@ jobs:
         # secret_manager 2.3 ms, storage 4.6 ms, slow-storage 1.4 ms and
         # heavy-storage 73 ms. A Mac measured storage at 2.6 ms and
         # heavy-storage at 25 ms: take counts from CI, not from a local run.
-        # A job's cost also moves from night to night, by up to twice, so
-        # the timeout is the margin. Four jobs changed since, and the
-        # nightly of 2026-09-28 (run 36405111801) timed each one's fuzzing
-        # step, its build included. core, with two gzip properties, took
-        # 100 minutes at 1000K, about 5.8 ms a run, so it drops to 900K.
-        # The Subscriber property's exactly-once half waits out real
-        # leases: slow-subscriber took 90 minutes at 75K, on target. The
-        # Publisher property compresses a quarter of its scripts:
-        # slow-pubsub took 75 minutes at 1M. heavy-pubsub, pubsub's per-id
-        # ack answers, took 3 minutes at 250K, so it rises to 5M until a
-        # nightly times that. Bucket settings (2026-09-29) added about 0.5
-        # ms a run to storage on a Mac, 2.6 to 3.1 ms, so storage drops to
-        # 1000K, and their model property of update sequences, 4.2 ms on a
-        # Mac, went to heavy-storage, which drops to 68K. Versions and soft
-        # delete took storage to 3.4 ms on the Mac, so it drops to 900K.
-        # Requester pays added a model property of billed and unbilled
-        # calls, 5.9 ms a run on a Mac, to heavy-storage, which drops to
-        # 56K. These counts are scaled from the Mac and want re-sizing from
-        # the next nightly.
+        # A job's cost also moves from night to night as its corpus
+        # changes, so the timeout is the margin: at an unchanged 1M,
+        # slow-pubsub's fuzzing step took 75, 41 and 25 minutes on three
+        # nights in a row. The counts below come from the nightlies of
+        # 2026-09-28, 09-29 and 09-30 (runs 36405111801, 36551262573 and
+        # 36697396197), timing each job's fuzzing step, its build included,
+        # and put the slowest of the three nights at about 90 minutes. core
+        # (89 minutes at 900K) and auth (89 at 500K) stay. slow-auth took at
+        # most 46 minutes at 50K, pubsub 43 at 750K, secret_manager 40 at
+        # 2M, slow-subscriber 101 at 75K, slow-pubsub 75 at 1M and
+        # slow-storage 71 at 3800K. heavy-pubsub, whose count changed on
+        # 09-29, took 56 at 5M on both of the nights since. Bucket settings,
+        # versions and requester pays added properties to storage and
+        # heavy-storage on 09-29, so those two are sized from 09-30 alone:
+        # storage took 49 minutes at 900K, and heavy-storage, whose count
+        # was scaled from a Mac, 121 at 56K.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 900K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
-          - { job: slow-auth, module: auth, filter: slow property, iterations: 50K }
-          - { job: pubsub, module: pubsub, filter: fuzz, iterations: 750K }
-          - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1M }
-          - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 75K }
-          - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 5M }
-          - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 2M }
-          - { job: storage, module: storage, filter: fuzz, iterations: 900K }
-          - { job: slow-storage, module: storage, filter: slow property, iterations: 3800K }
-          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 56K }
+          - { job: slow-auth, module: auth, filter: slow property, iterations: 100K }
+          - { job: pubsub, module: pubsub, filter: fuzz, iterations: 1500K }
+          - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1200K }
+          - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 65K }
+          - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 8M }
+          - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 4500K }
+          - { job: storage, module: storage, filter: fuzz, iterations: 1600K }
+          - { job: slow-storage, module: storage, filter: slow property, iterations: 4800K }
+          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 42K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
