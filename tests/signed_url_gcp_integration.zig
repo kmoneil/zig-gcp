@@ -336,6 +336,45 @@ test "signed URLs, real bucket: a PUT stores with its signed content type, and n
     }
 }
 
+test "signed URLs, real bucket: a keyed handle signs its key's headers in, and its URLs work only with them" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    var key: storage.EncryptionKey = .{ .bytes = undefined };
+    testing.io.random(&key.bytes);
+    defer key.wipe();
+    var key_text: [44]u8 = undefined;
+    var sha_text: [44]u8 = undefined;
+    defer std.crypto.secureZero(u8, &key_text);
+    _ = std.base64.standard.Encoder.encode(&key_text, &key.bytes);
+    _ = std.base64.standard.Encoder.encode(&sha_text, &key.sha256());
+    const key_headers = [_]std.http.Header{
+        .{ .name = "x-goog-encryption-algorithm", .value = "AES256" },
+        .{ .name = "x-goog-encryption-key", .value = &key_text },
+        .{ .name = "x-goog-encryption-key-sha256", .value = &sha_text },
+    };
+    const content_type: std.http.Header = .{ .name = "content-type", .value = "text/plain" };
+    var buffer: [2]Named = undefined;
+    for (f.signers(&buffer)) |s| {
+        const obj = (try f.object(s.name)).withEncryptionKey(&key);
+        // A PUT: the holder sends the key's three headers with the bytes.
+        const put_url = try f.sign(obj, s.signer, .{ .method = .PUT, .expires_in_s = 300, .headers = &.{content_type} });
+        try expectStatus(200, try useUrl(a, .PUT, put_url, &(.{content_type} ++ key_headers), hello), s.name);
+        var info = try obj.get(.{});
+        defer info.deinit();
+        try testing.expectEqualSlices(u8, &key.sha256(), &info.value.encryption_key_sha256.?);
+        // A GET, with the headers and without them.
+        const get_url = try f.sign(obj, s.signer, .{ .expires_in_s = 300 });
+        const got = try useUrl(a, .GET, get_url, &key_headers, null);
+        try expectStatus(200, got, s.name);
+        try testing.expectEqualStrings(hello, got.body);
+        const bare = try useUrl(a, .GET, get_url, &.{}, null);
+        std.debug.print("{s}: a keyed object's signed GET without the key's headers: {d} {s}\n", .{ s.name, bare.status, bare.code() });
+        try testing.expect(bare.status >= 400);
+    }
+}
+
 test "signed URLs, real bucket: DELETE removes the object" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;

@@ -95,7 +95,11 @@ including the ones that did not change.
   A test that swept allocation failures through a download could read
   them.
 - pubsub: `pubsub.Change` is core's `Change`, the same as before.
-- auth, secret_manager, examples: unchanged.
+- examples: `gcs_cp` takes `--billing-project P`, for a requester pays
+  bucket; `--encryption-key-file F`, a customer-supplied key read from a
+  file, never the command line, for a copy either way; and
+  `--kms-key NAME`, a Cloud KMS key for an upload.
+- auth, secret_manager: unchanged.
 
 ## 0.24.0 (2026-09-28)
 

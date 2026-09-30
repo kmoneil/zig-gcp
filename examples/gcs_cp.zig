@@ -11,6 +11,9 @@
 //!     ... -- gs://my-bucket/page.html page.html.gz --no-decompress
 //!     ... -- access.log gs://my-bucket/logs/access.log -z log,txt
 //!     ... -- report.csv gs://my-bucket/report.csv -Z
+//!     ... -- data.csv gs://their-bucket/data.csv --billing-project my-project
+//!     ... -- ledger.csv gs://my-bucket/ledger.csv --encryption-key-file ledger.key
+//!     ... -- report.pdf gs://my-bucket/report.pdf --kms-key projects/p/locations/l/keyRings/r/cryptoKeys/k
 //!
 //! Both directions are checksummed end to end. An upload reads the file at
 //! offsets, a chunk at a time, and its last request carries the file's
@@ -46,6 +49,14 @@
 //! the copy is done, and holds an upload's session URL, which lets anyone
 //! who has it write the object: keep it as private as a credential.
 //!
+//! `--billing-project P` bills project P for every request, as a requester
+//! pays bucket needs of anyone but its owners. `--encryption-key-file F`
+//! reads a customer-supplied key from the file F, as the 44 characters of
+//! base64 that gcloud and the console use, and uploads or downloads under
+//! it; the key never goes on the command line, where shell history and
+//! the process list would keep it. `--kms-key NAME` encrypts an upload with
+//! a Cloud KMS key instead of the bucket's default.
+//!
 //! Credentials come from `auth.findDefault`: the file
 //! `GOOGLE_APPLICATION_CREDENTIALS` names, then the one `gcloud auth
 //! application-default login` writes, then the metadata server. With
@@ -65,7 +76,9 @@ pub const std_options: std.Options = .{
 };
 
 const usage = "usage: gcs_cp <file> gs://<bucket>/<object> [--no-clobber] [--parallel N] [--resume STATE] [-z EXTS | -Z]\n" ++
-    "       gcs_cp gs://<bucket>/<object> <file> [--parallel N] [--resume STATE] [--no-decompress]\n";
+    "                [--billing-project P] [--encryption-key-file F | --kms-key NAME]\n" ++
+    "       gcs_cp gs://<bucket>/<object> <file> [--parallel N] [--resume STATE] [--no-decompress]\n" ++
+    "                [--billing-project P] [--encryption-key-file F]\n";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -80,6 +93,9 @@ pub fn main(init: std.process.Init) !void {
     var parallel: ?u16 = null;
     var state: ?[]const u8 = null;
     var compress: Compress = .none;
+    var billing_project: ?[]const u8 = null;
+    var key_file: ?[]const u8 = null;
+    var kms_key: ?[]const u8 = null;
     var bad = false;
     const args = try init.minimal.args.toSlice(arena);
     var i: usize = @min(1, args.len);
@@ -103,6 +119,18 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-Z")) {
             if (compress != .none) bad = true;
             compress = .all;
+        } else if (std.mem.eql(u8, arg, "--billing-project")) {
+            i += 1;
+            billing_project = if (i < args.len) args[i] else null;
+            if (billing_project == null) bad = true;
+        } else if (std.mem.eql(u8, arg, "--encryption-key-file")) {
+            i += 1;
+            key_file = if (i < args.len) args[i] else null;
+            if (key_file == null) bad = true;
+        } else if (std.mem.eql(u8, arg, "--kms-key")) {
+            i += 1;
+            kms_key = if (i < args.len) args[i] else null;
+            if (kms_key == null) bad = true;
         } else if (count < paths.len) {
             paths[count] = arg;
             count += 1;
@@ -113,10 +141,12 @@ pub fn main(init: std.process.Init) !void {
     const from_remote = if (count == 2) Remote.parse(paths[0]) else null;
     const to_remote = if (count == 2) Remote.parse(paths[1]) else null;
     // Exactly one side is in Cloud Storage, only an upload can refuse to
-    // replace what is there or compress, and only a download decompresses.
+    // replace what is there, compress, or name a KMS key, only a download
+    // decompresses, and an object is under one kind of key at most.
     if (bad or count != 2 or (from_remote == null) == (to_remote == null) or
         (no_clobber and to_remote == null) or (compress != .none and to_remote == null) or
-        (no_decompress and from_remote == null))
+        (no_decompress and from_remote == null) or (kms_key != null and to_remote == null) or
+        (kms_key != null and key_file != null))
     {
         try out.writeAll(usage);
         return out.flush();
@@ -140,13 +170,40 @@ pub fn main(init: std.process.Init) !void {
     }) catch |err| return fail(err, &diag);
     defer client.deinit();
 
+    var key: ?storage.EncryptionKey = if (key_file) |path| try readKey(init.io, arena, path) else null;
+    defer if (key) |*k| k.wipe();
+    const remote = to_remote orelse from_remote.?;
+    var bucket = client.bucket(remote.bucket);
+    if (billing_project) |project| bucket = bucket.withBillingProject(project);
+    var object = bucket.object(remote.name);
+    if (key) |*k| object = object.withEncryptionKey(k);
+
     const started = std.Io.Clock.awake.now(init.io);
-    if (to_remote) |remote| {
-        try upload(&client, init.io, paths[0], remote, no_clobber, parallel, state, compress.applies(paths[0]), out, &diag, started);
+    if (to_remote != null) {
+        try upload(object, init.io, paths[0], remote, no_clobber, parallel, state, compress.applies(paths[0]), kms_key, out, &diag, started);
     } else {
-        try download(&client, init.io, arena, from_remote.?, paths[1], parallel, state, !no_decompress, out, &diag, started);
+        try download(object, init.io, arena, remote, paths[1], parallel, state, !no_decompress, out, &diag, started);
     }
     try out.flush();
+}
+
+/// The customer-supplied key in the file at `path`: its 44 characters of
+/// base64, and a line end after them if there is one. The file's bytes
+/// are wiped once read.
+fn readKey(io: std.Io, arena: std.mem.Allocator, path: []const u8) !storage.EncryptionKey {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024)) catch |err| {
+        if (err == error.StreamTooLong) {
+            std.debug.print("{s} holds no key: it is far longer than one\n", .{path});
+        } else {
+            std.debug.print("{s}: the key file could not be read: {t}\n", .{ path, err });
+        }
+        return err;
+    };
+    defer std.crypto.secureZero(u8, text);
+    return storage.EncryptionKey.fromBase64(std.mem.trimEnd(u8, text, "\r\n")) catch |err| {
+        std.debug.print("{s} holds no key: expected the 44 characters of base64 of 32 bytes\n", .{path});
+        return err;
+    };
 }
 
 /// Which files `-z` and `-Z` compress.
@@ -189,7 +246,7 @@ const Remote = struct {
 };
 
 fn upload(
-    client: *storage.Client,
+    object: storage.Object,
     io: std.Io,
     path: []const u8,
     remote: Remote,
@@ -197,6 +254,7 @@ fn upload(
     parallel: ?u16,
     state: ?[]const u8,
     compress: bool,
+    kms_key: ?[]const u8,
     out: *std.Io.Writer,
     diag: *const storage.Diagnostics,
     started: std.Io.Timestamp,
@@ -209,9 +267,10 @@ fn upload(
     if (compress) {
         if (parallel != null) std.debug.print("{s} is compressed, which goes up as one stream: --parallel does not apply\n", .{path});
         const size = try file.length(io);
-        var info = client.bucket(remote.bucket).object(remote.name).uploadFile(file, .{
+        var info = object.uploadFile(file, .{
             .preconditions = preconditions,
             .checkpoint = checkpoint,
+            .kms_key_name = kms_key,
             .gzip = .{},
             // As gcloud sets it: every client gets the stored bytes, and
             // with them the stored checksum.
@@ -227,10 +286,11 @@ fn upload(
     }
     if (parallel) |concurrency| {
         // Each part is read at its own offset, and checked on its own.
-        var info = client.bucket(remote.bucket).object(remote.name).uploadParallel(.{ .file = file }, .{
+        var info = object.uploadParallel(.{ .file = file }, .{
             .concurrency = concurrency,
             .preconditions = preconditions,
             .checkpoint = checkpoint,
+            .kms_key_name = kms_key,
         }) catch |err| return refused(err, no_clobber, remote, diag, io, state);
         defer info.deinit();
         const ms = elapsedMs(io, started);
@@ -241,9 +301,10 @@ fn upload(
     }
     // The file is read at offsets, so a lost session starts over from it,
     // and a later run can carry on from what the server holds.
-    var info = client.bucket(remote.bucket).object(remote.name).uploadFile(file, .{
+    var info = object.uploadFile(file, .{
         .preconditions = preconditions,
         .checkpoint = checkpoint,
+        .kms_key_name = kms_key,
     }) catch |err| return refused(err, no_clobber, remote, diag, io, state);
     defer info.deinit();
     const ms = elapsedMs(io, started);
@@ -277,7 +338,7 @@ fn stateKept(io: std.Io, path: []const u8) bool {
 }
 
 fn download(
-    client: *storage.Client,
+    object: storage.Object,
     io: std.Io,
     arena: std.mem.Allocator,
     remote: Remote,
@@ -307,7 +368,7 @@ fn download(
         if (parallel != null or state != null) {
             // Each range is written at its own offset, and the ranges'
             // checksums combine into the whole object's.
-            break :r client.bucket(remote.bucket).object(remote.name).downloadParallel(.{ .file = file }, .{
+            break :r object.downloadParallel(.{ .file = file }, .{
                 .concurrency = parallel orelse 1,
                 .checkpoint = if (state != null) saved.checkpoint() else null,
                 .decompress = decompress,
@@ -315,7 +376,7 @@ fn download(
         }
         var buffer: [64 * 1024]u8 = undefined;
         var writer = file.writer(io, &buffer);
-        const got = client.bucket(remote.bucket).object(remote.name).download(&writer.interface, .{ .decompress = decompress }) catch |err|
+        const got = object.download(&writer.interface, .{ .decompress = decompress }) catch |err|
             return fail(err, diag);
         // The library never flushes a caller's writer: the buffer is ours.
         try writer.interface.flush();

@@ -19,7 +19,7 @@ modules it imports.
   cuts and stalls the connection; 26 Cloud Storage tests against
   fake-gcs-server, and 58 against real buckets, where uploads and
   downloads cut off mid-body, or ended with their process, resume against
-  Google itself, plus 18 that sign URLs and POST policies for one; 12 Secret
+  Google itself, plus 19 that sign URLs and POST policies for one; 12 Secret
   Manager tests against a real project, since it has no emulator; 10 auth
   tests against Google's token, STS and IAM Credentials endpoints; and a
   run on a Compute Engine VM, where the metadata server is the one that
@@ -1359,6 +1359,9 @@ var got = try dataset.object("2026/01.csv").downloadAlloc(64 << 20, .{});
 defer got.deinit();
 ```
 
+`examples/gcs_cp.zig --billing-project my-project` does the same for a
+copy either way.
+
 The principal needs `serviceusage.services.use` on the project it bills,
 which Service Usage Consumer grants. The project goes into every request
 a call makes:
@@ -1473,6 +1476,12 @@ the version goes before sending, since Cloud Storage refuses one. A name
 that is not a key's, and a customer key and a KMS key on one write, are
 refused before sending with `error.InvalidArgument`.
 
+`examples/gcs_cp.zig --encryption-key-file ledger.key` copies either way
+under a customer-supplied key, read from a file of its 44 characters of
+base64 and never from the command line, where shell history and the
+process list would keep it; `--kms-key NAME` uploads under a Cloud KMS
+key.
+
 Measured against Cloud Storage on 2026-09-30, with throwaway buckets and
 a software key:
 
@@ -1480,8 +1489,10 @@ a software key:
   `error.PermissionDenied`, and `Diagnostics` says what to grant to whom.
 - A copy that names no key gets the destination bucket's default key,
   else Google's own: never the source's.
-- A bucket's new default key reached new uploads after about 4 seconds;
-  clearing it acted at once.
+- A bucket's new default key reached new uploads within seconds, after
+  4.4 s in one run and 0.3 s in another; clearing it acted at once.
+- A signed URL for an object under a customer-supplied key, used without
+  the key's headers, is refused with 400 `MalformedSecurityHeader`.
 - A parallel upload's finish names no checksum under a key of either
   kind, and a create-only one's move names none under a customer key, so
   both are held to what was sent by reading the object back.
@@ -1928,6 +1939,13 @@ differences it found:
   a page forever. It has no soft delete at all: `softDeleted=true` lists
   live objects, a restore is taken for an update of an object named
   `{name}/restore`, and bulk and bucket restores do not exist.
+- It checks neither requester pays nor keys. It takes `userProject` and
+  the `x-goog-user-project` header from anyone and bills no one. It takes
+  a customer-supplied key, even a malformed one, stores the object
+  without it, serves it back with no key or another, reports its
+  checksums to every read, and never says it was keyed; it drops a Cloud
+  KMS key's name. So both are tested against an in-memory fake that holds
+  Cloud Storage's rules as measured, and against Cloud Storage itself.
 
 ## Zig 0.16 standard library issues handled here
 
