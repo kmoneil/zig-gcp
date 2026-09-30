@@ -13,7 +13,7 @@ modules it imports.
 | `core` | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, the `TokenProvider` and `Signer` seams, and test fakes. Services re-export what their callers need. | beta |
 
 - Zig **0.16.0** (`minimum_zig_version` enforces it). No dependencies.
-- Tested with 1225 unit, property and fuzz tests, Google's 29 V4 signing
+- Tested with 1226 unit, property and fuzz tests, Google's 29 V4 signing
   vectors among them; 28 Pub/Sub integration tests that pass against both
   the emulator and production, and 20 more through a proxy that drops,
   cuts and stalls the connection; 26 Cloud Storage tests against

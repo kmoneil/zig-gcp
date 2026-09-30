@@ -290,10 +290,13 @@ pub const FakeTransport = struct {
         };
         // The head is visible before any body byte, as the real transport
         // delivers it, so a cut mid-body still leaves the headers readable.
-        if (req.head_out) |out| out.* = .{
-            .status = canned.status,
-            .headers = try copyHeaders(arena, canned.headers),
-        };
+        // The headers are copied first: a literal assigned through the
+        // pointer is written in place, so a copy that ran out of memory
+        // inside it would leave the head set, its headers undefined.
+        if (req.head_out) |out| {
+            const headers = try copyHeaders(arena, canned.headers);
+            out.* = .{ .status = canned.status, .headers = headers };
+        }
         if (canned.status < 300) if (req.sink == .writer) {
             const w = req.sink.writer;
             if (canned.cut_after) |cut| {
@@ -1505,6 +1508,34 @@ test "fuzz FakeTransport: segment splits never change the recorded body" {
         "\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x05hello\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x06world!",
         "\x00\x00\x00\x00\x00\x00\x00\x00",
     } });
+}
+
+test "FakeTransport: a head it could not copy stays null" {
+    // Regression: the head was a struct literal with a `try` inside,
+    // written in place, so running out of memory in the copy left the
+    // head set with undefined headers, which a download then read. CI's
+    // Linux runner faulted on it; macOS happened to read mapped memory.
+    const script = [_]FakeTransport.Reply{.{ .respond = .{
+        .status = 200,
+        .body = "x",
+        .headers = &.{.{ .name = "x-goog-generation", .value = "7" }},
+    } }};
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fake: FakeTransport = .init(std.testing.allocator, &script);
+        defer fake.deinit();
+        var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = fail_index });
+        var arena: std.heap.ArenaAllocator = .init(failing.allocator());
+        defer arena.deinit();
+        var head: ?StreamRequest.Head = null;
+        _ = fake.transport().sendStream(.{ .method = .GET, .url = "http://x/o", .head_out = &head }, arena.allocator()) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            if (head) |h| try std.testing.expectEqualStrings("7", h.header("x-goog-generation").?);
+            continue;
+        };
+        try std.testing.expectEqualStrings("7", head.?.header("x-goog-generation").?);
+        break;
+    }
 }
 
 test "FakeTransport delivers the head before the body, cut or not" {
