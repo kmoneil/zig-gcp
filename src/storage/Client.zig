@@ -41,6 +41,7 @@ unauthenticated: bool,
 scope: rpc.Scope,
 retry: RetryPolicy,
 retry_unconditional_writes: bool,
+idempotency_tokens: bool,
 verify_checksums: bool,
 chunk_size: usize,
 single_request_limit: usize,
@@ -85,11 +86,24 @@ pub const Options = struct {
     /// The OAuth scope asked of the token provider.
     scope: rpc.Scope = .read_write,
     retry: RetryPolicy = .{},
-    /// A delete without a `generation` may repeat a delete that already
-    /// happened, and by then remove someone else's newer object. It is not
-    /// retried unless this opts in; a delete with a `generation` always is,
-    /// because a repeat fails cleanly instead.
+    /// A write without a condition may repeat one that already happened: a
+    /// delete without a `generation` may by then remove someone else's
+    /// newer object. With `idempotency_tokens`, such a write retries for
+    /// 60 s after its first attempt, while Cloud Storage recognises a
+    /// repeat; this opts into retrying it past that too, and, without
+    /// tokens, at all. A delete with a `generation` always retries, because
+    /// a repeat fails cleanly instead.
     retry_unconditional_writes: bool = false,
+    /// Send `X-Goog-Gcs-Idempotency-Token` on every write, one value per
+    /// call and the same on its retries, so that a repeat Cloud Storage
+    /// recognises is answered with the first result instead of acting
+    /// again. With it, an upload of one request, a metadata update and a
+    /// delete retry without a condition for 60 s after their first attempt,
+    /// and a conditional write whose answer was lost gets its own result
+    /// back instead of a failed condition. Off, writes retry only as
+    /// `retry_unconditional_writes` and conditions allow. A bulk restore
+    /// carries its token either way: its retries depend on it.
+    idempotency_tokens: bool = true,
     /// Compute and check CRC-32C checksums on uploads and downloads. Off,
     /// nothing is computed, checked, or sent beyond what the caller passed.
     verify_checksums: bool = true,
@@ -182,6 +196,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
         .scope = options.scope,
         .retry = options.retry,
         .retry_unconditional_writes = options.retry_unconditional_writes,
+        .idempotency_tokens = options.idempotency_tokens,
         .verify_checksums = options.verify_checksums,
         .chunk_size = options.chunk_size,
         .single_request_limit = options.single_request_limit,

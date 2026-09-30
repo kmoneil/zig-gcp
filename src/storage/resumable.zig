@@ -23,6 +23,7 @@ const checkpoint = @import("checkpoint.zig");
 const codec = @import("codec.zig");
 const encryption = @import("encryption.zig");
 const errors = @import("errors.zig");
+const idempotency = @import("idempotency.zig");
 const logging = @import("logging.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
@@ -216,6 +217,11 @@ pub fn startSession(
     key.init(client.encryption_key, .object);
     defer key.wipe();
     try headers.appendSlice(a, key.slice());
+    // A repeated start opens another session, as measured, which is
+    // harmless: it expires unused. The token is what Google recommends.
+    var token: idempotency.Token = undefined;
+    token.init(client);
+    try headers.appendSlice(a, token.slice());
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
     const res = rpc.executeStream(client, &response, .{
@@ -760,7 +766,9 @@ const Machine = struct {
         var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
         defer scratch.deinit();
         const path = names.objectPath(scratch.allocator(), bucket_name, object_name, generation, .{}) catch return false;
-        rpc.executeDiscard(self.client, .{ .method = .DELETE, .path = path }) catch |err| {
+        var token: idempotency.Token = undefined;
+        token.init(self.client);
+        rpc.executeDiscard(self.client, .{ .method = .DELETE, .path = path, .headers = token.slice() }) catch |err| {
             logging.warn("deleting the truncated upload of {s} failed with {t}", .{ object_name, err });
             return false;
         };
@@ -992,10 +1000,13 @@ test "a status query answered as a finalize is a truncated object, not a success
 
     try testing.expectError(error.InvalidResponse, h.client.bucket("b").object("backup.tar").upload(data, .{}));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "holding 262144 of its 614400 bytes; the truncated object was deleted again") != null);
-    // The truncated object went again, pinned to the generation it got.
+    // The truncated object went again, pinned to the generation it got,
+    // with a token, as every write carries.
     const cleanup = try h.fake.request(0);
     try testing.expectEqual(.DELETE, cleanup.method);
     try testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/b/o/backup.tar?generation=61", cleanup.url);
+    try testing.expectEqual(32, (cleanup.header(idempotency.header_name) orelse return error.TestExpectedToken).len);
+    try testing.expectEqual(null, (try h.fake.streamRequest(1)).header(idempotency.header_name));
 }
 
 test "a finish before the stream has ended is not believed either" {

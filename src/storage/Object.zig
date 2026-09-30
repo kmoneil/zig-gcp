@@ -18,6 +18,7 @@ const encryption = @import("encryption.zig");
 const errors = @import("errors.zig");
 const gzip_download = @import("gzip_download.zig");
 const gzip_upload = @import("gzip_upload.zig");
+const idempotency = @import("idempotency.zig");
 const logging = @import("logging.zig");
 const metadata = @import("metadata.zig");
 const multipart = @import("multipart.zig");
@@ -291,12 +292,17 @@ fn deleteBilled(self: Object, options: types.DeleteOptions) Error!void {
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
     const path = try names.objectPath(scratch.allocator(), self.bucket, self.name, options.generation, options.preconditions);
+    var token: idempotency.Token = undefined;
+    token.init(self.client);
+    const retry = idempotency.writeRetry(self.client, options.generation != null or
+        options.preconditions.makesWriteSafe() or
+        self.client.retry_unconditional_writes);
     try rpc.executeDiscard(self.client, .{
         .method = .DELETE,
         .path = path,
-        .retry = options.generation != null or
-            options.preconditions.makesWriteSafe() or
-            self.client.retry_unconditional_writes,
+        .headers = token.slice(),
+        .retry = retry.retry,
+        .retry_window_ms = retry.window_ms,
     });
 }
 
@@ -386,20 +392,22 @@ fn sendMultipart(self: Object, data: []const u8, options: types.UploadOptions, c
     var key: encryption.KeyHeaders = undefined;
     key.init(self.client.encryption_key, .object);
     defer key.wipe();
+    var token: idempotency.Token = undefined;
+    token.init(self.client);
+    var header_storage: [4]core.transport.Header = undefined;
+    const retry = idempotency.writeRetry(self.client, options.preconditions.makesWriteSafe() or self.client.retry_unconditional_writes);
     const res = rpc.executeStream(self.client, result.arena, .{
         .method = .POST,
         .path = path,
         .content_type = parts.content_type,
-        .headers = key.slice(),
+        .headers = idempotency.withToken(&header_storage, key.slice(), &token),
         .body = .{ .segments = &.{ parts.opening, data, parts.closing } },
-        .retry = options.preconditions.makesWriteSafe() or self.client.retry_unconditional_writes,
+        .retry = retry.retry,
+        .retry_window_ms = retry.window_ms,
     }) catch |err| switch (err) {
         // The sink is a buffer; there is no caller writer to fail.
         error.WriteFailed => unreachable,
-        error.FailedPrecondition => return rpc.ambiguous412(
-            self.client,
-            options.preconditions.makesWriteSafe() or self.client.retry_unconditional_writes,
-        ),
+        error.FailedPrecondition => return rpc.ambiguous412(self.client, retry.retry),
         else => |e| return e,
     };
     result.value = codec.decodeObject(result.arena.allocator(), res.body) catch |err|
@@ -1049,7 +1057,7 @@ test "exists: found, missing, and a failure that is neither" {
     try testing.expectError(error.PermissionDenied, obj.exists());
 }
 
-test "delete retries only when it can do so safely" {
+test "without idempotency tokens, delete retries only when it can do so safely" {
     var h: test_util.Harness = undefined;
     const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{
         .status = 503,
@@ -1061,7 +1069,7 @@ test "delete retries only when it can do so safely" {
         // With a generation: retried to success.
         unavailable,
         .{ .respond = .{ .status = 204, .body = "" } },
-    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 }, .idempotency_tokens = false });
     defer h.deinit();
     const obj = h.client.bucket("my-bucket").object("a");
 
@@ -1149,10 +1157,10 @@ test "upload: verification off sends nothing computed, but forwards an asserted 
     try testing.expect(std.mem.indexOf(u8, (try h.fake.streamRequest(1)).body_prefix, "\"crc32c\":\"AAAAAQ==\"") != null);
 }
 
-test "upload retries only when the client opted in" {
+test "without idempotency tokens, upload retries only when the client opted in" {
     const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{}" } };
     var h: test_util.Harness = undefined;
-    try h.init(&.{unavailable}, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    try h.init(&.{unavailable}, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 }, .idempotency_tokens = false });
     defer h.deinit();
     try testing.expectError(error.Unavailable, h.client.bucket("b").object("a").upload("data", .{}));
     try testing.expectEqual(1, h.fake.stream_requests.items.len);
@@ -1161,6 +1169,7 @@ test "upload retries only when the client opted in" {
     try opted.init(&.{ unavailable, .{ .respond = .{ .body = "{}" } } }, .{
         .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 },
         .retry_unconditional_writes = true,
+        .idempotency_tokens = false,
     });
     defer opted.deinit();
     var info = try opted.client.bucket("b").object("a").upload("data", .{});
@@ -1805,12 +1814,12 @@ test "preconditioned writes retry; a 412 after retries names the ambiguity" {
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "an earlier attempt may have succeeded") != null);
 }
 
-test "unconditioned writes still do not retry" {
+test "without idempotency tokens, unconditioned writes still do not retry" {
     var h: test_util.Harness = undefined;
     try h.init(&.{
         .{ .respond = .{ .status = 503, .body = "{}" } },
         .{ .respond = .{ .status = 503, .body = "{}" } },
-    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 } });
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1 }, .idempotency_tokens = false });
     defer h.deinit();
     const obj = h.client.bucket("b").object("a");
     // A not-match condition does not make a write idempotent.

@@ -41,6 +41,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const encryption = @import("encryption.zig");
+const idempotency = @import("idempotency.zig");
 const logging = @import("logging.zig");
 const metadata = @import("metadata.zig");
 const names = @import("names.zig");
@@ -89,8 +90,8 @@ pub fn copy(
     var destination_key: encryption.KeyHeaders = undefined;
     destination_key.init(dest_key, .object);
     defer destination_key.wipe();
-    var header_storage: [6]core.transport.Header = undefined;
-    const headers = encryption.withKey(&header_storage, source_key.slice(), &destination_key);
+    var key_storage: [6]core.transport.Header = undefined;
+    const keys = encryption.withKey(&key_storage, source_key.slice(), &destination_key);
     var body: []const u8 = "{}";
     if (changes(options)) {
         const path = try names.objectPath(scratch.allocator(), source_bucket, source_object, options.source_generation, .{});
@@ -117,13 +118,19 @@ pub fn copy(
         _ = response.reset(.retain_capacity);
         const path = try names.rewritePath(scratch.allocator(), source_bucket, source_object, dest_bucket, dest_object, params);
         // A call that carries a token repeats earlier work, which is safe;
-        // the first call is safe only under a destination condition.
+        // the first call is safe only under a destination condition. A
+        // repeated rewrite runs again, as measured, so the idempotency
+        // token, new for each call as Google's libraries make it, changes
+        // no retry.
         const retried = params.rewrite_token != null or first_retries;
+        var token: idempotency.Token = undefined;
+        token.init(client);
+        var header_storage: [7]core.transport.Header = undefined;
         const reply = rpc.execute(client, &response, .{
             .method = .POST,
             .path = path,
             .body = body,
-            .headers = headers,
+            .headers = idempotency.withToken(&header_storage, keys, &token),
             .retry = retried,
         }) catch |err| switch (err) {
             error.FailedPrecondition => {

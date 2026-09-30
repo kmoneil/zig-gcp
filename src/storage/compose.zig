@@ -28,6 +28,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const encryption = @import("encryption.zig");
+const idempotency = @import("idempotency.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -58,11 +59,16 @@ pub fn compose(
     var key: encryption.KeyHeaders = undefined;
     key.init(client.encryption_key, .object);
     defer key.wipe();
+    // A repeated compose runs again, as measured: the token changes no
+    // retry here.
+    var token: idempotency.Token = undefined;
+    token.init(client);
+    var header_storage: [4]core.transport.Header = undefined;
     const response = try rpc.execute(client, result.arena, .{
         .method = .POST,
         .path = path,
         .body = body,
-        .headers = key.slice(),
+        .headers = idempotency.withToken(&header_storage, key.slice(), &token),
         // A repeat of a compose that deletes its sources finds them gone
         // and fails for a reason that has nothing to do with the first
         // attempt, so that one needs a precondition whatever the client's

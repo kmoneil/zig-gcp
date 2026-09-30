@@ -11,6 +11,7 @@ const Client = @import("Client.zig");
 const Object = @import("Object.zig");
 const bucket_settings = @import("bucket_settings.zig");
 const codec = @import("codec.zig");
+const idempotency = @import("idempotency.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
 const post_policy = @import("post_policy.zig");
@@ -67,10 +68,12 @@ pub fn create(self: Bucket, config: types.BucketConfig) Error!types.Owned(types.
     defer scratch.deinit();
     const path = try names.bucketsPath(scratch.allocator(), project, .{});
     const body = try bucket_settings.encodeConfig(scratch.allocator(), self.name, config);
+    var token: idempotency.Token = undefined;
+    token.init(self.client);
 
     var result: types.Owned(types.BucketInfo) = try .init(self.client.gpa);
     errdefer result.deinit();
-    const response = try rpc.execute(self.client, result.arena, .{ .method = .POST, .path = path, .body = body });
+    const response = try rpc.execute(self.client, result.arena, .{ .method = .POST, .path = path, .body = body, .headers = token.slice() });
     result.value = codec.decodeBucket(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(self.client, err, "bucket");
     return result;
@@ -136,7 +139,9 @@ fn deleteBilled(self: Bucket) Error!void {
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
     const path = try names.bucketPath(scratch.allocator(), self.name);
-    try rpc.executeDiscard(self.client, .{ .method = .DELETE, .path = path });
+    var token: idempotency.Token = undefined;
+    token.init(self.client);
+    try rpc.executeDiscard(self.client, .{ .method = .DELETE, .path = path, .headers = token.slice() });
 }
 
 /// Brings back the soft-deleted bucket of this name and `generation`, as
