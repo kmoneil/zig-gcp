@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.25.0 (unreleased)
+## 0.25.0 (2026-09-30)
 
 - storage: buckets take their settings, and can change them.
   `BucketConfig` gains `versioning`, `soft_delete_retention_s`,
@@ -31,7 +31,8 @@ including the ones that did not change.
   off with a retention of 0, since `"softDeletePolicy": null` puts the
   7-day default back, and an empty label change sends nothing, since
   `"labels": {}` removes every label. `storage.limits` gains the limits.
-  Not breaking: every new field has a default.
+  Breaking, for an exhaustive `switch` over `storage.Error`: it gains
+  `InvalidBucketSettings`. Every new field has a default.
 - storage: versions and soft delete. `ListOptions` gains `versions`,
   `soft_deleted` and `match_glob`; `ObjectInfo` gains `time_deleted`,
   `soft_delete_time`, `hard_delete_time` and `restore_token`; `GetOptions`
