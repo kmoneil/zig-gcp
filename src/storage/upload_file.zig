@@ -1101,8 +1101,7 @@ fn resumeProperty(_: void, input: []const u8) !void {
 
 // About 15 ms a run in Debug, with two uploads of up to 600 KiB over a
 // real file: named out of the nightly's "fuzz" and "slow property"
-// filters, like the parallel fault properties, until a job of its own is
-// sized for them.
+// filters, like the parallel fault properties, for the fault-storage job.
 test "fault property uploadFile resume: a second run completes the object, sending nothing the session holds" {
     try test_util.fuzzBytes({}, resumeProperty, .{
         .random_runs = 100,
@@ -1572,8 +1571,8 @@ fn compressedResumeProperty(_: void, input: []const u8) !void {
 }
 
 // Compressing up to 700 KiB several times a run in Debug, over a real
-// file: named out of the nightly filters, like the uncompressed resume
-// property.
+// file, about 290 ms a run: named out of the nightly's other filters, for
+// the fault-gzip job with the gzip fault properties.
 test "fault property compressed uploadFile resume: a second run ends with std's bytes, sending nothing the session holds" {
     try test_util.fuzzBytes({}, compressedResumeProperty, .{
         .random_runs = 60,

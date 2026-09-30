@@ -2073,9 +2073,9 @@ fn faultProperty(_: void, input: []const u8) !void {
     try runUnderFaults(clock.io(), false, input);
 }
 
-// About 2.3 ms a run in Debug: named out of the nightly's "fuzz" and "slow
-// property" filters, like the parallel upload's fault property, until a
-// job of its own is sized for it.
+// About 5 ms a run in Debug: named out of the nightly's "fuzz" and "slow
+// property" filters, like the parallel upload's fault property, for the
+// fault-storage job.
 test "fault property parallel download: every run under faults writes the object whole, or fails" {
     try test_util.fuzzBytes({}, faultProperty, .{
         .random_runs = 300,
@@ -2232,10 +2232,10 @@ fn resumeProperty(_: void, input: []const u8) !void {
     try resumeUnderFaults(input);
 }
 
-// About 9 ms a run in Debug, with two or three downloads over real
+// About 18 ms a run in Debug, with two or three downloads over real
 // threads and a real file: named out of the nightly's "fuzz" and "slow
-// property" filters, like the other parallel fault properties, until a
-// job of its own is sized for them.
+// property" filters, like the other parallel fault properties, for the
+// fault-storage job.
 test "fault property parallel resume: a second run completes the object, fetching nothing the file holds" {
     try test_util.fuzzBytes({}, resumeProperty, .{
         .random_runs = 100,

@@ -1723,9 +1723,9 @@ fn faultProperty(_: void, input: []const u8) !void {
     try runUnderFaults(clock.io(), input);
 }
 
-// About 0.87 ms a run, far more than the other storage properties: named
-// out of the nightly's "fuzz" and "slow property" filters, which would run
-// it millions of times, until a job of its own is sized for it.
+// Far costlier a run than the other storage properties, so named out of
+// the nightly's "fuzz" and "slow property" filters, which would run it
+// millions of times: the nightly's fault-storage job fuzzes it.
 test "fault property parallel: every run under faults succeeds whole, or fails and cleans up" {
     try test_util.fuzzBytes({}, faultProperty, .{
         .random_runs = 300,
@@ -3257,10 +3257,10 @@ fn resumeProperty(_: void, input: []const u8) !void {
     try resumeUnderFaults(input);
 }
 
-// About 9 ms a run in Debug, with two uploads over real threads and a real
-// file: named out of the nightly's "fuzz" and "slow property" filters,
-// like the other parallel fault properties, until a job of its own is
-// sized for them.
+// About 15 ms a run in Debug, with two uploads over real threads and a
+// real file: named out of the nightly's "fuzz" and "slow property"
+// filters, like the other parallel fault properties, for the
+// fault-storage job.
 test "fault property parallel upload resume: a second run completes the object, sending nothing the server holds" {
     try test_util.fuzzBytes({}, resumeProperty, .{
         .random_runs = 100,
