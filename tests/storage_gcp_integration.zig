@@ -81,6 +81,7 @@ const Fixture = struct {
         chunk_size: usize = 8 * 1024 * 1024,
         single_request_limit: usize = 8 * 1024 * 1024,
         verify_checksums: bool = true,
+        idempotency_tokens: bool = true,
         /// Faults for the client's transport to inject.
         plan: []FaultTransport.Fault = &.{},
         /// Record every exchange in `faults.exchanges`.
@@ -122,6 +123,7 @@ const Fixture = struct {
             .chunk_size = options.chunk_size,
             .single_request_limit = options.single_request_limit,
             .verify_checksums = options.verify_checksums,
+            .idempotency_tokens = options.idempotency_tokens,
             // A slow link moves an 8 MiB chunk slowly; a hang still ends.
             .request_timeout_ms = 120_000,
             .user_agent = user_agent,
@@ -404,14 +406,14 @@ test "1. preconditions: create-only once, a stale generation refused, the curren
     try testing.expect(!try obj.exists());
 }
 
-test "a lost answer: a create-only upload retries into its own precondition; an unconditional one never retries" {
+test "a lost answer, without idempotency tokens: a create-only upload retries into its own precondition; an unconditional one never retries" {
     var plan = [_]FaultTransport.Fault{.{
         .method = .POST,
         .url_contains = "uploadType=multipart",
         .action = .lose_response,
     }};
     var f: Fixture = undefined;
-    if (!try f.init(.{ .plan = &plan, .record = true })) return error.SkipZigTest;
+    if (!try f.init(.{ .plan = &plan, .record = true, .idempotency_tokens = false })) return error.SkipZigTest;
     defer f.deinit();
     const obj = try f.object("lost-answer.txt");
 
@@ -434,13 +436,141 @@ test "a lost answer: a create-only upload retries into its own precondition; an 
         .action = .lose_response,
     }};
     var g: Fixture = undefined;
-    if (!try g.init(.{ .plan = &plan2, .record = true })) return error.SkipZigTest;
+    if (!try g.init(.{ .plan = &plan2, .record = true, .idempotency_tokens = false })) return error.SkipZigTest;
     defer g.deinit();
     const once = try g.object("once.txt");
     try testing.expectError(error.ConnectionResetByPeer, once.upload("once", .{}));
     try testing.expect(plan2[0].fired);
     try testing.expectEqual(1, g.faults.exchanges.items.len);
     try g.expectContent(once, "once");
+}
+
+/// Another writer's patch of one metadata key, between an attempt and its
+/// repeat.
+const OtherPatch = struct {
+    object: storage.Object,
+    err: ?anyerror = null,
+
+    fn run(context: *anyopaque, _: *const FaultTransport.Fault) void {
+        const self: *OtherPatch = @ptrCast(@alignCast(context));
+        var info = self.object.updateMetadata(.{ .edit = .{ .change = &.{.{ .key = "who", .value = "other" }} } }) catch |err| {
+            self.err = err;
+            return;
+        };
+        info.deinit();
+    }
+};
+
+/// The token every recorded exchange carried, which must be one.
+fn oneToken(f: *const Fixture) ![]const u8 {
+    const first = f.faults.exchanges.items[0].header("X-Goog-Gcs-Idempotency-Token") orelse return error.TestExpectedToken;
+    for (f.faults.exchanges.items[1..]) |e| try testing.expectEqualStrings(first, e.header("X-Goog-Gcs-Idempotency-Token") orelse return error.TestExpectedToken);
+    try testing.expectEqual(32, first.len);
+    return first;
+}
+
+test "58. idempotency: a write whose answer was lost is answered with its first result, even after another writer" {
+    const gpa = testing.allocator;
+    // A create-only upload lands and loses its answer: its repeat, with
+    // the same token, gets its own object back, not 412.
+    var create_plan = [_]FaultTransport.Fault{.{ .method = .POST, .url_contains = "uploadType=multipart", .action = .lose_response }};
+    var f: Fixture = undefined;
+    if (!try f.init(.{ .plan = &create_plan, .record = true })) return error.SkipZigTest;
+    defer f.deinit();
+    const created = try f.object("created.txt");
+    var mine = created.upload("landed", .{ .preconditions = .does_not_exist }) catch |err| return f.report(err);
+    defer mine.deinit();
+    try testing.expect(create_plan[0].fired);
+    try testing.expectEqual(2, f.faults.exchanges.items.len);
+    _ = try oneToken(&f);
+    try f.expectContent(created, "landed");
+    var read = try created.get(.{});
+    defer read.deinit();
+    try testing.expectEqual(read.value.generation, mine.value.generation);
+
+    // An upload without a condition lands and loses its answer; another
+    // writer replaces the object; the repeat is answered with the first
+    // upload's own result, and the other writer's object stays.
+    var other: storage.Client = try .init(gpa, testing.io, .{ .token_provider = f.token.provider(), .user_agent = Fixture.user_agent });
+    defer other.deinit();
+    var upload_plan = [_]FaultTransport.Fault{.{ .method = .POST, .url_contains = "uploadType=multipart", .action = .lose_response }};
+    var g: Fixture = undefined;
+    if (!try g.init(.{ .plan = &upload_plan, .record = true })) return error.SkipZigTest;
+    defer g.deinit();
+    const replaced = try g.object("replaced.txt");
+    var overwrite: Overwrite = .{ .object = other.bucket(g.bucket_name).object(replaced.name), .data = "the other writer's" };
+    g.faults.after_fault = .{ .context = &overwrite, .run = Overwrite.run };
+    var first = replaced.upload("the first writer's", .{}) catch |err| return g.report(err);
+    defer first.deinit();
+    if (overwrite.err) |err| return err;
+    try testing.expect(upload_plan[0].fired);
+    _ = try oneToken(&g);
+    try testing.expect(overwrite.generation > first.value.generation);
+    try g.expectContent(replaced, "the other writer's");
+
+    // A delete lands and loses its answer; another writer creates the name
+    // again; the repeat is answered, and the new object stays.
+    var delete_plan = [_]FaultTransport.Fault{.{ .method = .DELETE, .action = .lose_response }};
+    var d: Fixture = undefined;
+    if (!try d.init(.{ .plan = &delete_plan, .record = true })) return error.SkipZigTest;
+    defer d.deinit();
+    const deleted = try d.object("deleted.txt");
+    var seed = deleted.upload("gone soon", .{}) catch |err| return d.report(err);
+    seed.deinit();
+    var recreate: Overwrite = .{ .object = other.bucket(d.bucket_name).object(deleted.name), .data = "created again" };
+    d.faults.after_fault = .{ .context = &recreate, .run = Overwrite.run };
+    const before = d.faults.exchanges.items.len;
+    deleted.delete(.{}) catch |err| return d.report(err);
+    if (recreate.err) |err| return err;
+    try testing.expect(delete_plan[0].fired);
+    const deletes = d.faults.exchanges.items[before..];
+    try testing.expectEqual(2, deletes.len);
+    try testing.expectEqualStrings(deletes[0].header("X-Goog-Gcs-Idempotency-Token").?, deletes[1].header("X-Goog-Gcs-Idempotency-Token").?);
+    try testing.expectEqual(204, deletes[1].status.?);
+    try d.expectContent(deleted, "created again");
+
+    // A patch lands and loses its answer; another writer patches the same
+    // key; the repeat answers with the first patch's result, and the
+    // object keeps the other writer's value.
+    var patch_plan = [_]FaultTransport.Fault{.{ .method = .PATCH, .action = .lose_response }};
+    var p: Fixture = undefined;
+    if (!try p.init(.{ .plan = &patch_plan, .record = true })) return error.SkipZigTest;
+    defer p.deinit();
+    const patched = try p.object("patched.txt");
+    var base = patched.upload("patched", .{}) catch |err| return p.report(err);
+    base.deinit();
+    var other_patch: OtherPatch = .{ .object = other.bucket(p.bucket_name).object(patched.name) };
+    p.faults.after_fault = .{ .context = &other_patch, .run = OtherPatch.run };
+    var answer = patched.updateMetadata(.{ .edit = .{ .change = &.{.{ .key = "who", .value = "first" }} } }) catch |err| return p.report(err);
+    defer answer.deinit();
+    if (other_patch.err) |err| return err;
+    try testing.expect(patch_plan[0].fired);
+    try testing.expectEqualStrings("first", answer.value.metadataValue("who").?);
+    var now = try patched.get(.{});
+    defer now.deinit();
+    try testing.expectEqualStrings("other", now.value.metadataValue("who").?);
+
+    // A parallel upload's move lands and loses its answer: the repeat is
+    // answered 200 with the move's result, where without a token it meets
+    // 404 or 412 and reads the object back.
+    var move_plan = [_]FaultTransport.Fault{.{ .method = .POST, .url_contains = "/moveTo/", .action = .lose_response }};
+    var m: Fixture = undefined;
+    if (!try m.init(.{ .plan = &move_plan, .record = true })) return error.SkipZigTest;
+    defer m.deinit();
+    const data = try pattern(gpa, 58, 6 * 1024 * 1024);
+    defer gpa.free(data);
+    const moved = try m.object("moved.bin");
+    var info = moved.uploadParallel(.{ .data = data }, .{ .part_size = 5 * 1024 * 1024, .concurrency = 1, .preconditions = .does_not_exist }) catch |err| return m.report(err);
+    defer info.deinit();
+    try testing.expect(move_plan[0].fired);
+    const lost = try m.faulted(0);
+    const repeat = try m.after(lost);
+    try testing.expect(std.mem.indexOf(u8, repeat.url, "/moveTo/") != null);
+    try testing.expectEqual(200, repeat.status.?);
+    try testing.expectEqualStrings(m.faults.exchanges.items[lost].header("X-Goog-Gcs-Idempotency-Token").?, repeat.header("X-Goog-Gcs-Idempotency-Token").?);
+    try testing.expectEqual(core.crc32c.hash(data), info.value.crc32c.?);
+    try m.expectContent(moved, data);
+    try testing.expectEqual(0, try tempObjects(&m));
 }
 
 test "2. server-side validation: a wrong declared crc32c is refused with 400, and nothing is stored" {
@@ -2088,12 +2218,12 @@ test "29. create-only parallel upload: a new name, with its metadata and metagen
     try f.expectContent(obj, data);
 }
 
-test "30. create-only parallel upload: a lost move answer is settled by reading, and what the repeat met" {
+test "30. create-only parallel upload, without idempotency tokens: a lost move answer is settled by reading, and what the repeat met" {
     var plan = [_]FaultTransport.Fault{
         .{ .method = .POST, .url_contains = "/moveTo/", .action = .lose_response },
     };
     var f: Fixture = undefined;
-    if (!try f.init(.{ .plan = &plan, .record = true })) return error.SkipZigTest;
+    if (!try f.init(.{ .plan = &plan, .record = true, .idempotency_tokens = false })) return error.SkipZigTest;
     defer f.deinit();
     const data = try pattern(testing.allocator, 30, 6 * 1024 * 1024);
     defer testing.allocator.free(data);
