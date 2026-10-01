@@ -73,6 +73,58 @@ pub fn update(client: *Client, bucket: []const u8, changes: types.BucketUpdate) 
     return result;
 }
 
+/// Locks the policy of the metageneration named. The caller has begun the
+/// call and checked the name.
+///
+/// Measured on 2026-09-30: a lock needs `ifMetagenerationMatch` (400
+/// `required` without, 412 when stale), answers the bucket locked, and
+/// moves the metageneration. Repeated, it is 400 `invalid` "Bucket '...'
+/// does not have an unlocked retention policy.", the answer to a bucket
+/// with no policy too. So that 400 is resolved by reading the bucket: a
+/// locked policy is the lock's success, a repeat's or an earlier one's.
+pub fn lock(client: *Client, bucket: []const u8, metageneration: u64) Error!types.Owned(types.BucketInfo) {
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const path = try std.fmt.allocPrint(scratch.allocator(), "{s}/lockRetentionPolicy?ifMetagenerationMatch={d}", .{
+        try names.bucketPath(scratch.allocator(), bucket),
+        metageneration,
+    });
+    var token: idempotency.Token = undefined;
+    token.init(client);
+
+    var result: types.Owned(types.BucketInfo) = try .init(client.gpa);
+    errdefer result.deinit();
+    // Always safe to repeat: the condition is required.
+    const response = rpc.execute(client, result.arena, .{ .method = .POST, .path = path, .headers = token.slice(), .retry = true }) catch |err| {
+        if (err != error.InvalidArgument) return err;
+        // The refusal's words, for when the bucket is not locked after all.
+        const refusal: ?core.Diagnostics = if (client.diagnostics) |d| d.* else null;
+        const restore = struct {
+            fn words(c: *Client, saved: ?core.Diagnostics) void {
+                if (c.diagnostics) |d| d.* = saved.?;
+            }
+        }.words;
+        const read = rpc.execute(client, result.arena, .{ .method = .GET, .path = try names.bucketPath(scratch.allocator(), bucket) }) catch {
+            restore(client, refusal);
+            return err;
+        };
+        const info = codec.decodeBucket(result.arena.allocator(), read) catch {
+            restore(client, refusal);
+            return err;
+        };
+        const locked = if (info.retention_policy) |policy| policy.locked else false;
+        if (!locked) {
+            restore(client, refusal);
+            return err;
+        }
+        result.value = info;
+        return result;
+    };
+    result.value = codec.decodeBucket(result.arena.allocator(), response) catch |err|
+        return rpc.decodeFailed(client, err, "bucket");
+    return result;
+}
+
 // Checks
 
 /// Every setting of a new bucket, before anything is sent.

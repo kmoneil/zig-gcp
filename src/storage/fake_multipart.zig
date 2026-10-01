@@ -83,6 +83,14 @@
 //! checked first. New objects get the bucket's default event-based hold
 //! unless their metadata says `eventBasedHold: false`. `objects.patch`
 //! sets and releases holds, and takes nothing else.
+//!
+//! Object retention, in a bucket created with it, is held to the same
+//! day's measurements: an upload or a patch names both its mode and its
+//! time, in the future and with a zone, and not beside an event-based
+//! hold, or is refused 400 with production's words; the object is kept
+//! until its time; a patch extends it freely, while shortening, removing
+//! (both fields null; `{}` changes nothing) or locking an unlocked one
+//! needs `overrideUnlockedRetention=true`, and a locked one only extends.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -271,8 +279,15 @@ pub const FakeMultipart = struct {
         /// The keys its start named. The name is owned.
         key_sha256: ?[32]u8 = null,
         kms_key_name: ?[]u8 = null,
-        /// The holds its start's metadata asked for.
+        /// The holds and retention its start's metadata asked for.
         holds: Holds = .{},
+        retention: ?Retention = null,
+    };
+
+    /// An object's own retention.
+    pub const Retention = struct {
+        locked: bool,
+        until_ns: i96,
     };
 
     /// An object's holds: null until set, `false` once released.
@@ -297,6 +312,8 @@ pub const FakeMultipart = struct {
         /// The Cloud KMS key it is stored under, without a version. Owned.
         kms_key_name: ?[]u8 = null,
         holds: Holds = .{},
+        /// Its own retention: until when, on the fake's clock.
+        retention: ?Retention = null,
         /// Moved by every patch.
         metageneration: u64 = 1,
         /// When its retention period started, on the fake's clock: its
@@ -662,9 +679,17 @@ pub const FakeMultipart = struct {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return .{ .status = 400, .body = bad ++ "a body that is not JSON\"}}" };
         if (parsed != .object) return .{ .status = 400, .body = bad ++ "a body that is not an object\"}}" };
         var holds = o.holds;
+        var retention = o.retention;
         var it = parsed.object.iterator();
         while (it.next()) |entry| {
             const value = entry.value_ptr.*;
+            if (std.mem.eql(u8, entry.key_ptr.*, "retention")) {
+                switch (try self.retentionChange(target, o.retention, value, arena)) {
+                    .refused => |reply| return reply,
+                    .next => |next| retention = next,
+                }
+                continue;
+            }
             if (value != .bool) return .{ .status = 400, .body = bad ++ "a field that is not a boolean\"}}" };
             if (std.mem.eql(u8, entry.key_ptr.*, "temporaryHold")) {
                 holds.temporary = value.bool;
@@ -672,10 +697,95 @@ pub const FakeMultipart = struct {
                 holds.event_based = value.bool;
             } else return .{ .status = 400, .body = bad ++ "another field\"}}" };
         }
+        if (retention != null and (holds.event_based orelse false)) return try jsonRefusal(arena, 400, "invalid", "Retention and event based holds cannot be configured together.");
         if (o.holds.event_based orelse false and !(holds.event_based orelse false)) o.retained_from_ns = self.now();
         o.holds = holds;
+        o.retention = retention;
         o.metageneration += 1;
         return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, false) };
+    }
+
+    const RetentionOutcome = union(enum) { next: ?Retention, refused: Reply };
+
+    /// What a patch's `retention` makes of `old`, as measured.
+    fn retentionChange(self: *FakeMultipart, target: JsonTarget, old: ?Retention, value: std.json.Value, arena: Allocator) Allocator.Error!RetentionOutcome {
+        const unlocked_words = "The unlocked object retention cannot be removed and its retention period cannot be shortened without overriding unlocked retention intent and permission.";
+        const locked_words = "The locked object retention cannot be removed. Its retention mode cannot be changed and its retention period cannot be shortened.";
+        const removing = switch (value) {
+            .null => true,
+            .object => |fields| removal: {
+                // `{}` changes nothing.
+                if (fields.count() == 0) return .{ .next = old };
+                const mode = fields.get("mode") orelse break :removal false;
+                const until = fields.get("retainUntilTime") orelse break :removal false;
+                break :removal mode == .null and until == .null;
+            },
+            else => return .{ .refused = try jsonRefusal(arena, 400, "invalid", "retention is not an object") },
+        };
+        if (removing) {
+            const current = old orelse return .{ .next = null };
+            if (current.locked) return .{ .refused = try jsonRefusal(arena, 403, "forbidden", locked_words) };
+            if (!target.override_unlocked_retention) return .{ .refused = try jsonRefusal(arena, 403, "forbidden", unlocked_words) };
+            return .{ .next = null };
+        }
+        const next = switch (try self.parseRetention(target.bucket, value, arena)) {
+            .refused => |reply| return .{ .refused = reply },
+            .ok => |r| r,
+        };
+        const current = old orelse return .{ .next = next };
+        const shortens = next.until_ns < current.until_ns;
+        if (current.locked) {
+            if (!next.locked or shortens) return .{ .refused = try jsonRefusal(arena, 403, "forbidden", locked_words) };
+            return .{ .next = next };
+        }
+        if ((shortens or next.locked) and !target.override_unlocked_retention) {
+            return .{ .refused = try jsonRefusal(arena, 403, "forbidden", unlocked_words) };
+        }
+        return .{ .next = next };
+    }
+
+    const ParsedRetention = union(enum) { ok: Retention, refused: Reply };
+
+    /// A retention as an upload or a patch names it, held to production's
+    /// 400s: both fields, a known mode, a time with a zone and in the
+    /// future, in a bucket with object retention.
+    fn parseRetention(self: *const FakeMultipart, bucket: []const u8, value: std.json.Value, arena: Allocator) Allocator.Error!ParsedRetention {
+        const fields = switch (value) {
+            .object => |o| o,
+            else => return .{ .refused = try jsonRefusal(arena, 400, "invalid", "retention is not an object") },
+        };
+        if (!self.buckets.objectRetention(bucket)) return .{ .refused = try jsonRefusal(arena, 400, "invalid", "Object retention is not enabled on the bucket.") };
+        const mode = fields.get("mode") orelse return .{ .refused = try jsonRefusal(arena, 400, "invalid", "Missing retention mode. Both mode and retain until time are required.") };
+        const until = fields.get("retainUntilTime") orelse return .{ .refused = try jsonRefusal(arena, 400, "invalid", "Missing retain until time. Both mode and retain until time are required.") };
+        if (mode != .string or until != .string) return .{ .refused = try jsonRefusal(arena, 400, "invalid", "retention's fields are not strings") };
+        const locked = if (std.mem.eql(u8, mode.string, "Locked"))
+            true
+        else if (std.mem.eql(u8, mode.string, "Unlocked"))
+            false
+        else
+            return .{ .refused = try jsonRefusal(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for: {s} is not a valid value", .{mode.string})) };
+        const at = core.timestamp.parse(until.string) catch return .{ .refused = try jsonRefusal(
+            arena,
+            400,
+            "invalid",
+            "Parse Error: Invalid value for type.googleapis.com/google.protobuf.Timestamp field: 'Field 'retainUntilTime', Illegal timestamp format; timestamps must end with 'Z' or have a valid timezone offset.'.",
+        ) };
+        const until_ns = at.nanoseconds - wall_base_s * std.time.ns_per_s;
+        if (until_ns <= self.now()) return .{ .refused = try jsonRefusal(arena, 400, "invalid", "Retain until time cannot be in the past.") };
+        return .{ .ok = .{ .locked = locked, .until_ns = until_ns } };
+    }
+
+    const UploadRetention = union(enum) { ok: ?Retention, refused: Reply };
+
+    /// An upload's retention, if its metadata names one, refused beside an
+    /// event-based hold.
+    fn uploadRetention(self: *const FakeMultipart, bucket: []const u8, meta: Meta, arena: Allocator) Allocator.Error!UploadRetention {
+        const value = meta.retention orelse return .{ .ok = null };
+        if (meta.eventBasedHold orelse false) return .{ .refused = try jsonRefusal(arena, 400, "invalid", "Retention and event based holds cannot be configured together.") };
+        return switch (try self.parseRetention(bucket, value, arena)) {
+            .ok => |r| .{ .ok = r },
+            .refused => |reply| .{ .refused = reply },
+        };
     }
 
     /// The fake's clock.
@@ -686,9 +796,11 @@ pub const FakeMultipart = struct {
     /// When the object's retention ends, on the fake's clock, or null when
     /// no policy applies, or an event-based hold defers it.
     fn retainedUntil(self: *const FakeMultipart, bucket: []const u8, o: *const Stored) ?i96 {
-        const period = self.buckets.retentionPeriod(bucket) orelse return null;
-        if (o.holds.event_based orelse false) return null;
-        return o.retained_from_ns + @as(i96, period) * std.time.ns_per_s;
+        const own: ?i96 = if (o.retention) |r| r.until_ns else null;
+        const period = self.buckets.retentionPeriod(bucket) orelse return own;
+        if (o.holds.event_based orelse false) return own;
+        const policy = o.retained_from_ns + @as(i96, period) * std.time.ns_per_s;
+        return if (own) |until| @max(until, policy) else policy;
     }
 
     /// The holds a new object in `bucket` gets: those asked for, and the
@@ -1223,6 +1335,10 @@ pub const FakeMultipart = struct {
         else
             target.conditions.checkAbsent();
         if (!held) return condition_failed;
+        const retention = switch (try self.uploadRetention(target.bucket, meta, arena)) {
+            .refused => |reply| return reply,
+            .ok => |r| r,
+        };
 
         const declared: ?u64 = if (headerValue(headers, "X-Upload-Content-Length")) |text|
             std.fmt.parseInt(u64, text, 10) catch null
@@ -1256,6 +1372,7 @@ pub const FakeMultipart = struct {
             .key_sha256 = keys.key_sha256,
             .kms_key_name = kms,
             .holds = .{ .temporary = meta.temporaryHold, .event_based = meta.eventBasedHold },
+            .retention = retention,
         });
         self.next_session += 1;
         return .{ .status = 200, .headers = try replyHeaders(arena, &.{.{ .name = "Location", .value = location }}) };
@@ -1344,6 +1461,7 @@ pub const FakeMultipart = struct {
         if (try self.keptLive(.json, s.bucket, s.name, arena)) |refusal| return refusal;
 
         const o = try self.store(s.bucket, s.name, s.bytes.items, s.content_type, s.gzip, s.key_sha256, s.kms_key_name, s.holds);
+        o.retention = s.retention;
         s.done = o.generation;
         s.bytes.clearAndFree(self.gpa);
         return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, s.bucket, false, true) };
@@ -1432,7 +1550,12 @@ pub const FakeMultipart = struct {
         }
         if (try self.keptLive(.json, target.bucket, meta.name, arena)) |refusal| return refusal;
         const holds: Holds = .{ .temporary = meta.temporaryHold, .event_based = meta.eventBasedHold };
+        const retention = switch (try self.uploadRetention(target.bucket, meta, arena)) {
+            .refused => |reply| return reply,
+            .ok => |r| r,
+        };
         const o = try self.store(target.bucket, meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip(), keys.key_sha256, keys.kms_key_name, holds);
+        o.retention = retention;
         return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, true) };
     }
 
@@ -1815,6 +1938,10 @@ fn objectJson(
         .temporaryHold = o.holds.temporary,
         .eventBasedHold = o.holds.event_based,
         .retentionExpirationTime = expiration,
+        .retention = if (o.retention) |r| @as(?struct { mode: []const u8, retainUntilTime: []const u8 }, .{
+            .mode = if (r.locked) "Locked" else "Unlocked",
+            .retainUntilTime = try rfc3339(arena, r.until_ns),
+        }) else null,
     }) catch return error.OutOfMemory;
     return out.written();
 }
@@ -1831,8 +1958,11 @@ fn jsonRefusal(arena: Allocator, status: u16, reason: []const u8, message: []con
 
 /// The fake's wall clock: its clock's reading past midnight UTC on
 /// 2026-09-30, the day this was measured, in RFC 3339 to the millisecond.
+/// The fake's wall clock starts at midnight UTC on 2026-09-30.
+const wall_base_s: i96 = 1_790_726_400;
+
 fn rfc3339(arena: Allocator, ns: i96) Allocator.Error![]const u8 {
-    const base_s: i96 = 1_790_726_400;
+    const base_s: i96 = wall_base_s;
     const total_ms: u64 = @intCast(@max(0, base_s * std.time.ms_per_s + @divFloor(ns, std.time.ns_per_ms)));
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = total_ms / std.time.ms_per_s };
     const day = epoch.getEpochDay();
@@ -1900,6 +2030,7 @@ const Meta = struct {
     crc32c: ?[]const u8 = null,
     temporaryHold: ?bool = null,
     eventBasedHold: ?bool = null,
+    retention: ?std.json.Value = null,
 
     fn gzip(m: Meta) bool {
         return std.ascii.eqlIgnoreCase(m.contentEncoding orelse "", "gzip");
@@ -1962,6 +2093,7 @@ fn copyStored(gpa: Allocator, o: *const FakeMultipart.Stored, generation: u64) A
         .key_sha256 = o.key_sha256,
         .kms_key_name = kms,
         .holds = o.holds,
+        .retention = o.retention,
         .metageneration = o.metageneration,
         .retained_from_ns = o.retained_from_ns,
     };
@@ -2015,6 +2147,8 @@ const JsonTarget = struct {
     /// `softDeleted=true`: a soft-deleted generation's metadata.
     soft_deleted: bool = false,
     conditions: Conditions = .{},
+    /// `overrideUnlockedRetention=true`, on a patch.
+    override_unlocked_retention: bool = false,
 };
 
 const RestoreTarget = struct {
@@ -2120,6 +2254,11 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         } };
     }
     if (std.mem.eql(u8, path, "/storage/v1/b")) return .{ .bucket = try bucketTarget(arena, null, query) };
+    if (std.mem.startsWith(u8, path, "/storage/v1/b/") and std.mem.endsWith(u8, path, "/lockRetentionPolicy")) {
+        var target = try bucketTarget(arena, try decode(arena, path["/storage/v1/b/".len .. path.len - "/lockRetentionPolicy".len]), query);
+        target.lock = true;
+        return .{ .bucket = target };
+    }
     if (std.mem.startsWith(u8, path, "/storage/v1/b/") and
         std.mem.indexOfScalar(u8, path["/storage/v1/b/".len..], '/') == null)
     {
@@ -2134,6 +2273,7 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         var source_generation: ?u64 = null;
         var media = false;
         var soft_deleted = false;
+        var override = false;
         var conditions: Conditions = .{};
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
@@ -2146,6 +2286,8 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
                 media = true;
             } else if (std.mem.eql(u8, param, "softDeleted=true")) {
                 soft_deleted = true;
+            } else if (std.mem.eql(u8, param, "overrideUnlockedRetention=true")) {
+                override = true;
             }
         }
         if (std.mem.endsWith(u8, object_part, "/restore")) return .{ .restore = .{
@@ -2170,6 +2312,7 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
             .media = media,
             .soft_deleted = soft_deleted,
             .conditions = conditions,
+            .override_unlocked_retention = override,
         } };
     }
 
@@ -2220,6 +2363,8 @@ fn bucketTarget(arena: Allocator, name: ?[]const u8, query: []const u8) core.tra
         } else if (std.mem.startsWith(u8, param, "ifMetagenerationNotMatch=")) {
             target.if_metageneration_not_match = std.fmt.parseInt(u64, param["ifMetagenerationNotMatch=".len..], 10) catch
                 return error.HttpProtocolError;
+        } else if (std.mem.eql(u8, param, "enableObjectRetention=true")) {
+            target.object_retention = true;
         } else return error.HttpProtocolError;
     }
     return target;

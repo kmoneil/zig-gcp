@@ -77,10 +77,13 @@ pub const ObjectInfo = struct {
     /// The same, and under a retention policy the period runs from the
     /// hold's release rather than from the object's creation.
     event_based_hold: bool = false,
-    /// RFC 3339: the earliest time the bucket's retention policy lets the
-    /// object be deleted or replaced. Null where no policy applies, and
-    /// while an event-based hold defers it.
+    /// RFC 3339: the earliest time the object may be deleted or replaced,
+    /// the later of its bucket's retention policy and its own retention.
+    /// Null where neither applies, and while an event-based hold defers
+    /// the policy.
     retention_expiration_time: ?[]const u8 = null,
+    /// Its own retention, in a bucket with object retention enabled.
+    retention: ?ObjectRetention = null,
 
     /// The value of the custom metadata entry named `key`, or null.
     pub fn metadataValue(self: ObjectInfo, key: []const u8) ?[]const u8 {
@@ -184,6 +187,8 @@ pub const ComposeOptions = struct {
     /// the bucket's default would (false). Null: as the bucket's default
     /// says.
     event_based_hold: ?bool = null,
+    /// The composite's own retention.
+    retention: ?ObjectRetention = null,
     /// Hard-deletes every source once the composite exists, which is what
     /// Google advises for parallel composite uploads, to keep the parts
     /// from being billed. Irreversible, and the wrong choice where soft
@@ -197,6 +202,30 @@ pub const ComposeOptions = struct {
     /// bucket's default, which a compose that names none gets, whatever
     /// keys its sources are under.
     kms_key_name: ?[]const u8 = null,
+};
+
+/// An object's own retention, in a bucket created with
+/// `BucketConfig.object_retention`: it is kept until `retain_until`, as a
+/// retention policy keeps it, and a write that would delete, replace or
+/// move it is `error.ObjectRetained`. Not together with an event-based
+/// hold.
+pub const ObjectRetention = struct {
+    mode: Mode,
+    /// RFC 3339 with `Z` or an offset, in the future and at most 100 years
+    /// ahead.
+    retain_until: []const u8,
+
+    pub const Mode = enum {
+        /// Extended freely; shortened, removed or locked only with
+        /// `MetadataUpdate.override_unlocked_retention`.
+        unlocked,
+        /// Extended only: never shortened, unlocked or removed, override
+        /// or not.
+        locked,
+        /// A mode the server sent that this library does not know. Never
+        /// sent: a write carrying it is refused.
+        unknown,
+    };
 };
 
 /// What a patch does to an object's custom metadata. Cloud Storage reads
@@ -233,6 +262,16 @@ pub const MetadataUpdate = struct {
     /// Place (true) or release (false) an event-based hold, which under a
     /// retention policy starts the period over. Null leaves it.
     event_based_hold: ?bool = null,
+    /// The object's own retention: `.set` extends it, or places it on an
+    /// object without; shortening, removing (`.clear`) or locking an
+    /// unlocked one also needs `override_unlocked_retention`. A locked one
+    /// is only ever extended.
+    retention: Change(ObjectRetention) = .keep,
+    /// Allows shortening, removing or locking an unlocked retention. Needs
+    /// `storage.objects.overrideUnlockedRetention`. Without it, such a
+    /// change is `error.PermissionDenied`, as is any but an extension of a
+    /// locked one.
+    override_unlocked_retention: bool = false,
     /// Change one older generation's metadata instead of the live one.
     generation: ?u64 = null,
     /// `if_metageneration_match` is what makes this safe to retry.
@@ -292,6 +331,8 @@ pub const UploadOptions = struct {
     /// the bucket's default would (false). Null: as the bucket's default
     /// says.
     event_based_hold: ?bool = null,
+    /// The object's own retention, in a bucket with object retention.
+    retention: ?ObjectRetention = null,
 };
 
 /// How `UploadOptions.gzip` compresses.
@@ -508,6 +549,9 @@ pub const CopyOptions = struct {
     /// change, and reads the source first as the fields above do.
     temporary_hold: bool = false,
     event_based_hold: ?bool = null,
+    /// The copy's own retention, which it never carries from the source.
+    /// Setting it is a change, as the holds are.
+    retention: ?ObjectRetention = null,
 };
 
 /// What an update does to a setting that can be taken away: `.keep`,
@@ -652,6 +696,11 @@ pub const BucketConfig = struct {
     /// Place an event-based hold on every object written to the bucket
     /// that does not ask for none.
     default_event_based_hold: bool = false,
+    /// Let objects carry a retention of their own. Permanent: it cannot be
+    /// turned off, nor turned on later, and Cloud Storage places a lien on
+    /// the project that keeps it from being deleted. Needs
+    /// `storage.buckets.enableObjectRetention`.
+    object_retention: bool = false,
 };
 
 /// A bucket's retention policy: every object is kept at least `period_s`
@@ -695,6 +744,8 @@ pub const BucketInfo = struct {
     /// Null: none.
     retention_policy: ?RetentionPolicy = null,
     default_event_based_hold: bool = false,
+    /// Objects may carry a retention of their own.
+    object_retention: bool = false,
     /// A soft-deleted bucket's: when it was deleted, and when it stops
     /// being restorable. Null for a live one.
     soft_delete_time: ?[]const u8 = null,

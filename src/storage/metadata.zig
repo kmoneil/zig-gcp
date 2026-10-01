@@ -24,6 +24,7 @@ const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const encryption = @import("encryption.zig");
 const idempotency = @import("idempotency.zig");
+const retention = @import("retention.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -41,13 +42,18 @@ pub fn update(
     try check(client.diagnostics, options);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
-    const path = try names.objectPath(
+    const object_path = try names.objectPath(
         scratch.allocator(),
         bucket,
         object,
         options.generation,
         options.preconditions,
     );
+    const path = if (options.override_unlocked_retention) try std.fmt.allocPrint(
+        scratch.allocator(),
+        "{s}{c}overrideUnlockedRetention=true",
+        .{ object_path, @as(u8, if (std.mem.indexOfScalar(u8, object_path, '?') == null) '?' else '&') },
+    ) else object_path;
     const body = try encode(scratch.allocator(), options);
 
     var result: types.Owned(types.ObjectInfo) = try .init(client.gpa);
@@ -93,6 +99,10 @@ pub fn check(
         options.content_language,
     });
     try checkEdit(diag, options.edit);
+    switch (options.retention) {
+        .set => |r| if (!retention.checkObjectRetention(diag, r, options.event_based_hold)) return error.InvalidMetadataUpdate,
+        .keep, .clear => {},
+    }
 }
 
 /// The five fixed fields, in the order `content_type`, `cache_control`,
@@ -184,6 +194,11 @@ fn write(jw: *Stringify, options: types.MetadataUpdate) Stringify.Error!void {
     if (options.event_based_hold) |on| {
         try jw.objectField("eventBasedHold");
         try jw.write(on);
+    }
+    switch (options.retention) {
+        .keep => {},
+        .set => |r| try codec.writeRetention(jw, r),
+        .clear => try codec.writeRetentionRemoved(jw),
     }
     try jw.endObject();
 }

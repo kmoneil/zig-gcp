@@ -27,6 +27,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const retention = @import("retention.zig");
 const encryption = @import("encryption.zig");
 const idempotency = @import("idempotency.zig");
 const names = @import("names.zig");
@@ -123,6 +124,9 @@ pub fn check(
         }
         return error.InvalidComposeSources;
     }
+    if (options.retention) |r| if (!retention.checkObjectRetention(diag, r, options.event_based_hold)) {
+        return error.InvalidComposeSources;
+    };
 }
 
 /// The `objects.compose` body.
@@ -185,6 +189,7 @@ fn write(
         try jw.endObject();
     }
     try codec.writeHolds(jw, options.temporary_hold, options.event_based_hold);
+    if (options.retention) |r| try codec.writeRetention(jw, r);
     try jw.endObject();
     if (options.delete_sources) {
         try jw.objectField("deleteSourceObjects");

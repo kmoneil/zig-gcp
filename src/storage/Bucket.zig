@@ -66,7 +66,9 @@ pub fn create(self: Bucket, config: types.BucketConfig) Error!types.Owned(types.
     const project = try rpc.requireProject(self.client);
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
-    const path = try names.bucketsPath(scratch.allocator(), project, .{});
+    const collection = try names.bucketsPath(scratch.allocator(), project, .{});
+    // Object retention is turned on by a parameter, never in the body.
+    const path = if (config.object_retention) try std.mem.concat(scratch.allocator(), u8, &.{ collection, "&enableObjectRetention=true" }) else collection;
     const body = try bucket_settings.encodeConfig(scratch.allocator(), self.name, config);
     var token: idempotency.Token = undefined;
     token.init(self.client);
@@ -122,6 +124,27 @@ fn updateBilled(self: Bucket, changes: types.BucketUpdate) Error!types.Owned(typ
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return bucket_settings.update(self.client, self.name, changes);
+}
+
+/// Locks the bucket's retention policy, permanently: it can then only be
+/// lengthened, never shortened or removed, and the bucket can be deleted
+/// only once every object has met it. Cloud Storage places a lien on the
+/// project, which keeps it from being deleted until an owner removes the
+/// lien; deleting the bucket does not. `metageneration` is the bucket's
+/// as last read, which Cloud Storage requires: it locks only the policy
+/// that was read. Safe to retry, and a bucket already locked answers as
+/// locked, as the repeat of a lock that landed must. A bucket with no
+/// policy is `error.InvalidArgument`; one changed since the read,
+/// `error.FailedPrecondition`.
+pub fn lockRetentionPolicy(self: Bucket, metageneration: u64) Error!types.Owned(types.BucketInfo) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).lockBilled(metageneration);
+}
+
+fn lockBilled(self: Bucket, metageneration: u64) Error!types.Owned(types.BucketInfo) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return bucket_settings.lock(self.client, self.name, metageneration);
 }
 
 /// Deletes the bucket, which must be empty. Safe to retry: a lost first

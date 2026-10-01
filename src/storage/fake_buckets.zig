@@ -27,6 +27,13 @@
 //!   changes nothing; `effectiveTime` stays where it was when the period
 //!   changes, and `isLocked` or `effectiveTime` in a patch are ignored.
 //!   `FakeMultipart` holds objects to it, and to `defaultEventBasedHold`.
+//! - A lock needs `ifMetagenerationMatch` (400 `required`), finds an
+//!   unlocked policy or answers 400 `invalid` "does not have an unlocked
+//!   retention policy" (a repeat included), checks the metageneration
+//!   (412), then locks and moves it. A locked period may grow; shrinking
+//!   it is 403 `forbidden`, removing it 403 `retentionPolicyNotMet`.
+//! - `enableObjectRetention=true` on a create gives `objectRetention`
+//!   `Enabled`; a patch of `objectRetention` is taken and ignored.
 //!
 //! Letters beyond ASCII pass in labels, since this fake has no Unicode
 //! tables; Cloud Storage refuses the uppercase ones. Fields this library
@@ -45,14 +52,17 @@ pub const FakeBuckets = struct {
     buckets: std.StringArrayHashMapUnmanaged(Stored) = .empty,
     next_generation: u64 = 1_790_690_832_240_124_605,
     counts: Counts = .{},
-    /// Why the latest refusal refused.
+    /// Why the latest refusal refused, and how.
     refusal: []const u8 = "",
+    refusal_status: u16 = 400,
+    refusal_reason: []const u8 = "invalid",
 
     pub const Counts = struct {
         creates: u32 = 0,
         reads: u32 = 0,
         patches: u32 = 0,
         deletes: u32 = 0,
+        locks: u32 = 0,
     };
 
     const Stored = struct {
@@ -67,6 +77,10 @@ pub const FakeBuckets = struct {
         project: ?[]const u8 = null,
         if_metageneration_match: ?u64 = null,
         if_metageneration_not_match: ?u64 = null,
+        /// `.../lockRetentionPolicy`.
+        lock: bool = false,
+        /// `enableObjectRetention=true`, on a create.
+        object_retention: bool = false,
     };
 
     pub const Reply = struct {
@@ -96,8 +110,13 @@ pub const FakeBuckets = struct {
         const name = target.name orelse {
             if (method != .POST or target.project == null) return error.HttpProtocolError;
             self.counts.creates += 1;
-            return self.create(body, arena);
+            return self.create(body, target.object_retention, arena);
         };
+        if (target.lock) {
+            if (method != .POST) return error.HttpProtocolError;
+            self.counts.locks += 1;
+            return self.lock(name, target, arena);
+        }
         switch (method) {
             .GET => {
                 self.counts.reads += 1;
@@ -117,7 +136,7 @@ pub const FakeBuckets = struct {
         }
     }
 
-    fn create(self: *FakeBuckets, body: []const u8, arena: Allocator) Error!Reply {
+    fn create(self: *FakeBuckets, body: []const u8, object_retention: bool, arena: Allocator) Error!Reply {
         const a = self.arena.allocator();
         const parsed = std.json.parseFromSliceLeaky(Value, arena, body, .{}) catch return self.invalid(arena, "Parse Error");
         const fields = objectOf(parsed) orelse return self.invalid(arena, "the body is not an object");
@@ -148,6 +167,11 @@ pub const FakeBuckets = struct {
         try next.put(a, "iamConfiguration", .{ .object = iam });
         const regional = std.mem.indexOfScalar(u8, location, '-') != null;
         try next.put(a, "locationType", .{ .string = if (regional) "region" else "multi-region" });
+        if (object_retention) {
+            var mode: ObjectMap = .empty;
+            try mode.put(a, "mode", .{ .string = "Enabled" });
+            try next.put(a, "objectRetention", .{ .object = mode });
+        }
 
         var it = fields.iterator();
         while (it.next()) |entry| {
@@ -191,6 +215,35 @@ pub const FakeBuckets = struct {
         return .{ .status = 200, .body = try render(arena, next) };
     }
 
+    /// `lockRetentionPolicy`, as measured.
+    fn lock(self: *FakeBuckets, name: []const u8, target: Target, arena: Allocator) Error!Reply {
+        const stored = self.buckets.getPtr(name) orelse return notFound();
+        const wanted = target.if_metageneration_match orelse return .{ .status = 400, .body =
+            \\{"error":{"code":400,"message":"Required parameter: ifMetagenerationMatch","errors":[{"message":"Required parameter: ifMetagenerationMatch","domain":"global","reason":"required"}]}}
+        };
+        const policy = stored.resource.get("retentionPolicy");
+        const unlocked = if (policy) |p| p.object.get("isLocked") == null else false;
+        if (!unlocked) return self.invalidFmt(arena, "Bucket '{s}' does not have an unlocked retention policy.", .{name});
+        if (wanted != stored.metageneration) return .{ .status = 412, .body =
+        \\{"error":{"code":412,"message":"At least one of the pre-conditions you specified did not hold.","errors":[{"message":"At least one of the pre-conditions you specified did not hold.","domain":"global","reason":"conditionNotMet"}]}}
+        };
+        const a = self.arena.allocator();
+        var next = try cloneObject(a, stored.resource);
+        var locked = try cloneObject(a, policy.?.object);
+        try locked.put(a, "isLocked", .{ .bool = true });
+        try next.put(a, "retentionPolicy", .{ .object = locked });
+        stored.metageneration += 1;
+        try next.put(a, "metageneration", .{ .string = try std.fmt.allocPrint(a, "{d}", .{stored.metageneration}) });
+        stored.resource = next;
+        return .{ .status = 200, .body = try render(arena, next) };
+    }
+
+    /// Whether objects in the bucket may carry a retention of their own.
+    pub fn objectRetention(self: *const FakeBuckets, name: []const u8) bool {
+        const r = self.resource(name) orelse return false;
+        return r.get("objectRetention") != null;
+    }
+
     const ApplyError = error{ Invalid, OutOfMemory };
 
     /// One field of a create or a patch, applied to `next`.
@@ -203,6 +256,9 @@ pub const FakeBuckets = struct {
         if (std.mem.eql(u8, key, "encryption")) return self.applyEncryption(next, value);
         if (std.mem.eql(u8, key, "iamConfiguration")) return self.applyIam(next, value);
         if (std.mem.eql(u8, key, "retentionPolicy")) return self.applyRetention(next, value);
+        // Measured: taken, and ignored. Only a create's parameter turns it
+        // on.
+        if (std.mem.eql(u8, key, "objectRetention")) return;
         if (std.mem.eql(u8, key, "defaultEventBasedHold")) {
             if (value != .bool) return self.fail("defaultEventBasedHold is not a boolean");
             return next.put(self.arena.allocator(), "defaultEventBasedHold", value);
@@ -408,8 +464,12 @@ pub const FakeBuckets = struct {
 
     fn applyRetention(self: *FakeBuckets, next: *ObjectMap, value: Value) ApplyError!void {
         const a = self.arena.allocator();
+        const old = next.get("retentionPolicy");
+        const locked = if (old) |p| p.object.get("isLocked") != null else false;
+        const name = next.get("name").?.string;
         const fields = switch (value) {
             .null => {
+                if (locked) return self.forbid("retentionPolicyNotMet", try std.fmt.allocPrint(a, "Bucket '{s}' has a locked Retention Policy which cannot be removed.", .{name}));
                 _ = next.orderedRemove("retentionPolicy");
                 return;
             },
@@ -427,10 +487,15 @@ pub const FakeBuckets = struct {
         if (period < 1 or period > 3_155_760_000) {
             return self.fail("Retention policy must have a retention period greater than 0 and less than 100 years.");
         }
-        const effective = if (next.get("retentionPolicy")) |old| old.object.get("effectiveTime").? else Value{ .string = "2026-09-30T21:57:51.487Z" };
+        if (locked) {
+            const current = std.fmt.parseInt(i64, old.?.object.get("retentionPeriod").?.string, 10) catch unreachable;
+            if (period < current) return self.forbid("forbidden", try std.fmt.allocPrint(a, "Cannot reduce retention duration of a locked Retention Policy for bucket '{s}'.", .{name}));
+        }
+        const effective = if (old) |p| p.object.get("effectiveTime").? else Value{ .string = "2026-09-30T21:57:51.487Z" };
         var policy: ObjectMap = .empty;
         try policy.put(a, "retentionPeriod", .{ .string = try std.fmt.allocPrint(a, "{d}", .{period}) });
         try policy.put(a, "effectiveTime", effective);
+        if (locked) try policy.put(a, "isLocked", .{ .bool = true });
         try next.put(a, "retentionPolicy", .{ .object = policy });
     }
 
@@ -518,17 +583,32 @@ pub const FakeBuckets = struct {
 
     fn fail(self: *FakeBuckets, message: []const u8) error{Invalid} {
         self.refusal = message;
+        self.refusal_status = 400;
+        self.refusal_reason = "invalid";
+        return error.Invalid;
+    }
+
+    /// A 403 refusal, as a locked policy's.
+    fn forbid(self: *FakeBuckets, reason: []const u8, message: []const u8) error{Invalid} {
+        self.refusal = message;
+        self.refusal_status = 403;
+        self.refusal_reason = reason;
         return error.Invalid;
     }
 
     fn failFmt(self: *FakeBuckets, comptime format: []const u8, args: anytype) ApplyError {
-        self.refusal = try std.fmt.allocPrint(self.arena.allocator(), format, args);
-        return error.Invalid;
+        return self.fail(try std.fmt.allocPrint(self.arena.allocator(), format, args));
     }
 
-    /// The 400 for the latest refusal.
+    /// The latest refusal's answer.
     fn refused(self: *FakeBuckets, arena: Allocator) Allocator.Error!Reply {
-        return self.invalid(arena, self.refusal);
+        if (self.refusal_status == 400) return self.invalid(arena, self.refusal);
+        const body = try std.json.Stringify.valueAlloc(arena, .{ .@"error" = .{
+            .code = self.refusal_status,
+            .message = self.refusal,
+            .errors = .{.{ .message = self.refusal, .domain = "global", .reason = self.refusal_reason }},
+        } }, .{});
+        return .{ .status = self.refusal_status, .body = body };
     }
 
     fn invalid(self: *FakeBuckets, arena: Allocator, message: []const u8) Allocator.Error!Reply {
