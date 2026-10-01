@@ -1344,6 +1344,81 @@ Measured against Cloud Storage on 2026-09-29:
   versions with a delimiter still groups a folder whose every object is
   noncurrent.
 
+### Retention and holds
+
+Cloud Storage can refuse to let an object go. A bucket's retention policy
+keeps every object for a period after its creation; a hold keeps one
+object until it is released; and an object's own retention, in a bucket
+created to allow it, keeps it until a time. A write that would delete,
+replace or move a kept object is `error.ObjectRetained`, with Cloud
+Storage's words, and the time where there is one, in `Diagnostics`. Its
+metadata stays editable.
+
+```zig
+// A bucket that keeps every object a day, and holds new ones until released.
+var ledger = try gcs.bucket("my-ledger").create(.{
+    .retention_period_s = 86_400,
+    .default_event_based_hold = true,
+});
+defer ledger.deinit();
+
+// Held as it is written; released when the event happens, and the day starts then.
+const entry = gcs.bucket("my-ledger").object("2026/09/30.csv");
+var stored = try entry.upload(data, .{ .temporary_hold = true });
+defer stored.deinit();
+var released = try entry.updateMetadata(.{ .temporary_hold = false, .event_based_hold = false });
+defer released.deinit();
+
+// Permanent: the policy may grow, never shrink or go.
+var locked = try gcs.bucket("my-ledger").lockRetentionPolicy(ledger.value.metageneration);
+defer locked.deinit();
+```
+
+- **Locking is permanent**, and so is a bucket created with
+  `object_retention`. Cloud Storage places a lien on the project, which
+  keeps it from being deleted until an owner removes the lien; deleting
+  the bucket did not remove it when measured. A locked policy may be
+  lengthened; shortening or removing it is `error.PermissionDenied`.
+- **An object's own retention** (`UploadOptions.retention`, and on
+  compose, copy and `updateMetadata`) extends freely. Shortening,
+  removing or locking an unlocked one takes
+  `MetadataUpdate.override_unlocked_retention`; a locked one only
+  extends. Otherwise the change is `error.PermissionDenied`. It cannot go
+  beside an event-based hold.
+- **Copies** never carry their source's holds or retention: a copy names
+  its own, which makes it a changed copy.
+- **A resumable upload over a kept object** sends every byte before its
+  last request is refused. Nothing is checked first, which would cost a
+  read per upload.
+- **Parallel uploads with conditions** into a bucket that keeps every new
+  object, by a policy or a default hold, go up as one ordinary upload, and
+  the log says so: there, the temporary object they finish under could
+  never be moved or deleted. Telling takes `storage.buckets.get`; without
+  it the upload goes up in parts, and its temporary object can be
+  stranded, and billed, for the whole period, as `Diagnostics` then says.
+- **The cleanup of a failed upload**, a checksum mismatch or a truncated
+  object, cannot delete a kept object, and `Diagnostics` says it stays.
+
+Measured against Cloud Storage on 2026-09-30:
+
+- A retained object's refusals are 403 `retentionPolicyNotMet`. A held
+  one's are 403 `forbidden`, the reason a missing permission has, told
+  apart only by the message: never the documented
+  `objectUnderActiveHold`. The XML API names both, at the finish of a
+  multipart upload whose parts it took.
+- A condition is checked before retention: 412 comes first.
+- A policy's period runs from 1 to 3,155,760,000 seconds, and covers the
+  objects already there. Its removal took over three seconds to stop
+  refusing once. With versioning on, a retained live object can still be
+  made noncurrent, and a noncurrent one cannot be deleted.
+- Releasing an event-based hold starts the policy's period over; its
+  `retention_expiration_time` is absent while held.
+- A lock repeated after a lost answer is refused 400, as if there were no
+  policy, so `lockRetentionPolicy` reads the bucket back and answers a
+  locked one as locked. A 60-second locked policy is enforced.
+- Object retention can only be turned on at create: a later patch is
+  taken and ignored.
+
 ### Requester pays
 
 A bucket with `requester_pays` on bills each request to the project the
