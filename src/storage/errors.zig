@@ -38,6 +38,14 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// told apart from a missing permission by the reason and message
     /// Cloud Storage sends. Never retried.
     ObjectRetained,
+    /// Cloud Storage cannot publish to a notification configuration's
+    /// topic: it does not exist, or the project's Cloud Storage service
+    /// agent, which `Client.serviceAgent` names, lacks
+    /// `roles/pubsub.publisher` on it. HTTP 403 `forbidden` or 400
+    /// `invalid`, told apart from other refusals by Cloud Storage's
+    /// message; `Diagnostics` says what to grant. A fresh grant took a few
+    /// seconds to apply when measured. Never retried.
+    TopicNotPublishable,
     /// A resumable session vanished (HTTP 404 or 410 on its URI) and the
     /// source cannot be replayed. The caller reopens the source and
     /// retries; `upload` starts a new session itself, since its bytes are
@@ -89,6 +97,13 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// update that changes nothing. `Diagnostics` says which. Nothing was
     /// sent.
     InvalidBucketSettings,
+    /// A notification configuration breaks a rule Cloud Storage holds it
+    /// to, or one it would silently get wrong: a topic Pub/Sub would not
+    /// name, an empty or repeated event type, more than 5 custom
+    /// attributes, a key or value out of bounds, a key twice or named like
+    /// an attribute every message carries, or a type or format this
+    /// library does not know. `Diagnostics` says which. Nothing was sent.
+    InvalidNotificationConfig,
     /// A compose breaks a rule: fewer than 1 or more than 32 sources, a
     /// name Cloud Storage would refuse, a source named twice at the same
     /// generation, or a source whose generation and precondition

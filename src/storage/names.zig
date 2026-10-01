@@ -131,6 +131,23 @@ fn writeOperations(w: *Writer, bucket: []const u8, request: OperationRequest) Wr
     }
 }
 
+/// `/storage/v1/b/{bucket}/notificationConfigs`, or one of them by `id`.
+pub fn notificationsPath(arena: Allocator, bucket: []const u8, id: ?[]const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeNotifications(&out.writer, bucket, id) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeNotifications(w: *Writer, bucket: []const u8, id: ?[]const u8) Writer.Error!void {
+    try w.writeAll("/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/notificationConfigs");
+    if (id) |i| {
+        try w.writeByte('/');
+        try query.writeStrictSegment(w, i);
+    }
+}
+
 /// `/storage/v1/b/{bucket}/o` with listing options.
 pub fn objectsPath(arena: Allocator, bucket: []const u8, options: types.ListOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);

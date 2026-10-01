@@ -888,6 +888,86 @@ pub const BucketPage = struct {
 /// The request a signed URL allows. A signed POST can only start a
 /// resumable upload, with the header `x-goog-resumable: start`; the
 /// session URI it answers with then takes the bytes with no signature.
+/// One custom attribute of a notification configuration, which Cloud
+/// Storage puts on every message it publishes for it.
+pub const Attribute = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// A Pub/Sub topic, as a notification configuration names it.
+pub const TopicName = struct {
+    /// A project ID, or a project number, which Cloud Storage keeps as a
+    /// number.
+    project: []const u8,
+    /// The topic's ID within the project.
+    topic: []const u8,
+};
+
+/// What a notification's message carries besides its attributes.
+pub const PayloadFormat = enum {
+    /// The object's metadata, as the JSON API gives it: `JSON_API_V1`.
+    json,
+    /// Nothing but the attributes: `NONE`.
+    none,
+    /// A format this library does not know, as read back. Never sent.
+    unknown,
+};
+
+/// A change to an object that Cloud Storage can publish, as measured on
+/// 2026-10-01.
+pub const EventType = enum {
+    /// An object, or a new generation of one, came to be: an upload of any
+    /// kind, a compose, a copy, a restore, the destination of a move.
+    finalize,
+    /// The metadata of a generation changed: any patch, holds included,
+    /// even one that sets what was there.
+    metadata_update,
+    /// A generation went, for good or into soft delete: a delete, an
+    /// overwrite in a bucket without versioning, the source of a move.
+    delete,
+    /// A live generation became noncurrent, in a bucket with versioning:
+    /// a delete or an overwrite.
+    archive,
+    /// An object began to be written, in a zonal bucket.
+    initialize,
+    /// A type this library does not know, as read back. Never sent.
+    unknown,
+};
+
+/// What `Bucket.createNotification` creates.
+pub const NotificationConfig = struct {
+    topic: TopicName,
+    payload: PayloadFormat = .json,
+    /// Null publishes every type. Neither empty, which Cloud Storage would
+    /// also read as every type, nor repeated.
+    events: ?[]const EventType = null,
+    /// At most 5: keys of 1 to 256 characters, values of up to 1,024, and
+    /// no key twice or named like an attribute every message carries,
+    /// which Cloud Storage would silently override.
+    custom_attributes: []const Attribute = &.{},
+    /// Only objects whose names begin with these bytes, case and all. An
+    /// empty one is the same as none.
+    object_name_prefix: ?[]const u8 = null,
+};
+
+/// A notification configuration, as Cloud Storage keeps it.
+pub const Notification = struct {
+    /// What `Bucket.getNotification` and `Bucket.deleteNotification` take.
+    /// Never reused within the bucket.
+    id: []const u8,
+    /// As Cloud Storage gives it: `//pubsub.googleapis.com/projects/P/topics/T`.
+    topic: []const u8,
+    /// `topic` taken apart, or null when it has another form.
+    topic_name: ?TopicName,
+    payload: PayloadFormat,
+    /// Empty for every type.
+    events: []const EventType,
+    custom_attributes: []const Attribute,
+    object_name_prefix: ?[]const u8,
+    etag: ?[]const u8,
+};
+
 pub const SignedMethod = enum { GET, HEAD, PUT, POST, DELETE };
 
 /// A header signed into a URL, which its holder must send with this

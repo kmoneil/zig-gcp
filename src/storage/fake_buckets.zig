@@ -35,6 +35,18 @@
 //! - `enableObjectRetention=true` on a create gives `objectRetention`
 //!   `Enabled`; a patch of `objectRetention` is taken and ignored.
 //!
+//! - Notification configurations (2026-10-01): an ID is the bucket's
+//!   metageneration, which every create and delete moves; `payload_format`
+//!   is required; a topic is taken as `//pubsub.googleapis.com/projects/P/
+//!   topics/T` or `projects/P/topics/T` and answered in the first form; at
+//!   most 5 custom attributes, keys of 1 to 256 characters and values of up
+//!   to 1,024; unknown event types and empty lists dropped, the rest in
+//!   Cloud Storage's order; at most 10 configurations overlapping on any
+//!   event type, one with none overlapping every type; a list of none has
+//!   no `items`; and the two refusals of a topic Cloud Storage cannot
+//!   publish to, for the topics `setTopic` names. Whether prefixes keep
+//!   configurations from overlapping was not measured: here they do not.
+//!
 //! Letters beyond ASCII pass in labels, since this fake has no Unicode
 //! tables; Cloud Storage refuses the uppercase ones. Fields this library
 //! never sends are refused, so a misspelled one fails the test.
@@ -56,6 +68,17 @@ pub const FakeBuckets = struct {
     refusal: []const u8 = "",
     refusal_status: u16 = 400,
     refusal_reason: []const u8 = "invalid",
+    /// Topics a notification configuration cannot publish to, by their
+    /// `//pubsub.googleapis.com/` name. Every other topic exists, and Cloud
+    /// Storage's service agent may publish to it.
+    topics: std.StringHashMapUnmanaged(TopicState) = .empty,
+
+    pub const TopicState = enum {
+        /// No such topic.
+        missing,
+        /// The service agent lacks `roles/pubsub.publisher` on it.
+        ungranted,
+    };
 
     pub const Counts = struct {
         creates: u32 = 0,
@@ -63,11 +86,16 @@ pub const FakeBuckets = struct {
         patches: u32 = 0,
         deletes: u32 = 0,
         locks: u32 = 0,
+        notification_creates: u32 = 0,
+        notification_reads: u32 = 0,
+        notification_deletes: u32 = 0,
     };
 
     const Stored = struct {
         resource: ObjectMap,
         metageneration: u64,
+        /// Its notification configurations, oldest first.
+        notifications: std.ArrayListUnmanaged(ObjectMap) = .empty,
     };
 
     /// What a bucket URL names.
@@ -81,6 +109,13 @@ pub const FakeBuckets = struct {
         lock: bool = false,
         /// `enableObjectRetention=true`, on a create.
         object_retention: bool = false,
+        /// `.../notificationConfigs`, or one of them.
+        notification: ?NotificationTarget = null,
+    };
+
+    pub const NotificationTarget = union(enum) {
+        collection,
+        id: []const u8,
     };
 
     pub const Reply = struct {
@@ -112,6 +147,7 @@ pub const FakeBuckets = struct {
             self.counts.creates += 1;
             return self.create(body, target.object_retention, arena);
         };
+        if (target.notification) |n| return self.serveNotification(method, name, n, body, arena);
         if (target.lock) {
             if (method != .POST) return error.HttpProtocolError;
             self.counts.locks += 1;
@@ -235,6 +271,152 @@ pub const FakeBuckets = struct {
         stored.metageneration += 1;
         try next.put(a, "metageneration", .{ .string = try std.fmt.allocPrint(a, "{d}", .{stored.metageneration}) });
         stored.resource = next;
+        return .{ .status = 200, .body = try render(arena, next) };
+    }
+
+    /// Makes `topic`, a `//pubsub.googleapis.com/` name, refuse the
+    /// configurations that name it.
+    pub fn setTopic(self: *FakeBuckets, topic: []const u8, state: TopicState) Allocator.Error!void {
+        const a = self.arena.allocator();
+        try self.topics.put(a, try a.dupe(u8, topic), state);
+    }
+
+    /// The bucket's notification configurations as kept, oldest first.
+    pub fn notifications(self: *const FakeBuckets, bucket: []const u8) []const ObjectMap {
+        const stored = self.buckets.getPtr(bucket) orelse return &.{};
+        return stored.notifications.items;
+    }
+
+    fn serveNotification(self: *FakeBuckets, method: Method, bucket: []const u8, target: NotificationTarget, body: []const u8, arena: Allocator) Error!Reply {
+        const stored = self.buckets.getPtr(bucket) orelse return notFound();
+        switch (target) {
+            .collection => switch (method) {
+                .POST => {
+                    self.counts.notification_creates += 1;
+                    return self.createNotification(bucket, stored, body, arena);
+                },
+                .GET => {
+                    self.counts.notification_reads += 1;
+                    return .{ .status = 200, .body = try renderNotifications(arena, stored.notifications.items) };
+                },
+                else => return error.HttpProtocolError,
+            },
+            .id => |id| {
+                const index = for (stored.notifications.items, 0..) |n, i| {
+                    if (std.mem.eql(u8, stringOf(n.get("id").?).?, id)) break i;
+                } else null;
+                switch (method) {
+                    .GET => {
+                        self.counts.notification_reads += 1;
+                        const i = index orelse return notificationMissing();
+                        return .{ .status = 200, .body = try render(arena, stored.notifications.items[i]) };
+                    },
+                    .DELETE => {
+                        self.counts.notification_deletes += 1;
+                        const i = index orelse return notificationMissing();
+                        _ = stored.notifications.orderedRemove(i);
+                        try self.bump(stored);
+                        return .{ .status = 204 };
+                    },
+                    else => return error.HttpProtocolError,
+                }
+            },
+        }
+    }
+
+    /// A configuration's create or delete moves the bucket's metageneration.
+    fn bump(self: *FakeBuckets, stored: *Stored) Allocator.Error!void {
+        const a = self.arena.allocator();
+        stored.metageneration += 1;
+        var next = try cloneObject(a, stored.resource);
+        try next.put(a, "metageneration", .{ .string = try std.fmt.allocPrint(a, "{d}", .{stored.metageneration}) });
+        stored.resource = next;
+    }
+
+    /// Cloud Storage's order: it answers with the event types in this one,
+    /// whatever the order sent.
+    const event_order = [_][]const u8{ "OBJECT_FINALIZE", "OBJECT_METADATA_UPDATE", "OBJECT_DELETE", "OBJECT_ARCHIVE", "OBJECT_INITIALIZE" };
+    const max_overlapping = 10;
+
+    fn createNotification(self: *FakeBuckets, bucket: []const u8, stored: *Stored, body: []const u8, arena: Allocator) Error!Reply {
+        const a = self.arena.allocator();
+        const parsed = std.json.parseFromSliceLeaky(Value, arena, body, .{}) catch return self.invalid(arena, "Parse Error");
+        const fields = objectOf(parsed) orelse return self.invalid(arena, "the body is not an object");
+        var it = fields.iterator();
+        while (it.next()) |entry| {
+            // A field this library never sends fails the test.
+            if (!isOneOf(entry.key_ptr.*, &.{ "topic", "payload_format", "event_types", "custom_attributes", "object_name_prefix" })) return error.HttpProtocolError;
+        }
+        const format = if (fields.get("payload_format")) |v| stringOf(v) orelse "" else "";
+        if (!isOneOf(format, &.{ "JSON_API_V1", "NONE" })) return answer(arena, 400, "required", "You must specify a payload format in the 'payload_format' field.");
+        const sent_topic = if (fields.get("topic")) |v| stringOf(v) orelse "" else "";
+        const topic = try normalTopic(arena, sent_topic) orelse
+            return self.invalid(arena, "Invalid Google Cloud Pub/Sub topic. It should look like '//pubsub.googleapis.com/projects/*/topics/*.'");
+        if (self.topics.get(topic)) |state| switch (state) {
+            .missing => return self.invalidFmt(arena, "Cloud Pub/Sub topic '{s}' not found, or user '{s}' does not have permission to it.", .{ topic, service_agent }),
+            .ungranted => return answer(arena, 403, "forbidden", try std.fmt.allocPrint(
+                arena,
+                "The service account '{s}' does not have permission to publish messages to to the Cloud Pub/Sub topic '{s}', or that topic does not exist.",
+                .{ service_agent, topic },
+            )),
+        };
+
+        var attributes: ObjectMap = .empty;
+        if (fields.get("custom_attributes")) |v| {
+            const map = objectOf(v) orelse return error.HttpProtocolError;
+            if (map.count() > 5) return self.invalidFmt(arena, "Maximum of 5 custom attributes, notification config had {d}", .{map.count()});
+            var attribute_it = map.iterator();
+            while (attribute_it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const value = stringOf(entry.value_ptr.*) orelse return error.HttpProtocolError;
+                if (key.len == 0) return self.invalid(arena, "Custom attribute keys may not be empty");
+                const key_chars = characters(key);
+                if (key_chars > 256) return self.invalidFmt(arena, "Notification keys may not be longer than 256 characters, but key '{s}' contains {d} characters.", .{ key, key_chars });
+                const value_chars = characters(value);
+                if (value_chars > 1024) return self.invalidFmt(arena, "Notification values may not be longer than 1024 characters, but value '{s}' contains {d} characters.", .{ value, value_chars });
+                try attributes.put(a, try a.dupe(u8, key), .{ .string = try a.dupe(u8, value) });
+            }
+        }
+
+        // The types Cloud Storage knows, in its order; the rest dropped.
+        var events: [event_order.len]bool = @splat(false);
+        if (fields.get("event_types")) |v| {
+            for (arrayOf(v) orelse return error.HttpProtocolError) |item| {
+                const name = stringOf(item) orelse return error.HttpProtocolError;
+                for (event_order, &events) |known, *on| if (std.mem.eql(u8, name, known)) {
+                    on.* = true;
+                };
+            }
+        }
+        const every = std.mem.indexOfScalar(bool, &events, true) == null;
+        for (event_order, events) |name, on| {
+            if (!every and !on) continue;
+            var overlapping: usize = 0;
+            for (stored.notifications.items) |n| {
+                if (covers(n, name)) overlapping += 1;
+            }
+            if (overlapping >= max_overlapping) return self.invalid(arena, "Too many overlapping notifications. The maximum is 10.");
+        }
+
+        const id = try std.fmt.allocPrint(a, "{d}", .{stored.metageneration});
+        var next: ObjectMap = .empty;
+        try next.put(a, "kind", .{ .string = "storage#notification" });
+        try next.put(a, "selfLink", .{ .string = try std.fmt.allocPrint(a, "https://www.googleapis.com/storage/v1/b/{s}/notificationConfigs/{s}", .{ bucket, id }) });
+        try next.put(a, "id", .{ .string = id });
+        try next.put(a, "topic", .{ .string = try a.dupe(u8, topic) });
+        if (!every) {
+            var list: std.json.Array = .init(a);
+            for (event_order, events) |name, on| if (on) try list.append(.{ .string = name });
+            try next.put(a, "event_types", .{ .array = list });
+        }
+        if (attributes.count() > 0) try next.put(a, "custom_attributes", .{ .object = attributes });
+        try next.put(a, "etag", .{ .string = id });
+        if (fields.get("object_name_prefix")) |v| {
+            try next.put(a, "object_name_prefix", .{ .string = try a.dupe(u8, stringOf(v) orelse return error.HttpProtocolError) });
+        }
+        try next.put(a, "payload_format", .{ .string = if (std.mem.eql(u8, format, "NONE")) "NONE" else "JSON_API_V1" });
+        try stored.notifications.append(a, next);
+        try self.bump(stored);
         return .{ .status = 200, .body = try render(arena, next) };
     }
 
@@ -630,6 +812,71 @@ fn notFound() FakeBuckets.Reply {
     return .{ .status = 404, .body =
     \\{"error":{"code":404,"message":"The specified bucket does not exist.","errors":[{"message":"The specified bucket does not exist.","domain":"global","reason":"notFound"}]}}
     };
+}
+
+/// The project's Cloud Storage service agent, as production names it in
+/// the refusals of a topic.
+const service_agent = "service-82150720798@gs-project-accounts.iam.gserviceaccount.com";
+
+fn notificationMissing() FakeBuckets.Reply {
+    return .{ .status = 404, .body =
+    \\{"error":{"code":404,"message":"The requested resource was not found.","errors":[{"message":"The requested resource was not found.","domain":"global","reason":"notFound"}]}}
+    };
+}
+
+/// A refusal with `status`, `reason` and `message`, in Cloud Storage's shape.
+fn answer(arena: Allocator, status: u16, reason: []const u8, message: []const u8) Allocator.Error!FakeBuckets.Reply {
+    const body = try std.json.Stringify.valueAlloc(arena, .{ .@"error" = .{
+        .code = status,
+        .message = message,
+        .errors = .{.{ .message = message, .domain = "global", .reason = reason }},
+    } }, .{});
+    return .{ .status = status, .body = body };
+}
+
+/// `topic` in the form Cloud Storage keeps, or null for one it refuses.
+fn normalTopic(arena: Allocator, topic: []const u8) Allocator.Error!?[]const u8 {
+    const full = "//pubsub.googleapis.com/";
+    const rest = if (std.mem.startsWith(u8, topic, full)) topic[full.len..] else topic;
+    if (!std.mem.startsWith(u8, rest, "projects/")) return null;
+    var parts = std.mem.splitScalar(u8, rest["projects/".len..], '/');
+    const project = parts.next() orelse return null;
+    const word = parts.next() orelse return null;
+    const id = parts.next() orelse return null;
+    if (parts.next() != null or project.len == 0 or id.len == 0 or !std.mem.eql(u8, word, "topics")) return null;
+    return try std.fmt.allocPrint(arena, "//pubsub.googleapis.com/projects/{s}/topics/{s}", .{ project, id });
+}
+
+/// Characters, as Cloud Storage counts them in its limits.
+fn characters(text: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(text) catch text.len;
+}
+
+/// Whether a kept configuration publishes `event`: one that names no types
+/// publishes every type.
+fn covers(n: ObjectMap, event: []const u8) bool {
+    const listed = n.get("event_types") orelse return true;
+    for (listed.array.items) |item| {
+        if (std.mem.eql(u8, item.string, event)) return true;
+    }
+    return false;
+}
+
+fn renderNotifications(arena: Allocator, items: []const ObjectMap) Allocator.Error![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    jw.beginObject() catch return error.OutOfMemory;
+    jw.objectField("kind") catch return error.OutOfMemory;
+    jw.write("storage#notifications") catch return error.OutOfMemory;
+    // A list of none has no `items` at all, as measured.
+    if (items.len > 0) {
+        jw.objectField("items") catch return error.OutOfMemory;
+        jw.beginArray() catch return error.OutOfMemory;
+        for (items) |item| jw.write(Value{ .object = item }) catch return error.OutOfMemory;
+        jw.endArray() catch return error.OutOfMemory;
+    }
+    jw.endObject() catch return error.OutOfMemory;
+    return out.written();
 }
 
 fn render(arena: Allocator, object: ObjectMap) Allocator.Error![]const u8 {

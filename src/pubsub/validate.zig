@@ -61,18 +61,9 @@ pub fn publishRequestBytes(messages: []const types.Message, ordering_key: ?[]con
 }
 
 /// Topic and subscription ids: 3 to 255 characters from `[A-Za-z0-9-_.~+%]`,
-/// starting with a letter, and not starting with "goog" in any case (the
-/// emulator allows "GOOG"; production does not).
-pub fn isResourceId(id: []const u8) bool {
-    if (id.len < 3 or id.len > 255) return false;
-    if (!std.ascii.isAlphabetic(id[0])) return false;
-    if (std.ascii.startsWithIgnoreCase(id, "goog")) return false;
-    for (id) |c| switch (c) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~', '+', '%' => {},
-        else => return false,
-    };
-    return true;
-}
+/// starting with a letter, and not starting with "goog" in any case.
+/// Storage names topics too, so the rule lives in core with its tests.
+pub const isResourceId = @import("core").names.isPubSubId;
 
 /// Project ids and numbers, including legacy domain-scoped ids such as
 /// `example.com:my-project`. Shared with the other service modules, so it
@@ -353,27 +344,6 @@ fn reject(diag: ?*Diagnostics, comptime format: []const u8, args: anytype) error
 }
 
 const testing = std.testing;
-
-test "resource ids: the documented rules at their boundaries" {
-    try testing.expect(isResourceId("abc"));
-    try testing.expect(!isResourceId("ab"));
-    try testing.expect(isResourceId("a" ** 255));
-    try testing.expect(!isResourceId("a" ** 256));
-    try testing.expect(isResourceId("a.b~c_d-e+f%41"));
-    try testing.expect(isResourceId("gooXfoo"));
-    try testing.expect(isResourceId("xgoog"));
-    try testing.expect(!isResourceId("googfoo"));
-    try testing.expect(!isResourceId("goog"));
-    // Production rejects any case; the emulator accepts this one.
-    try testing.expect(!isResourceId("GOOGfoo"));
-    try testing.expect(!isResourceId("GoOgle-topic"));
-    try testing.expect(!isResourceId("1abc"));
-    try testing.expect(!isResourceId("-abc"));
-    try testing.expect(!isResourceId("ab/c"));
-    try testing.expect(!isResourceId("ab c"));
-    try testing.expect(!isResourceId("mi-t\xc3\xb3pico"));
-    try testing.expect(!isResourceId(""));
-}
 
 fn expectRejected(messages: []const types.Message, ordering_key: ?[]const u8, want: []const u8) !void {
     var d: Diagnostics = .{};

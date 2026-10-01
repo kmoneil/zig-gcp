@@ -12,6 +12,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
+const notifications = @import("notifications.zig");
 const retention = @import("retention.zig");
 const validate = @import("validate.zig");
 const Error = errors.Error;
@@ -58,7 +59,8 @@ fn engine(client: *Client) Engine {
 }
 
 /// The engine for one request, with diagnostics of its own when the client
-/// keeps none: whether a refusal is `ObjectRetained` is read from them.
+/// keeps none: whether a refusal is `ObjectRetained` or
+/// `TopicNotPublishable` is read from them.
 fn engineWith(client: *Client, local: *core.Diagnostics) Engine {
     var e = engine(client);
     if (e.diagnostics == null) e.diagnostics = local;
@@ -198,6 +200,7 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
     return e.execute(response, billed_call) catch |err| {
         hint(client, err);
         if (retained(e, err)) return error.ObjectRetained;
+        if (notifications.isNotPublishable(err, e.diagnostics.?)) return error.TopicNotPublishable;
         return err;
     };
 }
