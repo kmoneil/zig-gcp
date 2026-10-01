@@ -46,9 +46,12 @@ jobs:
       - name: Core unit tests on a baseline CPU
         run: zig build test -Dmodule=core -Dcpu=baseline --summary all
 
+      # One network for both emulators, so fake-gcs-server can publish a
+      # bucket's notifications to the Pub/Sub emulator by its name.
       - name: Start the Pub/Sub emulator
         run: |
-          docker run -d --name pubsub -p 8085:8085 \
+          docker network create emulators
+          docker run -d --name pubsub --network emulators -p 8085:8085 \
             gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
             gcloud beta emulators pubsub start --project=test --host-port=0.0.0.0:8085
           for _ in $(seq 1 90); do
@@ -66,7 +69,8 @@ jobs:
           # default, filesystem, answers a versioned bucket with 500), and
           # what local runs use. Pinned, so a release cannot change CI's
           # answers unseen.
-          docker run -d --name fake-gcs -p 4443:4443 \
+          docker run -d --name fake-gcs --network emulators -p 4443:4443 \
+            -e PUBSUB_EMULATOR_HOST=pubsub:8085 \
             fsouza/fake-gcs-server:1.56.1@sha256:797ce226d62f947c009dc40246b30cfb456b8473d8241407f9d6f2c04e4d69ef \
             -backend memory -scheme http -port 4443 -public-host 127.0.0.1:4443
           for _ in $(seq 1 30); do

@@ -284,7 +284,10 @@ const WireObject = struct {
     temporaryHold: ?bool = null,
     eventBasedHold: ?bool = null,
     retentionExpirationTime: ?[]const u8 = null,
-    retention: ?struct { mode: ?[]const u8 = null, retainUntilTime: ?[]const u8 = null } = null,
+    /// `retainUntilTime` is RFC 3339 from the JSON API, and "protocol
+    /// buffer Timestamp format" in a notification's payload, its
+    /// documentation says, which could be either text or seconds and nanos.
+    retention: ?struct { mode: ?[]const u8 = null, retainUntilTime: ?std.json.Value = null } = null,
 };
 
 const WireObjectPage = struct {
@@ -382,7 +385,7 @@ fn objectFromWire(arena: Allocator, wire: WireObject) DecodeError!types.ObjectIn
                 .locked
             else
                 .unknown,
-            .retain_until = nonEmpty(r.retainUntilTime) orelse return error.InvalidResponse,
+            .retain_until = (try timeOf(arena, r.retainUntilTime)) orelse return error.InvalidResponse,
         } else null,
     };
 }
@@ -796,6 +799,41 @@ fn sha256FromWire(text: ?[]const u8) DecodeError!?[32]u8 {
     var digest: [32]u8 = undefined;
     decoder.decode(&digest, t) catch return error.InvalidResponse;
     return digest;
+}
+
+/// A time as text, or as a protocol buffer Timestamp's `seconds` and
+/// `nanos` written out in RFC 3339, or null for anything else.
+fn timeOf(arena: Allocator, value: ?std.json.Value) Allocator.Error!?[]const u8 {
+    const v = value orelse return null;
+    switch (v) {
+        .string => |s| return nonEmpty(s),
+        .object => |o| {
+            const seconds = intOf(o.get("seconds") orelse return null) orelse return null;
+            const nanos = if (o.get("nanos")) |n| intOf(n) orelse return null else 0;
+            if (seconds < 0 or nanos < 0 or nanos >= std.time.ns_per_s) return null;
+            const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(seconds) };
+            const year_day = epoch.getEpochDay().calculateYearDay();
+            if (year_day.year > 9999) return null;
+            const month_day = year_day.calculateMonthDay();
+            const day = epoch.getDaySeconds();
+            const date = try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+                year_day.year,         month_day.month.numeric(), @as(u8, month_day.day_index) + 1,
+                day.getHoursIntoDay(), day.getMinutesIntoHour(),  day.getSecondsIntoMinute(),
+            });
+            if (nanos == 0) return try std.fmt.allocPrint(arena, "{s}Z", .{date});
+            return try std.fmt.allocPrint(arena, "{s}.{d:0>9}Z", .{ date, @as(u64, @intCast(nanos)) });
+        },
+        else => return null,
+    }
+}
+
+/// A JSON integer, or a decimal string of one, as proto3 writes an int64.
+fn intOf(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |n| n,
+        .string, .number_string => |s| std.fmt.parseInt(i64, s, 10) catch null,
+        else => null,
+    };
 }
 
 fn nonEmpty(text: ?[]const u8) ?[]const u8 {

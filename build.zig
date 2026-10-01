@@ -182,6 +182,24 @@ pub fn build(b: *std.Build) void {
     const run_storage_integration = streamed(b, storage_integration_tests);
     integration_step.dependOn(&run_storage_integration.step);
 
+    // Cloud Storage's notifications end to end: fake-gcs-server publishing
+    // to the Pub/Sub emulator. Skips unless both are set.
+    const notifications_integration_tests = b.addTest(.{
+        .name = "notifications-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/notifications_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "storage", .module = storage },
+                .{ .name = "pubsub", .module = mod },
+            },
+        }),
+        .filters = test_filters,
+    });
+    const run_notifications_integration = streamed(b, notifications_integration_tests);
+    integration_step.dependOn(&run_notifications_integration.step);
+
     // auth against Google's token endpoint, when AUTH_TEST_CREDENTIALS names
     // a credentials file. They skip otherwise.
     const auth_integration_tests = b.addTest(.{
