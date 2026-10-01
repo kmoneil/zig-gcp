@@ -23,6 +23,7 @@ const checkpoint = @import("checkpoint.zig");
 const codec = @import("codec.zig");
 const encryption = @import("encryption.zig");
 const errors = @import("errors.zig");
+const retention = @import("retention.zig");
 const idempotency = @import("idempotency.zig");
 const logging = @import("logging.zig");
 const names = @import("names.zig");
@@ -366,10 +367,9 @@ const Machine = struct {
                     const named = codec.decodeObjectSize(response.allocator(), res.body) catch null;
                     const complete = if (self.total) |total| (named orelse total) == total else false;
                     if (!complete) {
-                        const deleted = self.discard(bucket_name, object_name, result.value.generation);
+                        const fate = self.discard(bucket_name, object_name, result.value.generation).words();
                         // After the delete, whose success cleared them.
                         if (self.client.diagnostics) |d| {
-                            const fate = if (deleted) "; the truncated object was deleted again" else "";
                             if (self.total) |total| d.print(
                                 "the server finished the upload holding {d} of its {d} bytes{s}",
                                 .{ named.?, total, fate },
@@ -393,10 +393,10 @@ const Machine = struct {
                         };
                         if (result.value.crc32c) |stored_crc| {
                             if (stored_crc != whole) {
-                                const deleted = self.discard(bucket_name, object_name, result.value.generation);
+                                const fate = self.discard(bucket_name, object_name, result.value.generation).words();
                                 if (self.client.diagnostics) |d| d.print(
                                     "checksum mismatch after the upload finished: the {s} hashes to {d}, the object stores {d}{s}",
-                                    .{ if (self.source == .file) "file" else "stream", whole, stored_crc, if (deleted) "; the object was deleted again" else "" },
+                                    .{ if (self.source == .file) "file" else "stream", whole, stored_crc, fate },
                                 );
                                 return error.ChecksumMismatch;
                             }
@@ -753,26 +753,28 @@ const Machine = struct {
         const body = core.errors.decodeErrorBody(scratch.allocator(), res.body) catch null;
         const status_text = if (body) |b| b.status else "";
         const message = if (body) |b| b.message else res.body;
-        if (self.client.diagnostics) |d| d.set(res.status, status_text, message);
+        var local: core.Diagnostics = .{};
+        const d = self.client.diagnostics orelse &local;
+        d.set(res.status, status_text, message);
         const err = core.errors.fromResponse(res.status, status_text);
+        // A final chunk over a retained or held object, after every byte.
+        if (retention.isRetained(err, d)) return .{ .fatal = error.ObjectRetained };
         return if (core.isRetryable(err)) .{ .transient = err } else .{ .fatal = err };
     }
 
     /// Best-effort delete of an object the upload must not leave behind,
     /// pinned to its generation, so nothing newer can go with it. Without a
-    /// generation nothing is deleted. Returns whether the object went.
-    fn discard(self: *Machine, bucket_name: []const u8, object_name: []const u8, generation: u64) bool {
-        if (generation == 0) return false;
+    /// generation nothing is deleted.
+    fn discard(self: *Machine, bucket_name: []const u8, object_name: []const u8, generation: u64) rpc.Cleanup {
+        if (generation == 0) return .unpinned;
         var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
         defer scratch.deinit();
-        const path = names.objectPath(scratch.allocator(), bucket_name, object_name, generation, .{}) catch return false;
+        const path = names.objectPath(scratch.allocator(), bucket_name, object_name, generation, .{}) catch return .left;
         var token: idempotency.Token = undefined;
         token.init(self.client);
-        rpc.executeDiscard(self.client, .{ .method = .DELETE, .path = path, .headers = token.slice() }) catch |err| {
-            logging.warn("deleting the truncated upload of {s} failed with {t}", .{ object_name, err });
-            return false;
-        };
-        return true;
+        const deleted = rpc.executeDiscard(self.client, .{ .method = .DELETE, .path = path, .headers = token.slice() });
+        deleted catch |err| logging.warn("deleting the unfinished upload of {s} failed with {t}", .{ object_name, err });
+        return .of(deleted);
     }
 
     /// Cancels the session, unless the caller keeps failed sessions for a
@@ -999,7 +1001,7 @@ test "a status query answered as a finalize is a truncated object, not a success
     defer testing.allocator.free(data);
 
     try testing.expectError(error.InvalidResponse, h.client.bucket("b").object("backup.tar").upload(data, .{}));
-    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "holding 262144 of its 614400 bytes; the truncated object was deleted again") != null);
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "holding 262144 of its 614400 bytes; the object was deleted again") != null);
     // The truncated object went again, pinned to the generation it got,
     // with a token, as every write carries.
     const cleanup = try h.fake.request(0);
@@ -1007,6 +1009,27 @@ test "a status query answered as a finalize is a truncated object, not a success
     try testing.expectEqualStrings("https://storage.googleapis.com/storage/v1/b/b/o/backup.tar?generation=61", cleanup.url);
     try testing.expectEqual(32, (cleanup.header(idempotency.header_name) orelse return error.TestExpectedToken).len);
     try testing.expectEqual(null, (try h.fake.streamRequest(1)).header(idempotency.header_name));
+}
+
+test "a truncated object a retention policy keeps is reported as staying" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        opened,
+        kept(chunk_size - 1),
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{ .status = 200, .body = "{\"name\":\"backup.tar\",\"size\":\"262144\",\"generation\":\"61\"}" } },
+        // The cleanup delete, refused: the bucket keeps the object.
+        .{ .respond = .{ .status = 403, .body = "{\"error\":{\"code\":403,\"message\":\"Object 'b/backup.tar' is subject to bucket's retention policy or object retention and cannot be deleted or overwritten until 2026-09-30T15:58:01.185839-07:00\",\"errors\":[{\"reason\":\"retentionPolicyNotMet\"}]}}" } },
+    }, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+
+    try testing.expectError(error.InvalidResponse, h.client.bucket("b").object("backup.tar").upload(data, .{}));
+    try testing.expectEqualStrings(
+        "the server finished the upload holding 262144 of its 614400 bytes; the object stays, kept by its bucket's retention policy or a hold",
+        h.diag.message(),
+    );
 }
 
 test "a finish before the stream has ended is not believed either" {
@@ -1030,7 +1053,7 @@ test "a finish before the stream has ended is not believed either" {
         error.InvalidResponse,
         h.client.bucket("b").object("backup.tar").uploadFrom(&reader, .{ .crc32c = core.crc32c.hash(data) }),
     );
-    try testing.expectEqualStrings("the server finished the upload before the stream ended", h.diag.message());
+    try testing.expectEqualStrings("the server finished the upload before the stream ended; the answer named no generation to pin a delete to, so the object was left alone", h.diag.message());
     try h.expectRequestCount(0);
     // The query that got the premature answer named no total.
     try testing.expectEqualStrings("bytes */*", (try h.fake.streamRequest(3)).header("Content-Range").?);

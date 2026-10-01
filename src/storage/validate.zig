@@ -21,6 +21,11 @@ pub const max_label_bytes = 128;
 /// 90 days, both included.
 pub const min_soft_delete_retention_s = 604_800;
 pub const max_soft_delete_retention_s = 7_776_000;
+/// A retention policy's period, both included: 3,155,760,000 is taken and
+/// 3,155,760,001 refused, as measured, though Cloud Storage's message says
+/// "less than 100 years".
+pub const min_retention_period_s = 1;
+pub const max_retention_period_s = 3_155_760_000;
 /// Prefixes and suffixes across all of a bucket's lifecycle rules, and
 /// bytes in each. The documented limit of 100 rules is not enforced.
 pub const max_lifecycle_affixes = 1000;

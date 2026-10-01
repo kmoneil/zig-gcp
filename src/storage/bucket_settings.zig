@@ -15,6 +15,9 @@
 //!   back.
 //! - `{"iamConfiguration":{"publicAccessPrevention":"enforced"}}` leaves
 //!   uniform bucket-level access as it was, and the other way round.
+//! - `{"retentionPolicy":null}` removes a retention policy, where
+//!   `{"retentionPolicy":{}}` changes nothing (2026-09-30). A period of 0
+//!   is refused, so a policy is set or removed, never emptied.
 //!
 //! The emulator neither checks nor keeps these settings, so what Cloud
 //! Storage refuses is refused here first: code tested against the
@@ -75,6 +78,7 @@ pub fn update(client: *Client, bucket: []const u8, changes: types.BucketUpdate) 
 /// Every setting of a new bucket, before anything is sent.
 pub fn checkConfig(diag: ?*core.Diagnostics, config: types.BucketConfig) CheckError!void {
     if (config.soft_delete_retention_s) |seconds| try checkSoftDelete(diag, seconds);
+    if (config.retention_period_s) |seconds| try checkRetentionPeriod(diag, seconds);
     if (config.default_kms_key_name) |key| try checkKmsKey(diag, key);
     try checkLabels(diag, config.labels);
     try checkLifecycle(diag, config.lifecycle);
@@ -84,6 +88,10 @@ pub fn checkConfig(diag: ?*core.Diagnostics, config: types.BucketConfig) CheckEr
 /// An update: something to change, and every new value valid.
 pub fn checkUpdate(diag: ?*core.Diagnostics, changes: types.BucketUpdate) CheckError!void {
     if (changes.soft_delete_retention_s) |seconds| try checkSoftDelete(diag, seconds);
+    switch (changes.retention_period_s) {
+        .set => |seconds| try checkRetentionPeriod(diag, seconds),
+        .keep, .clear => {},
+    }
     switch (changes.default_kms_key_name) {
         .set => |key| try checkKmsKey(diag, key),
         .keep, .clear => {},
@@ -110,7 +118,8 @@ fn changesSomething(changes: types.BucketUpdate) bool {
     return labels or changes.versioning != null or changes.soft_delete_retention_s != null or
         changes.requester_pays != null or changes.default_kms_key_name != .keep or
         changes.lifecycle != null or changes.uniform_bucket_level_access != null or
-        changes.public_access_prevention != null or changes.storage_class != null;
+        changes.public_access_prevention != null or changes.storage_class != null or
+        changes.retention_period_s != .keep or changes.default_event_based_hold != null;
 }
 
 fn checkLabels(diag: ?*core.Diagnostics, labels: []const types.Label) CheckError!void {
@@ -191,6 +200,15 @@ fn checkSoftDelete(diag: ?*core.Diagnostics, seconds: u32) CheckError!void {
         seconds,
         limits.min_soft_delete_retention_s,
         limits.max_soft_delete_retention_s,
+    });
+}
+
+fn checkRetentionPeriod(diag: ?*core.Diagnostics, seconds: u64) CheckError!void {
+    if (seconds >= limits.min_retention_period_s and seconds <= limits.max_retention_period_s) return;
+    return refuse(diag, "a retention period of {d} s is not {d} to {d} s (100 years)", .{
+        seconds,
+        limits.min_retention_period_s,
+        limits.max_retention_period_s,
     });
 }
 
@@ -360,6 +378,8 @@ fn writeConfig(jw: *Stringify, name: []const u8, config: types.BucketConfig) Str
     }
     if (config.lifecycle.len > 0) try writeLifecycle(jw, config.lifecycle);
     try writeIamConfiguration(jw, config.uniform_bucket_level_access, config.public_access_prevention);
+    if (config.retention_period_s) |seconds| try writeRetentionPolicy(jw, seconds);
+    if (config.default_event_based_hold) try writeDefaultHold(jw, true);
     try jw.endObject();
 }
 
@@ -405,6 +425,12 @@ fn writeUpdate(jw: *Stringify, changes: types.BucketUpdate) Stringify.Error!void
         try jw.objectField("storageClass");
         try jw.write(class);
     }
+    switch (changes.retention_period_s) {
+        .keep => {},
+        .set => |seconds| try writeRetentionPolicy(jw, seconds),
+        .clear => try writeRetentionPolicy(jw, null),
+    }
+    if (changes.default_event_based_hold) |on| try writeDefaultHold(jw, on);
     try jw.endObject();
 }
 
@@ -422,6 +448,21 @@ fn writeSoftDelete(jw: *Stringify, seconds: u32) Stringify.Error!void {
     try jw.objectField("retentionDurationSeconds");
     try writeDecimalString(jw, seconds);
     try jw.endObject();
+}
+
+/// Null removes the policy.
+fn writeRetentionPolicy(jw: *Stringify, seconds: ?u64) Stringify.Error!void {
+    try jw.objectField("retentionPolicy");
+    const period = seconds orelse return jw.write(null);
+    try jw.beginObject();
+    try jw.objectField("retentionPeriod");
+    try writeDecimalString(jw, period);
+    try jw.endObject();
+}
+
+fn writeDefaultHold(jw: *Stringify, on: bool) Stringify.Error!void {
+    try jw.objectField("defaultEventBasedHold");
+    try jw.write(on);
 }
 
 fn writeBilling(jw: *Stringify, requester_pays: bool) Stringify.Error!void {
@@ -652,6 +693,8 @@ const config_goldens = [_]ConfigGolden{
             .lifecycle = &.{.{ .action = .abort_incomplete_multipart_upload, .condition = .{ .age_days = 7 } }},
             .uniform_bucket_level_access = true,
             .public_access_prevention = .enforced,
+            .retention_period_s = 86_400,
+            .default_event_based_hold = true,
         },
         .body = "{\"name\":\"b\",\"location\":\"us-central1\",\"storageClass\":\"NEARLINE\"," ++
             "\"versioning\":{\"enabled\":true}," ++
@@ -660,7 +703,23 @@ const config_goldens = [_]ConfigGolden{
             "\"encryption\":{\"defaultKmsKeyName\":\"" ++ kms_key ++ "\"}," ++
             "\"labels\":{\"env\":\"test\"}," ++
             "\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"AbortIncompleteMultipartUpload\"},\"condition\":{\"age\":7}}]}," ++
-            "\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true},\"publicAccessPrevention\":\"enforced\"}}",
+            "\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true},\"publicAccessPrevention\":\"enforced\"}," ++
+            "\"retentionPolicy\":{\"retentionPeriod\":\"86400\"},\"defaultEventBasedHold\":true}",
+    },
+    .{
+        .label = "a retention policy, the int64 as a string, at both ends of its range",
+        .config = .{ .retention_period_s = 3_155_760_000 },
+        .body = create_start ++ ",\"retentionPolicy\":{\"retentionPeriod\":\"3155760000\"}}",
+    },
+    .{
+        .label = "a retention policy of one second",
+        .config = .{ .retention_period_s = 1 },
+        .body = create_start ++ ",\"retentionPolicy\":{\"retentionPeriod\":\"1\"}}",
+    },
+    .{
+        .label = "the default event-based hold",
+        .config = .{ .default_event_based_hold = true },
+        .body = create_start ++ ",\"defaultEventBasedHold\":true}",
     },
 };
 
@@ -809,6 +868,8 @@ const update_goldens = [_]UpdateGolden{
             .uniform_bucket_level_access = false,
             .public_access_prevention = .enforced,
             .storage_class = "STANDARD",
+            .retention_period_s = .{ .set = 3600 },
+            .default_event_based_hold = false,
         },
         .body = "{\"versioning\":{\"enabled\":true}," ++
             "\"softDeletePolicy\":{\"retentionDurationSeconds\":\"691200\"}," ++
@@ -817,7 +878,23 @@ const update_goldens = [_]UpdateGolden{
             "\"labels\":{\"env\":\"test\"}," ++
             "\"lifecycle\":{\"rule\":[]}," ++
             "\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":false},\"publicAccessPrevention\":\"enforced\"}," ++
-            "\"storageClass\":\"STANDARD\"}",
+            "\"storageClass\":\"STANDARD\"," ++
+            "\"retentionPolicy\":{\"retentionPeriod\":\"3600\"},\"defaultEventBasedHold\":false}",
+    },
+    .{
+        .label = "a retention policy's period changed",
+        .update = .{ .retention_period_s = .{ .set = 7200 } },
+        .body = "{\"retentionPolicy\":{\"retentionPeriod\":\"7200\"}}",
+    },
+    .{
+        .label = "a retention policy removed: null, never {}, which changes nothing",
+        .update = .{ .retention_period_s = .clear },
+        .body = "{\"retentionPolicy\":null}",
+    },
+    .{
+        .label = "the default event-based hold on",
+        .update = .{ .default_event_based_hold = true },
+        .body = "{\"defaultEventBasedHold\":true}",
     },
 };
 
@@ -1091,6 +1168,22 @@ test "soft delete: 0, or 7 to 90 days, both ends included" {
         try expectRefused(checkConfig(&d, .{ .soft_delete_retention_s = s }), &d, "7 to 90 days");
         try expectRefused(checkUpdate(&d, .{ .soft_delete_retention_s = s }), &d, "7 to 90 days");
     }
+}
+
+test "retention period: 1 to 3,155,760,000 seconds, both ends included, as measured" {
+    var d: core.Diagnostics = .{};
+    for ([_]u64{ 1, 60, 86_400, 3_155_759_999, 3_155_760_000 }) |s| {
+        try checkConfig(&d, .{ .retention_period_s = s });
+        try checkUpdate(&d, .{ .retention_period_s = .{ .set = s } });
+    }
+    for ([_]u64{ 0, 3_155_760_001, std.math.maxInt(u64) }) |s| {
+        errdefer std.debug.print("period: {d}\n", .{s});
+        try expectRefused(checkConfig(&d, .{ .retention_period_s = s }), &d, "(100 years)");
+        try expectRefused(checkUpdate(&d, .{ .retention_period_s = .{ .set = s } }), &d, "(100 years)");
+    }
+    // Removal and the default hold change something, and need no period.
+    try checkUpdate(&d, .{ .retention_period_s = .clear });
+    try checkUpdate(&d, .{ .default_event_based_hold = false });
 }
 
 test "the default key: a key's name, never a version's, with no part empty" {
@@ -1599,6 +1692,12 @@ fn drawUpdate(arena: Allocator, g: *test_util.ByteGen) !types.BucketUpdate {
     if (g.boolean()) u.uniform_bucket_level_access = g.boolean();
     if (g.boolean()) u.public_access_prevention = g.pick(types.PublicAccessPrevention, &.{ .inherited, .enforced });
     if (g.intRange(u8, 0, 3) == 0) u.storage_class = "NEARLINE";
+    u.retention_period_s = switch (g.intRange(u8, 0, 3)) {
+        0, 1 => .keep,
+        2 => .{ .set = g.pick(u64, &.{ 1, 3600, 3_155_760_000, 0, 3_155_760_001 }) },
+        else => .clear,
+    };
+    if (g.boolean()) u.default_event_based_hold = g.boolean();
     if (g.boolean()) u.if_metageneration_match = g.int(u8);
     return u;
 }
@@ -1674,6 +1773,23 @@ fn updateBodyProperty(_: void, bytes: []const u8) !void {
         expected += 1;
         try testing.expectEqualStrings(class, root.get("storageClass").?.string);
     }
+    switch (u.retention_period_s) {
+        .keep => try testing.expectEqual(null, root.get("retentionPolicy")),
+        .set => |period| {
+            expected += 1;
+            const policy = root.get("retentionPolicy").?.object;
+            try testing.expectEqual(1, policy.count());
+            try testing.expectEqual(period, try std.fmt.parseInt(u64, policy.get("retentionPeriod").?.string, 10));
+        },
+        .clear => {
+            expected += 1;
+            try testing.expectEqual(std.json.Value.null, root.get("retentionPolicy").?);
+        },
+    }
+    if (u.default_event_based_hold) |on| {
+        expected += 1;
+        try testing.expectEqual(on, root.get("defaultEventBasedHold").?.bool);
+    }
     try testing.expectEqual(expected, root.count());
 }
 
@@ -1706,6 +1822,8 @@ fn configRoundTripProperty(_: void, bytes: []const u8) !void {
         .lifecycle = u.lifecycle orelse &.{},
         .uniform_bucket_level_access = u.uniform_bucket_level_access,
         .public_access_prevention = u.public_access_prevention,
+        .retention_period_s = if (u.retention_period_s == .set) u.retention_period_s.set else null,
+        .default_event_based_hold = u.default_event_based_hold orelse false,
     };
     checkConfig(null, config) catch return;
     // The create body is a bucket resource, so the decoder reads it back.
@@ -1726,6 +1844,8 @@ fn configRoundTripProperty(_: void, bytes: []const u8) !void {
     try expectRulesEqual(config.lifecycle, info.lifecycle);
     try testing.expectEqual(config.uniform_bucket_level_access orelse false, info.uniform_bucket_level_access);
     try testing.expectEqual(config.public_access_prevention orelse .inherited, info.public_access_prevention);
+    try testing.expectEqual(config.retention_period_s, if (info.retention_policy) |p| p.period_s else null);
+    try testing.expectEqual(config.default_event_based_hold, info.default_event_based_hold);
 }
 
 test "fuzz bucket configs: a config goes out and comes back as it was" {
@@ -1892,6 +2012,8 @@ const Model = struct {
     uniform: bool,
     prevention: types.PublicAccessPrevention,
     class: []const u8,
+    retention: ?u64,
+    default_hold: bool,
     metageneration: u64 = 1,
 
     fn init(arena: Allocator, config: types.BucketConfig) !Model {
@@ -1907,6 +2029,8 @@ const Model = struct {
             .uniform = config.uniform_bucket_level_access orelse false,
             .prevention = config.public_access_prevention orelse .inherited,
             .class = config.storage_class,
+            .retention = config.retention_period_s,
+            .default_hold = config.default_event_based_hold,
         };
     }
 
@@ -1935,6 +2059,12 @@ const Model = struct {
         if (u.uniform_bucket_level_access) |on| m.uniform = on;
         if (u.public_access_prevention) |p| m.prevention = p;
         if (u.storage_class) |class| m.class = class;
+        switch (u.retention_period_s) {
+            .keep => {},
+            .set => |period| m.retention = period,
+            .clear => m.retention = null,
+        }
+        if (u.default_event_based_hold) |on| m.default_hold = on;
         m.metageneration += 1;
         return true;
     }
@@ -1952,6 +2082,8 @@ const Model = struct {
         try testing.expectEqual(m.uniform, info.uniform_bucket_level_access);
         try testing.expectEqual(m.prevention, info.public_access_prevention);
         try testing.expectEqualStrings(m.class, info.storage_class);
+        try testing.expectEqual(m.retention, if (info.retention_policy) |p| p.period_s else null);
+        try testing.expectEqual(m.default_hold, info.default_event_based_hold);
     }
 };
 
@@ -1984,6 +2116,8 @@ fn modelProperty(_: void, bytes: []const u8) !void {
         .lifecycle = first.lifecycle orelse &.{},
         .uniform_bucket_level_access = first.uniform_bucket_level_access,
         .public_access_prevention = first.public_access_prevention,
+        .retention_period_s = if (first.retention_period_s == .set) first.retention_period_s.set else null,
+        .default_event_based_hold = first.default_event_based_hold orelse false,
     };
     checkConfig(null, config) catch return;
     var created = try b.create(config);

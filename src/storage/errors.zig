@@ -6,7 +6,9 @@
 //! such as "notFound". The canonical names apply: a bucket name that is
 //! taken, and a bucket that is not empty on delete, are both
 //! `error.AlreadyExists` (HTTP 409), and a failed generation precondition is
-//! `error.FailedPrecondition` (HTTP 412).
+//! `error.FailedPrecondition` (HTTP 412). One 403 is told apart by its
+//! reason and message: an object kept by retention or a hold is
+//! `error.ObjectRetained`, not `error.PermissionDenied`.
 
 const core = @import("core");
 
@@ -29,6 +31,13 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// wherever that concrete writer keeps it. Whatever it holds by then
     /// must be discarded.
     WriteFailed,
+    /// Cloud Storage is keeping the object: under its bucket's retention
+    /// policy until the time `Diagnostics` names, or under a hold until it
+    /// is released. Deleting it, replacing it by upload, compose or copy,
+    /// and moving it are refused; its metadata stays editable. HTTP 403,
+    /// told apart from a missing permission by the reason and message
+    /// Cloud Storage sends. Never retried.
+    ObjectRetained,
     /// A resumable session vanished (HTTP 404 or 410 on its URI) and the
     /// source cannot be replayed. The caller reopens the source and
     /// retries; `upload` starts a new session itself, since its bytes are

@@ -469,13 +469,12 @@ fn uploadFromBilled(self: Object, reader: *std.Io.Reader, unchecked: types.Uploa
     };
     const streamed = hasher.final();
     if (streamed == expected) return result;
-    self.delete(.{ .generation = result.value.generation }) catch |err| {
-        logging.warn("deleting the mismatched upload of {s} failed with {t}", .{ self.name, err });
-    };
+    const deleted = self.delete(.{ .generation = result.value.generation });
+    deleted catch |err| logging.warn("deleting the mismatched upload of {s} failed with {t}", .{ self.name, err });
     // After the delete, whose own begin cleared the diagnostics.
     if (self.client.diagnostics) |d| d.print(
-        "checksum mismatch after upload: the stream hashed to {d}, the object stores {d}; the object was deleted again",
-        .{ streamed, expected },
+        "checksum mismatch after upload: the stream hashed to {d}, the object stores {d}{s}",
+        .{ streamed, expected, rpc.Cleanup.of(deleted).words() },
     );
     return error.ChecksumMismatch;
 }

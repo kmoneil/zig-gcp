@@ -111,6 +111,7 @@ test {
     _ = @import("gzip_download.zig");
     _ = @import("gzip_upload.zig");
     _ = @import("idempotency.zig");
+    _ = @import("retention.zig");
     _ = @import("errors.zig");
     _ = @import("fake_buckets.zig");
     _ = @import("fake_multipart.zig");
