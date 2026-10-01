@@ -177,6 +177,14 @@ fn write(jw: *Stringify, options: types.MetadataUpdate) Stringify.Error!void {
             try jw.endObject();
         },
     }
+    if (options.temporary_hold) |on| {
+        try jw.objectField("temporaryHold");
+        try jw.write(on);
+    }
+    if (options.event_based_hold) |on| {
+        try jw.objectField("eventBasedHold");
+        try jw.write(on);
+    }
     try jw.endObject();
 }
 

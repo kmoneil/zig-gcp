@@ -186,7 +186,9 @@ pub fn changes(options: types.CopyOptions) bool {
         options.content_encoding != null or
         options.content_language != null or
         std.meta.activeTag(options.edit) != .keep or
-        options.storage_class != null;
+        options.storage_class != null or
+        options.temporary_hold or
+        options.event_based_hold != null;
 }
 
 /// Refuses what a changed copy could not send, and says why in `diag`: the
@@ -263,6 +265,8 @@ fn writeResource(
         try jw.objectField("storageClass");
         try jw.write(class);
     }
+    // A copy never carries its source's holds: only what the caller asks.
+    try codec.writeHolds(jw, options.temporary_hold, options.event_based_hold);
     try jw.endObject();
 }
 

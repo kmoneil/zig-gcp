@@ -12,6 +12,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
+const retention = @import("retention.zig");
 const validate = @import("validate.zig");
 const Error = errors.Error;
 
@@ -55,6 +56,47 @@ fn engine(client: *Client) Engine {
         .diagnostics = client.diagnostics,
     };
 }
+
+/// The engine for one request, with diagnostics of its own when the client
+/// keeps none: whether a refusal is `ObjectRetained` is read from them.
+fn engineWith(client: *Client, local: *core.Diagnostics) Engine {
+    var e = engine(client);
+    if (e.diagnostics == null) e.diagnostics = local;
+    return e;
+}
+
+/// Whether a failed request was refused for a retained or held object.
+fn retained(e: Engine, err: anyerror) bool {
+    return retention.isRetained(err, e.diagnostics.?);
+}
+
+/// What became of an object a failed upload deleted again, for the
+/// diagnostics that report the failure.
+pub const Cleanup = enum {
+    deleted,
+    /// Cloud Storage keeps it: its bucket's retention policy, or a hold.
+    kept,
+    /// The delete failed any other way.
+    left,
+    /// Nothing was deleted: there was no generation to pin a delete to,
+    /// and one without could take another writer's newer object.
+    unpinned,
+
+    pub fn of(result: Error!void) Cleanup {
+        _ = result catch |err| return if (err == error.ObjectRetained) .kept else .left;
+        return .deleted;
+    }
+
+    /// How the report of the failure ends.
+    pub fn words(self: Cleanup) []const u8 {
+        return switch (self) {
+            .deleted => "; the object was deleted again",
+            .kept => "; the object stays, kept by its bucket's retention policy or a hold",
+            .left => "; the object could not be deleted again",
+            .unpinned => "; the answer named no generation to pin a delete to, so the object was left alone",
+        };
+    }
+};
 
 /// Starts a public call: `Diagnostics` describe only the latest call.
 pub fn begin(client: *Client) void {
@@ -151,8 +193,11 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
     var billed_call = call;
     if (path) |p| billed_call.path = p;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
-    return engine(client).execute(response, billed_call) catch |err| {
+    var local: core.Diagnostics = .{};
+    const e = engineWith(client, &local);
+    return e.execute(response, billed_call) catch |err| {
         hint(client, err);
+        if (retained(e, err)) return error.ObjectRetained;
         return err;
     };
 }
@@ -164,13 +209,18 @@ pub fn executeDiscard(client: *Client, call: Call) Error!void {
     var billed_call = call;
     if (path) |p| billed_call.path = p;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
-    return engine(client).executeDiscard(billed_call) catch |err| {
+    var local: core.Diagnostics = .{};
+    const e = engineWith(client, &local);
+    return e.executeDiscard(billed_call) catch |err| {
         hint(client, err);
+        if (retained(e, err)) return error.ObjectRetained;
         return err;
     };
 }
 
 pub const StreamCall = core.rpc.StreamCall;
+pub const StreamCallError = core.rpc.StreamCallError || error{ObjectRetained};
+pub const StreamBodyError = core.rpc.StreamBodyError || error{ObjectRetained};
 
 /// Sends a streaming JSON API call and returns the first 2xx response
 /// whole: status, headers, and the body, buffered or delivered to the sink.
@@ -178,14 +228,17 @@ pub fn executeStream(
     client: *Client,
     response: *std.heap.ArenaAllocator,
     call: StreamCall,
-) core.rpc.StreamCallError!core.transport.StreamResponse {
+) StreamCallError!core.transport.StreamResponse {
     const path = try billedPath(client, call.path);
     defer if (path) |p| client.gpa.free(p);
     var billed_call = call;
     if (path) |p| billed_call.path = p;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
-    return engine(client).executeStream(response, billed_call) catch |err| {
+    var local: core.Diagnostics = .{};
+    const e = engineWith(client, &local);
+    return e.executeStream(response, billed_call) catch |err| {
         hint(client, err);
+        if (retained(e, err)) return error.ObjectRetained;
         return err;
     };
 }
@@ -196,11 +249,14 @@ pub fn executeXml(
     client: *Client,
     response: *std.heap.ArenaAllocator,
     call: StreamCall,
-) core.rpc.StreamCallError!core.transport.StreamResponse {
+) StreamCallError!core.transport.StreamResponse {
     var billed_call = call;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
-    return engine(client).executeStream(response, billed_call) catch |err| {
+    var local: core.Diagnostics = .{};
+    const e = engineWith(client, &local);
+    return e.executeStream(response, billed_call) catch |err| {
         hint(client, err);
+        if (retained(e, err)) return error.ObjectRetained;
         return err;
     };
 }
@@ -212,11 +268,14 @@ pub fn executeXmlBody(
     response: *std.heap.ArenaAllocator,
     call: StreamCall,
     body: core.rpc.StreamBody,
-) core.rpc.StreamBodyError!core.transport.StreamResponse {
+) StreamBodyError!core.transport.StreamResponse {
     var billed_call = call;
     if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
-    return engine(client).executeStreamBody(response, billed_call, body) catch |err| {
+    var local: core.Diagnostics = .{};
+    const e = engineWith(client, &local);
+    return e.executeStreamBody(response, billed_call, body) catch |err| {
         hint(client, err);
+        if (retained(e, err)) return error.ObjectRetained;
         return err;
     };
 }

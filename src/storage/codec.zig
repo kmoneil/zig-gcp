@@ -74,7 +74,22 @@ fn writeUploadMetadata(
         try jw.objectField("crc32c");
         try jw.write(&checksum);
     }
+    try writeHolds(jw, options.temporary_hold, options.event_based_hold);
     try jw.endObject();
+}
+
+/// A new object's holds: a temporary one only when asked for, and an
+/// event-based one when the caller said either way, since `false` also
+/// turns away the bucket's default hold.
+pub fn writeHolds(jw: *Stringify, temporary: bool, event_based: ?bool) Stringify.Error!void {
+    if (temporary) {
+        try jw.objectField("temporaryHold");
+        try jw.write(true);
+    }
+    if (event_based) |on| {
+        try jw.objectField("eventBasedHold");
+        try jw.write(on);
+    }
 }
 
 // Responses
@@ -237,6 +252,9 @@ const WireObject = struct {
     restoreToken: ?[]const u8 = null,
     kmsKeyName: ?[]const u8 = null,
     customerEncryption: ?struct { keySha256: ?[]const u8 = null } = null,
+    temporaryHold: ?bool = null,
+    eventBasedHold: ?bool = null,
+    retentionExpirationTime: ?[]const u8 = null,
 };
 
 const WireObjectPage = struct {
@@ -266,6 +284,14 @@ const WireBucket = struct {
     iamConfiguration: ?WireIamConfiguration = null,
     softDeleteTime: ?[]const u8 = null,
     hardDeleteTime: ?[]const u8 = null,
+    retentionPolicy: ?WireRetentionPolicy = null,
+    defaultEventBasedHold: ?bool = null,
+};
+
+const WireRetentionPolicy = struct {
+    retentionPeriod: ?std.json.Value = null,
+    effectiveTime: ?[]const u8 = null,
+    isLocked: ?bool = null,
 };
 
 const WireSoftDeletePolicy = struct {
@@ -312,6 +338,10 @@ fn objectFromWire(arena: Allocator, wire: WireObject) DecodeError!types.ObjectIn
         .restore_token = nonEmpty(wire.restoreToken),
         .kms_key_name = nonEmpty(wire.kmsKeyName),
         .encryption_key_sha256 = if (wire.customerEncryption) |c| try sha256FromWire(c.keySha256) else null,
+        // Absent until set, `false` once released.
+        .temporary_hold = wire.temporaryHold orelse false,
+        .event_based_hold = wire.eventBasedHold orelse false,
+        .retention_expiration_time = nonEmpty(wire.retentionExpirationTime),
     };
 }
 
@@ -343,6 +373,21 @@ fn bucketFromWire(arena: Allocator, wire: WireBucket) DecodeError!types.BucketIn
         .public_access_prevention = publicAccessPreventionFromWire(iam.publicAccessPrevention),
         .soft_delete_time = nonEmpty(wire.softDeleteTime),
         .hard_delete_time = nonEmpty(wire.hardDeleteTime),
+        .retention_policy = try retentionPolicyFromWire(wire.retentionPolicy),
+        .default_event_based_hold = wire.defaultEventBasedHold orelse false,
+    };
+}
+
+/// A policy names a period of at least a second; one that names none
+/// could not be sent back, so it is `InvalidResponse`.
+fn retentionPolicyFromWire(wire: ?WireRetentionPolicy) DecodeError!?types.RetentionPolicy {
+    const policy = wire orelse return null;
+    const period = try u64FromValue(policy.retentionPeriod);
+    if (period == 0) return error.InvalidResponse;
+    return .{
+        .period_s = period,
+        .effective_time = nonEmpty(policy.effectiveTime),
+        .locked = policy.isLocked orelse false,
     };
 }
 

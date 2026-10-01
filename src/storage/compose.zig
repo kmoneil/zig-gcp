@@ -184,6 +184,7 @@ fn write(
         }
         try jw.endObject();
     }
+    try codec.writeHolds(jw, options.temporary_hold, options.event_based_hold);
     try jw.endObject();
     if (options.delete_sources) {
         try jw.objectField("deleteSourceObjects");

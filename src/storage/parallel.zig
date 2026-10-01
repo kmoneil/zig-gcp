@@ -25,7 +25,12 @@
 //!
 //! Against an emulator the object goes up as one ordinary upload instead,
 //! with the conditions applied to it: fake-gcs-server has no multipart
-//! uploads, and no `objects.move`.
+//! uploads, and no `objects.move`. So does an upload with conditions into
+//! a bucket with a retention policy or a default event-based hold: there
+//! the finished temporary object is retained or held, so Cloud Storage
+//! refuses both its move and its delete, and it would stay, billed, for
+//! the whole period. Its settings are read first to tell; a caller who
+//! may not read the bucket gets the temporary object.
 //!
 //! Under a customer-supplied key the start, every part and the finish carry
 //! it, and the object is read back with it. Cloud Storage's finish names no
@@ -94,7 +99,15 @@ pub fn upload(
         if (options.checkpoint != null) {
             logging.warn("{s}: an emulator's one ordinary upload cannot resume, so the checkpoint is ignored", .{object});
         }
-        return fallback(client, bucket, object, source, size, options);
+        return fallback(client, bucket, object, source, size, options, "an emulator has no multipart uploads");
+    }
+    const conditioned = !std.meta.eql(options.preconditions, types.Preconditions{});
+    if (conditioned and try bucketKeeps(client, bucket, object)) {
+        logging.warn("{s}: the bucket keeps every new object, by a retention policy or a default event-based hold, so this upload with conditions goes up as one ordinary upload, not in parts", .{object});
+        if (options.checkpoint != null) {
+            logging.warn("{s}: one ordinary upload cannot resume, so the checkpoint is ignored", .{object});
+        }
+        return fallback(client, bucket, object, source, size, options, "the bucket would keep the temporary object a move needs");
     }
     if (options.checkpoint) |cp| {
         return persistent(client, bucket, object, source.file, size, options, cp);
@@ -531,7 +544,34 @@ fn sourceSize(client: *Client, source: types.ParallelSource) Error!u64 {
     };
 }
 
-/// One ordinary upload, for an emulator, which has no multipart uploads.
+/// Whether the bucket keeps every new object, by a retention policy or a
+/// default event-based hold, under which a finished temporary object could
+/// be neither moved nor deleted. A bucket this caller may not read, or
+/// that answers otherwise, counts as keeping nothing, and the log says so.
+fn bucketKeeps(client: *Client, bucket: []const u8, object: []const u8) Error!bool {
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const path = try names.bucketPath(scratch.allocator(), bucket);
+    const body = rpc.execute(client, &scratch, .{ .method = .GET, .path = path }) catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => |e| return e,
+        else => {
+            logging.warn("{s}: reading the bucket's settings failed with {t}; under a retention policy or a default event-based hold, the temporary object would stay", .{ object, err });
+            if (client.diagnostics) |d| d.clear();
+            return false;
+        },
+    };
+    const info = codec.decodeBucket(scratch.allocator(), body) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidResponse => {
+            logging.warn("{s}: the bucket's settings did not decode; under a retention policy or a default event-based hold, the temporary object would stay", .{object});
+            return false;
+        },
+    };
+    return info.retention_policy != null or info.default_event_based_hold;
+}
+
+/// One ordinary upload, where the multipart upload cannot go: `why` says
+/// which way.
 fn fallback(
     client: *Client,
     bucket: []const u8,
@@ -539,8 +579,9 @@ fn fallback(
     source: types.ParallelSource,
     size: u64,
     options: types.ParallelUploadOptions,
+    why: []const u8,
 ) Error!types.Owned(types.ObjectInfo) {
-    logging.debug("{s}: an emulator has no multipart uploads; sending one ordinary upload", .{object});
+    logging.debug("{s}: {s}; sending one ordinary upload", .{ object, why });
     const target: Object = .{ .client = client, .bucket = bucket, .name = object, .encryption_key = client.encryption_key };
     const upload_options: types.UploadOptions = .{
         .content_type = options.content_type,
@@ -1191,22 +1232,21 @@ fn deleteMismatch(
         defer found.deinit();
         break :g found.value.generation;
     };
-    var deleted = false;
+    var fate = rpc.Cleanup.unpinned.words();
     if (generation) |g| {
         var scratch: std.heap.ArenaAllocator = .init(client.gpa);
         defer scratch.deinit();
         if (names.objectPath(scratch.allocator(), bucket, object, g, .{})) |path| {
             var token: idempotency.Token = undefined;
             token.init(client);
-            rpc.executeDiscard(client, .{ .method = .DELETE, .path = path, .headers = token.slice() }) catch |err| {
-                logging.warn("deleting the mismatched upload of {s} failed with {t}", .{ object, err });
-            };
-            deleted = true;
+            const deleted = rpc.executeDiscard(client, .{ .method = .DELETE, .path = path, .headers = token.slice() });
+            deleted catch |err| logging.warn("deleting the mismatched upload of {s} failed with {t}", .{ object, err });
+            fate = rpc.Cleanup.of(deleted).words();
         } else |_| {}
     }
     if (client.diagnostics) |d| d.print(
-        "checksum mismatch after the finish: the parts hash to {d}, the object stores {d}; the object {s}",
-        .{ whole, stored, if (deleted) "was deleted again" else "could not be pinned to a generation, and was left alone" },
+        "checksum mismatch after the finish: the parts hash to {d}, the object stores {d}{s}",
+        .{ whole, stored, fate },
     );
     return error.ChecksumMismatch;
 }

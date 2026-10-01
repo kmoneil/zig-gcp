@@ -70,6 +70,17 @@ pub const ObjectInfo = struct {
     /// gives the same for a key, to tell which one this is. Such an object
     /// read without its key reports no `crc32c` and no `md5`.
     encryption_key_sha256: ?[32]u8 = null,
+    /// Held until released: neither deleted nor replaced, nor moved, though
+    /// its metadata stays editable. A write refused for it is
+    /// `error.ObjectRetained`.
+    temporary_hold: bool = false,
+    /// The same, and under a retention policy the period runs from the
+    /// hold's release rather than from the object's creation.
+    event_based_hold: bool = false,
+    /// RFC 3339: the earliest time the bucket's retention policy lets the
+    /// object be deleted or replaced. Null where no policy applies, and
+    /// while an event-based hold defers it.
+    retention_expiration_time: ?[]const u8 = null,
 
     /// The value of the custom metadata entry named `key`, or null.
     pub fn metadataValue(self: ObjectInfo, key: []const u8) ?[]const u8 {
@@ -167,6 +178,12 @@ pub const ComposeOptions = struct {
     cache_control: ?[]const u8 = null,
     content_encoding: ?[]const u8 = null,
     metadata: []const Metadata = &.{},
+    /// Place a temporary hold on the composite as it is made.
+    temporary_hold: bool = false,
+    /// Place an event-based hold on the composite (true), or not even where
+    /// the bucket's default would (false). Null: as the bucket's default
+    /// says.
+    event_based_hold: ?bool = null,
     /// Hard-deletes every source once the composite exists, which is what
     /// Google advises for parallel composite uploads, to keep the parts
     /// from being billed. Irreversible, and the wrong choice where soft
@@ -211,6 +228,11 @@ pub const MetadataUpdate = struct {
     content_encoding: ?[]const u8 = null,
     content_language: ?[]const u8 = null,
     edit: MetadataEdit = .keep,
+    /// Place (true) or release (false) a temporary hold. Null leaves it.
+    temporary_hold: ?bool = null,
+    /// Place (true) or release (false) an event-based hold, which under a
+    /// retention policy starts the period over. Null leaves it.
+    event_based_hold: ?bool = null,
     /// Change one older generation's metadata instead of the live one.
     generation: ?u64 = null,
     /// `if_metageneration_match` is what makes this safe to retry.
@@ -263,6 +285,13 @@ pub const UploadOptions = struct {
     /// must hold `roles/cloudkms.cryptoKeyEncrypterDecrypter` on it. Not
     /// together with a customer-supplied key.
     kms_key_name: ?[]const u8 = null,
+    /// Place a temporary hold on the object as it is written: it cannot be
+    /// deleted, replaced or moved until `updateMetadata` releases the hold.
+    temporary_hold: bool = false,
+    /// Place an event-based hold on the object (true), or not even where
+    /// the bucket's default would (false). Null: as the bucket's default
+    /// says.
+    event_based_hold: ?bool = null,
 };
 
 /// How `UploadOptions.gzip` compresses.
@@ -473,6 +502,12 @@ pub const CopyOptions = struct {
     /// gets the destination bucket's default key, else Google's own: the
     /// source's key does not carry over, as measured.
     kms_key_name: ?[]const u8 = null,
+    /// Holds for the copy, which never carries the source's: a temporary
+    /// hold, and an event-based one (true), or none even where the
+    /// bucket's default would place one (false). Setting either is a
+    /// change, and reads the source first as the fields above do.
+    temporary_hold: bool = false,
+    event_based_hold: ?bool = null,
 };
 
 /// What an update does to a setting that can be taken away: `.keep`,
@@ -609,6 +644,24 @@ pub const BucketConfig = struct {
     uniform_bucket_level_access: ?bool = null,
     /// Null: `.inherited`.
     public_access_prevention: ?PublicAccessPrevention = null,
+    /// Keep every object at least this long after its creation, 1 to
+    /// 3,155,760,000 seconds (100 years): until then it cannot be deleted,
+    /// replaced or moved, and a write that tries is
+    /// `error.ObjectRetained`. Null: no retention policy.
+    retention_period_s: ?u64 = null,
+    /// Place an event-based hold on every object written to the bucket
+    /// that does not ask for none.
+    default_event_based_hold: bool = false,
+};
+
+/// A bucket's retention policy: every object is kept at least `period_s`
+/// after its creation, or after its event-based hold's release.
+pub const RetentionPolicy = struct {
+    period_s: u64,
+    /// RFC 3339: from when every object has been kept for the period.
+    effective_time: ?[]const u8 = null,
+    /// A locked policy can only be lengthened: never removed or shortened.
+    locked: bool = false,
 };
 
 /// A bucket, as `create`, `get`, `update` and `listBuckets` return it.
@@ -639,6 +692,9 @@ pub const BucketInfo = struct {
     lifecycle: []const LifecycleRule = &.{},
     uniform_bucket_level_access: bool = false,
     public_access_prevention: PublicAccessPrevention = .inherited,
+    /// Null: none.
+    retention_policy: ?RetentionPolicy = null,
+    default_event_based_hold: bool = false,
     /// A soft-deleted bucket's: when it was deleted, and when it stops
     /// being restorable. Null for a live one.
     soft_delete_time: ?[]const u8 = null,
@@ -751,6 +807,12 @@ pub const BucketUpdate = struct {
     public_access_prevention: ?PublicAccessPrevention = null,
     /// The class new objects get when they name none, such as "NEARLINE".
     storage_class: ?[]const u8 = null,
+    /// `.set` gives the bucket a retention policy of that many seconds, 1
+    /// to 3,155,760,000, or changes its period; `.clear` removes it. Every
+    /// object, old and new, is kept for the period from its creation. A
+    /// locked policy can only be lengthened.
+    retention_period_s: Change(u64) = .keep,
+    default_event_based_hold: ?bool = null,
     /// Change the bucket only while its metageneration is this: what makes
     /// the update safe to retry.
     if_metageneration_match: ?u64 = null,

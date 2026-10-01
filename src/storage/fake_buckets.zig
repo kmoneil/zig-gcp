@@ -22,6 +22,11 @@
 //! - Labels, soft delete retentions, lifecycle rules, storage classes,
 //!   public access prevention and key names are held to Cloud Storage's
 //!   rules, and a refused patch leaves the bucket as it was.
+//! - A retention policy (2026-09-30): a period of 1 to 3,155,760,000 s,
+//!   as a string or a number; `retentionPolicy: null` removes it and `{}`
+//!   changes nothing; `effectiveTime` stays where it was when the period
+//!   changes, and `isLocked` or `effectiveTime` in a patch are ignored.
+//!   `FakeMultipart` holds objects to it, and to `defaultEventBasedHold`.
 //!
 //! Letters beyond ASCII pass in labels, since this fake has no Unicode
 //! tables; Cloud Storage refuses the uppercase ones. Fields this library
@@ -197,6 +202,11 @@ pub const FakeBuckets = struct {
         if (std.mem.eql(u8, key, "billing")) return self.applyFlag(next, "billing", "requesterPays", value);
         if (std.mem.eql(u8, key, "encryption")) return self.applyEncryption(next, value);
         if (std.mem.eql(u8, key, "iamConfiguration")) return self.applyIam(next, value);
+        if (std.mem.eql(u8, key, "retentionPolicy")) return self.applyRetention(next, value);
+        if (std.mem.eql(u8, key, "defaultEventBasedHold")) {
+            if (value != .bool) return self.fail("defaultEventBasedHold is not a boolean");
+            return next.put(self.arena.allocator(), "defaultEventBasedHold", value);
+        }
         if (!creating and std.mem.eql(u8, key, "storageClass")) {
             const text = stringOf(value) orelse return self.fail("storageClass is not a string");
             const class = storageClass(text) orelse return self.failFmt("Invalid storage class \"{s}\"", .{text});
@@ -394,6 +404,48 @@ pub const FakeBuckets = struct {
         try policy.put(a, "retentionDurationSeconds", .{ .string = try std.fmt.allocPrint(a, "{d}", .{seconds}) });
         if (seconds != 0) try policy.put(a, "effectiveTime", .{ .string = "2026-09-29T14:08:48.987Z" });
         try next.put(a, "softDeletePolicy", .{ .object = policy });
+    }
+
+    fn applyRetention(self: *FakeBuckets, next: *ObjectMap, value: Value) ApplyError!void {
+        const a = self.arena.allocator();
+        const fields = switch (value) {
+            .null => {
+                _ = next.orderedRemove("retentionPolicy");
+                return;
+            },
+            .object => |o| o,
+            else => return self.fail("retentionPolicy is not an object"),
+        };
+        // Measured: `{}`, `isLocked` and `effectiveTime` change nothing.
+        const period_value = fields.get("retentionPeriod") orelse return;
+        const period: i64 = switch (period_value) {
+            .integer => |n| n,
+            .string => |text| std.fmt.parseInt(i64, text, 10) catch
+                return self.failFmt("Parse Error: Invalid value for TYPE_INT64 field: '\"{s}\"'.", .{text}),
+            else => return self.fail("Parse Error: Invalid value for TYPE_INT64 field"),
+        };
+        if (period < 1 or period > 3_155_760_000) {
+            return self.fail("Retention policy must have a retention period greater than 0 and less than 100 years.");
+        }
+        const effective = if (next.get("retentionPolicy")) |old| old.object.get("effectiveTime").? else Value{ .string = "2026-09-30T21:57:51.487Z" };
+        var policy: ObjectMap = .empty;
+        try policy.put(a, "retentionPeriod", .{ .string = try std.fmt.allocPrint(a, "{d}", .{period}) });
+        try policy.put(a, "effectiveTime", effective);
+        try next.put(a, "retentionPolicy", .{ .object = policy });
+    }
+
+    /// The bucket's retention period, or null for none or no such bucket.
+    pub fn retentionPeriod(self: *const FakeBuckets, name: []const u8) ?u64 {
+        const r = self.resource(name) orelse return null;
+        const policy = r.get("retentionPolicy") orelse return null;
+        return std.fmt.parseInt(u64, policy.object.get("retentionPeriod").?.string, 10) catch unreachable;
+    }
+
+    /// Whether new objects in the bucket get an event-based hold.
+    pub fn defaultEventBasedHold(self: *const FakeBuckets, name: []const u8) bool {
+        const r = self.resource(name) orelse return false;
+        const on = r.get("defaultEventBasedHold") orelse return false;
+        return on.bool;
     }
 
     /// `versioning` and `billing`: one flag each.
@@ -797,4 +849,44 @@ test "the fake keeps what Cloud Storage kept on 2026-09-29" {
     try testing.expectEqual(404, (try patchRaw(&fake, a, "{\"storageClass\":\"STANDARD\"}")).status);
     // The create, and the one refused with 409.
     try testing.expectEqual(2, fake.counts.creates);
+}
+
+test "the fake keeps a retention policy as Cloud Storage did on 2026-09-30" {
+    var fake: FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const target: FakeBuckets.Target = .{ .name = "b" };
+    try testing.expectEqual(200, (try fake.serve(.POST, .{ .name = null, .project = "p" }, "{\"name\":\"b\",\"retentionPolicy\":{\"retentionPeriod\":\"3600\"}}", a)).status);
+    try testing.expectEqual(3600, fake.retentionPeriod("b").?);
+    const effective = fake.resource("b").?.get("retentionPolicy").?.object.get("effectiveTime").?.string;
+    // A number is taken; the effective time stays.
+    try testing.expectEqual(200, (try fake.serve(.PATCH, target, "{\"retentionPolicy\":{\"retentionPeriod\":7200}}", a)).status);
+    try testing.expectEqual(7200, fake.retentionPeriod("b").?);
+    try testing.expectEqualStrings(effective, fake.resource("b").?.get("retentionPolicy").?.object.get("effectiveTime").?.string);
+    // `{}`, `isLocked` and `effectiveTime` change nothing.
+    for ([_][]const u8{
+        "{\"retentionPolicy\":{}}",
+        "{\"retentionPolicy\":{\"isLocked\":false,\"effectiveTime\":\"2020-01-01T00:00:00Z\"}}",
+    }) |body| {
+        try testing.expectEqual(200, (try fake.serve(.PATCH, target, body, a)).status);
+        try testing.expectEqual(7200, fake.retentionPeriod("b").?);
+    }
+    // Out of range or not an integer: 400, and nothing changes.
+    for ([_][]const u8{
+        "{\"retentionPolicy\":{\"retentionPeriod\":\"0\"}}",
+        "{\"retentionPolicy\":{\"retentionPeriod\":\"3155760001\"}}",
+        "{\"retentionPolicy\":{\"retentionPeriod\":\"1.5\"}}",
+    }) |body| {
+        try testing.expectEqual(400, (try fake.serve(.PATCH, target, body, a)).status);
+        try testing.expectEqual(7200, fake.retentionPeriod("b").?);
+    }
+    try testing.expectEqual(200, (try fake.serve(.PATCH, target, "{\"retentionPolicy\":{\"retentionPeriod\":\"3155760000\"}}", a)).status);
+    // Null removes it.
+    try testing.expectEqual(200, (try fake.serve(.PATCH, target, "{\"retentionPolicy\":null}", a)).status);
+    try testing.expectEqual(null, fake.retentionPeriod("b"));
+    try testing.expect(!fake.defaultEventBasedHold("b"));
+    try testing.expectEqual(200, (try fake.serve(.PATCH, target, "{\"defaultEventBasedHold\":true}", a)).status);
+    try testing.expect(fake.defaultEventBasedHold("b"));
 }

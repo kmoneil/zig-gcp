@@ -69,6 +69,20 @@
 //! is not run again, whatever changed in between. A failure is not kept. A
 //! resumable session's start runs again, as production's does. A token on
 //! a read, the XML API, or a session's chunks fails the test that sent it.
+//!
+//! Holds and retention policies are held to what Cloud Storage measured on
+//! 2026-09-30 does. An object keeps its holds, absent until set and
+//! `false` once released, and a metageneration that a patch moves. Under a
+//! hold, or its bucket's retention policy in `buckets` (the period running
+//! on this fake's clock from the object's creation, or from its
+//! event-based hold's release), a delete, an overwrite (by one request, at
+//! a session's final PUT, or at an XML finish) and a move of it are
+//! refused 403, with production's reasons and messages: the JSON API's
+//! `retentionPolicyNotMet`, or `forbidden` for a hold; the XML API's
+//! `RetentionPolicyNotMet` and `ObjectUnderActiveHold`. A condition is
+//! checked first. New objects get the bucket's default event-based hold
+//! unless their metadata says `eventBasedHold: false`. `objects.patch`
+//! sets and releases holds, and takes nothing else.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -142,6 +156,10 @@ pub const FakeMultipart = struct {
         session_puts: u32 = 0,
         /// Repeats answered with a kept answer, and not run again.
         deduplicated: u32 = 0,
+        /// `objects.patch` requests.
+        patches: u32 = 0,
+        /// Writes refused because the object was held or retained.
+        kept_refusals: u32 = 0,
         session_cancels: u32 = 0,
         /// One-request `uploadType=multipart` uploads.
         inserts: u32 = 0,
@@ -153,7 +171,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch };
 
     pub const Fault = enum {
         none,
@@ -253,6 +271,14 @@ pub const FakeMultipart = struct {
         /// The keys its start named. The name is owned.
         key_sha256: ?[32]u8 = null,
         kms_key_name: ?[]u8 = null,
+        /// The holds its start's metadata asked for.
+        holds: Holds = .{},
+    };
+
+    /// An object's holds: null until set, `false` once released.
+    pub const Holds = struct {
+        temporary: ?bool = null,
+        event_based: ?bool = null,
     };
 
     /// An object the fake holds.
@@ -270,6 +296,12 @@ pub const FakeMultipart = struct {
         key_sha256: ?[32]u8 = null,
         /// The Cloud KMS key it is stored under, without a version. Owned.
         kms_key_name: ?[]u8 = null,
+        holds: Holds = .{},
+        /// Moved by every patch.
+        metageneration: u64 = 1,
+        /// When its retention period started, on the fake's clock: its
+        /// creation, or its event-based hold's latest release.
+        retained_from_ns: i96 = 0,
     };
 
     pub fn init(gpa: Allocator, io: std.Io) FakeMultipart {
@@ -342,6 +374,7 @@ pub const FakeMultipart = struct {
             .bytes = owned_bytes,
             .content_type = content_type,
             .metadata = metadata,
+            .retained_from_ns = self.now(),
         });
         self.next_generation += 1;
     }
@@ -443,9 +476,12 @@ pub const FakeMultipart = struct {
         const target = try parseTarget(arena, url);
         const kind: Kind = switch (target) {
             // A request this fake does not serve fails the test that sent it.
-            .json => |j| if (method == .GET)
-                (if (j.media) .media else .read)
-            else if (method == .DELETE) .delete else return error.HttpProtocolError,
+            .json => |j| switch (method) {
+                .GET => if (j.media) .media else .read,
+                .DELETE => .delete,
+                .PATCH => .patch,
+                else => return error.HttpProtocolError,
+            },
             .move => if (method == .POST) .move else return error.HttpProtocolError,
             .resumable => if (method == .POST) .session_start else return error.HttpProtocolError,
             .insert => if (method == .POST) .insert else return error.HttpProtocolError,
@@ -534,7 +570,7 @@ pub const FakeMultipart = struct {
         };
 
         const reply = switch (target) {
-            .json => |j| try self.json(kind, j, headers, accept_gzip, fault, arena),
+            .json => |j| try self.json(kind, j, headers, body, accept_gzip, fault, arena),
             .xml => |x| try self.multipartRequest(kind, x, content_type, headers, body, fault, arena),
             .move => |m| try self.moveObject(m, fault, arena),
             .resumable => |r| try self.sessionStart(r, content_type, headers, body, arena),
@@ -557,7 +593,7 @@ pub const FakeMultipart = struct {
         return reply;
     }
 
-    fn json(self: *FakeMultipart, kind: Kind, target: JsonTarget, headers: []const Header, accept_gzip: bool, fault: Fault, arena: Allocator) Allocator.Error!Reply {
+    fn json(self: *FakeMultipart, kind: Kind, target: JsonTarget, headers: []const Header, body: []const u8, accept_gzip: bool, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         const not_found: Reply = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
         const index = for (self.objects.items, 0..) |o, i| {
             if (std.mem.eql(u8, o.name, target.name) and (target.generation == null or target.generation.? == o.generation)) break i;
@@ -578,7 +614,7 @@ pub const FakeMultipart = struct {
                     .not_match_failed => return .{ .status = 304, .body = "" },
                 }
                 // Without its key, an object under one names no checksum.
-                return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false, given != .none) };
+                return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, given != .none) };
             },
             .media => {
                 self.counts.media += 1;
@@ -596,6 +632,7 @@ pub const FakeMultipart = struct {
             .delete => {
                 self.counts.deletes += 1;
                 const i = index orelse return not_found;
+                if (try self.keptRefusal(.json, target.bucket, &self.objects.items[i], arena)) |refusal| return refusal;
                 if (self.soft_delete) try self.soft_deleted.ensureUnusedCapacity(self.gpa, 1);
                 var removed = self.objects.orderedRemove(i);
                 if (self.soft_delete) {
@@ -605,8 +642,96 @@ pub const FakeMultipart = struct {
                 }
                 return .{ .status = 204 };
             },
+            .patch => return self.patchObject(target, index, body, arena),
             else => unreachable,
         }
+    }
+
+    /// `objects.patch`, of holds alone: every other field fails the test
+    /// that sent it. Releasing an event-based hold starts the retention
+    /// period over.
+    fn patchObject(self: *FakeMultipart, target: JsonTarget, index: ?usize, body: []const u8, arena: Allocator) Allocator.Error!Reply {
+        self.counts.patches += 1;
+        const i = index orelse return .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
+        const o = &self.objects.items[i];
+        switch (target.conditions.check(o)) {
+            .hold => {},
+            .match_failed, .not_match_failed => return condition_failed,
+        }
+        const bad = "{\"error\":{\"code\":400,\"message\":\"this fake patches holds alone: ";
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return .{ .status = 400, .body = bad ++ "a body that is not JSON\"}}" };
+        if (parsed != .object) return .{ .status = 400, .body = bad ++ "a body that is not an object\"}}" };
+        var holds = o.holds;
+        var it = parsed.object.iterator();
+        while (it.next()) |entry| {
+            const value = entry.value_ptr.*;
+            if (value != .bool) return .{ .status = 400, .body = bad ++ "a field that is not a boolean\"}}" };
+            if (std.mem.eql(u8, entry.key_ptr.*, "temporaryHold")) {
+                holds.temporary = value.bool;
+            } else if (std.mem.eql(u8, entry.key_ptr.*, "eventBasedHold")) {
+                holds.event_based = value.bool;
+            } else return .{ .status = 400, .body = bad ++ "another field\"}}" };
+        }
+        if (o.holds.event_based orelse false and !(holds.event_based orelse false)) o.retained_from_ns = self.now();
+        o.holds = holds;
+        o.metageneration += 1;
+        return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, false) };
+    }
+
+    /// The fake's clock.
+    fn now(self: *const FakeMultipart) i96 {
+        return std.Io.Clock.awake.now(self.io).nanoseconds;
+    }
+
+    /// When the object's retention ends, on the fake's clock, or null when
+    /// no policy applies, or an event-based hold defers it.
+    fn retainedUntil(self: *const FakeMultipart, bucket: []const u8, o: *const Stored) ?i96 {
+        const period = self.buckets.retentionPeriod(bucket) orelse return null;
+        if (o.holds.event_based orelse false) return null;
+        return o.retained_from_ns + @as(i96, period) * std.time.ns_per_s;
+    }
+
+    /// The holds a new object in `bucket` gets: those asked for, and the
+    /// bucket's default event-based hold unless the upload said false.
+    fn newHolds(self: *const FakeMultipart, bucket: []const u8, asked: Holds) Holds {
+        var holds = asked;
+        if (holds.event_based == null and self.buckets.defaultEventBasedHold(bucket)) holds.event_based = true;
+        return holds;
+    }
+
+    const Api = enum { json, xml };
+
+    /// Production's refusal of a write that would delete, replace or move
+    /// `o` while it is held or retained, else null.
+    fn keptRefusal(self: *FakeMultipart, api: Api, bucket: []const u8, o: *const Stored, arena: Allocator) Allocator.Error!?Reply {
+        const hold: ?[]const u8 = if (o.holds.temporary orelse false)
+            "Temporary"
+        else if (o.holds.event_based orelse false)
+            "Event-Based"
+        else
+            null;
+        if (hold) |kind| {
+            self.counts.kept_refusals += 1;
+            const details = try std.fmt.allocPrint(arena, "Object '{s}/{s}' is under active {s} hold and cannot be deleted, overwritten or archived until hold is removed.", .{ bucket, o.name, kind });
+            return switch (api) {
+                .json => try jsonRefusal(arena, 403, "forbidden", details),
+                .xml => .{ .status = 403, .body = try std.fmt.allocPrint(arena, "<?xml version='1.0' encoding='UTF-8'?><Error><Code>ObjectUnderActiveHold</Code><Message>Object overwrite or deletion is not allowed due to active hold on the object.</Message><Details>{s}</Details></Error>", .{details}) },
+            };
+        }
+        const until = self.retainedUntil(bucket, o) orelse return null;
+        if (self.now() >= until) return null;
+        self.counts.kept_refusals += 1;
+        const details = try std.fmt.allocPrint(arena, "Object '{s}/{s}' is subject to bucket's retention policy or object retention and cannot be deleted or overwritten until {s}", .{ bucket, o.name, try rfc3339(arena, until) });
+        return switch (api) {
+            .json => try jsonRefusal(arena, 403, "retentionPolicyNotMet", details),
+            .xml => .{ .status = 403, .body = try std.fmt.allocPrint(arena, "<?xml version='1.0' encoding='UTF-8'?><Error><Code>RetentionPolicyNotMet</Code><Message>Object overwrite or deletion is not allowed due to retention policy.</Message><Details>{s}</Details></Error>", .{details}) },
+        };
+    }
+
+    /// `keptRefusal` for the live object `name`, if there is one.
+    fn keptLive(self: *FakeMultipart, api: Api, bucket: []const u8, name: []const u8, arena: Allocator) Allocator.Error!?Reply {
+        const i = self.liveIndex(name) orelse return null;
+        return self.keptRefusal(api, bucket, &self.objects.items[i], arena);
     }
 
     /// The answer to a request requester pays refuses, or to one this
@@ -654,9 +779,9 @@ pub const FakeMultipart = struct {
 
     /// The kept answer for `key`, if one is young enough.
     fn keptAnswer(self: *FakeMultipart, key: []const u8) ?*const Kept {
-        const now = std.Io.Clock.awake.now(self.io).nanoseconds;
+        const at = self.now();
         for (self.kept.items) |*k| {
-            if (std.mem.eql(u8, k.key, key) and now - k.at_ns <= self.dedup_ns) return k;
+            if (std.mem.eql(u8, k.key, key) and at - k.at_ns <= self.dedup_ns) return k;
         }
         return null;
     }
@@ -671,7 +796,7 @@ pub const FakeMultipart = struct {
         errdefer self.gpa.free(body);
         try self.kept.append(self.gpa, .{
             .key = owned_key,
-            .at_ns = std.Io.Clock.awake.now(self.io).nanoseconds,
+            .at_ns = self.now(),
             .status = reply.status,
             .headers = headers,
             .body = body,
@@ -721,7 +846,7 @@ pub const FakeMultipart = struct {
             .body = "{\"error\":{\"code\":400,\"message\":\"You must specify a generation.\",\"errors\":[{\"reason\":\"required\"}]}}",
         };
         for (self.soft_deleted.items) |*o| if (std.mem.eql(u8, o.name, target.name) and o.generation == generation) {
-            return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false, false) };
+            return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, false) };
         };
         return .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"No such object\",\"errors\":[{\"reason\":\"notFound\"}]}}" };
     }
@@ -749,9 +874,11 @@ pub const FakeMultipart = struct {
         // may.
         var copy = try copyStored(self.gpa, &self.soft_deleted.items[source_index], self.next_generation);
         errdefer freeStored(self.gpa, &copy);
+        copy.metageneration = 1;
+        copy.retained_from_ns = self.now();
         // A restore needs no key, and answers without the checksums of an
         // object under one.
-        const reply_body = try objectJson(arena, &copy, copy.name, copy.generation, target.bucket, false, false);
+        const reply_body = try objectJson(self, arena, &copy, copy.name, copy.generation, target.bucket, false, false);
         try self.objects.ensureUnusedCapacity(self.gpa, 1);
         try self.soft_deleted.ensureUnusedCapacity(self.gpa, 1);
         self.next_generation += 1;
@@ -775,12 +902,15 @@ pub const FakeMultipart = struct {
         if (target.if_source_generation_match) |g| if (self.objects.items[s].generation != g) return condition_failed;
         if (!destination_holds) return condition_failed;
         if (std.mem.eql(u8, target.source, target.destination)) return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"same name\"}}" };
+        // A move takes its source away and replaces its destination.
+        if (try self.keptRefusal(.json, target.bucket, &self.objects.items[s], arena)) |refusal| return refusal;
+        if (try self.keptLive(.json, target.bucket, target.destination, arena)) |refusal| return refusal;
 
         // The reply and the new name first: once the objects change,
         // nothing may fail.
         const generation = self.next_generation;
         // So does a move.
-        const reply_body = try objectJson(arena, &self.objects.items[s], target.destination, generation, target.bucket, fault == .corrupt, false);
+        const reply_body = try objectJson(self, arena, &self.objects.items[s], target.destination, generation, target.bucket, fault == .corrupt, false);
         const name = try self.gpa.dupe(u8, target.destination);
         self.next_generation += 1;
         if (self.liveIndex(target.destination)) |d| {
@@ -791,6 +921,8 @@ pub const FakeMultipart = struct {
         self.gpa.free(moved.name);
         moved.name = name;
         moved.generation = generation;
+        moved.metageneration = 1;
+        moved.retained_from_ns = self.now();
         return .{ .status = 200, .body = reply_body };
     }
 
@@ -931,7 +1063,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 if (keyFault(self.uploads.items[index].key_sha256, requestKey(headers, object_key_prefix))) |key_fault| return xmlKeyReply(key_fault);
                 if (fault == .error_200) return .{ .status = 200, .body = "<Error><Code>InternalError</Code><Message>We encountered an internal error. Please try again.</Message></Error>" };
-                return self.finishUpload(index, body, fault, arena);
+                return self.finishUpload(target.bucket, index, body, fault, arena);
             },
             .abort => {
                 self.counts.aborts += 1;
@@ -944,7 +1076,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch => unreachable,
         }
     }
 
@@ -986,9 +1118,11 @@ pub const FakeMultipart = struct {
         return .{ .status = 200, .body = out.written() };
     }
 
-    fn finishUpload(self: *FakeMultipart, index: usize, body: []const u8, fault: Fault, arena: Allocator) Allocator.Error!Reply {
+    fn finishUpload(self: *FakeMultipart, bucket: []const u8, index: usize, body: []const u8, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         const invalid_part: Reply = .{ .status = 400, .body = "<Error><Code>InvalidPart</Code></Error>" };
         const u = &self.uploads.items[index];
+        // Refused after its parts went up, and the upload stays open.
+        if (try self.keptLive(.xml, bucket, u.name, arena)) |refusal| return refusal;
         const root = xml.parse(arena, body) catch return invalid_part;
         if (!std.mem.eql(u8, root.name, "CompleteMultipartUpload") or root.children.len == 0) return invalid_part;
         var assembled: std.ArrayList(u8) = .empty;
@@ -1035,6 +1169,9 @@ pub const FakeMultipart = struct {
             .metadata = u.metadata,
             .key_sha256 = u.key_sha256,
             .kms_key_name = u.kms_key_name,
+            // The XML API sets no hold; the bucket's default applies.
+            .holds = self.newHolds(bucket, .{}),
+            .retained_from_ns = self.now(),
         });
         u.name = u.name[0..0];
         u.content_type = u.content_type[0..0];
@@ -1118,6 +1255,7 @@ pub const FakeMultipart = struct {
             .gzip = meta.gzip(),
             .key_sha256 = keys.key_sha256,
             .kms_key_name = kms,
+            .holds = .{ .temporary = meta.temporaryHold, .event_based = meta.eventBasedHold },
         });
         self.next_session += 1;
         return .{ .status = 200, .headers = try replyHeaders(arena, &.{.{ .name = "Location", .value = location }}) };
@@ -1146,7 +1284,7 @@ pub const FakeMultipart = struct {
             // that object stands.
             for (self.objects.items) |*o| {
                 if (o.generation == generation and std.mem.eql(u8, o.name, s.name)) {
-                    return .{ .status = 200, .body = try objectJson(arena, o, o.name, generation, s.bucket, false, true) };
+                    return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, generation, s.bucket, false, true) };
                 }
             }
             return session_not_found;
@@ -1202,11 +1340,13 @@ pub const FakeMultipart = struct {
         };
         if (claimed) |wanted| if (wanted != actual) return mismatch;
         if (s.metadata_crc) |wanted| if (wanted != actual) return mismatch;
+        // Refused at the final PUT, after every byte went up.
+        if (try self.keptLive(.json, s.bucket, s.name, arena)) |refusal| return refusal;
 
-        const o = try self.store(s.name, s.bytes.items, s.content_type, s.gzip, s.key_sha256, s.kms_key_name);
+        const o = try self.store(s.bucket, s.name, s.bytes.items, s.content_type, s.gzip, s.key_sha256, s.kms_key_name, s.holds);
         s.done = o.generation;
         s.bytes.clearAndFree(self.gpa);
-        return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, s.bucket, false, true) };
+        return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, s.bucket, false, true) };
     }
 
     /// Stores `bytes` as the live object `name` at the next generation,
@@ -1216,12 +1356,14 @@ pub const FakeMultipart = struct {
     /// decompress are served as nothing.
     fn store(
         self: *FakeMultipart,
+        bucket: []const u8,
         name: []const u8,
         bytes: []const u8,
         content_type: []const u8,
         gzip: bool,
         key_sha256: ?[32]u8,
         kms_key_name: ?[]const u8,
+        holds: Holds,
     ) Allocator.Error!*Stored {
         const owned_name = try self.gpa.dupe(u8, name);
         errdefer self.gpa.free(owned_name);
@@ -1251,6 +1393,8 @@ pub const FakeMultipart = struct {
             .served = served,
             .key_sha256 = key_sha256,
             .kms_key_name = kms,
+            .holds = self.newHolds(bucket, holds),
+            .retained_from_ns = self.now(),
         });
         return &self.objects.items[self.objects.items.len - 1];
     }
@@ -1286,8 +1430,10 @@ pub const FakeMultipart = struct {
                 .body = "{\"error\":{\"code\":400,\"message\":\"Provided CRC32C does not match calculated CRC32C\",\"errors\":[{\"reason\":\"invalid\"}]}}",
             };
         }
-        const o = try self.store(meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip(), keys.key_sha256, keys.kms_key_name);
-        return .{ .status = 200, .body = try objectJson(arena, o, o.name, o.generation, target.bucket, false, true) };
+        if (try self.keptLive(.json, target.bucket, meta.name, arena)) |refusal| return refusal;
+        const holds: Holds = .{ .temporary = meta.temporaryHold, .event_based = meta.eventBasedHold };
+        const o = try self.store(target.bucket, meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip(), keys.key_sha256, keys.kms_key_name, holds);
+        return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, true) };
     }
 
     fn sessionCancel(self: *FakeMultipart, id: []const u8) Reply {
@@ -1507,7 +1653,7 @@ fn xmlKeyReply(fault: KeyFault) FakeMultipart.Reply {
 /// send one, else null. Read before the lock: it touches no state.
 fn keyRefusal(kind: FakeMultipart.Kind, target: Target, url: []const u8, headers: []const Header, arena: Allocator) Allocator.Error!?FakeMultipart.Reply {
     const takes_key = switch (kind) {
-        .start, .part, .finish, .media, .insert, .session_start => true,
+        .start, .part, .finish, .media, .insert, .session_start, .patch => true,
         // A soft-deleted object's metadata is read without one.
         .read => !target.json.soft_deleted,
         else => false,
@@ -1535,7 +1681,7 @@ fn keyRefusal(kind: FakeMultipart.Kind, target: Target, url: []const u8, headers
 fn tokenRefusal(kind: FakeMultipart.Kind, method: Method, headers: []const Header, arena: Allocator) Allocator.Error!?FakeMultipart.Reply {
     if (headerValue(headers, "X-Goog-Gcs-Idempotency-Token") == null) return null;
     const takes_token = switch (kind) {
-        .delete, .move, .insert, .session_start, .restore => true,
+        .delete, .move, .insert, .session_start, .restore, .patch => true,
         .bucket => method != .GET,
         else => false,
     };
@@ -1555,7 +1701,7 @@ fn tokenRefusal(kind: FakeMultipart.Kind, method: Method, headers: []const Heade
 fn keptKey(arena: Allocator, kind: FakeMultipart.Kind, target: Target, headers: []const Header, content_type: ?[]const u8, body: []const u8) Allocator.Error!?[]const u8 {
     const token = headerValue(headers, "X-Goog-Gcs-Idempotency-Token") orelse return null;
     const resource: []const u8 = switch (kind) {
-        .delete => try std.fmt.allocPrint(arena, "{s}/{s}#{?d}", .{ target.json.bucket, target.json.name, target.json.generation }),
+        .delete, .patch => try std.fmt.allocPrint(arena, "{s}/{s}#{?d}", .{ target.json.bucket, target.json.name, target.json.generation }),
         .move => try std.fmt.allocPrint(arena, "{s}/{s}>{s}", .{ target.move.bucket, target.move.source, target.move.destination }),
         .insert => try std.fmt.allocPrint(arena, "{s}/{s}", .{ target.insert.bucket, try insertedName(arena, content_type, body) orelse return null }),
         else => return null,
@@ -1632,7 +1778,11 @@ const condition_failed: FakeMultipart.Reply = .{
 /// a customer-supplied key names its checksum only with `keyed_request`,
 /// a request that carried the key, and names the key's SHA-256 always; one
 /// under a Cloud KMS key names the key's first version.
+/// An Object resource as Cloud Storage writes one: holds only once set,
+/// and the retention expiration where a policy applies and no event-based
+/// hold defers it.
 fn objectJson(
+    self: *const FakeMultipart,
     arena: Allocator,
     o: *const FakeMultipart.Stored,
     name: []const u8,
@@ -1646,12 +1796,13 @@ fn objectJson(
     const crc = core.crc32c.toBase64(core.crc32c.hash(o.bytes) ^ @intFromBool(wrong_crc));
     const hashes = o.key_sha256 == null or keyed_request;
     var sha_text: [44]u8 = undefined;
+    const expiration: ?[]const u8 = if (self.retainedUntil(bucket, o)) |until| try rfc3339(arena, until) else null;
     jw.write(.{
         .name = name,
         .bucket = bucket,
         .size = try std.fmt.allocPrint(arena, "{d}", .{o.bytes.len}),
         .generation = try std.fmt.allocPrint(arena, "{d}", .{generation}),
-        .metageneration = "1",
+        .metageneration = try std.fmt.allocPrint(arena, "{d}", .{o.metageneration}),
         .contentType = o.content_type,
         .contentEncoding = @as(?[]const u8, if (o.served != null) "gzip" else null),
         .crc32c = @as(?[]const u8, if (hashes) &crc else null),
@@ -1661,8 +1812,42 @@ fn objectJson(
             .encryptionAlgorithm = "AES256",
             .keySha256 = std.base64.standard.Encoder.encode(&sha_text, &digest),
         }) else null,
+        .temporaryHold = o.holds.temporary,
+        .eventBasedHold = o.holds.event_based,
+        .retentionExpirationTime = expiration,
     }) catch return error.OutOfMemory;
     return out.written();
+}
+
+/// A JSON API error body, as Cloud Storage writes one.
+fn jsonRefusal(arena: Allocator, status: u16, reason: []const u8, message: []const u8) Allocator.Error!FakeMultipart.Reply {
+    const body = try std.json.Stringify.valueAlloc(arena, .{ .@"error" = .{
+        .code = status,
+        .message = message,
+        .errors = .{.{ .message = message, .domain = "global", .reason = reason }},
+    } }, .{});
+    return .{ .status = status, .body = body };
+}
+
+/// The fake's wall clock: its clock's reading past midnight UTC on
+/// 2026-09-30, the day this was measured, in RFC 3339 to the millisecond.
+fn rfc3339(arena: Allocator, ns: i96) Allocator.Error![]const u8 {
+    const base_s: i96 = 1_790_726_400;
+    const total_ms: u64 = @intCast(@max(0, base_s * std.time.ms_per_s + @divFloor(ns, std.time.ns_per_ms)));
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = total_ms / std.time.ms_per_s };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const secs = epoch.getDaySeconds();
+    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        secs.getHoursIntoDay(),
+        secs.getMinutesIntoHour(),
+        secs.getSecondsIntoMinute(),
+        total_ms % std.time.ms_per_s,
+    });
 }
 
 /// The conditions a JSON request carries, on the object it names or, for
@@ -1678,9 +1863,9 @@ const Conditions = struct {
     /// Against a live object.
     fn check(c: Conditions, o: *const FakeMultipart.Stored) Outcome {
         if (c.if_generation_match) |g| if (g != o.generation) return .match_failed;
-        if (c.if_metageneration_match) |m| if (m != 1) return .match_failed;
+        if (c.if_metageneration_match) |m| if (m != o.metageneration) return .match_failed;
         if (c.if_generation_not_match) |g| if (g == o.generation) return .not_match_failed;
-        if (c.if_metageneration_not_match) |m| if (m == 1) return .not_match_failed;
+        if (c.if_metageneration_not_match) |m| if (m == o.metageneration) return .not_match_failed;
         return .hold;
     }
 
@@ -1713,6 +1898,8 @@ const Meta = struct {
     contentType: ?[]const u8 = null,
     contentEncoding: ?[]const u8 = null,
     crc32c: ?[]const u8 = null,
+    temporaryHold: ?bool = null,
+    eventBasedHold: ?bool = null,
 
     fn gzip(m: Meta) bool {
         return std.ascii.eqlIgnoreCase(m.contentEncoding orelse "", "gzip");
@@ -1774,6 +1961,9 @@ fn copyStored(gpa: Allocator, o: *const FakeMultipart.Stored, generation: u64) A
         .served = served,
         .key_sha256 = o.key_sha256,
         .kms_key_name = kms,
+        .holds = o.holds,
+        .metageneration = o.metageneration,
+        .retained_from_ns = o.retained_from_ns,
     };
 }
 
