@@ -942,9 +942,10 @@ pub const NotificationConfig = struct {
     /// Null publishes every type. Neither empty, which Cloud Storage would
     /// also read as every type, nor repeated.
     events: ?[]const EventType = null,
-    /// At most 5: keys of 1 to 256 characters, values of up to 1,024, and
-    /// no key twice or named like an attribute every message carries,
-    /// which Cloud Storage would silently override.
+    /// At most 5: keys of 1 to 256 bytes and values of up to 1,024, no key
+    /// twice, none named like an attribute every message carries, which
+    /// Cloud Storage would silently override, and none beginning with
+    /// goog, in any case, which would keep every message from arriving.
     custom_attributes: []const Attribute = &.{},
     /// Only objects whose names begin with these bytes, case and all. An
     /// empty one is the same as none.

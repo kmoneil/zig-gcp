@@ -100,9 +100,10 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// A notification configuration breaks a rule Cloud Storage holds it
     /// to, or one it would silently get wrong: a topic Pub/Sub would not
     /// name, an empty or repeated event type, more than 5 custom
-    /// attributes, a key or value out of bounds, a key twice or named like
-    /// an attribute every message carries, or a type or format this
-    /// library does not know. `Diagnostics` says which. Nothing was sent.
+    /// attributes, a key or value out of bounds, a key twice, named like
+    /// an attribute every message carries or beginning with goog, or a
+    /// type or format this library does not know. `Diagnostics` says
+    /// which. Nothing was sent.
     InvalidNotificationConfig,
     /// A compose breaks a rule: fewer than 1 or more than 32 sources, a
     /// name Cloud Storage would refuse, a source named twice at the same

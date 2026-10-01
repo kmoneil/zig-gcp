@@ -30,9 +30,9 @@ const Error = @import("errors.zig").Error;
 /// measured. Its documentation says 10.
 pub const max_custom_attributes = 5;
 /// The longest custom attribute key and value Cloud Storage takes, in
-/// characters.
-pub const max_attribute_key_chars = 256;
-pub const max_attribute_value_chars = 1024;
+/// bytes: its refusal says characters, and counts bytes, as measured.
+pub const max_attribute_key_bytes = 256;
+pub const max_attribute_value_bytes = 1024;
 
 /// The attributes Cloud Storage puts on its messages. A custom attribute of
 /// one of these names is taken, and every message carries Cloud Storage's
@@ -81,14 +81,23 @@ pub fn check(diag: ?*core.Diagnostics, config: types.NotificationConfig) CheckEr
     }
     for (attributes, 0..) |a, i| {
         if (a.key.len == 0) return refuse(diag, "a custom attribute key is empty", .{});
-        const key_chars = std.unicode.utf8CountCodepoints(a.key) catch return refuse(diag, "a custom attribute key is not UTF-8", .{});
-        if (key_chars > max_attribute_key_chars) {
-            return refuse(diag, "a custom attribute key of {d} characters, and Cloud Storage takes at most {d}", .{ key_chars, max_attribute_key_chars });
+        if (!std.unicode.utf8ValidateSlice(a.key)) return refuse(diag, "a custom attribute key is not UTF-8", .{});
+        if (a.key.len > max_attribute_key_bytes) {
+            return refuse(diag, "a custom attribute key of {d} bytes, and Cloud Storage takes at most {d}", .{ a.key.len, max_attribute_key_bytes });
         }
-        const value_chars = std.unicode.utf8CountCodepoints(a.value) catch return refuse(diag, "the value of custom attribute {s} is not UTF-8", .{a.key});
-        if (value_chars > max_attribute_value_chars) {
-            return refuse(diag, "custom attribute {s} has a value of {d} characters, and Cloud Storage takes at most {d}", .{ a.key, value_chars, max_attribute_value_chars });
+        if (!std.unicode.utf8ValidateSlice(a.value)) return refuse(diag, "the value of custom attribute {s} is not UTF-8", .{a.key});
+        if (a.value.len > max_attribute_value_bytes) {
+            return refuse(diag, "custom attribute {s} has a value of {d} bytes, and Cloud Storage takes at most {d}", .{ a.key, a.value.len, max_attribute_value_bytes });
         }
+        // Measured: Cloud Storage takes the configuration, and none of its
+        // messages ever arrives, since Pub/Sub keeps the prefix for itself;
+        // meanwhile the bucket's other configurations got each event
+        // several times over.
+        if (std.ascii.startsWithIgnoreCase(a.key, "goog")) return refuse(
+            diag,
+            "custom attribute {s} begins with goog, which Pub/Sub keeps for itself: Cloud Storage would take the configuration and deliver none of its messages",
+            .{a.key},
+        );
         for (builtin_attributes) |builtin| if (std.mem.eql(u8, a.key, builtin)) return refuse(
             diag,
             "custom attribute {s} is named like an attribute every message carries: Cloud Storage would take it and send its own value",
@@ -449,8 +458,13 @@ test "check: each refusal alone, and what production took" {
         .{ .config = .{ .topic = minimal.topic, .events = &.{ .finalize, .delete, .finalize } }, .says = "finalize is named twice" },
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &six }, .says = "6 custom attributes" },
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "", .value = "v" }} }, .says = "key is empty" },
-        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = k257, .value = "v" }} }, .says = "257 characters" },
-        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "k", .value = v1025 }} }, .says = "1025 characters" },
+        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = k257, .value = "v" }} }, .says = "257 bytes" },
+        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "k", .value = v1025 }} }, .says = "1025 bytes" },
+        // Characters to the eye, bytes to Cloud Storage, as measured.
+        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "é" ** 129, .value = "v" }} }, .says = "258 bytes" },
+        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "k", .value = "é" ** 513 }} }, .says = "1026 bytes" },
+        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "goog-x", .value = "1" }} }, .says = "begins with goog" },
+        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "GOOGy", .value = "1" }} }, .says = "begins with goog" },
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "eventType", .value = "x" }} }, .says = "named like an attribute every message carries" },
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{ .{ .key = "a", .value = "1" }, .{ .key = "a", .value = "2" } } }, .says = "a is named twice" },
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "\xff", .value = "v" }} }, .says = "not UTF-8" },
@@ -473,7 +487,8 @@ test "check: each refusal alone, and what production took" {
         .{ .topic = .{ .project = "82150720798", .topic = "zigps-t1" } },
         .{ .topic = minimal.topic, .custom_attributes = five },
         .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = k256, .value = v1024 }} },
-        .{ .topic = minimal.topic, .custom_attributes = &.{ .{ .key = "goog-x", .value = "" }, .{ .key = "ключ", .value = "значение" } } },
+        .{ .topic = minimal.topic, .custom_attributes = &.{ .{ .key = "xgoog", .value = "" }, .{ .key = "ключ", .value = "значение" } } },
+        .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "é" ** 128, .value = "é" ** 512 }} },
         .{ .topic = minimal.topic, .events = &.{ .initialize, .archive, .metadata_update } },
         .{ .topic = minimal.topic, .object_name_prefix = "" },
     }) |config| try check(null, config);
@@ -846,7 +861,7 @@ fn drawConfig(g: *test_util.ByteGen, arena: Allocator) !types.NotificationConfig
         const key: []const u8 = switch (g.intRange(u8, 0, 5)) {
             0 => "",
             1 => g.pick([]const u8, &builtin_attributes),
-            2 => "team",
+            2 => g.pick([]const u8, &.{ "team", "goog-x", "GoOg", "xgoog" }),
             3 => try arena.alloc(u8, g.intRange(usize, 254, 258)),
             4 => try std.fmt.allocPrint(arena, "{s}", .{g.utf8(try arena.alloc(u8, 600), 600)}),
             else => try std.fmt.allocPrint(arena, "k{d}", .{g.int(u8)}),
@@ -889,9 +904,10 @@ fn takenAsAsked(config: types.NotificationConfig) bool {
     }
     if (config.custom_attributes.len > 5) return false;
     for (config.custom_attributes, 0..) |a, i| {
-        const key_chars = std.unicode.utf8CountCodepoints(a.key) catch return false;
-        const value_chars = std.unicode.utf8CountCodepoints(a.value) catch return false;
-        if (key_chars == 0 or key_chars > 256 or value_chars > 1024) return false;
+        if (!std.unicode.utf8ValidateSlice(a.key) or !std.unicode.utf8ValidateSlice(a.value)) return false;
+        if (a.key.len == 0 or a.key.len > 256 or a.value.len > 1024) return false;
+        // Taken, and then no message arrives.
+        if (a.key.len >= 4 and std.ascii.eqlIgnoreCase(a.key[0..4], "goog")) return false;
         // Taken, and overridden on every message.
         for (builtin_attributes) |name| if (std.mem.eql(u8, a.key, name)) return false;
         // A JSON object keeps one of two.
