@@ -13,6 +13,9 @@
   compiles and runs;
 - every page under docs/ is linked from another page.
 
+What code blocks, inline code and HTML comments hold is not checked, as
+GitHub renders none of it as a link.
+
     python3 tools/check_docs.py
 
 Covers every Markdown file git tracks or would track. External links are
@@ -36,7 +39,9 @@ INLINE_CODE = re.compile(r"(`+)(?:(?!\1).)+?\1")
 INLINE_LINK = re.compile(r"\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
 REFERENCE_DEF = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*<?(\S+?)>?(?:\s+.*)?$")
 HTML_LINK = re.compile(r"""\b(?:href|src)=["']([^"']+)["']""", re.IGNORECASE)
-COMMENT = re.compile(r"<!--.*?-->")
+# An HTML comment, which may span lines, and which HTML also ends at "--!>".
+COMMENT = re.compile(r"<!--.*?--!?>", re.DOTALL)
+COMMENT_END = re.compile(r"--!?>")
 SNIPPET = re.compile(r"^\s*<!--\s*snippet:\s*([^\s#]+)(?:#(\S+))?\s*-->\s*$")
 EXTERNAL = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)
 
@@ -76,9 +81,16 @@ class Page:
     def parse(self):
         seen = {}
         in_fence = None
+        in_comment = False
         pending_snippet = None
         block = None
         for number, line in enumerate(self.lines, 1):
+            if in_comment:
+                end = COMMENT_END.search(line)
+                if end is None:
+                    continue
+                line = line[end.end():]
+                in_comment = False
             fence = FENCE.match(line)
             if in_fence:
                 if fence and fence.group(1) == in_fence and line.strip() == in_fence:
@@ -102,6 +114,10 @@ class Page:
             if pending_snippet and line.strip():
                 self.problems.append((pending_snippet[0], "a snippet marker must be followed by a code block"))
                 pending_snippet = None
+            # What a comment holds is not rendered: no heading, no link.
+            line = COMMENT.sub("", line)
+            if "<!--" in line:
+                line, in_comment = line[: line.index("<!--")], True
             heading = HEADING.match(line)
             if heading:
                 base = slug(heading.group(2))
@@ -110,7 +126,7 @@ class Page:
                 self.anchors.add(base if count == 0 else f"{base}-{count}")
             for anchor in HTML_ANCHOR.findall(line):
                 self.anchors.add(anchor)
-            text = INLINE_CODE.sub("", COMMENT.sub("", line))
+            text = INLINE_CODE.sub("", line)
             for target in INLINE_LINK.findall(text) + HTML_LINK.findall(text):
                 self.links.append((number, target))
             definition = REFERENCE_DEF.match(text)
