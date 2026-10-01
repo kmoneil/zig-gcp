@@ -65,3 +65,11 @@ test {
     _ = @import("types.zig");
     _ = @import("validate.zig");
 }
+
+test "every public declaration of types.zig is public here too" {
+    // Storage's retention types were public in its types.zig and missing
+    // from its root before 0.26.0 was tagged; the same check guards here.
+    inline for (@typeInfo(@import("types.zig")).@"struct".decls) |decl| {
+        if (!@hasDecl(@This(), decl.name)) @compileError("not exported: types." ++ decl.name);
+    }
+}
