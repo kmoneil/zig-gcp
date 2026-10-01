@@ -167,7 +167,7 @@ pub const DeadLetterPolicy = struct {
     /// A topic id in this project, or `projects/{project}/topics/{id}` for
     /// another project's. It must exist, and Pub/Sub's service agent must
     /// be allowed to publish to it and to acknowledge on this subscription,
-    /// or nothing is forwarded (see the README).
+    /// or nothing is forwarded (see docs/pubsub/topics-and-subscriptions.md).
     topic: []const u8,
     /// 5 to 100.
     max_delivery_attempts: u8 = 5,

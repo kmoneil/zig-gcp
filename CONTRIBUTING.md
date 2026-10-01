@@ -5,12 +5,13 @@ small fix, open an issue first so the approach can be agreed on.
 
 ## Setup
 
-You need Zig 0.16.0. The README's Development section lists every build
-step; these are the ones to know:
+You need Zig 0.16.0. [docs/development.md](docs/development.md) lists
+every build step; these are the ones to know:
 
 ```
 zig build test          # unit, property and fuzz-corpus tests
 zig build fmt           # zig fmt --check
+python3 tools/check_docs.py  # the docs' links, anchors and snippets
 zig build test-integration
 ```
 
@@ -32,7 +33,8 @@ last line, a test name with no `OK` after it, is the test that hung.
 
 The auth integration tests run against Google when `AUTH_TEST_CREDENTIALS`
 names a credentials file, of type `authorized_user` or `service_account`;
-each test runs when the file is the type it exercises. The README shows how.
+each test runs when the file is the type it exercises.
+[docs/development.md](docs/development.md#auth) shows how.
 
 The metadata server can only be checked where there is one. One test skips
 unless a probe answers, and `examples/whoami.zig` shows the same path by
@@ -94,8 +96,9 @@ run `zig build coverage`; the report is `zig-out/coverage/index.html`.
   builds a client and a fake server every run, a millisecond or more, is a
   `heavy property <what>: …`, and storage's and pubsub's run in jobs of
   their own. A `fault property` drives whole transfers through injected
-  faults, costs more still, and is not fuzzed nightly; every test run
-  still runs it, under that run's seed. `--fuzz=N`
+  faults and costs more still; storage's run nightly in two jobs of their
+  own, `fault-storage` and `fault-gzip`, and every test run still runs
+  them, under that run's seed. `--fuzz=N`
   runs every matching property N times, so size a job from its
   properties' costs on CI: run the workflow by hand twice, with
   `fuzz_iterations` at two counts such as 2K and 20K, and each job's

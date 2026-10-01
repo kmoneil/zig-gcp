@@ -36,6 +36,11 @@ jobs:
       - name: Format
         run: zig build fmt
 
+      # Every relative link and anchor in the Markdown resolves, and the
+      # code the docs copy from examples/ and tests/ is that code.
+      - name: Docs
+        run: python3 tools/check_docs.py
+
       - name: Unit, property and fuzz-corpus tests
         run: zig build test --summary all
 
