@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.26.0 (unreleased)
+## 0.26.0 (2026-10-01)
 
 - storage: every JSON API write carries `X-Goog-Gcs-Idempotency-Token`,
   one value per call and the same on each of its retries; reads, the XML
