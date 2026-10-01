@@ -33,6 +33,7 @@ pub const BucketConfig = @import("types.zig").BucketConfig;
 pub const BucketInfo = @import("types.zig").BucketInfo;
 pub const BucketPage = @import("types.zig").BucketPage;
 pub const BucketUpdate = @import("types.zig").BucketUpdate;
+pub const RetentionPolicy = @import("types.zig").RetentionPolicy;
 pub const BulkRestoreOptions = @import("types.zig").BulkRestoreOptions;
 pub const Operation = @import("types.zig").Operation;
 pub const OperationPage = @import("types.zig").OperationPage;
@@ -57,6 +58,7 @@ pub const PageOptions = @import("types.zig").PageOptions;
 pub const Preconditions = @import("types.zig").Preconditions;
 pub const Range = @import("types.zig").Range;
 pub const UploadOptions = @import("types.zig").UploadOptions;
+pub const ObjectRetention = @import("types.zig").ObjectRetention;
 pub const Gzip = @import("types.zig").Gzip;
 pub const ParallelSource = @import("types.zig").ParallelSource;
 pub const ParallelUploadOptions = @import("types.zig").ParallelUploadOptions;
@@ -133,4 +135,13 @@ test {
     _ = @import("validate.zig");
     _ = @import("xml.zig");
     _ = @import("xml_multipart.zig");
+}
+
+test "every public declaration of types.zig is public here too" {
+    // RetentionPolicy and ObjectRetention were public in types.zig and
+    // missing here before 0.26.0 was tagged, so no program could name
+    // them; the module's own tests, which import types.zig, never knew.
+    inline for (@typeInfo(@import("types.zig")).@"struct".decls) |decl| {
+        if (!@hasDecl(@This(), decl.name)) @compileError("not exported: types." ++ decl.name);
+    }
 }
