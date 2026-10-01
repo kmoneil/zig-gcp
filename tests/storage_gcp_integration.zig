@@ -4267,3 +4267,136 @@ test "57. keys: a checkpointed upload cut partway resumes under its key, and sta
         try testing.expect(!try hasState(tmp.dir, "source.bin.upload"));
     }
 }
+
+/// Releases every hold, removes the policy, and deletes every object, so a
+/// bucket that kept objects can go, even after a failure. A removal can
+/// take seconds to stop refusing, so deletes are tried for a minute.
+fn letGo(f: *BucketFixture) void {
+    const b = f.bucket();
+    testing.io.sleep(.fromMilliseconds(1100), .awake) catch {};
+    if (b.update(.{ .retention_period_s = .clear, .default_event_based_hold = false })) |info| {
+        var owned = info;
+        owned.deinit();
+    } else |_| {}
+    for (0..30) |_| {
+        var page = b.listObjects(.{ .versions = true, .page_size = 1000 }) catch return;
+        defer page.deinit();
+        if (page.value.objects.len == 0) return;
+        for (page.value.objects) |info| {
+            const o = b.object(info.name);
+            if (info.temporary_hold or info.event_based_hold) {
+                if (o.updateMetadata(.{ .temporary_hold = false, .event_based_hold = false, .generation = info.generation })) |released| {
+                    var owned = released;
+                    owned.deinit();
+                } else |_| {}
+            }
+            o.delete(.{ .generation = info.generation }) catch {};
+        }
+        testing.io.sleep(.fromSeconds(2), .awake) catch {};
+    }
+    std.debug.print("cleanup: objects remain in {s}\n", .{&f.name});
+}
+
+test "59. retention: a policy and holds keep objects as measured, refused as ObjectRetained, and let them go" {
+    const gpa = testing.allocator;
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = f.bucket().create(.{ .location = "us-central1", .soft_delete_retention_s = 0, .retention_period_s = 3600 }) catch |err| return f.report(err);
+    try testing.expectEqual(3600, created.value.retention_policy.?.period_s);
+    try testing.expect(!created.value.retention_policy.?.locked);
+    created.deinit();
+    defer letGo(&f);
+    const b = f.bucket();
+
+    // Under the policy: every write that would take the object away is
+    // refused, its metadata stays editable.
+    var kept = b.object("kept").upload("kept", .{}) catch |err| return f.report(err);
+    try testing.expect(kept.value.retention_expiration_time != null);
+    kept.deinit();
+    try testing.expectError(error.ObjectRetained, b.object("kept").delete(.{}));
+    try testing.expectEqualStrings("retentionPolicyNotMet", f.diag.status());
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "cannot be deleted or overwritten until") != null);
+    try testing.expectError(error.ObjectRetained, b.object("kept").upload("over", .{}));
+    var stream: std.Io.Reader = .fixed("over it, resumably");
+    try testing.expectError(error.ObjectRetained, b.object("kept").uploadFrom(&stream, .{}));
+    var patched = b.object("kept").updateMetadata(.{ .cache_control = "no-store" }) catch |err| return f.report(err);
+    patched.deinit();
+
+    // A parallel upload over it is refused at its finish; one with
+    // conditions goes up whole, and strands nothing.
+    const data = try pattern(gpa, 59, 6 * 1024 * 1024);
+    defer gpa.free(data);
+    try testing.expectError(error.ObjectRetained, b.object("kept").uploadParallel(.{ .data = data }, .{ .part_size = 5 * 1024 * 1024 }));
+    try testing.expectEqualStrings("RetentionPolicyNotMet", f.diag.status());
+    var whole = b.object("whole.bin").uploadParallel(.{ .data = data }, .{ .part_size = 5 * 1024 * 1024, .preconditions = .does_not_exist }) catch |err| return f.report(err);
+    whole.deinit();
+    try f.expectContent(b.object("whole.bin"), data);
+    var temp = try b.listObjects(.{ .prefix = "zig-gcp-tmp/" });
+    defer temp.deinit();
+    try testing.expectEqual(0, temp.value.objects.len);
+
+    // Without the policy, the objects go, once the removal has reached
+    // them: it took seconds when measured.
+    var cleared = try f.update(.{ .retention_period_s = .clear });
+    try testing.expectEqual(null, cleared.value.retention_policy);
+    cleared.deinit();
+    // Not at once, and not everywhere at once, as measured: for seconds
+    // some requests still see the policy, keeping an object written then.
+    // So a new object is written and deleted until five in a row go.
+    var streak: u32 = 0;
+    var rounds: u32 = 0;
+    while (streak < 5) : (rounds += 1) {
+        if (rounds == 60) return error.TestPolicyRemovalNeverSettled;
+        var probe_name: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&probe_name, "probe-{d}", .{rounds});
+        var probe = b.object(name).upload("probe", .{}) catch |err| return f.report(err);
+        probe.deinit();
+        if (b.object(name).delete(.{})) {
+            streak += 1;
+        } else |err| {
+            if (err != error.ObjectRetained) return f.report(err);
+            streak = 0;
+            try testing.io.sleep(.fromSeconds(2), .awake);
+        }
+    }
+    std.debug.print("the policy's removal settled after {d} probes\n", .{rounds});
+    for ([_][]const u8{ "kept", "whole.bin" }) |name| b.object(name).delete(.{}) catch |err| return f.report(err);
+
+    // A hold keeps an object alone.
+    var held = b.object("held").upload("held", .{ .temporary_hold = true }) catch |err| return f.report(err);
+    try testing.expect(held.value.temporary_hold);
+    held.deinit();
+    try testing.expectError(error.ObjectRetained, b.object("held").delete(.{}));
+    try testing.expectEqualStrings("forbidden", f.diag.status());
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "under active Temporary hold") != null);
+    var released = b.object("held").updateMetadata(.{ .temporary_hold = false }) catch |err| return f.report(err);
+    try testing.expect(!released.value.temporary_hold);
+    released.deinit();
+    b.object("held").delete(.{}) catch |err| return f.report(err);
+
+    // The default event-based hold reaches a new object, unless refused.
+    var defaulted = try f.update(.{ .default_event_based_hold = true });
+    try testing.expect(defaulted.value.default_event_based_hold);
+    defaulted.deinit();
+    // The setting takes seconds to reach new objects, as measured: new
+    // ones are written until one comes back held, and the rest deleted.
+    var tries: u32 = 0;
+    while (true) : (tries += 1) {
+        var event = b.object("event").upload("event", .{ .preconditions = .does_not_exist }) catch |err| return f.report(err);
+        defer event.deinit();
+        if (event.value.event_based_hold) break;
+        b.object("event").delete(.{}) catch |err| return f.report(err);
+        if (tries == 30) return error.TestDefaultHoldNeverApplied;
+        try testing.io.sleep(.fromSeconds(2), .awake);
+    }
+    if (tries > 0) std.debug.print("the default hold reached a new object {d} uploads after it was set\n", .{tries + 1});
+    var free = b.object("free").upload("free", .{ .event_based_hold = false }) catch |err| return f.report(err);
+    try testing.expect(!free.value.event_based_hold);
+    free.deinit();
+    try testing.expectError(error.ObjectRetained, b.object("event").delete(.{}));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "under active Event-Based hold") != null);
+    var let_go = b.object("event").updateMetadata(.{ .event_based_hold = false }) catch |err| return f.report(err);
+    let_go.deinit();
+    b.object("event").delete(.{}) catch |err| return f.report(err);
+}
