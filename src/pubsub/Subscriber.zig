@@ -1399,6 +1399,17 @@ const FakePubSub = struct {
         f.cond.broadcast(f.io);
     }
 
+    /// Lapses every lease now, whatever its time: each message comes again
+    /// under a new ack id.
+    fn lapseAll(f: *FakePubSub) !void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        while (f.leased.count() > 0) {
+            var it = f.leased.keyIterator();
+            try f.lapse(it.next().?.*);
+        }
+    }
+
     /// Lapses every exactly-once lease whose time is up. The caller holds
     /// the mutex.
     fn sweep(f: *FakePubSub) !void {
@@ -1510,6 +1521,11 @@ const TestHandler = struct {
     sleep_ms: i64 = 0,
     /// Sleep this long on a message's first delivery only.
     sleep_first_ms: i64 = 0,
+    /// Hold a message's first delivery until this is true of the harness,
+    /// looking every 5 ms. A fixed sleep stands in for an event and races
+    /// it when the machine stalls; this waits for the event itself. Panics
+    /// after 10 s.
+    hold_first_until: ?*const fn (*Harness) bool = null,
     active: usize = 0,
     max_active: usize = 0,
     stop_after: ?usize = null,
@@ -1554,6 +1570,16 @@ const TestHandler = struct {
         };
         if (h.sleep_ms > 0) try io.sleep(.fromMilliseconds(h.sleep_ms), .awake);
         if (attempt == 1 and h.sleep_first_ms > 0) try io.sleep(.fromMilliseconds(h.sleep_first_ms), .awake);
+        if (attempt == 1) if (h.hold_first_until) |released| {
+            const harness: *Harness = @alignCast(@fieldParentPtr("handler", h));
+            const limit_ms = std.Io.Clock.awake.now(io).toMilliseconds() + 10_000;
+            while (!released(harness)) {
+                if (std.Io.Clock.awake.now(io).toMilliseconds() > limit_ms) {
+                    @panic("a held first delivery waited 10 s for its test's event");
+                }
+                try io.sleep(.fromMilliseconds(5), .awake);
+            }
+        };
 
         h.mutex.lockUncancelable(io);
         defer h.mutex.unlock(io);
@@ -1818,10 +1844,19 @@ test "Subscriber: on an exactly-once subscription, an ack that comes too late is
     try h.init(.{ .concurrency = 2, .extension_period_s = null, .max_extension_s = 1, .tick_ms = 20 });
     defer h.deinit();
     h.fake.exactly_once = true;
-    h.fake.lease_ms = 150;
+    // Leases last a second, extended every 20 ms. At 150 ms, a macOS runner
+    // that stalled for longer lapsed one early, and the message came a
+    // third time.
+    h.fake.lease_ms = 1000;
     // The first delivery outlives max_extension_s, so its lease lapses and
-    // the message comes again; the second is handled at once.
-    h.handler.sleep_first_ms = 1400;
+    // the message comes again; the second is handled at once. The first
+    // returns once the second's ack is taken, so its own comes too late.
+    const Late = struct {
+        fn redeliveryAcked(harness: *Harness) bool {
+            return harness.fake.ackedData("late") >= 1;
+        }
+    };
+    h.handler.hold_first_until = Late.redeliveryAcked;
     h.handler.stop_after = 2;
     try h.fake.publish("late");
     try runWithin(&h, 20_000);
@@ -1831,6 +1866,9 @@ test "Subscriber: on an exactly-once subscription, an ack that comes too late is
     try testing.expectEqual(1, counts.acked);
     try testing.expectEqual(1, counts.ack_failed);
     try expectAccounted(counts);
+    // The late ack went to the server, which refused it: the janitor had
+    // not already learned from a refused extension that its lease was lost.
+    try testing.expect(h.fake.ackAttempted("ack-0"));
     try testing.expectEqual(1, h.fake.ackedData("late"));
     // The subscription said it has exactly-once delivery: every lease went
     // to at least 60 s, the receipt of each pull included.
@@ -1864,14 +1902,37 @@ test "Subscriber: when the subscription cannot be read, leases go 60 s and exact
     defer h.deinit();
     h.fake.refuse_get = true;
     h.fake.exactly_once = true;
-    h.fake.lease_ms = 200;
-    // The first ack is refused, as for a lease that lapsed; the message
-    // lapses on the fake and comes again.
+    // The first ack is refused, as for a lease that lapsed.
     h.fake.refuse_acks = 1;
+    const Probe = struct {
+        fn extended(harness: *Harness) bool {
+            return harness.fake.extensions() >= 1;
+        }
+        fn learned(s: *Subscriber) bool {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            return s.exactly_once;
+        }
+        fn handledTwice(handler: *TestHandler) bool {
+            return handler.seenCount() >= 2;
+        }
+    };
+    // The first delivery returns once its lease has been extended, which
+    // the subscriber does at the fallback period before it learns more.
+    h.handler.hold_first_until = Probe.extended;
     h.handler.stop_after = 2;
     logging.capture.reset();
     try h.fake.publish("learned");
-    try runWithin(&h, 20_000);
+    var running = try testing.io.concurrent(Subscriber.run, .{ &h.subscriber, h.handler.handler() });
+    // The message comes again only once the refusal has taught the
+    // subscriber, so the redelivery's receipt shows what it learned. On a
+    // timer, a stalled machine could pull the redelivery first.
+    const learned = try waitUntil(10_000, &h.subscriber, Probe.learned);
+    if (learned) try h.fake.lapseAll();
+    const handled = learned and try waitUntil(10_000, &h.handler, Probe.handledTwice);
+    h.subscriber.stop();
+    try running.await(testing.io);
+    try testing.expect(handled);
 
     const counts = h.subscriber.stats();
     try testing.expectEqual(1, counts.ack_failed);
@@ -1880,10 +1941,11 @@ test "Subscriber: when the subscription cannot be read, leases go 60 s and exact
     const log = logging.capture.text();
     try testing.expect(std.mem.indexOf(u8, log, "may not read subscription worker, which needs pubsub.subscriptions.get") != null);
     try testing.expect(std.mem.indexOf(u8, log, "has exactly-once delivery") != null);
-    // Every lease was set to the fallback period, and the second pull was
-    // extended on receipt, which only exactly-once asks for.
+    // Every lease was set to the fallback period, never to the 10 s the
+    // subscription would have said: the first delivery's by extension, the
+    // second's on receipt, which only exactly-once asks for.
     try testing.expectEqual(0, h.fake.modacksOf(10));
-    try testing.expect(h.fake.modacksOf(60) >= 1);
+    try testing.expect(h.fake.modacksOf(60) >= 2);
 }
 
 test "Subscriber: acknowledgements go out promptly, not at the lease tick" {
@@ -1937,7 +1999,9 @@ test "Subscriber: an ack refused for now is sent again later, and given up at th
     }
     {
         var h: Harness = undefined;
-        try h.init(.{ .max_attempts = 1, .tick_ms = 10, .give_up_ms = 150 });
+        // A second before giving up: long enough that a stalled machine
+        // still sends the ack again before the limit.
+        try h.init(.{ .max_attempts = 1, .tick_ms = 10, .give_up_ms = 1000 });
         defer h.deinit();
         h.fake.exactly_once = true;
         h.fake.transient_acks = 1_000_000;
@@ -1965,12 +2029,29 @@ test "Subscriber: an ack refused for now is sent again later, and given up at th
 test "Subscriber: a lease the server refuses to extend is extended no more, and its ack is never sent" {
     var h: Harness = undefined;
     // The period is set, so the subscription is not read, and exactly-once
-    // is learned from the refused extension.
-    try h.init(.{ .tick_ms = 20 });
+    // is learned from the refused extension. One message at a time: the
+    // redelivery, waiting on the fake since the refusal, is pulled only
+    // once the first resolves, after the subscriber has learned. With room
+    // for more, a stalled machine pulled it first, and it went unextended.
+    try h.init(.{ .max_outstanding = 1, .tick_ms = 20 });
     defer h.deinit();
     h.fake.exactly_once = true;
     h.fake.refuse_modacks = 1;
-    h.handler.sleep_first_ms = 200;
+    // The first delivery returns only once the janitor has marked its
+    // lease lost. A 200 ms sleep raced the refusal on a stalled machine,
+    // and the ack went out and was refused there instead.
+    const Lost = struct {
+        fn lease(harness: *Harness) bool {
+            const s = &harness.subscriber;
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            for (s.inflight.items) |tracked| {
+                if (tracked.lease_lost) return true;
+            }
+            return false;
+        }
+    };
+    h.handler.hold_first_until = Lost.lease;
     h.handler.stop_after = 2;
     try h.fake.publish("lost lease");
     try runWithin(&h, 20_000);
