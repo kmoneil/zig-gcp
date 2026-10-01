@@ -702,7 +702,7 @@ test "timeout: race a held pull against a sleep with Io.Select" {
     const topic = try f.createTopic("race");
     const sub = try f.createSubscription("race-sub", .{ .topic_id = topic.id });
 
-    // The pattern from the README: whichever finishes first wins, and the
+    // The pattern from docs/essentials.md: whichever finishes first wins, and the
     // other is canceled. An empty subscription holds the pull open, so the
     // timer wins here.
     const Race = union(enum) {

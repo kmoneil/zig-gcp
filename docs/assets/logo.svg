@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+  <title id="title">zig-gcp</title>
+  <defs>
+    <linearGradient id="cloud" x1="34" y1="59" x2="222" y2="197" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6FA3FF"/>
+      <stop offset="1" stop-color="#2F6FE4"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#cloud)">
+    <circle cx="78" cy="153" r="44"/>
+    <circle cx="130" cy="121" r="62"/>
+    <circle cx="182" cy="157" r="40"/>
+    <rect x="78" y="153" width="104" height="44"/>
+  </g>
+  <polygon points="94,104 162,104 162,123 121,157 162,157 162,176 94,176 94,157 135,123 94,123" fill="#F7A41D" stroke="#F7A41D" stroke-width="4" stroke-linejoin="round"/>
+</svg>

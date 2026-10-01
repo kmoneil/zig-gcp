@@ -2909,7 +2909,7 @@ test "37. sessions: abandonTransfer cancels a session and aborts a multipart upl
 // Objects stored gzip-compressed: the gzip spec's section 6, real-bucket
 // cases 1 to 7. Downloads ask for bytes as stored and decompress here, so
 // the stored checksum applies and a cut resumes; what Cloud Storage's own
-// transcoding does is asked raw, for the README.
+// transcoding does is asked raw, for docs/storage/checksums-and-compression.md.
 
 /// `data` gzip-compressed by std. Owned by the testing allocator.
 fn gzipAlloc(data: []const u8, options: std.compress.flate.Compress.Options) ![]u8 {

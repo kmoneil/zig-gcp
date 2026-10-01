@@ -117,6 +117,27 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(signing_tests).step);
     }
 
+    // The code the documentation shows, run beside pubsub's unit tests so
+    // it cannot drift; tools/check_docs.py holds the docs to this file.
+    const docs_tests = b.addTest(.{
+        .name = "docs-examples",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/docs_examples.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pubsub", .module = mod },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = if (fuzz_runner) .{ .path = b.path("tools/test_runner.zig"), .mode = .server } else null,
+        .use_llvm = if (fuzz_runner) true else null,
+    });
+    if (only_module == null or std.mem.eql(u8, only_module.?, "pubsub")) {
+        test_step.dependOn(&b.addRunArtifact(docs_tests).step);
+    }
+
     // Line coverage of the unit tests, measured by kcov, which must be on
     // PATH. Each module's tests run under kcov, and the merged report is
     // installed to zig-out/coverage: index.html, plus coverage.json and
@@ -313,15 +334,16 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify" }) |name| {
-        // whoami, secret, gcs_cp, gcs_sign and gcs_notify pick their own credentials.
+    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "quickstart" }) |name| {
+        // whoami, secret, gcs_cp, gcs_sign, gcs_notify and quickstart pick
+        // their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
             &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_cp") or std.mem.eql(u8, name, "gcs_sign"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } }
-        else if (std.mem.eql(u8, name, "gcs_notify"))
+        else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else
             &.{.{ .name = "pubsub", .module = mod }};

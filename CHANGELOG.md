@@ -47,10 +47,20 @@ including the ones that did not change.
   breaking.
 - examples: `gcs_notify` sets a bucket's notifications up, granting the
   service agent and creating the topic and a subscription, and watches the
-  changes come in, decoded.
+  changes come in, decoded. `quickstart` is the README's quick start, which
+  `zig build test` compiles with the other examples.
+- docs: the README is a landing page, and the guides it held are in
+  `docs/`: what every module shares, credentials, a guide per service,
+  and Cloud Storage's by topic, with development and the Zig 0.16
+  workarounds beside them. Nothing was dropped; the parts written for
+  Pub/Sub alone that hold for every module now say so.
 - ci: the two emulators share a Docker network, so fake-gcs-server
   publishes a bucket's notifications to the Pub/Sub emulator, and an
-  integration suite and the examples run them end to end.
+  integration suite and the examples run them end to end. A docs step,
+  `tools/check_docs.py`, holds every relative link and anchor in the
+  Markdown to a file and heading that exist, and the code the docs copy
+  from `examples/` and `tests/` to that code, which `tests/docs_examples.zig`
+  runs.
 - auth, secret_manager: unchanged.
 
 ## 0.26.0 (2026-10-01)
