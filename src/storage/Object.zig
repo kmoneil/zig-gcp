@@ -28,6 +28,7 @@ const parallel_download = @import("parallel_download.zig");
 const post_policy = @import("post_policy.zig");
 const restore_impl = @import("restore.zig");
 const resumable = @import("resumable.zig");
+const retention = @import("retention.zig");
 const rpc = @import("rpc.zig");
 const signing = @import("signing.zig");
 const types = @import("types.zig");
@@ -639,6 +640,9 @@ fn checkUploadOptions(client: *Client, unchecked: types.UploadOptions) Error!typ
             return error.InvalidArgument;
         }
     }
+    if (options.retention) |r| if (!retention.checkObjectRetention(client.diagnostics, r, options.event_based_hold)) {
+        return error.InvalidArgument;
+    };
     // An empty key was already refused here; a repeated one was not, and
     // made a body carrying two entries of one name.
     if (validate.metadataFault(options.metadata)) |fault| {

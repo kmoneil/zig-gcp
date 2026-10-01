@@ -75,6 +75,35 @@ fn writeUploadMetadata(
         try jw.write(&checksum);
     }
     try writeHolds(jw, options.temporary_hold, options.event_based_hold);
+    if (options.retention) |r| try writeRetention(jw, r);
+    try jw.endObject();
+}
+
+/// An object's own retention, as the JSON API spells its mode.
+pub fn writeRetention(jw: *Stringify, retention: types.ObjectRetention) Stringify.Error!void {
+    try jw.objectField("retention");
+    try jw.beginObject();
+    try jw.objectField("mode");
+    try jw.write(switch (retention.mode) {
+        .unlocked => "Unlocked",
+        .locked => "Locked",
+        // The checks refuse it before anything is encoded.
+        .unknown => unreachable,
+    });
+    try jw.objectField("retainUntilTime");
+    try jw.write(retention.retain_until);
+    try jw.endObject();
+}
+
+/// What removes an object's retention: both fields null, as measured.
+/// `{}` changes nothing.
+pub fn writeRetentionRemoved(jw: *Stringify) Stringify.Error!void {
+    try jw.objectField("retention");
+    try jw.beginObject();
+    try jw.objectField("mode");
+    try jw.write(null);
+    try jw.objectField("retainUntilTime");
+    try jw.write(null);
     try jw.endObject();
 }
 
@@ -255,6 +284,7 @@ const WireObject = struct {
     temporaryHold: ?bool = null,
     eventBasedHold: ?bool = null,
     retentionExpirationTime: ?[]const u8 = null,
+    retention: ?struct { mode: ?[]const u8 = null, retainUntilTime: ?[]const u8 = null } = null,
 };
 
 const WireObjectPage = struct {
@@ -286,6 +316,7 @@ const WireBucket = struct {
     hardDeleteTime: ?[]const u8 = null,
     retentionPolicy: ?WireRetentionPolicy = null,
     defaultEventBasedHold: ?bool = null,
+    objectRetention: ?struct { mode: ?[]const u8 = null } = null,
 };
 
 const WireRetentionPolicy = struct {
@@ -342,6 +373,17 @@ fn objectFromWire(arena: Allocator, wire: WireObject) DecodeError!types.ObjectIn
         .temporary_hold = wire.temporaryHold orelse false,
         .event_based_hold = wire.eventBasedHold orelse false,
         .retention_expiration_time = nonEmpty(wire.retentionExpirationTime),
+        // A retention names its time; one that does not could not be sent
+        // back.
+        .retention = if (wire.retention) |r| .{
+            .mode = if (std.mem.eql(u8, r.mode orelse "", "Unlocked"))
+                .unlocked
+            else if (std.mem.eql(u8, r.mode orelse "", "Locked"))
+                .locked
+            else
+                .unknown,
+            .retain_until = nonEmpty(r.retainUntilTime) orelse return error.InvalidResponse,
+        } else null,
     };
 }
 
@@ -375,6 +417,7 @@ fn bucketFromWire(arena: Allocator, wire: WireBucket) DecodeError!types.BucketIn
         .hard_delete_time = nonEmpty(wire.hardDeleteTime),
         .retention_policy = try retentionPolicyFromWire(wire.retentionPolicy),
         .default_event_based_hold = wire.defaultEventBasedHold orelse false,
+        .object_retention = if (wire.objectRetention) |o| std.mem.eql(u8, o.mode orelse "", "Enabled") else false,
     };
 }
 

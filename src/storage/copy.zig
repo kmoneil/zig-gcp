@@ -40,6 +40,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const retention = @import("retention.zig");
 const encryption = @import("encryption.zig");
 const idempotency = @import("idempotency.zig");
 const logging = @import("logging.zig");
@@ -188,7 +189,8 @@ pub fn changes(options: types.CopyOptions) bool {
         std.meta.activeTag(options.edit) != .keep or
         options.storage_class != null or
         options.temporary_hold or
-        options.event_based_hold != null;
+        options.event_based_hold != null or
+        options.retention != null;
 }
 
 /// Refuses what a changed copy could not send, and says why in `diag`: the
@@ -208,6 +210,9 @@ pub fn check(diag: ?*core.Diagnostics, options: types.CopyOptions) error{Invalid
     };
     if (options.storage_class) |class| if (!isStorageClass(class)) {
         if (diag) |d| d.print("storage_class: 1 to {d} capital letters and underscores, such as NEARLINE", .{max_storage_class_len});
+        return error.InvalidMetadataUpdate;
+    };
+    if (options.retention) |r| if (!retention.checkObjectRetention(diag, r, options.event_based_hold)) {
         return error.InvalidMetadataUpdate;
     };
 }
@@ -265,8 +270,10 @@ fn writeResource(
         try jw.objectField("storageClass");
         try jw.write(class);
     }
-    // A copy never carries its source's holds: only what the caller asks.
+    // A copy never carries its source's holds or retention: only what the
+    // caller asks.
     try codec.writeHolds(jw, options.temporary_hold, options.event_based_hold);
+    if (options.retention) |r| try codec.writeRetention(jw, r);
     try jw.endObject();
 }
 
