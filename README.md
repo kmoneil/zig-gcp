@@ -1028,15 +1028,37 @@ update, on gets, downloads, deletes, uploads and copies.
 
 Retries follow what is safe to repeat. Reads always retry, and resumable
 chunks always resume from what the server confirmed. A write is retried
-only when repeating it cannot do harm: an upload or copy carrying
-`if_generation_match`, or a delete naming a `generation`, whose repeat
-fails cleanly if the first attempt landed, instead of overwriting or
-deleting whatever is there by then. `Options.retry_unconditional_writes`
-opts every write in. A 412 on a write that may have been retried says so
-in `Diagnostics`: the first attempt may have succeeded, so `get` the object
-and compare checksums. An `if_generation_not_match` or
-`if_metageneration_not_match` met by the current object is
-`error.NotModified`, an answer rather than a failure.
+when repeating it cannot do harm: an upload or copy carrying
+`if_generation_match`, a metadata update carrying
+`if_metageneration_match`, or a delete naming a `generation`, whose
+repeat fails cleanly if the first attempt landed, instead of overwriting
+or deleting whatever is there by then.
+
+Every JSON API write also carries `X-Goog-Gcs-Idempotency-Token`, one
+value per call and the same on each of its retries. Cloud Storage answers
+a repeated upload of one request, metadata update, move or delete with its
+first result and does not act again, so these retry without a condition
+too, for 60 seconds after their first attempt: Google's "within a minute".
+A conditional one whose first answer was lost gets its own result back,
+not a failed condition. Compose, copy, restore and bucket calls act again
+on a repeat, token or not, and retry as before.
+`Options.idempotency_tokens = false` sends none and keeps only the
+conditions' retries. `Options.retry_unconditional_writes` retries every
+write, past the window too.
+
+A 412 on a write that may have been retried says so in `Diagnostics`: the
+first attempt may have succeeded, so `get` the object and compare
+checksums. An `if_generation_not_match` or `if_metageneration_not_match`
+met by the current object is `error.NotModified`, an answer rather than a
+failure.
+
+Measured against Cloud Storage on 2026-09-30, a repeat with the token was
+recognised 115 seconds after the first attempt and not after 130: an
+upload repeated after another writer replaced the object left that
+writer's object, a delete repeated after the name was created again left
+the new object, and a patch repeated after another writer's kept that
+writer's value. A failed attempt is not replayed: a repeat after its cause
+is gone succeeds.
 
 ### Signed URLs
 
