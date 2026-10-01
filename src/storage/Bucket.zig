@@ -14,6 +14,7 @@ const codec = @import("codec.zig");
 const idempotency = @import("idempotency.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
+const notifications = @import("notifications.zig");
 const post_policy = @import("post_policy.zig");
 const restore_impl = @import("restore.zig");
 const rpc = @import("rpc.zig");
@@ -239,6 +240,74 @@ fn listOperationsBilled(self: Bucket, page: types.PageOptions) Error!types.Owned
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return restore_impl.listOperations(self.client, self.name, page);
+}
+
+/// Asks Cloud Storage to publish a message to `config.topic` for every
+/// change to the bucket's objects that `config` selects, and returns the
+/// configuration as kept. The project's Cloud Storage service agent, which
+/// `Client.serviceAgent` names, needs `roles/pubsub.publisher` on the
+/// topic: without it, or without the topic, `error.TopicNotPublishable`.
+/// Messages began within seconds when measured. A bucket takes at most 100
+/// configurations, and at most 10 that publish any one event type, Eventarc
+/// and Cloud Run triggers on the bucket included: the eleventh is
+/// `error.InvalidArgument`. A configuration Cloud Storage would refuse, or
+/// silently get wrong, is refused here first, with
+/// `error.InvalidNotificationConfig`. Each create and delete moves the
+/// bucket's metageneration.
+///
+/// Safe to retry, though a repeat would make a second configuration: the
+/// bucket's configurations are listed first, and a create whose answer was
+/// lost is found among them afterwards rather than sent again. Needs
+/// `storage.buckets.update`, and `storage.buckets.get` for the list.
+pub fn createNotification(self: Bucket, config: types.NotificationConfig) Error!types.Owned(types.Notification) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).createNotificationBilled(config);
+}
+
+fn createNotificationBilled(self: Bucket, config: types.NotificationConfig) Error!types.Owned(types.Notification) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return notifications.create(self.client, self.name, config);
+}
+
+/// One of the bucket's notification configurations, by `Notification.id`.
+/// A missing one is `error.NotFound`, as a missing bucket is; `Diagnostics`
+/// tells them apart.
+pub fn getNotification(self: Bucket, id: []const u8) Error!types.Owned(types.Notification) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).getNotificationBilled(id);
+}
+
+fn getNotificationBilled(self: Bucket, id: []const u8) Error!types.Owned(types.Notification) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return notifications.get(self.client, self.name, id);
+}
+
+/// Every notification configuration of the bucket, oldest first.
+pub fn listNotifications(self: Bucket) Error!types.Owned([]const types.Notification) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).listNotificationsBilled();
+}
+
+fn listNotificationsBilled(self: Bucket) Error!types.Owned([]const types.Notification) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return notifications.list(self.client, self.name);
+}
+
+/// Deletes a notification configuration; its messages stopped at once when
+/// measured. Safe to retry: a lost first success shows up as
+/// `error.NotFound`.
+pub fn deleteNotification(self: Bucket, id: []const u8) Error!void {
+    var client: Client = undefined;
+    return (try self.billing(&client)).deleteNotificationBilled(id);
+}
+
+fn deleteNotificationBilled(self: Bucket, id: []const u8) Error!void {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return notifications.delete(self.client, self.name, id);
 }
 
 /// A handle for the object `name` in this bucket. Sends nothing. The handle

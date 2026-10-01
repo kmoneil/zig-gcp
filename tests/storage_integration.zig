@@ -1162,3 +1162,45 @@ test "keys: an emulator takes a customer-supplied key and a Cloud KMS key on eve
     try testing.expectEqual(2 * data.len, composed.value.size);
     composed.deinit();
 }
+
+test "notifications: create, read back, list and delete a configuration" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const b = f.bucket();
+
+    var none = try b.listNotifications();
+    try testing.expectEqual(0, none.value.len);
+    none.deinit();
+
+    // The emulator takes any topic, and publishes only on object events,
+    // which this test makes none of.
+    var made = try b.createNotification(.{
+        .topic = .{ .project = "test", .topic = "zigps-events" },
+        .events = &.{ .finalize, .delete },
+        .custom_attributes = &.{.{ .key = "team", .value = "data" }},
+        .object_name_prefix = "incoming/",
+    });
+    defer made.deinit();
+    try testing.expectEqualStrings("test", made.value.topic_name.?.project);
+    try testing.expectEqualStrings("zigps-events", made.value.topic_name.?.topic);
+    try testing.expectEqual(.json, made.value.payload);
+    try testing.expectEqualStrings("incoming/", made.value.object_name_prefix.?);
+
+    var got = try b.getNotification(made.value.id);
+    defer got.deinit();
+    try testing.expectEqualStrings(made.value.id, got.value.id);
+    try testing.expectEqualSlices(storage.EventType, &.{ .finalize, .delete }, got.value.events);
+    try testing.expectEqualStrings("team", got.value.custom_attributes[0].key);
+    try testing.expectEqualStrings("data", got.value.custom_attributes[0].value);
+
+    var all = try b.listNotifications();
+    defer all.deinit();
+    try testing.expectEqual(1, all.value.len);
+
+    try b.deleteNotification(made.value.id);
+    try testing.expectError(error.NotFound, b.getNotification(made.value.id));
+    try testing.expectError(error.NotFound, b.deleteNotification(made.value.id));
+}

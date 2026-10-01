@@ -1,5 +1,5 @@
 //! Google resource names: the id rules more than one service needs. A rule
-//! only one service has (a topic id, a secret id) stays with that module.
+//! only one service has (a secret id) stays with that module.
 
 const std = @import("std");
 const test_util = @import("testing.zig");
@@ -16,7 +16,43 @@ pub fn isProjectId(id: []const u8) bool {
     return true;
 }
 
+/// Pub/Sub topic and subscription ids: 3 to 255 characters from
+/// `[A-Za-z0-9-_.~+%]`, starting with a letter, and not starting with
+/// "goog" in any case (the emulator allows "GOOG"; production does not).
+/// Pub/Sub names its own; Cloud Storage's notifications name a topic.
+pub fn isPubSubId(id: []const u8) bool {
+    if (id.len < 3 or id.len > 255) return false;
+    if (!std.ascii.isAlphabetic(id[0])) return false;
+    if (std.ascii.startsWithIgnoreCase(id, "goog")) return false;
+    for (id) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_', '.', '~', '+', '%' => {},
+        else => return false,
+    };
+    return true;
+}
+
 const testing = std.testing;
+
+test "Pub/Sub ids: the documented rules at their boundaries" {
+    try testing.expect(isPubSubId("abc"));
+    try testing.expect(!isPubSubId("ab"));
+    try testing.expect(isPubSubId("a" ** 255));
+    try testing.expect(!isPubSubId("a" ** 256));
+    try testing.expect(isPubSubId("a.b~c_d-e+f%41"));
+    try testing.expect(isPubSubId("gooXfoo"));
+    try testing.expect(isPubSubId("xgoog"));
+    try testing.expect(!isPubSubId("googfoo"));
+    try testing.expect(!isPubSubId("goog"));
+    // Production rejects any case; the emulator accepts this one.
+    try testing.expect(!isPubSubId("GOOGfoo"));
+    try testing.expect(!isPubSubId("GoOgle-topic"));
+    try testing.expect(!isPubSubId("1abc"));
+    try testing.expect(!isPubSubId("-abc"));
+    try testing.expect(!isPubSubId("ab/c"));
+    try testing.expect(!isPubSubId("ab c"));
+    try testing.expect(!isPubSubId("mi-t\xc3\xb3pico"));
+    try testing.expect(!isPubSubId(""));
+}
 
 test "project ids" {
     try testing.expect(isProjectId("test"));

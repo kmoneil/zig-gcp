@@ -451,6 +451,106 @@ pub fn decodeOperationPage(arena: Allocator, body: []const u8) DecodeError!types
     return .{ .operations = operations, .next_page_token = nonEmpty(wire.nextPageToken) };
 }
 
+/// One notification configuration. Its multi-word keys are in snake case,
+/// unlike the rest of the API, and a field never set is absent.
+pub fn decodeNotification(arena: Allocator, body: []const u8) DecodeError!types.Notification {
+    return notificationFromWire(arena, try parseWire(WireNotification, arena, body));
+}
+
+/// Every notification configuration of a bucket, at most 100 and never
+/// paged. A bucket with none answers no `items` at all, as measured.
+pub fn decodeNotificationList(arena: Allocator, body: []const u8) DecodeError![]const types.Notification {
+    const wire = try parseWire(struct { items: ?[]const WireNotification = null }, arena, body);
+    const listed = wire.items orelse &.{};
+    const notifications = try arena.alloc(types.Notification, listed.len);
+    for (listed, notifications) |w, *n| n.* = try notificationFromWire(arena, w);
+    return notifications;
+}
+
+const WireNotification = struct {
+    id: ?[]const u8 = null,
+    topic: ?[]const u8 = null,
+    payload_format: ?[]const u8 = null,
+    event_types: ?[]const []const u8 = null,
+    custom_attributes: ?std.json.ArrayHashMap(?[]const u8) = null,
+    object_name_prefix: ?[]const u8 = null,
+    etag: ?[]const u8 = null,
+};
+
+fn notificationFromWire(arena: Allocator, w: WireNotification) DecodeError!types.Notification {
+    const id = nonEmpty(w.id) orelse return error.InvalidResponse;
+    const topic = nonEmpty(w.topic) orelse return error.InvalidResponse;
+    const names_sent = w.event_types orelse &.{};
+    const events = try arena.alloc(types.EventType, names_sent.len);
+    for (names_sent, events) |name, *event| event.* = eventTypeOf(name);
+    var attributes: []types.Attribute = &.{};
+    if (w.custom_attributes) |map| {
+        attributes = try arena.alloc(types.Attribute, map.map.count());
+        for (map.map.keys(), map.map.values(), attributes) |key, value, *a| a.* = .{ .key = key, .value = value orelse "" };
+    }
+    return .{
+        .id = id,
+        .topic = topic,
+        .topic_name = topicNameOf(topic),
+        .payload = payloadFormatOf(w.payload_format orelse ""),
+        .events = events,
+        .custom_attributes = attributes,
+        .object_name_prefix = w.object_name_prefix,
+        .etag = nonEmpty(w.etag),
+    };
+}
+
+/// The names Cloud Storage gives the event types, on configurations and on
+/// messages alike.
+pub fn eventTypeName(event: types.EventType) ?[]const u8 {
+    return switch (event) {
+        .finalize => "OBJECT_FINALIZE",
+        .metadata_update => "OBJECT_METADATA_UPDATE",
+        .delete => "OBJECT_DELETE",
+        .archive => "OBJECT_ARCHIVE",
+        .initialize => "OBJECT_INITIALIZE",
+        .unknown => null,
+    };
+}
+
+/// A type this library does not know is `.unknown`, never an error: Cloud
+/// Storage added `OBJECT_INITIALIZE` long after the other four.
+pub fn eventTypeOf(name: []const u8) types.EventType {
+    inline for (@typeInfo(types.EventType).@"enum".fields) |field| {
+        const event: types.EventType = @enumFromInt(field.value);
+        if (eventTypeName(event)) |known| if (std.mem.eql(u8, name, known)) return event;
+    }
+    return .unknown;
+}
+
+pub fn payloadFormatName(format: types.PayloadFormat) ?[]const u8 {
+    return switch (format) {
+        .json => "JSON_API_V1",
+        .none => "NONE",
+        .unknown => null,
+    };
+}
+
+pub fn payloadFormatOf(name: []const u8) types.PayloadFormat {
+    if (std.mem.eql(u8, name, "JSON_API_V1")) return .json;
+    if (std.mem.eql(u8, name, "NONE")) return .none;
+    return .unknown;
+}
+
+/// `//pubsub.googleapis.com/projects/P/topics/T` taken apart, or null for
+/// any other form.
+pub fn topicNameOf(topic: []const u8) ?types.TopicName {
+    const prefix = "//pubsub.googleapis.com/projects/";
+    if (!std.mem.startsWith(u8, topic, prefix)) return null;
+    const rest = topic[prefix.len..];
+    const cut = std.mem.indexOf(u8, rest, "/topics/") orelse return null;
+    const project = rest[0..cut];
+    const id = rest[cut + "/topics/".len ..];
+    if (project.len == 0 or id.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, project, '/') != null or std.mem.indexOfScalar(u8, id, '/') != null) return null;
+    return .{ .project = project, .topic = id };
+}
+
 const WireOperation = struct {
     /// `projects/_/buckets/{bucket}/operations/{id}`.
     name: ?[]const u8 = null,

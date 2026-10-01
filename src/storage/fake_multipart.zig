@@ -179,7 +179,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification };
 
     pub const Fault = enum {
         none,
@@ -502,7 +502,7 @@ pub const FakeMultipart = struct {
             .move => if (method == .POST) .move else return error.HttpProtocolError,
             .resumable => if (method == .POST) .session_start else return error.HttpProtocolError,
             .insert => if (method == .POST) .insert else return error.HttpProtocolError,
-            .bucket => .bucket,
+            .bucket => |b| if (b.notification != null) .notification else .bucket,
             .restore => if (method == .POST) .restore else return error.HttpProtocolError,
             .session => switch (method) {
                 .PUT => .session_put,
@@ -1188,7 +1188,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification => unreachable,
         }
     }
 
@@ -1805,7 +1805,7 @@ fn tokenRefusal(kind: FakeMultipart.Kind, method: Method, headers: []const Heade
     if (headerValue(headers, "X-Goog-Gcs-Idempotency-Token") == null) return null;
     const takes_token = switch (kind) {
         .delete, .move, .insert, .session_start, .restore, .patch => true,
-        .bucket => method != .GET,
+        .bucket, .notification => method != .GET,
         else => false,
     };
     if (takes_token) return null;
@@ -2254,6 +2254,20 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         } };
     }
     if (std.mem.eql(u8, path, "/storage/v1/b")) return .{ .bucket = try bucketTarget(arena, null, query) };
+    if (std.mem.startsWith(u8, path, "/storage/v1/b/")) {
+        const after = path["/storage/v1/b/".len..];
+        if (std.mem.indexOfScalar(u8, after, '/')) |slash| if (std.mem.startsWith(u8, after[slash..], "/notificationConfigs")) {
+            var target = try bucketTarget(arena, try decode(arena, after[0..slash]), query);
+            const tail = after[slash + "/notificationConfigs".len ..];
+            target.notification = if (tail.len == 0)
+                .collection
+            else if (tail[0] == '/' and tail.len > 1 and std.mem.indexOfScalar(u8, tail[1..], '/') == null)
+                .{ .id = try decode(arena, tail[1..]) }
+            else
+                return error.HttpProtocolError;
+            return .{ .bucket = target };
+        };
+    }
     if (std.mem.startsWith(u8, path, "/storage/v1/b/") and std.mem.endsWith(u8, path, "/lockRetentionPolicy")) {
         var target = try bucketTarget(arena, try decode(arena, path["/storage/v1/b/".len .. path.len - "/lockRetentionPolicy".len]), query);
         target.lock = true;
