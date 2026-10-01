@@ -968,6 +968,45 @@ pub const Notification = struct {
     etag: ?[]const u8,
 };
 
+/// One change Cloud Storage published about one object, as `decodeEvent`
+/// reads it from a Pub/Sub message.
+pub const ObjectEvent = struct {
+    kind: EventType,
+    bucket: []const u8,
+    /// The object's name, as it is: Cloud Storage escapes nothing in it.
+    object: []const u8,
+    /// The generation the change concerns: the new one of a finalize, the
+    /// one that went of a delete or an archive.
+    generation: u64,
+    /// When it happened, RFC 3339, as Cloud Storage sent it.
+    time: []const u8,
+    /// The configuration that published it, or null where an emulator
+    /// leaves that out.
+    config: ?ConfigRef,
+    /// A finalize that replaced a live generation: the one it replaced.
+    overwrote_generation: ?u64,
+    /// A delete or archive of a generation that another replaced: that one.
+    overwritten_by_generation: ?u64,
+    payload: PayloadFormat,
+    /// With a `.json` payload, the object's metadata: as it now is, or as it
+    /// was before a delete. Cloud Storage leaves out its ACLs.
+    info: ?ObjectInfo,
+    /// The configuration's own attributes: every attribute that is not one
+    /// Cloud Storage puts on its messages.
+    custom_attributes: []const Attribute,
+    /// The change's identity, for telling a repeat delivery apart from a
+    /// new change: Cloud Storage publishes at least once and Pub/Sub
+    /// delivers at least once, each repeat under a new message ID. Built
+    /// from the event type, bucket, object and generation, and for a
+    /// metadata update the metageneration, or without a payload the time.
+    key: []const u8,
+
+    pub const ConfigRef = struct {
+        bucket: []const u8,
+        id: []const u8,
+    };
+};
+
 pub const SignedMethod = enum { GET, HEAD, PUT, POST, DELETE };
 
 /// A header signed into a URL, which its holder must send with this

@@ -75,6 +75,13 @@ pub const PayloadFormat = @import("types.zig").PayloadFormat;
 pub const EventType = @import("types.zig").EventType;
 pub const NotificationConfig = @import("types.zig").NotificationConfig;
 pub const Notification = @import("types.zig").Notification;
+pub const ObjectEvent = @import("types.zig").ObjectEvent;
+/// Reads a Pub/Sub message Cloud Storage published for a bucket's
+/// notification configuration into an `ObjectEvent`. It takes a
+/// `pubsub.ReceivedMessage`, or anything with its `data` and `attributes`.
+pub const decodeEvent = @import("events.zig").decodeEvent;
+pub const DecodeEventOptions = @import("events.zig").DecodeEventOptions;
+pub const DecodeEventError = @import("events.zig").DecodeEventError;
 pub const SignedUrlOptions = @import("types.zig").SignedUrlOptions;
 pub const PostPolicy = @import("types.zig").PostPolicy;
 pub const PostPolicyOptions = @import("types.zig").PostPolicyOptions;
@@ -110,6 +117,7 @@ test {
     _ = @import("Client.zig");
     _ = @import("Endpoint.zig");
     _ = @import("notifications.zig");
+    _ = @import("events.zig");
     _ = @import("Object.zig");
     _ = @import("checkpoint.zig");
     _ = @import("codec.zig");
