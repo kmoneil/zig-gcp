@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.27.0 (unreleased)
+## 0.27.0 (2026-10-01)
 
 - storage: Pub/Sub notifications. `Bucket.createNotification`,
   `getNotification`, `listNotifications` and `deleteNotification` manage
