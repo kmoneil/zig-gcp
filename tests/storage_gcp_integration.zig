@@ -56,6 +56,13 @@
 //! draw random customer-supplied keys. The Cloud KMS test also needs
 //! GCP_TEST_KMS_KEY, a key in us-central1 whose grant to the project's
 //! Cloud Storage service agent is in place, and skips without it.
+//!
+//! The retention test makes a bucket of its own like the others, with an
+//! unlocked retention policy it removes before it ends and holds it
+//! releases, so the bucket can go. Settings reach requests unevenly for
+//! seconds after they change, which it waits out. It never locks a bucket
+//! or turns on object retention: both are permanent, and each places a
+//! lien on the project that keeps it from being deleted.
 
 const std = @import("std");
 const core = @import("core");

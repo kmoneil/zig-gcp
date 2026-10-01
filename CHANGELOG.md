@@ -4,6 +4,60 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.26.0 (unreleased)
+
+- storage: every JSON API write carries `X-Goog-Gcs-Idempotency-Token`,
+  one value per call and the same on each of its retries; reads, the XML
+  API and resumable chunks carry none. Cloud Storage answers a repeated
+  upload of one request, metadata update, move or delete with its first
+  result and does not act again, as measured, so those retry without a
+  condition for 60 seconds after their first attempt, and a conditional
+  one whose first answer was lost gets its own result back instead of
+  `error.FailedPrecondition`. Compose, copy, restore, resumable starts and
+  bucket calls act again on a repeat, carry a token, and retry as before.
+  New `Client.Options.idempotency_tokens`, on by default; off, no request
+  carries a token but a bulk restore, whose retries depend on it, and the
+  conditions' retries are the only ones. `retry_unconditional_writes`
+  retries past the window too. Not breaking, but a write that gave up on
+  its first transient error now retries.
+- storage: retention policies, Bucket Lock, holds and object retention.
+  `BucketConfig` gains `retention_period_s` (1 to 3,155,760,000 seconds,
+  checked before sending), `default_event_based_hold` and
+  `object_retention`; `BucketUpdate` gains `retention_period_s` (a
+  `storage.Change`) and `default_event_based_hold`; `BucketInfo` reports
+  them, the policy as `storage.RetentionPolicy`. New
+  `Bucket.lockRetentionPolicy(metageneration)` locks a policy for good,
+  retries, and answers a bucket already locked as locked, since a repeat
+  of a lock that landed is refused 400 as if there were no policy.
+  `UploadOptions`, `ComposeOptions` and `CopyOptions` gain
+  `temporary_hold`, `event_based_hold` and `retention`
+  (`storage.ObjectRetention`); a copy with any of them is a changed copy,
+  since it never carries its source's. `MetadataUpdate` gains
+  `temporary_hold`, `event_based_hold`, `retention` (a `storage.Change`)
+  and `override_unlocked_retention`. `ObjectInfo` gains `temporary_hold`,
+  `event_based_hold`, `retention` and `retention_expiration_time`.
+  Refused before sending: a retention with a mode this library does not
+  know, a time without a zone, or an event-based hold beside it.
+  Breaking, for an exhaustive `switch` over `storage.Error`: it gains
+  `ObjectRetained`, a write refused because the object is retained or
+  held, told from a missing permission by the reason and message Cloud
+  Storage sends, on every path, JSON, XML and resumable.
+- storage: a parallel upload with conditions into a bucket that keeps
+  every new object, by a retention policy or a default event-based hold,
+  goes up as one ordinary upload, since there the temporary object it
+  finishes under could be neither moved nor deleted. It reads the
+  bucket's settings to tell, one more request.
+- storage: the cleanup of a failed upload (a checksum mismatch after a
+  parallel or streamed upload, a truncated resumable one) says whether
+  the object went, stays kept, could not be deleted, or had no
+  generation to pin a delete to. Two of them said it went either way.
+- core: `rpc.Call` and `rpc.StreamCall` gain `retry_window_ms`: no retry
+  begins that long after the first attempt began, but the one retry with
+  a fresh token after a 401. Not breaking.
+- ci: the nightly fuzzing gains two jobs for the fault properties, and a
+  job's filter may name several tests.
+- auth, pubsub, secret_manager: unchanged.
+
 ## 0.25.0 (2026-09-30)
 
 - storage: buckets take their settings, and can change them.
