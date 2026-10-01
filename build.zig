@@ -257,6 +257,23 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, storage_gcp_tests).step);
     test_step.dependOn(&storage_gcp_tests.step);
+    // A bucket's Pub/Sub notifications against Google: GCP_TEST_PROJECT,
+    // GCP_TEST_BUCKET and GCP_TEST_TOKEN, with topics and their policies.
+    const notifications_gcp_tests = b.addTest(.{
+        .name = "notifications-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/notifications_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "storage", .module = storage },
+                .{ .name = "pubsub", .module = mod },
+            },
+        }),
+        .filters = test_filters,
+    });
+    gcp_step.dependOn(&streamed(b, notifications_gcp_tests).step);
+    test_step.dependOn(&notifications_gcp_tests.step);
     // Signed URLs against a real bucket, which is the only place a
     // signature is checked: GCP_TEST_BUCKET, GCP_TEST_TOKEN, and a signer,
     // GCP_TEST_SIGNER_KEY or GCP_TEST_SIGNER_EMAIL.
@@ -296,14 +313,16 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign" }) |name| {
-        // whoami, secret, gcs_cp and gcs_sign pick their own credentials.
+    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify" }) |name| {
+        // whoami, secret, gcs_cp, gcs_sign and gcs_notify pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
             &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_cp") or std.mem.eql(u8, name, "gcs_sign"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "gcs_notify"))
+            &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else
             &.{.{ .name = "pubsub", .module = mod }};
         const exe = b.addExecutable(.{

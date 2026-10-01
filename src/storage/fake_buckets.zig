@@ -39,8 +39,8 @@
 //!   metageneration, which every create and delete moves; `payload_format`
 //!   is required; a topic is taken as `//pubsub.googleapis.com/projects/P/
 //!   topics/T` or `projects/P/topics/T` and answered in the first form; at
-//!   most 5 custom attributes, keys of 1 to 256 characters and values of up
-//!   to 1,024; unknown event types and empty lists dropped, the rest in
+//!   most 5 custom attributes, keys of 1 to 256 bytes and values of up
+//!   to 1,024 (the refusals say characters); unknown event types and empty lists dropped, the rest in
 //!   Cloud Storage's order; at most 10 configurations overlapping on any
 //!   event type, one with none overlapping every type; a list of none has
 //!   no `items`; and the two refusals of a topic Cloud Storage cannot
@@ -847,9 +847,9 @@ fn normalTopic(arena: Allocator, topic: []const u8) Allocator.Error!?[]const u8 
     return try std.fmt.allocPrint(arena, "//pubsub.googleapis.com/projects/{s}/topics/{s}", .{ project, id });
 }
 
-/// Characters, as Cloud Storage counts them in its limits.
+/// What Cloud Storage's limits call characters: bytes, as measured.
 fn characters(text: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(text) catch text.len;
+    return text.len;
 }
 
 /// Whether a kept configuration publishes `event`: one that names no types

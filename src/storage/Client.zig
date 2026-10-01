@@ -318,8 +318,12 @@ pub fn listBuckets(self: *Client, page: types.PageOptions) Error!types.Owned(typ
 /// project's behalf, and so the one to grant
 /// `roles/cloudkms.cryptoKeyEncrypterDecrypter` on a key before any write
 /// names it. Without that grant, a write naming the key, and a bucket
-/// created with it as the default, are `error.PermissionDenied`. Asking
-/// creates the agent if the project has none yet.
+/// created with it as the default, are `error.PermissionDenied`. It is
+/// also the account that publishes a bucket's notifications, so it needs
+/// `roles/pubsub.publisher` on their topic (`pubsub.Topic.addIamBinding`
+/// grants it), or `Bucket.createNotification` is
+/// `error.TopicNotPublishable`. Asking creates the agent if the project has
+/// none yet.
 pub fn serviceAgent(self: *Client) Error!types.Owned([]const u8) {
     rpc.begin(self);
     const project = try rpc.requireProject(self);

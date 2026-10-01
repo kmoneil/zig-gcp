@@ -4,6 +4,55 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.27.0 (unreleased)
+
+- storage: Pub/Sub notifications. `Bucket.createNotification`,
+  `getNotification`, `listNotifications` and `deleteNotification` manage
+  the configurations by which Cloud Storage publishes a message for every
+  change to a bucket's objects, with `NotificationConfig`,
+  `Notification`, `TopicName`, `PayloadFormat`, `EventType` and
+  `Attribute`. A repeated create makes a second configuration, idempotency
+  token or not, as measured, so a create lists the bucket's
+  configurations first, and one whose answer was lost is found among them
+  afterwards rather than sent again. Refused before sending, with the new
+  `error.InvalidNotificationConfig`: a topic Pub/Sub would not name, an
+  empty, repeated or unknown event type (Cloud Storage drops an unknown
+  one and then publishes every type), more than 5 custom attributes (the
+  documentation says 10), keys over 256 bytes or values over 1,024 (its
+  refusals say characters, and count bytes), a key twice, a key named like
+  an attribute Cloud Storage sets, which it takes and silently overrides,
+  and a key beginning with goog, which it takes, and then delivers none of
+  the configuration's messages. A topic Cloud Storage cannot
+  publish to, missing or without `roles/pubsub.publisher` for the
+  project's service agent, is the new `error.TopicNotPublishable`.
+  Breaking, for an exhaustive `switch` over `storage.Error`: it gains
+  both.
+- storage: `decodeEvent` reads a message Cloud Storage published, as a
+  `pubsub.Subscriber` receives it or anything with its data and
+  attributes, into an `ObjectEvent`: the event type, bucket, object,
+  generation and time, the configuration that sent it, the generations an
+  overwrite links, the object's metadata from the payload, the
+  configuration's own attributes, and a `key` that tells a repeat delivery
+  from a new change. An event type it does not know is kept, never
+  refused. Not breaking.
+- storage: an object's `retention.retainUntilTime` is read as RFC 3339
+  text or as a protocol buffer Timestamp's seconds and nanos, the form the
+  documentation gives notification payloads. Not breaking.
+- pubsub: `Topic.iamPolicy`, `setIamPolicy` and `addIamBinding`, which
+  grants a member a role on a topic unless it holds it already, under the
+  read's etag, starting over on a concurrent change. Not breaking.
+- core: `iam`, with `Policy`, `Binding`, `decode`, `encodeSet` and
+  `withMember`, conditions kept as read; `names.isPubSubId`, the Pub/Sub
+  id rule, which `pubsub.limits.isResourceId` now re-exports. Not
+  breaking.
+- examples: `gcs_notify` sets a bucket's notifications up, granting the
+  service agent and creating the topic and a subscription, and watches the
+  changes come in, decoded.
+- ci: the two emulators share a Docker network, so fake-gcs-server
+  publishes a bucket's notifications to the Pub/Sub emulator, and an
+  integration suite and the examples run them end to end.
+- auth, secret_manager: unchanged.
+
 ## 0.26.0 (2026-10-01)
 
 - storage: every JSON API write carries `X-Goog-Gcs-Idempotency-Token`,

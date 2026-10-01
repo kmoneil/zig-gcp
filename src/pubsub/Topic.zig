@@ -71,6 +71,84 @@ pub fn delete(self: Topic) Error!void {
     return rpc.executeDiscard(c, .{ .method = .DELETE, .path = path });
 }
 
+/// The topic's IAM policy, conditional bindings included. Needs
+/// `pubsub.topics.getIamPolicy`. The emulator keeps none.
+pub fn iamPolicy(self: Topic) Error!Owned(core.iam.Policy) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "topic", self.id);
+    return getPolicy(c, self.id);
+}
+
+/// Writes `policy` as the topic's, and returns it as written. Pass a policy
+/// `iamPolicy` read, changed: its etag makes the write fail with
+/// `error.Aborted` if the policy changed since, rather than undo that
+/// change. Needs `pubsub.topics.setIamPolicy`.
+pub fn setIamPolicy(self: Topic, policy: core.iam.Policy) Error!Owned(core.iam.Policy) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "topic", self.id);
+    return setPolicy(c, self.id, policy);
+}
+
+/// Grants `member` the role `role` on the topic, unless it holds it
+/// already, and returns the policy as it then is. It reads the policy,
+/// adds the member, and writes it back under the read's etag, starting
+/// over when another change came in between, up to the retry policy's
+/// attempts. A bucket's notifications need it: `role` is
+/// `roles/pubsub.publisher`, and `member` is `serviceAccount:` and the
+/// address `storage.Client.serviceAgent` gives. A fresh grant took a few
+/// seconds to apply when measured. Needs `pubsub.topics.getIamPolicy` and
+/// `pubsub.topics.setIamPolicy`.
+pub fn addIamBinding(self: Topic, role: []const u8, member: []const u8) Error!Owned(core.iam.Policy) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "topic", self.id);
+    if (role.len == 0 or member.len == 0) {
+        if (c.diagnostics) |d| d.print("a binding names a role, such as roles/pubsub.publisher, and a member, such as serviceAccount:name@project.iam.gserviceaccount.com", .{});
+        return error.InvalidArgument;
+    }
+    var attempt: u32 = 0;
+    while (true) {
+        attempt += 1;
+        var read = try getPolicy(c, self.id);
+        if (read.value.grants(role, member)) return read;
+        defer read.deinit();
+        var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+        defer scratch.deinit();
+        const next = try core.iam.withMember(scratch.allocator(), read.value, role, member);
+        return setPolicy(c, self.id, next) catch |err| {
+            // Another change came between the read and the write.
+            if (err == error.Aborted and attempt < c.retry.max_attempts) continue;
+            return err;
+        };
+    }
+}
+
+fn getPolicy(c: *Client, id: []const u8) Error!Owned(core.iam.Policy) {
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try url.resourcePath(scratch.allocator(), c.project_id, .topics, id, ":getIamPolicy?options.requestedPolicyVersion=3");
+    return fetchPolicy(c, .{ .method = .GET, .path = path });
+}
+
+fn setPolicy(c: *Client, id: []const u8, policy: core.iam.Policy) Error!Owned(core.iam.Policy) {
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try url.resourcePath(a, c.project_id, .topics, id, ":setIamPolicy");
+    return fetchPolicy(c, .{ .method = .POST, .path = path, .body = try core.iam.encodeSet(a, policy) });
+}
+
+fn fetchPolicy(c: *Client, call: rpc.Call) Error!Owned(core.iam.Policy) {
+    var result: Owned(core.iam.Policy) = try .init(c.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(c, result.arena, call);
+    result.value = core.iam.decode(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(c, err, "IAM policy");
+    return result;
+}
+
 /// Publishes `messages` in one HTTP request. The returned ids match the order
 /// of `messages`. Limits are checked first (`error.InvalidMessage`), on the
 /// request as it is before any compression.
@@ -502,4 +580,79 @@ test "publish: every allocation failure with compression is OutOfMemory without 
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.publish, .{});
+}
+
+const agent = "serviceAccount:service-82150720798@gs-project-accounts.iam.gserviceaccount.com";
+const aborted =
+    \\{"error":{"code":409,"message":"There were concurrent policy changes. Please retry the whole read-modify-write with exponential backoff.","status":"ABORTED"}}
+;
+
+test "IAM: read, write, and grant once, on the paths Pub/Sub serves them" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"etag\":\"ACAB\"}" } },
+        .{ .respond = .{ .body = "{\"version\":1,\"etag\":\"BwX1\",\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:a@x.com\"]}]}" } },
+        .{ .respond = .{ .body = "{\"etag\":\"BwX1\",\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:a@x.com\"]}]}" } },
+        .{ .respond = .{ .body = "{\"etag\":\"BwX2\",\"bindings\":[{\"role\":\"roles/pubsub.viewer\",\"members\":[\"user:a@x.com\"]},{\"role\":\"roles/pubsub.publisher\",\"members\":[\"" ++ agent ++ "\"]}]}" } },
+        .{ .respond = .{ .body = "{\"etag\":\"BwX2\",\"bindings\":[{\"role\":\"roles/pubsub.publisher\",\"members\":[\"" ++ agent ++ "\"]}]}" } },
+    }, .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+
+    var empty = try orders.iamPolicy();
+    defer empty.deinit();
+    try testing.expectEqualStrings("ACAB", empty.value.etag.?);
+    try h.expectRequest(0, .GET, "http://localhost:8085/v1/projects/p/topics/orders:getIamPolicy?options.requestedPolicyVersion=3", null);
+
+    var written = try orders.setIamPolicy(.{ .etag = "ACAB", .bindings = &.{.{ .role = "roles/pubsub.viewer", .members = &.{"user:a@x.com"} }} });
+    defer written.deinit();
+    try h.expectRequest(1, .POST, "http://localhost:8085/v1/projects/p/topics/orders:setIamPolicy",
+        \\{"policy":{"version":1,"etag":"ACAB","bindings":[{"role":"roles/pubsub.viewer","members":["user:a@x.com"]}]}}
+    );
+
+    // Not held: read, then written under the read's etag.
+    var granted = try orders.addIamBinding("roles/pubsub.publisher", agent);
+    defer granted.deinit();
+    try testing.expect(granted.value.grants("roles/pubsub.publisher", agent));
+    try h.expectRequest(3, .POST, "http://localhost:8085/v1/projects/p/topics/orders:setIamPolicy",
+        \\{"policy":{"version":1,"etag":"BwX1","bindings":[{"role":"roles/pubsub.viewer","members":["user:a@x.com"]},{"role":"roles/pubsub.publisher","members":["serviceAccount:service-82150720798@gs-project-accounts.iam.gserviceaccount.com"]}]}}
+    );
+    // Held already: read, and nothing written.
+    var again = try orders.addIamBinding("roles/pubsub.publisher", agent);
+    defer again.deinit();
+    try h.expectRequestCount(5);
+
+    try testing.expectError(error.InvalidArgument, orders.addIamBinding("", agent));
+    try testing.expectError(error.InvalidArgument, orders.addIamBinding("roles/pubsub.publisher", ""));
+    try testing.expectError(error.InvalidResourceId, h.client.topic("a/b").iamPolicy());
+    try h.expectRequestCount(5);
+}
+
+test "IAM: a grant that meets another change starts over, and stops at the retry policy's attempts" {
+    {
+        var h: Harness = undefined;
+        try h.init(&.{
+            .{ .respond = .{ .body = "{\"etag\":\"E1\"}" } },
+            .{ .respond = .{ .status = 409, .body = aborted } },
+            // Read again: the other change was this very grant.
+            .{ .respond = .{ .body = "{\"etag\":\"E2\",\"bindings\":[{\"role\":\"roles/pubsub.publisher\",\"members\":[\"" ++ agent ++ "\"]}]}" } },
+        }, .{});
+        defer h.deinit();
+        var granted = try h.client.topic("orders").addIamBinding("roles/pubsub.publisher", agent);
+        defer granted.deinit();
+        try testing.expectEqualStrings("E2", granted.value.etag.?);
+        try h.expectRequestCount(3);
+    }
+    {
+        var h: Harness = undefined;
+        try h.init(&.{
+            .{ .respond = .{ .body = "{\"etag\":\"E1\"}" } },
+            .{ .respond = .{ .status = 409, .body = aborted } },
+            .{ .respond = .{ .body = "{\"etag\":\"E2\"}" } },
+            .{ .respond = .{ .status = 409, .body = aborted } },
+        }, .{ .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 1 } });
+        defer h.deinit();
+        try testing.expectError(error.Aborted, h.client.topic("orders").addIamBinding("roles/pubsub.publisher", agent));
+        try h.expectRequestCount(4);
+    }
 }

@@ -172,6 +172,16 @@ jobs:
             echo "--encryption-key-file took a file that holds no key"
             exit 1
           fi
+          # A bucket's notifications: gcs_notify sets them up, an upload
+          # under the prefix reaches the Pub/Sub emulator through
+          # fake-gcs-server, and gcs_notify watch prints it, decoded.
+          curl -sf -X POST "http://127.0.0.1:4443/storage/v1/b?project=test" \
+            -H "Content-Type: application/json" -d '{"name":"zigps-notify"}' >/dev/null
+          zig build example-gcs_notify -- setup zigps-notify test zigps-uploads --prefix incoming/
+          printf 'hello notifications\n' > "$RUNNER_TEMP/notify.txt"
+          zig build example-gcs_cp -- "$RUNNER_TEMP/notify.txt" gs://zigps-notify/incoming/hello.txt
+          timeout 120 zig build example-gcs_notify -- watch test zigps-uploads-watch --count 1 | tee "$RUNNER_TEMP/notify.log"
+          grep -q "finalize gs://zigps-notify/incoming/hello.txt" "$RUNNER_TEMP/notify.log"
 
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
   # read of undefined memory, can pass in Debug and fail here.

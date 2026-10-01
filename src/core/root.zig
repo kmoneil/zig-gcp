@@ -40,6 +40,9 @@ pub const Owned = @import("owned.zig").Owned;
 /// `.set`, or `.clear`. Service modules re-export it.
 pub const Change = @import("change.zig").Change;
 
+/// IAM policies as `getIamPolicy` and `setIamPolicy` read and write them.
+pub const iam = @import("iam.zig");
+
 /// The seam through which service modules get bearer tokens.
 pub const TokenProvider = @import("TokenProvider.zig");
 pub const StaticToken = @import("StaticToken.zig");
