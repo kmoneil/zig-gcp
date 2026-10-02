@@ -2449,7 +2449,7 @@ fn writeManagedPolicyRest(
 /// production's bare refusal of a bucket permission, as measured.
 fn managedTestPermissions(arena: Allocator, permissions: []const []const u8) Allocator.Error!FakeMultipart.Reply {
     const invalid: FakeMultipart.Reply = .{ .status = 400, .body =
-    \\{"error":{"code":400,"errors":[{"domain":"global","message":"Invalid argument.","reason":"invalid"}],"message":"Invalid argument."}}
+        \\{"error":{"code":400,"errors":[{"domain":"global","message":"Invalid argument.","reason":"invalid"}],"message":"Invalid argument."}}
     };
     if (permissions.len == 0 or permissions.len > 84) return .{ .status = 400, .body =
     \\{"error":{"code":400,"errors":[{"domain":"global","message":"Must specify <= 84 permissions.","reason":"invalid"}],"message":"Must specify <= 84 permissions."}}
