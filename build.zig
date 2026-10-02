@@ -334,15 +334,17 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "quickstart" }) |name| {
-        // whoami, secret, gcs_cp, gcs_sign, gcs_notify and quickstart pick
-        // their own credentials.
+    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "quickstart", "iam" }) |name| {
+        // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart and iam
+        // pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
             &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_cp") or std.mem.eql(u8, name, "gcs_sign"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "iam"))
+            &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else

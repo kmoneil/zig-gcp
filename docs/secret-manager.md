@@ -45,7 +45,7 @@ above as a program: `zig build example-secret -- db-password latest`.
 
 **On this page:** [The bytes](#the-bytes) ·
 [What it covers](#what-it-covers) · [Checksums](#checksums) ·
-[Regional secrets](#regional-secrets)
+[Regional secrets](#regional-secrets) · [IAM](#iam)
 
 ## The bytes
 
@@ -87,6 +87,7 @@ needs more care than other results do.
 | `.listVersions(options)` | One page of versions, newest first |
 | `.version(ref).get()` | A version's state, times and etag |
 | `.version(.{ .number = n }).enable()`, `.disable()`, `.destroy()` | Change what a version serves |
+| `.iamPolicy()`, `.setIamPolicy(policy)`, `.addIamBinding(role, member)`, `.removeIamBinding(role, member)`, `.testIamPermissions(permissions)` | Who may read the secret's bytes, or manage it: [IAM](#iam) |
 
 `enable`, `disable` and `destroy` take a version number and refuse
 `.latest` and aliases with `error.ExplicitVersionRequired`: "whatever is
@@ -96,8 +97,8 @@ disabling are idempotent; destroying is not, and a second destroy
 answers `error.FailedPrecondition`, which means the first one worked.
 
 Not in this version: `patch` (so no labels, aliases, expiry or rotation
-after creation), IAM policy calls, notification topics,
-customer-managed encryption keys, and etag preconditions.
+after creation), notification topics, customer-managed encryption keys,
+and etag preconditions.
 
 ## Checksums
 
@@ -136,3 +137,29 @@ makes two clients. A regional secret sends no `replication`, because its
 location decides where the bytes live; a global one must name it, and it
 cannot be changed afterwards. `location` is checked against a strict
 pattern before it becomes part of a host name.
+
+## IAM
+
+A secret's IAM policy says who may read its versions' bytes,
+`roles/secretmanager.secretAccessor`, and who may manage it. Its
+versions' permissions follow it. The five calls are the ones every
+resource takes, global and regional alike:
+
+```zig
+var policy = try secrets.secret("db-password").addIamBinding(
+    "roles/secretmanager.secretAccessor",
+    "serviceAccount:app@my-project.iam.gserviceaccount.com",
+);
+defer policy.deinit();
+```
+
+A secret takes conditional bindings, written as version 3 by
+themselves, and the basic roles. No `updateMask` is ever sent, so a
+secret's audit configuration, which `core.iam.Policy` does not hold,
+stays as it is: measured, a write that left `auditConfigs` out kept
+them. `testIamPermissions` on a secret that does not exist answers that
+none is held, where a missing topic or bucket is `error.NotFound`.
+
+[IAM on every resource](iam.md) has the calls, how members compare, and
+what each service does differently.
+

@@ -13,6 +13,7 @@ Google, not only what Google documents, and where the emulators differ.
 | --- | --- |
 | [Essentials](essentials.md) | Clients and handles, endpoints and emulators, results and memory, errors and `Diagnostics`, retries, time limits and cancellation, logging, and testing code that uses this library |
 | [Credentials](auth.md) | `findDefault` and where it looks, user logins, service account keys, workload identity federation, impersonation, static tokens, and signing |
+| [IAM on every resource](iam.md) | Reading, granting, revoking and testing permissions on buckets, topics, subscriptions and secrets, and where the services differ |
 
 ## 📨 Pub/Sub
 
@@ -41,7 +42,7 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Secret Manager](secret-manager.md) | Reading a secret's bytes, verified and wiped; versions; checksums; regional secrets |
+| [Secret Manager](secret-manager.md) | Reading a secret's bytes, verified and wiped; versions; checksums; regional secrets; IAM |
 
 ## 🛠️ Working on zig-gcp
 

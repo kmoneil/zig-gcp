@@ -124,6 +124,9 @@ What else is safe to repeat depends on the call, and each module says:
   checksum, see [Checksums](secret-manager.md#checksums), and retries
   `addVersion`, which can store the same bytes twice, unless
   `Options.retry_add_version` is false.
+- **IAM policy writes**, on every resource, are retried only under an
+  etag, and a concurrent change is `error.Aborted`: see
+  [IAM on every resource](iam.md#errors-and-retries).
 
 `std.http.Client` has no per-request timeout in 0.16, so the library
 adds one: every request is raced against a timer, and one that outlives

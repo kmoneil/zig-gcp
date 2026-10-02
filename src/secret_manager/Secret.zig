@@ -11,6 +11,7 @@ const SecretValue = @import("SecretValue.zig");
 const Version = @import("Version.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
+const iam = @import("iam.zig");
 const logging = @import("logging.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
@@ -91,6 +92,68 @@ pub fn delete(self: Secret) Error!void {
     defer scratch.deinit();
     const path = try names.secretPath(scratch.allocator(), c.parent(), self.id, "");
     return rpc.executeDiscard(c, .{ .method = .DELETE, .path = path });
+}
+
+/// The secret's IAM policy, asked for as version 3, conditional bindings
+/// included. A fresh secret's is empty, with the etag "ACAB". Its
+/// versions' permissions follow it. Needs
+/// `secretmanager.secrets.getIamPolicy`.
+pub fn iamPolicy(self: Secret) Error!types.Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return r.readPolicy();
+}
+
+/// Writes `policy` as the secret's, whole, and returns it as stored. Pass
+/// a policy `iamPolicy` read, changed: its etag makes the write fail with
+/// `error.Aborted` if the policy changed since, rather than undo that
+/// change. A write that carries an etag is retried; one whose first answer
+/// was lost then reports `error.Aborted` although it landed, so read the
+/// policy again. One without an etag is sent once. No `updateMask` is
+/// sent, so the secret's audit configuration, which `core.iam.Policy`
+/// does not hold, stays as it is. A policy with a condition is written as
+/// version 3. Needs `secretmanager.secrets.setIamPolicy`.
+pub fn setIamPolicy(self: Secret, policy: core.iam.Policy) Error!types.Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return iam.set(r, policy);
+}
+
+/// Grants `member` the role `role` on the secret, such as
+/// `roles/secretmanager.secretAccessor`, which reads its versions' bytes,
+/// unless it holds it already without a condition, and returns the policy
+/// as it then is. It reads the policy, adds the member, and writes it back
+/// under the read's etag, starting over after a jittered wait when another
+/// change came in between, up to the retry policy's attempts. Members
+/// compare as Secret Manager stores them, the address of a `user:`,
+/// `serviceAccount:`, `group:` or `domain:` member in any case. Needs
+/// `secretmanager.secrets.getIamPolicy` and `setIamPolicy`.
+pub fn addIamBinding(self: Secret, role: []const u8, member: []const u8) Error!types.Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return iam.change(r, .{ .grant = .{ .role = role, .member = member } });
+}
+
+/// Takes `member` out of the secret's binding of `role` without a
+/// condition, unless it is not there, and returns the policy as it then
+/// is, the same way `addIamBinding` grants.
+pub fn removeIamBinding(self: Secret, role: []const u8, member: []const u8) Error!types.Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return iam.change(r, .{ .revoke = .{ .role = role, .member = member } });
+}
+
+/// The permissions the caller holds on the secret, of `permissions`: 1 to
+/// 100 of Secret Manager's own, such as `secretmanager.versions.access`.
+/// On a secret that does not exist, none is held: an empty list, where a
+/// missing topic or bucket is `error.NotFound`. Meant for building
+/// permission-aware tools, not for authorization checks.
+pub fn testIamPermissions(self: Secret, permissions: []const []const u8) Error!types.Owned([]const []const u8) {
+    const r = try self.iamResource();
+    return iam.testPermissions(r, permissions);
+}
+
+fn iamResource(self: Secret) Error!iam.Resource {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkSecretId(c, self.id);
+    return .{ .client = c, .id = self.id };
 }
 
 /// One page of this secret's versions, newest first.

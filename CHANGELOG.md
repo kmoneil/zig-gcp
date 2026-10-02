@@ -45,7 +45,20 @@ including the ones that did not change.
   policy needs, as `.cloud_platform` does. `storage.iam` re-exports
   `core.iam`. Not breaking, except for an exhaustive `switch` over
   `Scope`.
-- auth, secret_manager: unchanged.
+- secret_manager: IAM on secrets, global and regional:
+  `Secret.iamPolicy`, `setIamPolicy`, `addIamBinding`, `removeIamBinding`
+  and `testIamPermissions`, on `core.iam` as the other resources.
+  Conditional bindings are taken, written as version 3; no `updateMask`
+  is sent, so a secret's audit configuration stays as it is, as
+  measured. On a secret that does not exist, `testIamPermissions` answers
+  that none is held. `secret_manager.iam` re-exports `core.iam`. Not
+  breaking.
+- examples: `iam` reads, grants, revokes and tests permissions on a
+  bucket, topic, subscription or secret.
+- docs: `docs/iam.md`, IAM on every resource: the calls, how members
+  compare, building a policy, and where the services differ, as
+  measured.
+- auth: unchanged.
 
 ## 0.27.0 (2026-10-01)
 

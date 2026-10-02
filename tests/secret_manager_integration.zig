@@ -373,6 +373,89 @@ test "regional: its own namespace, on its own host" {
     try testing.expectError(error.NotFound, global.secret(secret.id).get());
 }
 
+/// A secret's IAM, end to end: the member is the project's Cloud Storage
+/// service agent, whose address the project's number gives, and the
+/// secret's own name gives the number.
+fn iamCycle(f: *Fixture, secret: secret_manager.Secret) !void {
+    const a = f.arena.allocator();
+    var info = secret.get() catch |err| return f.report(err);
+    defer info.deinit();
+    var parts = std.mem.splitScalar(u8, info.value.name, '/');
+    _ = parts.next();
+    const number = parts.next().?;
+    const member = try std.fmt.allocPrint(a, "serviceAccount:service-{s}@gs-project-accounts.iam.gserviceaccount.com", .{number});
+    const shouting = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{try std.ascii.allocUpperString(a, member["serviceAccount:".len..])});
+    const role = "roles/secretmanager.secretAccessor";
+
+    var fresh = secret.iamPolicy() catch |err| return f.report(err);
+    defer fresh.deinit();
+    try testing.expectEqualStrings("ACAB", fresh.value.etag.?);
+    try testing.expectEqual(0, fresh.value.bindings.len);
+
+    var granted = secret.addIamBinding(role, member) catch |err| return f.report(err);
+    defer granted.deinit();
+    try testing.expect(granted.value.grants(role, member));
+    // Held already, asked in capitals: nothing written, so the etag stands.
+    var again = secret.addIamBinding(role, shouting) catch |err| return f.report(err);
+    defer again.deinit();
+    try testing.expectEqualStrings(granted.value.etag.?, again.value.etag.?);
+
+    var held = secret.testIamPermissions(&.{ "secretmanager.secrets.get", "secretmanager.versions.access" }) catch |err| return f.report(err);
+    defer held.deinit();
+    try testing.expectEqual(2, held.value.len);
+
+    // A condition, written as version 3 by itself.
+    var current = secret.iamPolicy() catch |err| return f.report(err);
+    defer current.deinit();
+    var conditional = current.value;
+    conditional.bindings = try std.mem.concat(a, secret_manager.iam.Binding, &.{ current.value.bindings, &.{.{
+        .role = "roles/secretmanager.viewer",
+        .members = &.{member},
+        .condition = "{\"title\":\"until 2030\",\"expression\":\"request.time < timestamp(\\\"2030-01-01T00:00:00Z\\\")\"}",
+    }} });
+    var conditioned = secret.setIamPolicy(conditional) catch |err| return f.report(err);
+    defer conditioned.deinit();
+    try testing.expectEqual(3, conditioned.value.version);
+    try testing.expect(conditioned.value.hasConditions());
+
+    var revoked = secret.removeIamBinding(role, shouting) catch |err| return f.report(err);
+    defer revoked.deinit();
+    try testing.expect(!revoked.value.grants(role, member));
+    // The conditional binding stays.
+    try testing.expect(revoked.value.hasConditions());
+    var gone = secret.removeIamBinding(role, member) catch |err| return f.report(err);
+    defer gone.deinit();
+    try testing.expectEqualStrings(revoked.value.etag.?, gone.value.etag.?);
+
+    // A write under an etag another write has moved on is Aborted.
+    var stale = secret.iamPolicy() catch |err| return f.report(err);
+    defer stale.deinit();
+    var first = secret.setIamPolicy(try secret_manager.iam.withMember(a, stale.value, role, member)) catch |err| return f.report(err);
+    first.deinit();
+    try testing.expectError(error.Aborted, secret.setIamPolicy(try secret_manager.iam.withMember(a, stale.value, "roles/secretmanager.secretVersionManager", member)));
+
+    // A secret that does not exist: none held, not NotFound.
+    var none = f.client.secret(try f.name("missing")).testIamPermissions(&.{"secretmanager.secrets.get"}) catch |err| return f.report(err);
+    defer none.deinit();
+    try testing.expectEqual(0, none.value.len);
+}
+
+test "IAM: a secret's policy granted once in any case, tested, conditional, revoked, and stale" {
+    var f: Fixture = undefined;
+    if (!try f.init(false)) return error.SkipZigTest;
+    defer f.deinit();
+    const secret = f.create("iam", .{}) catch |err| return f.report(err);
+    try iamCycle(&f, secret);
+}
+
+test "regional: IAM on a regional secret, as on a global one" {
+    var f: Fixture = undefined;
+    if (!try f.init(true)) return error.SkipZigTest;
+    defer f.deinit();
+    const secret = f.create("iam-regional", .{}) catch |err| return f.report(err);
+    try iamCycle(&f, secret);
+}
+
 test "sweep: delete anything a crashed run left behind" {
     var f: Fixture = undefined;
     if (!try f.init(false)) return error.SkipZigTest;
