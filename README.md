@@ -72,7 +72,7 @@ that brings its own tokens needs no `auth` at all.
 Zig **0.16.0** (`minimum_zig_version` enforces it).
 
 ```sh
-zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.28.0
+zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.29.0
 ```
 
 ```zig
