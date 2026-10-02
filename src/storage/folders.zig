@@ -28,6 +28,7 @@ const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const logging = @import("logging.zig");
 const names = @import("names.zig");
+const restore_impl = @import("restore.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
 const validate = @import("validate.zig");
@@ -158,6 +159,99 @@ pub fn delete(client: *Client, bucket: []const u8, path: []const u8, preconditio
     try rpc.executeDiscard(client, .{ .method = .DELETE, .path = delete_path });
 }
 
+/// Starts a rename and answers its operation, which for a small tree is
+/// already done in the first response, as measured. Never blindly retried:
+/// a repeat of a rename that landed answers 404 for the gone source, which
+/// nothing can tell from a source that never existed. The caller has begun
+/// the call and checked the bucket name.
+pub fn startRename(
+    client: *Client,
+    bucket: []const u8,
+    source: []const u8,
+    destination: []const u8,
+    if_source_metageneration_match: ?u64,
+) Error!types.Owned(types.OperationInfo) {
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const src = try normalizedChecked(client, scratch.allocator(), source);
+    const dst = try normalizedChecked(client, scratch.allocator(), destination);
+    const path = try names.renameFolderPath(scratch.allocator(), bucket, src, dst, if_source_metageneration_match);
+
+    var result: types.Owned(types.OperationInfo) = try .init(client.gpa);
+    errdefer result.deinit();
+    const response = rpc.execute(client, result.arena, .{ .method = .POST, .path = path, .retry = false }) catch |err| {
+        if (core.isRetryable(err)) {
+            if (client.diagnostics) |d| d.print(
+                "renaming {s} to {s} failed with {t}, and a rename is never sent twice: Bucket.listOperations says whether it started",
+                .{ src, dst, err },
+            );
+        }
+        return err;
+    };
+    result.value = codec.decodeOperation(result.arena.allocator(), response) catch |err|
+        return rpc.decodeFailed(client, err, "rename operation");
+    return result;
+}
+
+/// `startRename`, waited to its end: polls the operation under the
+/// client's backoff until it is done, up to the retry policy's attempts,
+/// and returns the destination folder. A rename cannot be canceled, so an
+/// exhausted wait leaves it running: `error.DeadlineExceeded`, with the
+/// operation's id in the diagnostics for `Bucket.operation` to follow.
+pub fn rename(
+    client: *Client,
+    bucket: []const u8,
+    source: []const u8,
+    destination: []const u8,
+    if_source_metageneration_match: ?u64,
+) Error!types.Owned(types.FolderInfo) {
+    var op = try startRename(client, bucket, source, destination, if_source_metageneration_match);
+    var op_live = true;
+    defer if (op_live) op.deinit();
+    var attempt: u32 = 0;
+    while (true) {
+        if (op.value.done) {
+            if (op.value.failure) |failure| {
+                const err = core.errors.fromRpcCode(failure.code);
+                if (client.diagnostics) |d| d.print("the rename failed after starting: {s}", .{failure.message});
+                return err;
+            }
+            if (op.value.folder) |folder| return copyFolder(client.gpa, folder);
+            // Done without the folder: read it, as it now is.
+            op.deinit();
+            op_live = false;
+            return get(client, bucket, destination);
+        }
+        attempt += 1;
+        if (attempt > client.retry.max_attempts) {
+            if (client.diagnostics) |d| d.print(
+                "the rename is still running as operation {s}, which cannot be canceled: Bucket.operation follows it",
+                .{op.value.id},
+            );
+            return error.DeadlineExceeded;
+        }
+        try client.io.sleep(.fromMilliseconds(rpc.backoffMs(client, attempt)), .awake);
+        const next = try restore_impl.operation(client, bucket, op.value.id);
+        op.deinit();
+        op = next;
+    }
+}
+
+/// `folder`, in memory of its own.
+fn copyFolder(gpa: Allocator, folder: types.FolderInfo) Error!types.Owned(types.FolderInfo) {
+    var result: types.Owned(types.FolderInfo) = try .init(gpa);
+    errdefer result.deinit();
+    const a = result.arena.allocator();
+    result.value = .{
+        .name = try a.dupe(u8, folder.name),
+        .bucket = try a.dupe(u8, folder.bucket),
+        .metageneration = folder.metageneration,
+        .create_time = try a.dupe(u8, folder.create_time),
+        .update_time = try a.dupe(u8, folder.update_time),
+    };
+    return result;
+}
+
 /// One page of the bucket's folders. The caller has begun the call and
 /// checked the bucket name.
 pub fn list(client: *Client, bucket: []const u8, options: types.FolderListOptions) Error!types.Owned(types.FolderPage) {
@@ -222,6 +316,208 @@ const layout_flat =
 const layout_emulator =
     \\{"kind":"storage#storageLayout","bucket":"zigps-layout-probe","location":"US-CENTRAL1","locationType":"region","hierarchicalNamespace":{"enabled":false}}
 ;
+
+// The rename operation, verbatim from production (run 2fcd21d0): pending
+// at the start of a 300-folder tree, done 925 ms later, and done in the
+// very FIRST answer for a small tree (run 8d3fe5fa). The response is the
+// control-plane Folder, not storage#folder.
+const rename_pending_answer =
+    \\{"done":false,"kind":"storage#operation","metadata":{"@type":"type.googleapis.com/google.storage.control.v2.RenameFolderMetadata","commonMetadata":{"createTime":"2026-10-02T19:27:56.736Z","progressPercent":1,"requestedCancellation":false,"type":"rename-folder","updateTime":"2026-10-02T19:27:56.736Z"},"destinationFolderId":"rb/","sourceFolderId":"ra/"},"name":"projects/_/buckets/zigps-h/operations/CiQzMmQ2ZDU2OTQAQ","selfLink":"https://www.googleapis.com/storage/v1/b/zigps-h/operations/CiQzMmQ2ZDU2OTQAQ"}
+;
+const rename_done_answer =
+    \\{"done":true,"kind":"storage#operation","metadata":{"@type":"type.googleapis.com/google.storage.control.v2.RenameFolderMetadata","commonMetadata":{"createTime":"2026-10-02T19:27:56.736Z","endTime":"2026-10-02T19:27:57.326Z","progressPercent":100,"requestedCancellation":false,"type":"rename-folder","updateTime":"2026-10-02T19:27:57.326Z"},"destinationFolderId":"rb/","sourceFolderId":"ra/"},"name":"projects/_/buckets/zigps-h/operations/CiQzMmQ2ZDU2OTQAQ","response":{"@type":"type.googleapis.com/google.storage.control.v2.Folder","createTime":"2026-10-02T19:26:49.637Z","metageneration":"1","name":"projects/_/buckets/zigps-h/folders/rb/","updateTime":"2026-10-02T19:27:57.256Z"},"selfLink":"https://www.googleapis.com/storage/v1/b/zigps-h/operations/CiQzMmQ2ZDU2OTQAQ"}
+;
+
+test "decode: the rename operation pending, done, and what the response folder keeps" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const pending = try codec.decodeOperation(arena, rename_pending_answer);
+    try testing.expectEqual(.rename_folder, pending.kind);
+    try testing.expect(!pending.done);
+    try testing.expectEqualStrings("ra/", pending.source_folder.?);
+    try testing.expectEqualStrings("rb/", pending.destination_folder.?);
+    try testing.expectEqual(1, pending.progress_percent.?);
+    try testing.expectEqual(null, pending.folder);
+    try testing.expectEqual(null, pending.end_time);
+    try testing.expectEqualStrings("CiQzMmQ2ZDU2OTQAQ", pending.id);
+
+    const done = try codec.decodeOperation(arena, rename_done_answer);
+    try testing.expect(done.done);
+    try testing.expectEqual(100, done.progress_percent.?);
+    const folder = done.folder.?;
+    // The control-plane shape, read back into this library's: the folder
+    // keeps its create time and metageneration from before the rename.
+    try testing.expectEqualStrings("rb/", folder.name);
+    try testing.expectEqualStrings("zigps-h", folder.bucket);
+    try testing.expectEqual(1, folder.metageneration);
+    try testing.expectEqualStrings("2026-10-02T19:26:49.637Z", folder.create_time);
+
+    // A kind this library does not know is kept, never an error; a bulk
+    // restore keeps its own.
+    const unknown = try codec.decodeOperation(arena,
+        \\{"done":true,"name":"projects/_/buckets/b/operations/X","metadata":{"@type":"type.googleapis.com/google.storage.control.v2.SomethingNew"}}
+    );
+    try testing.expectEqual(.unknown, unknown.kind);
+    const restore = try codec.decodeOperation(arena,
+        \\{"done":false,"name":"projects/_/buckets/b/operations/Y","metadata":{"@type":"type.googleapis.com/google.storage.control.v2.BulkRestoreObjectsMetadata","succeededCount":"3"}}
+    );
+    try testing.expectEqual(.bulk_restore, restore.kind);
+    try testing.expectEqual(3, restore.succeeded);
+
+    // A folder mid-rename names its operation.
+    const locked = try codec.decodeFolder(arena,
+        \\{"name":"ra/","bucket":"b","metageneration":"1","pendingRenameInfo":{"operationId":"CiQz"}}
+    );
+    try testing.expectEqualStrings("CiQz", locked.pending_rename_operation_id.?);
+}
+
+test "golden: a rename waits its operation out, and a small one is done at once" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = rename_pending_answer } },
+        .{ .respond = .{ .body = rename_pending_answer } },
+        .{ .respond = .{ .body = rename_done_answer } },
+        .{ .respond = .{ .body = rename_done_answer } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer h.deinit();
+    const b = h.client.bucket("zigps-h");
+
+    var renamed = try b.folder("ra/").renameTo("rb", .{ .if_source_metageneration_match = 1 });
+    defer renamed.deinit();
+    try testing.expectEqualStrings("rb/", renamed.value.name);
+    try testing.expectEqual(1, renamed.value.metageneration);
+    try h.expectRequest(0, .POST, "https://storage.googleapis.com/storage/v1/b/zigps-h/folders/ra%2F/renameTo/folders/rb%2F?ifSourceMetagenerationMatch=1", null);
+    try h.expectRequest(1, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-h/operations/CiQzMmQ2ZDU2OTQAQ", null);
+    try h.expectRequest(2, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-h/operations/CiQzMmQ2ZDU2OTQAQ", null);
+
+    // Done in the first answer: no poll at all.
+    var at_once = try b.folder("ra/").renameTo("rb/", .{});
+    defer at_once.deinit();
+    try h.expectRequest(3, .POST, "https://storage.googleapis.com/storage/v1/b/zigps-h/folders/ra%2F/renameTo/folders/rb%2F", null);
+    try h.expectRequestCount(4);
+}
+
+test "a rename that fails after starting, and one that outlives the wait" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"done":true,"kind":"storage#operation","name":"projects/_/buckets/zigps-h/operations/X","metadata":{"@type":"type.googleapis.com/google.storage.control.v2.RenameFolderMetadata"},"error":{"code":9,"message":"The source folder changed underneath the rename."}}
+        } },
+        .{ .respond = .{ .body = rename_pending_answer } },
+        .{ .respond = .{ .body = rename_pending_answer } },
+        .{ .respond = .{ .body = rename_pending_answer } },
+    }, .{ .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer h.deinit();
+    const b = h.client.bucket("zigps-h");
+
+    try testing.expectError(error.FailedPrecondition, b.folder("ra/").renameTo("rb/", .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "The source folder changed") != null);
+
+    // Never done within the attempts: the wait ends, the rename does not.
+    try testing.expectError(error.DeadlineExceeded, b.folder("ra/").renameTo("rb/", .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "CiQzMmQ2ZDU2OTQAQ") != null);
+    try h.expectRequestCount(4);
+}
+
+test "a rename start that fails transiently is never sent twice, and says so" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .fail = error.ConnectionResetByPeer },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer h.deinit();
+    try testing.expectError(error.ConnectionResetByPeer, h.client.bucket("zigps-h").folder("ra/").renameTo("rb/", .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "never sent twice") != null);
+    try h.expectRequestCount(1);
+}
+
+test "a rename done without its folder reads the destination back" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"done":true,"kind":"storage#operation","name":"projects/_/buckets/zigps-h/operations/X","metadata":{"@type":"type.googleapis.com/google.storage.control.v2.RenameFolderMetadata","sourceFolderId":"a/b/","destinationFolderId":"rb/"}}
+        } },
+        .{ .respond = .{ .body = folder_answer } },
+    }, .{});
+    defer h.deinit();
+    var renamed = try h.client.bucket("zigps-h").folder("a/b/").renameTo("rb/", .{});
+    defer renamed.deinit();
+    try testing.expectEqualStrings("a/b/", renamed.value.name);
+    try h.expectRequest(1, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-h/folders/rb%2F", null);
+    try h.expectRequestCount(2);
+}
+
+test "golden: the rename refusals production answered" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 404, .body = missing_body } },
+        .{ .respond = .{ .status = 409, .body = exists_body } },
+        .{ .respond = .{ .status = 412, .body =
+        \\{"error":{"code":412,"errors":[{"domain":"global","location":"If-Match","locationType":"header","message":"At least one of the pre-conditions you specified did not hold.","reason":"conditionNotMet"}],"message":"At least one of the pre-conditions you specified did not hold."}}
+        } },
+    }, .{ .retry = .{ .max_attempts = 1 } });
+    defer h.deinit();
+    const b = h.client.bucket("zigps-h");
+    try testing.expectError(error.NotFound, b.folder("missing/").renameTo("elsewhere/", .{}));
+    try testing.expectError(error.AlreadyExists, b.folder("ra/").renameTo("exists/", .{}));
+    try testing.expectError(error.FailedPrecondition, b.folder("ra/").renameTo("rb/", .{ .if_source_metageneration_match = 999 }));
+    try testing.expectError(error.InvalidFolderName, b.folder("ra/").renameTo("../", .{}));
+}
+
+test "against production's rules: a rename moves the tree, blocks writes while it runs, and its operation is followed" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.fake.rename_pending = 2;
+    const b = f.client.bucket("zigps-h");
+    var made = try b.folder("ra/c0/").create(.{ .recursive = true });
+    made.deinit();
+    var up = try b.object("ra/c0/one.txt").upload("x", .{});
+    defer up.deinit();
+
+    // The waiting rename polls it to done; the tree and its object moved,
+    // and the folder kept its state.
+    var renamed = try b.folder("ra/").renameTo("rb/", .{ .if_source_metageneration_match = 1 });
+    defer renamed.deinit();
+    try testing.expectEqualStrings("rb/", renamed.value.name);
+    try testing.expectError(error.NotFound, b.folder("ra/").get());
+    var child = try b.folder("rb/c0/").get();
+    defer child.deinit();
+    var moved = try b.object("rb/c0/one.txt").get(.{});
+    defer moved.deinit();
+
+    // A write under a renaming tree answers 429 until the rename ends,
+    // and this library's own retries wait it out.
+    f.fake.rename_pending = 2;
+    var started = try b.folder("rb/").startRenameTo("rc/", .{});
+    defer started.deinit();
+    try testing.expect(!started.value.done);
+    var blocked = try b.object("rb/c0/two.txt").upload("y", .{});
+    defer blocked.deinit();
+    try testing.expectEqual(1, f.fake.counts.folder_renames - 1);
+
+    // The operation reads done now, listed with the first one; a cancel is
+    // taken and changes nothing.
+    var op = try b.operation(started.value.id);
+    defer op.deinit();
+    try testing.expect(op.value.done);
+    try testing.expectEqual(.rename_folder, op.value.kind);
+    try testing.expectEqualStrings("rc/", op.value.folder.?.name);
+    var page = try b.listOperations(.{});
+    defer page.deinit();
+    try testing.expectEqual(2, page.value.operations.len);
+    try b.cancelOperation(started.value.id);
+    try testing.expectError(error.NotFound, b.operation("CiRtaXNzaW5n"));
+
+    // The sync refusals: a taken destination, a missing source, a stale
+    // source metageneration.
+    var taken = try b.folder("blocker/").create(.{});
+    taken.deinit();
+    try testing.expectError(error.AlreadyExists, b.folder("rc/").renameTo("blocker/", .{}));
+    try testing.expectError(error.NotFound, b.folder("gone/").renameTo("anywhere/", .{}));
+    try testing.expectError(error.FailedPrecondition, b.folder("rc/").renameTo("rd/", .{ .if_source_metageneration_match = 999 }));
+}
 
 fn conflict(comptime message: []const u8) []const u8 {
     return "{\"error\":{\"code\":409,\"errors\":[{\"domain\":\"global\",\"message\":\"" ++ message ++
@@ -692,8 +988,13 @@ fn pathsProperty(_: void, bytes: []const u8) !void {
         var page = try b.listFolders(.{ .prefix = made.value.name });
         defer page.deinit();
         try testing.expectEqualStrings(made.value.name, page.value.folders[0].name);
-        try b.folder(path).delete(.{});
-        try testing.expectError(error.NotFound, b.folder(path).get());
+        // A rename to a fresh top-level name moves it, whatever it was.
+        var renamed = try b.folder(path).renameTo("renamed-leg", .{});
+        defer renamed.deinit();
+        try testing.expectEqualStrings("renamed-leg/", renamed.value.name);
+        try testing.expectError(error.NotFound, b.folder(made.value.name).get());
+        try b.folder("renamed-leg/").delete(.{});
+        try testing.expectError(error.NotFound, b.folder("renamed-leg/").get());
     } else |err| {
         // Refused: only for the reason the checks give, before sending.
         try testing.expectEqual(error.InvalidFolderName, err);
@@ -718,6 +1019,8 @@ fn everyCall(gpa: Allocator) !void {
         .{ .respond = .{ .body = folder_page } },
         .{ .respond = .{ .status = 204, .body = "" } },
         .{ .respond = .{ .body = layout_hns } },
+        .{ .respond = .{ .body = rename_pending_answer } },
+        .{ .respond = .{ .body = rename_done_answer } },
     });
     defer fake.deinit();
     var clock: test_util.FakeClock = .{};
@@ -740,6 +1043,8 @@ fn everyCall(gpa: Allocator) !void {
     try b.folder("a/b/").delete(.{});
     var l = try b.storageLayout();
     l.deinit();
+    var renamed = try b.folder("ra/").renameTo("rb/", .{ .if_source_metageneration_match = 1 });
+    renamed.deinit();
 }
 
 test "folders: every allocation failure is OutOfMemory, and nothing leaks" {

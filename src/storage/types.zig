@@ -820,36 +820,48 @@ pub const BulkRestoreOptions = struct {
     copy_source_acl: bool = false,
 };
 
-/// A long-running operation, as a bulk restore starts one.
-pub const Operation = struct {
+/// What a long-running operation is doing: read from its metadata's type,
+/// so one this library does not know is `.unknown`, never an error.
+pub const OperationKind = enum { bulk_restore, rename_folder, unknown };
+
+/// A long-running operation, as a bulk restore or a folder rename starts
+/// one.
+pub const OperationInfo = struct {
     /// What `Bucket.operation` and `Bucket.cancelOperation` take.
     id: []const u8,
     done: bool,
+    kind: OperationKind = .unknown,
     /// Set when it ended without finishing: code 1 when it was cancelled.
     failure: ?Failure = null,
     /// Null while Cloud Storage cannot say, which it could not for any bulk
-    /// restore measured.
+    /// restore measured; a rename answered 1, then 100.
     progress_percent: ?u8 = null,
     requested_cancellation: bool = false,
-    /// Objects restored, skipped (a live one of the name, without
-    /// `allow_overwrite`), and failed.
+    /// A bulk restore's objects restored, skipped (a live one of the name,
+    /// without `allow_overwrite`), and failed.
     succeeded: u64 = 0,
     skipped: u64 = 0,
     failed: u64 = 0,
+    /// A rename's two paths, as its metadata names them.
+    source_folder: ?[]const u8 = null,
+    destination_folder: ?[]const u8 = null,
+    /// A finished rename's destination folder, which keeps its create time
+    /// and metageneration from before the rename, as measured.
+    folder: ?FolderInfo = null,
     /// RFC 3339.
     create_time: ?[]const u8 = null,
     update_time: ?[]const u8 = null,
     end_time: ?[]const u8 = null,
 
     pub const Failure = struct {
-        /// A `google.rpc.Code`.
+        /// A `google.rpc.Code`; `core.errors.fromRpcCode` maps it.
         code: i32,
         message: []const u8,
     };
 };
 
 pub const OperationPage = struct {
-    operations: []const Operation,
+    operations: []const OperationInfo,
     /// Pass as `page_token` to get the next page. Null on the last page.
     next_page_token: ?[]const u8,
 };
@@ -913,9 +925,12 @@ pub const FolderInfo = struct {
     metageneration: u64,
     /// RFC 3339, as sent by the server: `createTime`, not the
     /// `timeCreated` objects carry. An implicit folder's is its first
-    /// object's write.
+    /// object's write; a renamed folder keeps its own.
     create_time: []const u8 = "",
     update_time: []const u8 = "",
+    /// The rename this folder is part of, while one is running: every
+    /// write under it answers a retryable 429 until the operation ends.
+    pending_rename_operation_id: ?[]const u8 = null,
 };
 
 pub const FolderPage = struct {

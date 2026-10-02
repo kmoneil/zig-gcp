@@ -324,6 +324,7 @@ const WireFolder = struct {
     /// measured on 2026-10-02.
     createTime: ?[]const u8 = null,
     updateTime: ?[]const u8 = null,
+    pendingRenameInfo: ?struct { operationId: ?[]const u8 = null } = null,
 };
 
 fn folderFromWire(wire: WireFolder) DecodeError!types.FolderInfo {
@@ -333,6 +334,7 @@ fn folderFromWire(wire: WireFolder) DecodeError!types.FolderInfo {
         .metageneration = try u64FromValue(wire.metageneration),
         .create_time = wire.createTime orelse "",
         .update_time = wire.updateTime orelse "",
+        .pending_rename_operation_id = if (wire.pendingRenameInfo) |p| nonEmpty(p.operationId) else null,
     };
 }
 
@@ -497,7 +499,7 @@ fn retentionPolicyFromWire(wire: ?WireRetentionPolicy) DecodeError!?types.Retent
 }
 
 /// One long-running operation, as a bulk restore starts one.
-pub fn decodeOperation(arena: Allocator, body: []const u8) DecodeError!types.Operation {
+pub fn decodeOperation(arena: Allocator, body: []const u8) DecodeError!types.OperationInfo {
     return operationFromWire(try parseWire(WireOperation, arena, body));
 }
 
@@ -508,7 +510,7 @@ pub fn decodeOperationPage(arena: Allocator, body: []const u8) DecodeError!types
         nextPageToken: ?[]const u8 = null,
     }, arena, body);
     const listed = wire.operations orelse &.{};
-    const operations = try arena.alloc(types.Operation, listed.len);
+    const operations = try arena.alloc(types.OperationInfo, listed.len);
     for (listed, operations) |w, *op| op.* = try operationFromWire(w);
     return .{ .operations = operations, .next_page_token = nonEmpty(wire.nextPageToken) };
 }
@@ -619,14 +621,31 @@ const WireOperation = struct {
     done: ?bool = null,
     @"error": ?struct { code: ?i64 = null, message: ?[]const u8 = null } = null,
     metadata: ?WireOperationMetadata = null,
+    response: ?WireOperationResponse = null,
 };
 
-/// A bulk restore's `BulkRestoreObjectsMetadata`.
+/// A bulk restore's `BulkRestoreObjectsMetadata` and a rename's
+/// `RenameFolderMetadata`, one struct: the fields the `@type` does not
+/// bring stay absent.
 const WireOperationMetadata = struct {
+    @"@type": ?[]const u8 = null,
     commonMetadata: ?WireCommonMetadata = null,
     succeededCount: ?std.json.Value = null,
     skippedCount: ?std.json.Value = null,
     failedCount: ?std.json.Value = null,
+    sourceFolderId: ?[]const u8 = null,
+    destinationFolderId: ?[]const u8 = null,
+};
+
+/// A finished rename's `response` is the CONTROL-PLANE folder, not
+/// `storage#folder`: a long `name` and no bucket or id fields, as measured
+/// on 2026-10-02.
+const WireOperationResponse = struct {
+    @"@type": ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    metageneration: ?std.json.Value = null,
+    createTime: ?[]const u8 = null,
+    updateTime: ?[]const u8 = null,
 };
 
 const WireCommonMetadata = struct {
@@ -640,7 +659,7 @@ const WireCommonMetadata = struct {
 
 /// An operation that names no id cannot be followed, so it is
 /// `InvalidResponse`.
-fn operationFromWire(wire: WireOperation) DecodeError!types.Operation {
+fn operationFromWire(wire: WireOperation) DecodeError!types.OperationInfo {
     const name = wire.name orelse return error.InvalidResponse;
     const slash = std.mem.lastIndexOfScalar(u8, name, '/') orelse return error.InvalidResponse;
     const id = name[slash + 1 ..];
@@ -648,9 +667,17 @@ fn operationFromWire(wire: WireOperation) DecodeError!types.Operation {
     const metadata: WireOperationMetadata = wire.metadata orelse .{};
     const common: WireCommonMetadata = metadata.commonMetadata orelse .{};
     const progress = common.progressPercent orelse -1;
+    const type_name = metadata.@"@type" orelse "";
+    const kind: types.OperationKind = if (std.mem.endsWith(u8, type_name, "BulkRestoreObjectsMetadata"))
+        .bulk_restore
+    else if (std.mem.endsWith(u8, type_name, "RenameFolderMetadata"))
+        .rename_folder
+    else
+        .unknown;
     return .{
         .id = id,
         .done = wire.done orelse false,
+        .kind = kind,
         .failure = if (wire.@"error") |e| .{
             .code = std.math.cast(i32, e.code orelse 0) orelse return error.InvalidResponse,
             .message = e.message orelse "",
@@ -660,9 +687,32 @@ fn operationFromWire(wire: WireOperation) DecodeError!types.Operation {
         .succeeded = try u64FromValue(metadata.succeededCount),
         .skipped = try u64FromValue(metadata.skippedCount),
         .failed = try u64FromValue(metadata.failedCount),
+        .source_folder = nonEmpty(metadata.sourceFolderId),
+        .destination_folder = nonEmpty(metadata.destinationFolderId),
+        .folder = try folderFromResponse(wire.response),
         .create_time = nonEmpty(common.createTime),
         .update_time = nonEmpty(common.updateTime),
         .end_time = nonEmpty(common.endTime),
+    };
+}
+
+/// The control-plane folder a finished rename answers with, read back into
+/// the `storage#folder` shape: the path after `/folders/` and the bucket
+/// after `/buckets/`, from its one long name.
+fn folderFromResponse(wire: ?WireOperationResponse) DecodeError!?types.FolderInfo {
+    const response = wire orelse return null;
+    if (!std.mem.endsWith(u8, response.@"@type" orelse "", ".Folder")) return null;
+    const name = response.name orelse return error.InvalidResponse;
+    const folders_at = std.mem.indexOf(u8, name, "/folders/") orelse return error.InvalidResponse;
+    const buckets_at = std.mem.indexOf(u8, name, "/buckets/") orelse return error.InvalidResponse;
+    const path = name[folders_at + "/folders/".len ..];
+    if (path.len == 0) return error.InvalidResponse;
+    return .{
+        .name = path,
+        .bucket = name[buckets_at + "/buckets/".len .. folders_at],
+        .metageneration = try u64FromValue(response.metageneration),
+        .create_time = response.createTime orelse "",
+        .update_time = response.updateTime orelse "",
     };
 }
 

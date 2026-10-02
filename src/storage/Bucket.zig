@@ -197,24 +197,24 @@ fn restoreBilled(self: Bucket, generation: u64) Error!types.Owned(types.BucketIn
 /// lost is not started twice. Needs `storage.buckets.restore` besides the
 /// object permissions. Time bounds that are not RFC 3339 are refused
 /// before sending, with `error.InvalidArgument`.
-pub fn bulkRestore(self: Bucket, options: types.BulkRestoreOptions) Error!types.Owned(types.Operation) {
+pub fn bulkRestore(self: Bucket, options: types.BulkRestoreOptions) Error!types.Owned(types.OperationInfo) {
     var client: Client = undefined;
     return (try self.billing(&client)).bulkRestoreBilled(options);
 }
 
-fn bulkRestoreBilled(self: Bucket, options: types.BulkRestoreOptions) Error!types.Owned(types.Operation) {
+fn bulkRestoreBilled(self: Bucket, options: types.BulkRestoreOptions) Error!types.Owned(types.OperationInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return restore_impl.bulkRestore(self.client, self.name, options);
 }
 
 /// One of the bucket's long-running operations, by `Operation.id`.
-pub fn operation(self: Bucket, id: []const u8) Error!types.Owned(types.Operation) {
+pub fn operation(self: Bucket, id: []const u8) Error!types.Owned(types.OperationInfo) {
     var client: Client = undefined;
     return (try self.billing(&client)).operationBilled(id);
 }
 
-fn operationBilled(self: Bucket, id: []const u8) Error!types.Owned(types.Operation) {
+fn operationBilled(self: Bucket, id: []const u8) Error!types.Owned(types.OperationInfo) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return restore_impl.operation(self.client, self.name, id);

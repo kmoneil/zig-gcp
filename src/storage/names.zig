@@ -178,6 +178,41 @@ fn writeFolders(w: *Writer, bucket: []const u8, request: FolderRequest) Writer.E
     }
 }
 
+/// `/storage/v1/b/{bucket}/folders/{source}/renameTo/folders/{destination}`:
+/// an atomic rename of the folder and everything under it. The condition is
+/// `ifSourceMetagenerationMatch`, the one production honors: the reference
+/// page's `ifMetagenerationMatch` is silently ignored and must never be
+/// sent, as measured on 2026-10-02.
+pub fn renameFolderPath(
+    arena: Allocator,
+    bucket: []const u8,
+    source: []const u8,
+    destination: []const u8,
+    if_source_metageneration_match: ?u64,
+) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeRenameFolder(&out.writer, bucket, source, destination, if_source_metageneration_match) catch
+        return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeRenameFolder(
+    w: *Writer,
+    bucket: []const u8,
+    source: []const u8,
+    destination: []const u8,
+    if_source_metageneration_match: ?u64,
+) Writer.Error!void {
+    try w.writeAll("/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/folders/");
+    try query.writeStrictSegment(w, source);
+    try w.writeAll("/renameTo/folders/");
+    try query.writeStrictSegment(w, destination);
+    var params: query.Params = .init(w);
+    if (if_source_metageneration_match) |m| try params.addInt("ifSourceMetagenerationMatch", m);
+}
+
 /// `/storage/v1/b/{bucket}/storageLayout`.
 pub fn storageLayoutPath(arena: Allocator, bucket: []const u8) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
@@ -667,6 +702,14 @@ test "folder and layout paths encode the folder as one segment" {
         } }),
     );
     try expectPath("/storage/v1/b/my-bucket/storageLayout", try storageLayoutPath(gpa, "my-bucket"));
+    try expectPath(
+        "/storage/v1/b/b/folders/ra%2F/renameTo/folders/rb%2F",
+        try renameFolderPath(gpa, "b", "ra/", "rb/", null),
+    );
+    try expectPath(
+        "/storage/v1/b/b%25c/folders/a%2Fb%2F/renameTo/folders/c%20d%2F?ifSourceMetagenerationMatch=7",
+        try renameFolderPath(gpa, "b%c", "a/b/", "c d/", 7),
+    );
 }
 
 test "object listing paths" {
