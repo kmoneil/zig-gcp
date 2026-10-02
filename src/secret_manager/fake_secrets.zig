@@ -38,9 +38,28 @@
 //!   one it is `DESTROYED` at once. Access to a version that is not
 //!   enabled is "... is in DISABLED state." (or DESTROYED).
 //!
-//! Not modelled yet: topics, rotation and customer-managed keys (501),
-//! list filters and paging, expiry actually deleting a secret, a
-//! scheduled destruction coming due.
+//! - Topics (2026-10-02): at most 10 ("No more than 10 topics can be
+//!   configured on a secret."), distinct ("Topics must have distinct
+//!   names."), each `projects/P/topics/T` or "Failed to Publish to topic
+//!   [NAME], got an error from Pub/Sub."; then each is published to, as
+//!   production does before judging anything else, so a topic `setTopic`
+//!   names missing is 404 "Topic [NAME] not found." and one it names
+//!   unpublishable the 400 `FAILED_PRECONDITION` naming
+//!   `pubsub.topics.publish`. Checked on create and on a patch whose mask
+//!   names `topics`, never otherwise. A list sent as one object is a list
+//!   of one.
+//! - Rotation: needs topics ("There must be at least one topic configured
+//!   when a Rotation policy is set."), a time 5 minutes to 876,000 hours
+//!   ahead, a period of at least an hour, and a time whenever there is a
+//!   period (a 400 `FAILED_PRECONDITION`, the one refusal of its kind);
+//!   masks `rotation`, `rotation.next_rotation_time` and
+//!   `rotation.rotation_period`. `fireRotation` does what production did
+//!   when one came due: advance the time by the period, or, without one,
+//!   remove the rotation; and move the etag.
+//!
+//! Not modelled yet: customer-managed keys (501), list filters and paging,
+//! expiry actually deleting a secret, a scheduled destruction coming due,
+//! publishing events.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -61,6 +80,10 @@ pub const FakeSecrets = struct {
     project_number: []const u8 = "82150720798",
     /// Requests served, by every route.
     requests: u32 = 0,
+    /// Topics Secret Manager could not publish to; any other is fine.
+    topic_states: std.StringHashMapUnmanaged(TopicState) = .empty,
+
+    pub const TopicState = enum { missing, unpublishable };
 
     pub const Reply = struct { status: u16, body: []const u8 };
 
@@ -78,6 +101,9 @@ pub const FakeSecrets = struct {
         aliases: Aliases = .empty,
         expire_s: ?i64 = null,
         delay_s: ?u64 = null,
+        topics: []const []const u8 = &.{},
+        rotation_next_s: ?i64 = null,
+        rotation_period_s: ?u64 = null,
         versions: std.ArrayListUnmanaged(StoredVersion) = .empty,
     };
 
@@ -109,6 +135,28 @@ pub const FakeSecrets = struct {
         const self: *FakeSecrets = @ptrCast(@alignCast(ptr));
         const reply = self.serve(req.method, req.url, req.body orelse "", arena) catch return error.OutOfMemory;
         return .{ .status = reply.status, .body = reply.body };
+    }
+
+    /// Makes `topic` (`projects/P/topics/T`) one Secret Manager cannot
+    /// publish to.
+    pub fn setTopic(self: *FakeSecrets, topic: []const u8, state: TopicState) Allocator.Error!void {
+        const a = self.store.allocator();
+        try self.topic_states.put(a, try a.dupe(u8, topic), state);
+    }
+
+    /// What production did when a rotation came due: the next time moves on
+    /// by the period, or a rotation without one is removed; the etag moves.
+    pub fn fireRotation(self: *FakeSecrets, location: ?[]const u8, id: []const u8) void {
+        var buf: [320]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}|{s}", .{ location orelse "", id }) catch return;
+        const s = self.secrets.get(key) orelse return;
+        const next = s.rotation_next_s orelse return;
+        if (s.rotation_period_s) |p| {
+            s.rotation_next_s = next + @as(i64, @intCast(p));
+        } else {
+            s.rotation_next_s = null;
+        }
+        s.etag = self.etag();
     }
 
     /// A secret as stored, for tests to inspect; null when there is none.
@@ -166,6 +214,16 @@ pub const FakeSecrets = struct {
             return fail(arena, 400, "INVALID_ARGUMENT", "Secret.replication must be provided.");
         }
         if (fields.unsupported) |what| return unsupported(arena, what);
+        if (fields.topics) |v| {
+            draft.topics = switch (try self.readTopics(arena, v)) {
+                .ok => |t| t,
+                .refused => |r| return r,
+            };
+            draft.rotation_changed = true;
+        }
+        if (fields.rotation) |v| {
+            if (try readRotation(arena, v, &draft, true, true)) |refused| return refused;
+        }
         if (fields.labels) |v| draft.labels = switch (try readMap(arena, v, "labels")) {
             .ok => |m| m,
             .refused => |r| return r,
@@ -181,7 +239,7 @@ pub const FakeSecrets = struct {
             .ok => |d| d,
             .refused => |r| return r,
         };
-        if (try checkDraft(arena, draft, 0)) |refused| return refused;
+        if (try self.checkDraft(arena, draft, 0)) |refused| return refused;
 
         const a = self.store.allocator();
         const stored = try a.create(Stored);
@@ -210,7 +268,18 @@ pub const FakeSecrets = struct {
             .aliases = s.aliases,
             .expire_s = s.expire_s,
             .delay_s = s.delay_s,
+            .topics = s.topics,
+            .rotation_next_s = s.rotation_next_s,
+            .rotation_period_s = s.rotation_period_s,
         };
+        // Production publishes to every topic a patch names before it
+        // judges anything else.
+        if (std.mem.indexOf(u8, mask, "topics") != null) {
+            draft.topics = if (fields.topics) |v| switch (try self.readTopics(arena, v)) {
+                .ok => |t| t,
+                .refused => |r| return r,
+            } else &.{};
+        }
         var paths = std.mem.splitScalar(u8, mask, ',');
         while (paths.next()) |raw| {
             if (raw.len == 0 and mask.len == 0) break;
@@ -250,9 +319,20 @@ pub const FakeSecrets = struct {
                     .ok => |d| d,
                     .refused => |r| return r,
                 } else null,
+                .topics => draft.rotation_changed = true,
+                .rotation, .rotation_next, .rotation_period => {
+                    const whole = path == .rotation;
+                    if (fields.rotation) |v| {
+                        if (try readRotation(arena, v, &draft, whole or path == .rotation_next, whole or path == .rotation_period)) |refused| return refused;
+                    } else {
+                        if (whole or path == .rotation_next) draft.rotation_next_s = null;
+                        if (whole or path == .rotation_period) draft.rotation_period_s = null;
+                        draft.rotation_changed = true;
+                    }
+                },
             }
         }
-        if (try checkDraft(arena, draft, s.versions.items.len)) |refused| return refused;
+        if (try self.checkDraft(arena, draft, s.versions.items.len)) |refused| return refused;
         try self.commit(s, draft);
         s.etag = self.etag();
         return .{ .status = 200, .body = try self.secretJson(arena, s) };
@@ -395,6 +475,14 @@ pub const FakeSecrets = struct {
         aliases: Aliases = .empty,
         expire_s: ?i64 = null,
         delay_s: ?u64 = null,
+        topics: []const []const u8 = &.{},
+        rotation_next_s: ?i64 = null,
+        rotation_period_s: ?u64 = null,
+        /// Whether this request set the rotation's time, so its bounds are
+        /// judged, or anything a rotation depends on.
+        rotation_changed: bool = false,
+        next_sent: bool = false,
+        period_sent: ?u64 = null,
     };
 
     fn commit(self: *FakeSecrets, s: *Stored, draft: Draft) Allocator.Error!void {
@@ -405,11 +493,28 @@ pub const FakeSecrets = struct {
         for (draft.aliases.keys(), draft.aliases.values()) |k, v| try s.aliases.put(a, try a.dupe(u8, k), v);
         s.expire_s = draft.expire_s;
         s.delay_s = draft.delay_s;
+        const topics = try a.alloc([]const u8, draft.topics.len);
+        for (draft.topics, topics) |t, *copy| copy.* = try a.dupe(u8, t);
+        s.topics = topics;
+        s.rotation_next_s = draft.rotation_next_s;
+        s.rotation_period_s = draft.rotation_period_s;
     }
 
     /// The rules production holds a secret's settings to, judged on the
     /// whole result, as production judges them.
-    fn checkDraft(arena: Allocator, draft: Draft, versions: usize) Allocator.Error!?Reply {
+    fn checkDraft(self: *FakeSecrets, arena: Allocator, draft: Draft, versions: usize) Allocator.Error!?Reply {
+        if (draft.rotation_next_s != null or draft.rotation_period_s != null) {
+            if (draft.topics.len == 0) return try fail(arena, 400, "INVALID_ARGUMENT", "There must be at least one topic configured when a Rotation policy is set.");
+            if (draft.rotation_next_s == null) return try fail(arena, 400, "FAILED_PRECONDITION", "Next rotation time must be set while the rotation period is set.");
+        }
+        if (draft.next_sent) {
+            const next = draft.rotation_next_s.?;
+            if (next < self.now_s + 300) return try fail(arena, 400, "INVALID_ARGUMENT", "Next rotation time must be at least [5m] in the future.");
+            if (next > self.now_s + 876_000 * 3600) return try fail(arena, 400, "INVALID_ARGUMENT", "Next rotation time cannot be more than [876000h] from now.");
+        }
+        if (draft.period_sent) |p| {
+            if (p < 3600) return try fail(arena, 400, "INVALID_ARGUMENT", "Rotation period cannot be shorter than [1h].");
+        }
         if (draft.labels.count() > 64) return try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
             arena,
             "Invalid field \"labels\"; at most 64 entries allowed but found {d}",
@@ -513,6 +618,28 @@ pub const FakeSecrets = struct {
             try jw.objectField("versionDestroyTtl");
             try jw.print("\"{d}s\"", .{d});
         }
+        if (s.topics.len > 0) {
+            try jw.objectField("topics");
+            try jw.beginArray();
+            for (s.topics) |t| {
+                try jw.beginObject();
+                try jw.objectField("name");
+                try jw.write(t);
+                try jw.endObject();
+            }
+            try jw.endArray();
+        }
+        if (s.rotation_next_s) |next| {
+            try jw.objectField("rotation");
+            try jw.beginObject();
+            try jw.objectField("nextRotationTime");
+            try writeTime(&jw, next);
+            if (s.rotation_period_s) |p| {
+                try jw.objectField("rotationPeriod");
+                try jw.print("\"{d}s\"", .{p});
+            }
+            try jw.endObject();
+        }
         try jw.objectField("etag");
         try jw.print("\"\\\"{x}\\\"\"", .{s.etag});
         try jw.endObject();
@@ -559,6 +686,44 @@ pub const FakeSecrets = struct {
     }
 
     // Helpers
+
+    /// Topics from a body, checked as production checks them, publishing
+    /// included.
+    fn readTopics(self: *FakeSecrets, arena: Allocator, value: std.json.Value) Allocator.Error!TopicsResult {
+        const items: []const std.json.Value = switch (value) {
+            .array => |list| list.items,
+            .object => &.{value},
+            else => return .{ .refused = try invalidArgument(arena) },
+        };
+        if (items.len > 10) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "No more than 10 topics can be configured on a secret.") };
+        const out = try arena.alloc([]const u8, items.len);
+        for (items, out, 0..) |item, *name, i| {
+            if (item != .object) return .{ .refused = try invalidArgument(arena) };
+            const n = item.object.get("name") orelse return .{ .refused = try invalidArgument(arena) };
+            if (n != .string) return .{ .refused = try invalidArgument(arena) };
+            name.* = n.string;
+            for (out[0..i]) |earlier| if (std.mem.eql(u8, earlier, n.string)) {
+                return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Topics must have distinct names.") };
+            };
+        }
+        for (out) |name| {
+            if (!fullTopicName(name)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
+                arena,
+                "Failed to Publish to topic [{s}], got an error from Pub/Sub.",
+                .{name},
+            )) };
+            const state = self.topic_states.get(name) orelse continue;
+            return .{ .refused = switch (state) {
+                .missing => try fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "Topic [{s}] not found.", .{name})),
+                .unpublishable => try fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(
+                    arena,
+                    "Permission 'pubsub.topics.publish' denied for service-{s}@gcp-sa-secretmanager.iam.gserviceaccount.com for pubsub topic: {s} or the topic doesn't exist. Grant the 'pubsub.topic.publish' permission (or 'roles/pubsub.publisher') on this topic to service-{s}@gcp-sa-secretmanager.iam.gserviceaccount.com.",
+                    .{ self.project_number, name, self.project_number },
+                )),
+            } };
+        }
+        return .{ .ok = out };
+    }
 
     fn etag(self: *FakeSecrets) u64 {
         self.next_etag += 1 + (self.next_etag % 7);
@@ -660,6 +825,8 @@ const Fields = struct {
     delay: ?[]const u8 = null,
     etag: ?[]const u8 = null,
     replication: ?std.json.Value = null,
+    topics: ?std.json.Value = null,
+    rotation: ?std.json.Value = null,
     unsupported: ?[]const u8 = null,
     expire_s: ?i64 = null,
 };
@@ -696,7 +863,11 @@ fn parseBody(arena: Allocator, body: []const u8) Allocator.Error!Parsed {
             f.etag = v.string;
         } else if (eqlAny(k, &.{"replication"})) {
             f.replication = v;
-        } else if (eqlAny(k, &.{ "topics", "rotation", "customerManagedEncryption", "customer_managed_encryption" })) {
+        } else if (eqlAny(k, &.{"topics"})) {
+            f.topics = v;
+        } else if (eqlAny(k, &.{"rotation"})) {
+            f.rotation = v;
+        } else if (eqlAny(k, &.{ "customerManagedEncryption", "customer_managed_encryption" })) {
             f.unsupported = k;
         } else if (eqlAny(k, &.{ "name", "createTime", "create_time", "tags", "secretType", "secret_type", "policyMember", "policy_member" })) {
             // Ignored on patch, or immutable: the mask decides.
@@ -719,6 +890,10 @@ const Path = union(enum) {
     ttl,
     delay,
     replication,
+    topics,
+    rotation,
+    rotation_next,
+    rotation_period,
     ignored,
     immutable: []const u8,
     unsupported: []const u8,
@@ -737,7 +912,41 @@ fn canonicalPath(raw: []const u8) ?Path {
     if (eqlAny(raw, &.{ "name", "create_time", "createTime", "tags", "etag" })) return .ignored;
     if (eqlAny(raw, &.{ "secret_type", "secretType" })) return .{ .immutable = "secret_type" };
     if (eqlAny(raw, &.{ "policy_member", "policyMember" })) return .{ .immutable = "policy_member" };
-    if (eqlAny(raw, &.{ "topics", "rotation", "customer_managed_encryption", "customerManagedEncryption" })) return .{ .unsupported = raw };
+    if (eqlAny(raw, &.{"topics"})) return .topics;
+    if (eqlAny(raw, &.{"rotation"})) return .rotation;
+    if (eqlAny(raw, &.{ "rotation.next_rotation_time", "rotation.nextRotationTime" })) return .rotation_next;
+    if (eqlAny(raw, &.{ "rotation.rotation_period", "rotation.rotationPeriod" })) return .rotation_period;
+    if (eqlAny(raw, &.{ "customer_managed_encryption", "customerManagedEncryption" })) return .{ .unsupported = raw };
+    return null;
+}
+
+const TopicsResult = union(enum) { ok: []const []const u8, refused: FakeSecrets.Reply };
+
+/// Rotation fields from a body, into `draft`: the time and the period
+/// where `take_next` and `take_period` say the mask names them.
+fn readRotation(arena: Allocator, value: std.json.Value, draft: *FakeSecrets.Draft, take_next: bool, take_period: bool) Allocator.Error!?FakeSecrets.Reply {
+    if (value != .object) return try invalidArgument(arena);
+    draft.rotation_changed = true;
+    if (take_next) {
+        draft.rotation_next_s = null;
+        if (value.object.get("nextRotationTime") orelse value.object.get("next_rotation_time")) |t| {
+            if (t != .string) return try invalidArgument(arena);
+            const ts = core.timestamp.parse(t.string) catch return try invalidArgument(arena);
+            draft.rotation_next_s = @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s));
+            draft.next_sent = true;
+        }
+    }
+    if (take_period) {
+        draft.rotation_period_s = null;
+        if (value.object.get("rotationPeriod") orelse value.object.get("rotation_period")) |p| {
+            if (p != .string) return try invalidArgument(arena);
+            const d = core.duration.parse(p.string) catch return try invalidArgument(arena);
+            if (d.nanoseconds < 0) return try invalidArgument(arena);
+            const secs: u64 = @intCast(@divFloor(d.nanoseconds, std.time.ns_per_s));
+            draft.rotation_period_s = secs;
+            draft.period_sent = secs;
+        }
+    }
     return null;
 }
 
@@ -805,6 +1014,15 @@ fn labelProblem(text: []const u8, key: bool) ?[]const u8 {
             "does not conform to regular expression \"[\\p{Ll}\\p{Lo}\\p{N}_-]{0,63}\"";
     }
     return null;
+}
+
+fn fullTopicName(name: []const u8) bool {
+    var parts = std.mem.splitScalar(u8, name, '/');
+    const a = parts.next() orelse return false;
+    const project = parts.next() orelse return false;
+    const b = parts.next() orelse return false;
+    const topic = parts.next() orelse return false;
+    return std.mem.eql(u8, a, "projects") and project.len > 0 and std.mem.eql(u8, b, "topics") and topic.len > 0 and parts.next() == null;
 }
 
 fn annotationKey(key: []const u8) bool {
@@ -1002,7 +1220,7 @@ test "FakeSecrets: what production refuses, refused in its words" {
         .{ .PATCH, base ++ "/s?updateMask=version_destroy_ttl", "{\"versionDestroyTtl\":\"86399s\"}", 400, "at least [24h]" },
         .{ .PATCH, base ++ "/s?updateMask=labels", "{\"labels\":{},\"etag\":\"\\\"0\\\"\"}", 400, "etag provided" },
         .{ .PATCH, base ++ "/s?updateMask=labels", "{\"noSuchField\":1}", 400, "Unknown name" },
-        .{ .PATCH, base ++ "/s?updateMask=topics", "{}", 501, "does not model" },
+        .{ .PATCH, base ++ "/s?updateMask=customer_managed_encryption", "{}", 501, "does not model" },
         .{ .DELETE, base ++ "/s?etag=%220%22", "", 400, "etag provided" },
         .{ .GET, base ++ "/missing", "", 404, "not found" },
         .{ .POST, base ++ "/s/versions/latest:destroy", "{}", 400, "expected format" },
@@ -1031,6 +1249,9 @@ const Model = struct {
     aliases: [4]?u64 = @splat(null),
     expire_time: []const u8 = "",
     delay_s: ?u64 = null,
+    topics: u3 = 0,
+    /// The rotation's next time and period, as the server writes them.
+    rotation: ?struct { next: []const u8, period_s: ?u64 } = null,
     versions: [8]VersionModel = undefined,
     version_count: usize = 0,
     /// Every secret etag seen, oldest first; the last is current.
@@ -1052,6 +1273,9 @@ const Model = struct {
         .{ .key = "n", .value = "\xc3\xa9" },
     };
     const alias_names = [4][]const u8{ "prod", "Prod", "stable", "new" };
+    /// The last one Secret Manager cannot publish to.
+    const topic_pool = [3][]const u8{ "projects/p/topics/alpha", "projects/p/topics/bravo", "projects/p/topics/badly" };
+    const bad_topic: u3 = 0b100;
 
     fn currentEtag(m: *const Model) []const u8 {
         return m.etags[m.etag_count - 1];
@@ -1086,6 +1310,16 @@ const Model = struct {
         try testing.expectEqual(alias_count, info.aliases.len);
         try testing.expectEqualStrings(m.expire_time, info.expire_time);
         try testing.expectEqual(m.delay_s, info.version_destroy_delay_s);
+        try testing.expectEqual(@as(usize, @popCount(m.topics)), info.topics.len);
+        var t: usize = 0;
+        for (topic_pool, 0..) |name, i| if (m.topics & (@as(u3, 1) << @intCast(i)) != 0) {
+            try testing.expectEqualStrings(name, info.topics[t]);
+            t += 1;
+        };
+        if (m.rotation) |r| {
+            try testing.expectEqualStrings(r.next, info.rotation.?.next_time);
+            try testing.expectEqual(r.period_s, info.rotation.?.period_s);
+        } else try testing.expectEqual(null, info.rotation);
         try testing.expectEqualStrings(m.currentEtag(), info.etag);
     }
 };
@@ -1095,6 +1329,7 @@ fn modelProperty(_: void, input: []const u8) !void {
     var r: Rig = undefined;
     try r.init(if (input.len > 0 and input[0] & 1 == 1) "europe-west3" else null);
     defer r.deinit();
+    try r.fake.setTopic(Model.topic_pool[2], .unpublishable);
     var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -1110,7 +1345,7 @@ fn modelProperty(_: void, input: []const u8) !void {
 
     var steps: usize = 0;
     while (steps < 24 and g.pos < g.bytes.len) : (steps += 1) {
-        switch (g.intRange(u8, 0, 5)) {
+        switch (g.intRange(u8, 0, 6)) {
             0, 1 => {
                 var changes: types.SecretUpdate = .{};
                 var next = m;
@@ -1189,6 +1424,46 @@ fn modelProperty(_: void, input: []const u8) !void {
                         next.delay_s = null;
                     },
                 }
+                switch (g.intRange(u8, 0, 2)) {
+                    0 => {},
+                    1 => {
+                        const bits: u3 = @truncate(g.byte());
+                        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+                        for (Model.topic_pool, 0..) |t, i| if (bits & (@as(u3, 1) << @intCast(i)) != 0) try list.append(a, t);
+                        changes.topics = .{ .set = list.items };
+                        next.topics = bits;
+                    },
+                    else => {
+                        changes.topics = .clear;
+                        next.topics = 0;
+                    },
+                }
+                switch (g.intRange(u8, 0, 2)) {
+                    0 => {},
+                    1 => {
+                        const period: ?u64 = switch (g.intRange(u8, 0, 2)) {
+                            0 => null,
+                            1 => 3600,
+                            else => 7200,
+                        };
+                        changes.rotation = .{ .set = .{ .next_time = "2026-10-02T14:00:00Z", .period_s = period } };
+                        next.rotation = .{ .next = "2026-10-02T14:00:00Z", .period_s = period };
+                    },
+                    else => {
+                        changes.rotation = .clear;
+                        next.rotation = null;
+                    },
+                }
+                // A rotation set beside no topics is refused before sending;
+                // one the server would be left with without topics is
+                // refused by the server.
+                const local_rotation = changes.rotation == .set and switch (changes.topics) {
+                    .keep => false,
+                    .clear => true,
+                    .set => |list| list.len == 0,
+                };
+                const bad_topics = changes.topics == .set and next.topics & Model.bad_topic != 0;
+                const orphan_rotation = next.rotation != null and next.topics == 0;
                 var stale_etag = false;
                 switch (g.intRange(u8, 0, 2)) {
                     0 => {},
@@ -1202,18 +1477,20 @@ fn modelProperty(_: void, input: []const u8) !void {
                 if (secret.update(changes)) |got| {
                     var owned = got;
                     defer owned.deinit();
-                    try testing.expect(!changes.isEmpty() and !stale_etag and alias_ok);
+                    try testing.expect(!changes.isEmpty() and !stale_etag and alias_ok and !local_rotation and !bad_topics and !orphan_rotation);
                     try next.sawEtag(a, owned.value.etag);
                     m = next;
                     try m.expectSecret(owned.value);
                 } else |err| {
-                    if (changes.isEmpty()) {
+                    if (changes.isEmpty() or local_rotation) {
                         try testing.expectEqual(error.InvalidArgument, err);
                         try testing.expectEqual(sent_before, r.fake.requests);
                     } else if (stale_etag) {
                         try testing.expectEqual(error.Aborted, err);
+                    } else if (bad_topics) {
+                        try testing.expectEqual(error.TopicNotPublishable, err);
                     } else {
-                        try testing.expect(!alias_ok);
+                        try testing.expect(!alias_ok or orphan_rotation);
                         try testing.expectEqual(error.InvalidArgument, err);
                     }
                 }
@@ -1272,6 +1549,26 @@ fn modelProperty(_: void, input: []const u8) !void {
                         try testing.expect(vm.state == .destroyed or (verb == 2 and vm.scheduled));
                     }
                 }
+            },
+            5 => if (m.rotation) |rot| {
+                // The rotation comes due, as production did it.
+                r.fake.fireRotation(if (input[0] & 1 == 1) "europe-west3" else null, "model");
+                if (rot.period_s) |p| {
+                    const t = try core.timestamp.parse(rot.next);
+                    const next_s = @divFloor(t.nanoseconds, std.time.ns_per_s) + @as(i96, p);
+                    var buf: std.ArrayListUnmanaged(u8) = .empty;
+                    var jw_out: std.Io.Writer.Allocating = .init(a);
+                    var jw: Stringify = .{ .writer = &jw_out.writer };
+                    try writeTime(&jw, @intCast(next_s));
+                    const quoted = jw_out.written();
+                    try buf.appendSlice(a, quoted[1 .. quoted.len - 1]);
+                    m.rotation = .{ .next = buf.items, .period_s = p };
+                } else {
+                    m.rotation = null;
+                }
+                var fired = try secret.get();
+                defer fired.deinit();
+                try m.sawEtag(a, fired.value.etag);
             },
             else => {},
         }

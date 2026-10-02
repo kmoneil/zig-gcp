@@ -8,6 +8,7 @@
 //! refused, and 260 characters are refused.
 
 const std = @import("std");
+const core = @import("core");
 const test_util = @import("test_util.zig");
 
 /// The most a secret version can hold, counted before base64.
@@ -42,6 +43,29 @@ pub const max_expiry_s = 876_000 * 3600;
 /// The delay before a destroyed version goes: 1 to 1,000 days.
 pub const min_destroy_delay_s = 86_400;
 pub const max_destroy_delay_s = 86_400_000;
+
+/// The most topics a secret names, and a rotation's period: 1 hour to 100
+/// years.
+pub const max_topics = 10;
+pub const min_rotation_period_s = 3600;
+pub const max_rotation_period_s = 3_153_600_000;
+
+/// A topic named in full, `projects/PROJECT/topics/TOPIC`, as Secret
+/// Manager takes it: production refused a short name, and a malformed
+/// one, as "Failed to Publish". The topic's id is held to Pub/Sub's rule;
+/// the project only to having no `/`, since a topic may live in another
+/// project.
+pub fn isTopicName(name: []const u8) bool {
+    const prefix = "projects/";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    const rest = name[prefix.len..];
+    const cut = std.mem.indexOf(u8, rest, "/topics/") orelse return false;
+    const project = rest[0..cut];
+    const topic = rest[cut + "/topics/".len ..];
+    if (project.len == 0 or std.mem.indexOfScalar(u8, project, '/') != null) return false;
+    for (project) |c| if (c <= ' ' or c >= 0x7f) return false;
+    return core.names.isPubSubId(topic);
+}
 
 /// Secret ids: 1 to 255 characters from `[A-Za-z0-9_-]`. Production's error
 /// message quotes `[a-zA-Z_0-9]+`, but hyphens are accepted, and Google's
@@ -195,6 +219,22 @@ test "label keys and values, as production judged them" {
     for ([_][]const u8{ "a" ** 64, "ABC", "a.b", "x/y" }) |value| {
         try testing.expect(labelValueProblem(value) != null);
     }
+}
+
+test "topic names: in full, with a Pub/Sub id" {
+    try testing.expect(isTopicName("projects/extractctl/topics/rotations"));
+    try testing.expect(isTopicName("projects/other-project/topics/a-b_c.d~e%f+g"));
+    for ([_][]const u8{
+        "rotations",
+        "projects/extractctl/topics/",
+        "projects//topics/rotations",
+        "projects/a/b/topics/rotations",
+        "projects/x/topicz/y",
+        "projects/extractctl/topics/goog-rotations",
+        "projects/extractctl/topics/a/b",
+        "//pubsub.googleapis.com/projects/extractctl/topics/rotations",
+        "projects/ext ractctl/topics/rotations",
+    }) |name| try testing.expect(!isTopicName(name));
 }
 
 test "annotation keys, as production judged them" {

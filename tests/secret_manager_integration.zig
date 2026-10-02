@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const secret_manager = @import("secret_manager");
+const pubsub = @import("pubsub");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
@@ -632,6 +633,157 @@ test "delayed destruction: scheduled, refused a second time, cancelled" {
     var value = secret.access(.{ .number = 1 }) catch |err| return f.report(err);
     defer value.deinit();
     try testing.expectEqualStrings("v1", value.bytes());
+}
+
+test "serviceAgent: the project's Secret Manager service agent" {
+    var f: Fixture = undefined;
+    if (!try f.init(false)) return error.SkipZigTest;
+    defer f.deinit();
+    var agent = f.client.serviceAgent() catch |err| return f.report(err);
+    defer agent.deinit();
+    try testing.expect(std.mem.startsWith(u8, agent.value, "service-"));
+    try testing.expect(std.mem.endsWith(u8, agent.value, "@gcp-sa-secretmanager.iam.gserviceaccount.com"));
+}
+
+/// A topic and a subscription on it, both deleted when the test ends.
+const Topic = struct {
+    ps: pubsub.Client,
+    diag: pubsub.Diagnostics,
+    id: []const u8,
+    sub_id: []const u8,
+    name: []const u8,
+
+    fn init(t: *Topic, f: *Fixture) !void {
+        const project = f.env.get("GCP_TEST_PROJECT").?;
+        t.diag = .{};
+        t.id = try f.name("topic");
+        t.sub_id = try f.name("watch");
+        t.name = try std.fmt.allocPrint(f.arena.allocator(), "projects/{s}/topics/{s}", .{ project, t.id });
+        t.ps = try .init(testing.allocator, testing.io, .{ .project_id = project, .token_provider = f.token.provider(), .diagnostics = &t.diag });
+        errdefer t.ps.deinit();
+        var topic = try t.ps.topic(t.id).create(.{});
+        topic.deinit();
+        var sub = try t.ps.subscription(t.sub_id).create(.{ .topic_id = t.id });
+        sub.deinit();
+    }
+
+    fn deinit(t: *Topic) void {
+        t.ps.subscription(t.sub_id).delete() catch {};
+        t.ps.topic(t.id).delete() catch {};
+        t.ps.deinit();
+    }
+
+    /// Grants the Secret Manager agent publisher on the topic.
+    fn grant(t: *Topic, f: *Fixture) !void {
+        var agent = f.client.serviceAgent() catch |err| return f.report(err);
+        defer agent.deinit();
+        const member = try std.fmt.allocPrint(f.arena.allocator(), "serviceAccount:{s}", .{agent.value});
+        var policy = try t.ps.topic(t.id).addIamBinding("roles/pubsub.publisher", member);
+        policy.deinit();
+    }
+};
+
+test "regional: topics refused before the grant, then every event received and decoded" {
+    var f: Fixture = undefined;
+    if (!try f.init(true)) return error.SkipZigTest;
+    defer f.deinit();
+    var t: Topic = undefined;
+    t.init(&f) catch |err| return f.report(err);
+    defer t.deinit();
+
+    const id = try f.name("events");
+    try f.created.append(testing.allocator, id);
+    const secret = f.client.secret(id);
+    const config: secret_manager.SecretConfig = .{ .labels = &.{test_label}, .topics = &.{t.name} };
+    try testing.expectError(error.TopicNotPublishable, secret.create(config));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "roles/pubsub.publisher") != null);
+
+    try t.grant(&f);
+    // A grant reached Secret Manager within a second when measured.
+    var tries: usize = 0;
+    var created = while (true) : (tries += 1) {
+        break secret.create(config) catch |err| {
+            if (err != error.TopicNotPublishable or tries == 30) return f.report(err);
+            try testing.io.sleep(.fromSeconds(2), .awake);
+            continue;
+        };
+    };
+    created.deinit();
+    var added = secret.addVersion("v1") catch |err| return f.report(err);
+    added.deinit();
+    var updated = secret.update(.{ .labels = .{ .set = &.{ test_label, .{ .key = "step", .value = "2" } } } }) catch |err| return f.report(err);
+    updated.deinit();
+    secret.delete() catch |err| return f.report(err);
+
+    // A regional secret's events came within a second when measured.
+    const want = [_]secret_manager.EventKind{ .secret_create, .version_add, .secret_update, .secret_delete };
+    var got: [want.len]bool = @splat(false);
+    var rounds: usize = 0;
+    while (!std.mem.allEqual(bool, &got, true) and rounds < 30) : (rounds += 1) {
+        var pulled = try t.ps.subscription(t.sub_id).pull(.{ .return_immediately = true });
+        defer pulled.deinit();
+        var acks: std.ArrayList([]const u8) = .empty;
+        defer acks.deinit(testing.allocator);
+        for (pulled.value.messages) |m| {
+            try acks.append(testing.allocator, m.ack_id);
+            var event = secret_manager.decodeEvent(testing.allocator, m, .{}) catch |err| return f.report(err);
+            defer event.deinit();
+            const e = event.value;
+            if (e.kind == .topic_configured) continue;
+            try testing.expectEqualStrings(id, e.secretId());
+            try testing.expectEqualStrings(f.env.get("GCP_TEST_LOCATION").?, e.location.?);
+            for (want, 0..) |kind, k| if (e.kind == kind) {
+                got[k] = true;
+            };
+            switch (e.kind) {
+                .version_add => {
+                    try testing.expectEqual(1, e.version.?);
+                    try testing.expectEqual(.enabled, e.version_info.?.state);
+                },
+                .secret_update => try testing.expectEqualStrings("2", e.info.?.label("step").?),
+                .secret_delete => try testing.expectEqual(.requested, e.delete_type.?),
+                else => {},
+            }
+        }
+        if (acks.items.len > 0) try t.ps.subscription(t.sub_id).ack(acks.items);
+        if (!std.mem.allEqual(bool, &got, true)) try testing.io.sleep(.fromSeconds(2), .awake);
+    }
+    try testing.expect(std.mem.allEqual(bool, &got, true));
+}
+
+test "rotation: set beside a topic, read back, cleared" {
+    var f: Fixture = undefined;
+    if (!try f.init(false)) return error.SkipZigTest;
+    defer f.deinit();
+    var t: Topic = undefined;
+    t.init(&f) catch |err| return f.report(err);
+    defer t.deinit();
+    try t.grant(&f);
+
+    const secret = try f.create("rotation", .{});
+    var tries: usize = 0;
+    var set = while (true) : (tries += 1) {
+        break secret.update(.{
+            .topics = .{ .set = &.{t.name} },
+            .rotation = .{ .set = .{ .next_time = "2100-01-01T00:00:00Z", .period_s = 2_592_000 } },
+        }) catch |err| {
+            if (err != error.TopicNotPublishable or tries == 30) return f.report(err);
+            try testing.io.sleep(.fromSeconds(2), .awake);
+            continue;
+        };
+    };
+    defer set.deinit();
+    try testing.expectEqualStrings(t.name, set.value.topics[0]);
+    try testing.expectEqualStrings("2100-01-01T00:00:00Z", set.value.rotation.?.next_time);
+    // The discovery document calls the period input only; it is read back.
+    try testing.expectEqual(2_592_000, set.value.rotation.?.period_s.?);
+
+    // Topics cannot go while a rotation needs them.
+    try testing.expectError(error.InvalidArgument, secret.update(.{ .topics = .clear }));
+    var cleared = secret.update(.{ .rotation = .clear, .topics = .clear }) catch |err| return f.report(err);
+    defer cleared.deinit();
+    try testing.expectEqual(null, cleared.value.rotation);
+    try testing.expectEqual(0, cleared.value.topics.len);
 }
 
 test "sweep: delete anything a crashed run left behind" {

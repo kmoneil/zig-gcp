@@ -188,6 +188,30 @@ pub fn secret(self: *Client, id: []const u8) Secret {
     return .{ .client = self, .id = id };
 }
 
+/// The Secret Manager service agent for `Options.project_id`, as
+/// `service-NUMBER@gcp-sa-secretmanager.iam.gserviceaccount.com`: the
+/// account that publishes a secret's events and rotations to its topics,
+/// and so the one to grant `roles/pubsub.publisher` on each topic first
+/// (`pubsub.Topic.addIamBinding` grants it), and that encrypts with a
+/// customer-managed key. Using Secret Manager does not create it, as
+/// measured on 2026-10-02: this asks Service Usage, which creates it if
+/// the project has none yet, and answers at once. Needs
+/// `serviceusage.services.use` on the project.
+pub fn serviceAgent(self: *Client) Error!types.Owned([]const u8) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const path = try names.serviceIdentityPath(scratch.allocator(), self.project_id);
+
+    var result: types.Owned([]const u8) = try .init(self.gpa);
+    errdefer result.deinit();
+    // Asking again asks for the same agent, so a lost answer is asked again.
+    const body = try rpc.executeServiceUsage(self, result.arena, .{ .method = .POST, .path = path, .body = "{}" });
+    result.value = codec.decodeServiceIdentity(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "service identity");
+    return result;
+}
+
 /// One page of this project's secrets, in this client's namespace: a global
 /// client never sees a regional secret, or the other way round.
 pub fn listSecrets(self: *Client, options: types.ListOptions) Error!types.Owned(types.SecretPage) {
@@ -364,4 +388,52 @@ test "golden: listSecrets in a regional namespace" {
         "https://secretmanager.europe-west3.rep.googleapis.com/v1/projects/extractctl/locations/europe-west3/secrets",
         null,
     );
+}
+
+test "golden: serviceAgent asks Service Usage, and reads the done operation" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"done":true,"name":"operations/finished.DONE_OPERATION","response":{"@type":"type.googleapis.com/google.api.serviceusage.v1beta1.ServiceIdentity","email":"service-82150720798@gcp-sa-secretmanager.iam.gserviceaccount.com","uniqueId":"101786303149630632912"}}
+        } },
+        .{ .respond = .{ .body = "{\"name\":\"operations/acf.p2-1\",\"done\":false}" } },
+        .{ .respond = .{ .body = "{\"done\":true,\"response\":{}}" } },
+    }, .{ .location = "europe-west3" });
+    defer h.deinit();
+
+    var agent = try h.client.serviceAgent();
+    defer agent.deinit();
+    // The same host for a regional client: the agent is the project's.
+    try h.expectRequest(
+        0,
+        .POST,
+        "https://serviceusage.googleapis.com/v1beta1/projects/extractctl/services/secretmanager.googleapis.com:generateServiceIdentity",
+        "{}",
+    );
+    try std.testing.expectEqualStrings("service-82150720798@gcp-sa-secretmanager.iam.gserviceaccount.com", agent.value);
+    // An operation still running, or one that names no address, is no answer.
+    try std.testing.expectError(error.InvalidResponse, h.client.serviceAgent());
+    try std.testing.expectError(error.InvalidResponse, h.client.serviceAgent());
+}
+
+test "serviceAgent: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            var fake: test_util.FakeTransport = .init(std.testing.allocator, &.{
+                .{ .respond = .{ .body = "{\"done\":true,\"response\":{\"email\":\"service-1@gcp-sa-secretmanager.iam.gserviceaccount.com\"}}" } },
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: test_util.FakeTokenProvider = .{};
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "extractctl",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+            var agent = try client.serviceAgent();
+            agent.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

@@ -36,6 +36,13 @@ pub const Label = @import("types.zig").Label;
 pub const Annotation = @import("types.zig").Annotation;
 pub const Alias = @import("types.zig").Alias;
 pub const Expiry = @import("types.zig").Expiry;
+pub const Rotation = @import("types.zig").Rotation;
+pub const EventKind = @import("types.zig").EventKind;
+pub const DeleteType = @import("types.zig").DeleteType;
+pub const SecretEvent = @import("types.zig").SecretEvent;
+pub const decodeEvent = @import("events.zig").decodeEvent;
+pub const DecodeEventError = @import("events.zig").DecodeEventError;
+pub const DecodeEventOptions = @import("events.zig").DecodeEventOptions;
 pub const SecretUpdate = @import("types.zig").SecretUpdate;
 /// Keep, set or clear a setting in an update, as `SecretUpdate` takes it.
 pub const Change = @import("types.zig").Change;
@@ -66,6 +73,7 @@ test {
     _ = @import("Version.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
+    _ = @import("events.zig");
     _ = @import("fake_secrets.zig");
     _ = @import("faults.zig");
     _ = @import("iam.zig");

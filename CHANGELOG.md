@@ -36,11 +36,30 @@ including the ones that did not change.
   documents a delayed destruction: the version stays `.disabled` until
   its `scheduled_destroy_time`, and a second destroy is
   `error.FailedPrecondition`.
+- secret_manager: notification topics and rotation. `SecretConfig` and
+  `SecretUpdate` take `topics` (up to 10, named in full) and a
+  `Rotation` (a next time and an optional period), read back on
+  `SecretInfo`; a rotation needs topics, and is refused before sending
+  without them. `Client.serviceAgent` names the project's Secret Manager
+  service agent, which must hold `roles/pubsub.publisher` on each
+  topic, asking Service Usage, which creates it: using Secret Manager
+  does not, as measured. **Breaking, for an exhaustive switch:**
+  `secret_manager.Error` gains `TopicNotPublishable`, for a topic Secret
+  Manager cannot publish to, missing or not granted, on a create or an
+  update that names topics.
+- secret_manager: `decodeEvent` reads a message from a secret's topic
+  into a `SecretEvent` (`EventKind`, `DeleteType`): the secret and its
+  location, the version, the time, and the secret or version as the
+  change left it, with a `key` for telling repeats apart, from the
+  messages production sent on 2026-10-02.
+- examples: `secret_rotation` sets a secret's topic and rotation up and
+  answers each rotation with a new version and a moved alias.
 - docs: the Secret Manager guide covers updates, preconditions,
-  aliases, expiry and delayed destruction, with every rule as measured.
+  aliases, expiry, delayed destruction, notifications and rotation,
+  with every rule as measured.
 - ci: a nightly `heavy-secret_manager` fuzz job runs the model property
-  of updates, conditions and version changes against a new
-  `FakeSecrets`.
+  of updates, conditions, topics, rotations and version changes against
+  a new `FakeSecrets`.
 - core, auth, pubsub and storage: unchanged.
 
 ## 0.28.0 (2026-10-02)
