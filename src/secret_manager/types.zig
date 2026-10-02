@@ -78,13 +78,34 @@ pub const Expiry = union(enum) {
     after_s: u64,
 };
 
-/// Where a global secret's bytes are stored. Immutable after creation, and
-/// not sent at all for a regional secret, whose location decides.
+/// Where a global secret's bytes are stored. Immutable after creation,
+/// but for its keys, and not sent at all for a regional secret, whose
+/// location decides.
 pub const Replication = union(enum) {
-    /// Google chooses the regions.
+    /// Google chooses the regions. `SecretConfig.kms_key` names its key.
     automatic,
-    /// Location ids such as `europe-west1`.
-    user_managed: []const []const u8,
+    /// The locations, each with its own key or none.
+    user_managed: []const Replica,
+};
+
+/// One location a user-managed secret is stored in.
+pub const Replica = struct {
+    /// A location id, such as `europe-west1`.
+    location: []const u8,
+    /// The Cloud KMS key that encrypts the secret here,
+    /// `projects/P/locations/L/keyRings/R/cryptoKeys/K`, in this location;
+    /// null for Google's own encryption. Every replica has one, or none
+    /// does.
+    kms_key: ?[]const u8 = null,
+};
+
+/// The Cloud KMS key version that wrapped a version's bytes, where.
+pub const KeyVersion = struct {
+    /// The replica's location, or null for an automatic or regional
+    /// secret.
+    location: ?[]const u8 = null,
+    /// `projects/P/locations/L/keyRings/R/cryptoKeys/K/cryptoKeyVersions/N`.
+    name: []const u8,
 };
 
 pub const SecretConfig = struct {
@@ -104,6 +125,13 @@ pub const SecretConfig = struct {
     topics: []const []const u8 = &.{},
     /// Needs topics.
     rotation: ?Rotation = null,
+    /// The Cloud KMS key that encrypts the secret's versions: in `global`
+    /// for automatic replication, or in the client's location for a
+    /// regional secret. User-managed replication names its keys per
+    /// replica instead. The service agent `Client.serviceAgent` names
+    /// needs `roles/cloudkms.cryptoKeyEncrypterDecrypter` on it, or the
+    /// create is `error.KeyUnavailable`.
+    kms_key: ?[]const u8 = null,
 };
 
 /// What `Secret.update` changes. Every field left at `.keep` stays as it
@@ -126,6 +154,13 @@ pub const SecretUpdate = struct {
     topics: Change([]const []const u8) = .keep,
     /// `.set` replaces the rotation, time and period; `.clear` removes it.
     rotation: Change(Rotation) = .keep,
+    /// The key of an automatic or regional secret: `.set` makes versions
+    /// added from now on use it, `.clear` Google's encryption. Versions
+    /// already stored keep the key that wrapped them.
+    kms_key: Change([]const u8) = .keep,
+    /// The keys of a user-managed secret: every replica, in the locations
+    /// it has, which cannot change, each with its new key or null.
+    replica_keys: ?[]const Replica = null,
     /// Change the secret only if its etag is still this one, as read: a
     /// changed secret is `error.Aborted` and nothing changes. Null: no
     /// condition.
@@ -135,6 +170,10 @@ pub const SecretUpdate = struct {
     pub fn isEmpty(self: SecretUpdate) bool {
         inline for (@typeInfo(SecretUpdate).@"struct".fields) |field| {
             if (comptime std.mem.eql(u8, field.name, "etag")) continue;
+            if (comptime std.mem.eql(u8, field.name, "replica_keys")) {
+                if (self.replica_keys != null) return false;
+                continue;
+            }
             if (@field(self, field.name) != .keep) return false;
         }
         return true;
@@ -179,6 +218,11 @@ pub const SecretInfo = struct {
     /// each time a rotation fires; a rotation without a period is gone
     /// once it has fired.
     rotation: ?Rotation = null,
+    /// The key of an automatic or regional secret, or null.
+    kms_key: ?[]const u8 = null,
+    /// A user-managed secret's locations and keys; empty for automatic
+    /// replication and for a regional secret.
+    replicas: []const Replica = &.{},
 
     /// The value of the label named `key`, or null.
     pub fn label(self: SecretInfo, key: []const u8) ?[]const u8 {
@@ -300,6 +344,10 @@ pub const VersionInfo = struct {
     /// Whether the checksum stored with this version came from the client.
     /// False means the server computed it.
     client_specified_payload_checksum: bool,
+    /// The key versions that wrapped its bytes, one per replica, or one
+    /// for an automatic or regional secret; empty under Google's own
+    /// encryption. A key changed later leaves these as they were.
+    kms_key_versions: []const KeyVersion = &.{},
 
     /// The trailing number of `name`, or null if it has none.
     pub fn number(self: VersionInfo) ?u64 {

@@ -42,7 +42,10 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Secret Manager](secret-manager.md) | Reading a secret's bytes, verified and wiped; versions; changing a secret under an etag; aliases, expiry and delayed destruction; notifications and rotation; checksums; regional secrets; IAM |
+| [Overview](secret-manager/README.md) | Reading a secret's bytes, verified and wiped; every call; checksums; regional secrets; IAM |
+| [Changing a secret](secret-manager/updating.md) | Updates, etag preconditions, aliases, expiry and delayed destruction, with the rules production enforces |
+| [Notifications and rotation](secret-manager/notifications.md) | Topics, the service agent, every event and how late it comes, and rotating on schedule |
+| [Encryption keys](secret-manager/encryption.md) | Cloud KMS keys for automatic, user-managed and regional secrets, and what a key that goes away does |
 
 ## 🛠️ Working on zig-gcp
 

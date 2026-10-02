@@ -31,6 +31,10 @@ ref: types.VersionRef,
 /// `retry.max_attempts` rounds of the retry policy. Cancel the surrounding
 /// `std.Io` task to bound it tighter than that.
 ///
+/// A version wrapped by a Cloud KMS key that is disabled, scheduled for
+/// destruction, or no longer usable by Secret Manager's service agent is
+/// `error.KeyUnavailable`.
+///
 /// The caller owns the result: `defer value.deinit()`.
 pub fn access(self: Version) Error!SecretValue {
     const c = self.client;
@@ -50,7 +54,7 @@ pub fn access(self: Version) Error!SecretValue {
 
     var attempt: u32 = 1;
     while (true) : (attempt += 1) {
-        const body = try rpc.execute(c, value.arena(), .{ .method = .GET, .path = path, .wipe = true });
+        const body = try rpc.executeMapped(c, value.arena(), .{ .method = .GET, .path = path, .wipe = true }, .{ .keys = true });
         const got = codec.decodeAccess(value.allocator(), body) catch |err|
             return rpc.decodeFailed(c, err, "access");
         const data = core.base64.decode(value.allocator(), got.data) catch |err| switch (err) {

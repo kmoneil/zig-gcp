@@ -54,31 +54,10 @@ pub fn encodeSecret(arena: Allocator, config: types.SecretConfig, regional: bool
 
 fn writeSecret(jw: *Stringify, config: types.SecretConfig, regional: bool) Stringify.Error!void {
     try jw.beginObject();
-    if (!regional) {
-        try jw.objectField("replication");
-        try jw.beginObject();
-        switch (config.replication) {
-            .automatic => {
-                try jw.objectField("automatic");
-                try jw.beginObject();
-                try jw.endObject();
-            },
-            .user_managed => |locations| {
-                try jw.objectField("userManaged");
-                try jw.beginObject();
-                try jw.objectField("replicas");
-                try jw.beginArray();
-                for (locations) |location| {
-                    try jw.beginObject();
-                    try jw.objectField("location");
-                    try jw.write(location);
-                    try jw.endObject();
-                }
-                try jw.endArray();
-                try jw.endObject();
-            },
-        }
-        try jw.endObject();
+    if (regional) {
+        if (config.kms_key) |key| try writeKey(jw, "customerManagedEncryption", "kmsKeyName", key);
+    } else {
+        try writeReplication(jw, config.replication, config.kms_key);
     }
     if (config.labels.len > 0) try writeLabels(jw, config.labels);
     if (config.annotations.len > 0) try writeAnnotations(jw, config.annotations);
@@ -108,6 +87,46 @@ fn writeRotation(jw: *Stringify, rotation: types.Rotation) Stringify.Error!void 
     try jw.objectField("nextRotationTime");
     try jw.write(rotation.next_time);
     if (rotation.period_s) |s| try writeSeconds(jw, "rotationPeriod", s);
+    try jw.endObject();
+}
+
+/// A global secret's replication, with its keys: `automatic_key` for
+/// automatic replication, each replica's own otherwise.
+fn writeReplication(jw: *Stringify, replication: types.Replication, automatic_key: ?[]const u8) Stringify.Error!void {
+    try jw.objectField("replication");
+    try jw.beginObject();
+    switch (replication) {
+        .automatic => {
+            try jw.objectField("automatic");
+            try jw.beginObject();
+            if (automatic_key) |key| try writeKey(jw, "customerManagedEncryption", "kmsKeyName", key);
+            try jw.endObject();
+        },
+        .user_managed => |replicas| {
+            try jw.objectField("userManaged");
+            try jw.beginObject();
+            try jw.objectField("replicas");
+            try jw.beginArray();
+            for (replicas) |replica| {
+                try jw.beginObject();
+                try jw.objectField("location");
+                try jw.write(replica.location);
+                if (replica.kms_key) |key| try writeKey(jw, "customerManagedEncryption", "kmsKeyName", key);
+                try jw.endObject();
+            }
+            try jw.endArray();
+            try jw.endObject();
+        },
+    }
+    try jw.endObject();
+}
+
+/// `"field": {"name": value}`, as keys travel.
+fn writeKey(jw: *Stringify, field: []const u8, name: []const u8, value: []const u8) Stringify.Error!void {
+    try jw.objectField(field);
+    try jw.beginObject();
+    try jw.objectField(name);
+    try jw.write(value);
     try jw.endObject();
 }
 
@@ -164,14 +183,14 @@ fn writeSeconds(jw: *Stringify, field: []const u8, seconds: u64) Stringify.Error
 /// The `secrets.patch` body: each field the update sets, and the etag. A
 /// field it clears is left out, which with its path in the mask is how
 /// production clears it.
-pub fn encodeUpdate(arena: Allocator, changes: types.SecretUpdate) Allocator.Error![]u8 {
+pub fn encodeUpdate(arena: Allocator, changes: types.SecretUpdate, regional: bool) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
     var jw: Stringify = .{ .writer = &out.writer };
-    writeUpdate(&jw, changes) catch return error.OutOfMemory;
+    writeUpdate(&jw, changes, regional) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn writeUpdate(jw: *Stringify, changes: types.SecretUpdate) Stringify.Error!void {
+fn writeUpdate(jw: *Stringify, changes: types.SecretUpdate, regional: bool) Stringify.Error!void {
     try jw.beginObject();
     switch (changes.labels) {
         .set => |labels| try writeLabels(jw, labels),
@@ -201,6 +220,17 @@ fn writeUpdate(jw: *Stringify, changes: types.SecretUpdate) Stringify.Error!void
         .set => |r| try writeRotation(jw, r),
         .keep, .clear => {},
     }
+    // A regional secret's key is a field of its own; a global secret's is
+    // inside its replication, which goes whole, with the key or without.
+    switch (changes.kms_key) {
+        .keep => {},
+        .set => |key| if (regional)
+            try writeKey(jw, "customerManagedEncryption", "kmsKeyName", key)
+        else
+            try writeReplication(jw, .automatic, key),
+        .clear => if (!regional) try writeReplication(jw, .automatic, null),
+    }
+    if (changes.replica_keys) |replicas| try writeReplication(jw, .{ .user_managed = replicas }, null);
     if (changes.etag) |etag| {
         try jw.objectField("etag");
         try jw.write(etag);
@@ -212,13 +242,13 @@ fn writeUpdate(jw: *Stringify, changes: types.SecretUpdate) Stringify.Error!void
 /// clears, in snake_case as gcloud sends them. Production takes either
 /// case. An expiry set as a duration is `ttl`; one set as a time, or
 /// cleared, is `expire_time`, which clears it however it was set.
-pub fn updateMask(arena: Allocator, changes: types.SecretUpdate) Allocator.Error![]u8 {
+pub fn updateMask(arena: Allocator, changes: types.SecretUpdate, regional: bool) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
-    writeMask(&out.writer, changes) catch return error.OutOfMemory;
+    writeMask(&out.writer, changes, regional) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn writeMask(w: *Writer, changes: types.SecretUpdate) Writer.Error!void {
+fn writeMask(w: *Writer, changes: types.SecretUpdate, regional: bool) Writer.Error!void {
     var first = true;
     const paths = [_]struct { bool, []const u8 }{
         .{ changes.labels != .keep, "labels" },
@@ -231,6 +261,7 @@ fn writeMask(w: *Writer, changes: types.SecretUpdate) Writer.Error!void {
         .{ changes.version_destroy_delay_s != .keep, "version_destroy_ttl" },
         .{ changes.topics != .keep, "topics" },
         .{ changes.rotation != .keep, "rotation" },
+        .{ changes.kms_key != .keep or changes.replica_keys != null, if (regional) "customer_managed_encryption" else "replication" },
     };
     for (paths) |entry| {
         if (!entry[0]) continue;
@@ -342,9 +373,23 @@ const WireSecret = struct {
     versionDestroyTtl: ?[]const u8 = null,
     topics: ?[]const WireTopic = null,
     rotation: ?WireRotation = null,
+    replication: ?WireReplication = null,
+    customerManagedEncryption: ?WireKey = null,
 };
 
 const WireTopic = struct { name: ?[]const u8 = null };
+
+const WireKey = struct { kmsKeyName: ?[]const u8 = null, kmsKeyVersionName: ?[]const u8 = null };
+
+const WireReplication = struct {
+    automatic: ?struct { customerManagedEncryption: ?WireKey = null } = null,
+    userManaged: ?struct { replicas: ?[]const WireReplica = null } = null,
+};
+
+const WireReplica = struct {
+    location: ?[]const u8 = null,
+    customerManagedEncryption: ?WireKey = null,
+};
 
 const WireRotation = struct {
     nextRotationTime: ?[]const u8 = null,
@@ -369,7 +414,29 @@ fn secretFromWire(arena: Allocator, wire: WireSecret) DecodeError!types.SecretIn
         .version_destroy_delay_s = try wholeSeconds(wire.versionDestroyTtl),
         .topics = try topicsFromWire(arena, wire.topics),
         .rotation = try rotationFromWire(wire.rotation),
+        .kms_key = automaticKey(wire),
+        .replicas = try replicasFromWire(arena, wire.replication),
     };
+}
+
+/// An automatic secret's key, inside its replication, or a regional
+/// secret's, beside it.
+fn automaticKey(wire: WireSecret) ?[]const u8 {
+    if (wire.customerManagedEncryption) |k| return k.kmsKeyName;
+    const r = wire.replication orelse return null;
+    const automatic = r.automatic orelse return null;
+    return (automatic.customerManagedEncryption orelse return null).kmsKeyName;
+}
+
+fn replicasFromWire(arena: Allocator, wire: ?WireReplication) Allocator.Error![]const types.Replica {
+    const r = wire orelse return &.{};
+    const listed = (r.userManaged orelse return &.{}).replicas orelse return &.{};
+    const out = try arena.alloc(types.Replica, listed.len);
+    for (listed, out) |w, *replica| replica.* = .{
+        .location = w.location orelse "",
+        .kms_key = if (w.customerManagedEncryption) |k| k.kmsKeyName else null,
+    };
+    return out;
 }
 
 fn topicsFromWire(arena: Allocator, wire: ?[]const WireTopic) Allocator.Error![]const []const u8 {
@@ -463,7 +530,7 @@ pub fn decodeVersionPage(arena: Allocator, body: []const u8) DecodeError!types.V
     const wire = try parseWire(WireVersionPage, arena, body);
     const listed = wire.versions orelse &.{};
     const out = try arena.alloc(types.VersionInfo, listed.len);
-    for (listed, out) |w, *info| info.* = versionFromWire(w);
+    for (listed, out) |w, *info| info.* = try versionFromWire(arena, w);
     return .{
         .versions = out,
         .next_page_token = nonEmpty(wire.nextPageToken),
@@ -479,7 +546,7 @@ const WireVersionPage = struct {
 
 /// The `SecretVersion` that add, get, enable, disable and destroy return.
 pub fn decodeVersion(arena: Allocator, body: []const u8) DecodeError!types.VersionInfo {
-    return versionFromWire(try parseWire(WireVersion, arena, body));
+    return versionFromWire(arena, try parseWire(WireVersion, arena, body));
 }
 
 const WireVersion = struct {
@@ -490,9 +557,46 @@ const WireVersion = struct {
     state: ?[]const u8 = null,
     etag: ?[]const u8 = null,
     clientSpecifiedPayloadChecksum: ?bool = null,
+    replicationStatus: ?WireReplication = null,
+    customerManagedEncryption: ?WireKey = null,
 };
 
-fn versionFromWire(wire: WireVersion) types.VersionInfo {
+/// The key versions that wrapped a version: a regional secret's beside it,
+/// an automatic one's inside its replication status, a user-managed one's
+/// per replica.
+fn keyVersionsFromWire(arena: Allocator, wire: WireVersion) Allocator.Error![]const types.KeyVersion {
+    if (wire.customerManagedEncryption) |k| if (k.kmsKeyVersionName) |name| {
+        const out = try arena.alloc(types.KeyVersion, 1);
+        out[0] = .{ .name = name };
+        return out;
+    };
+    const status = wire.replicationStatus orelse return &.{};
+    if (status.automatic) |automatic| {
+        const k = automatic.customerManagedEncryption orelse return &.{};
+        const name = k.kmsKeyVersionName orelse return &.{};
+        const out = try arena.alloc(types.KeyVersion, 1);
+        out[0] = .{ .name = name };
+        return out;
+    }
+    const replicas = (status.userManaged orelse return &.{}).replicas orelse return &.{};
+    var n: usize = 0;
+    for (replicas) |r| {
+        if (r.customerManagedEncryption) |k| if (k.kmsKeyVersionName != null) {
+            n += 1;
+        };
+    }
+    const out = try arena.alloc(types.KeyVersion, n);
+    var i: usize = 0;
+    for (replicas) |r| {
+        const k = r.customerManagedEncryption orelse continue;
+        const name = k.kmsKeyVersionName orelse continue;
+        out[i] = .{ .location = r.location, .name = name };
+        i += 1;
+    }
+    return out;
+}
+
+fn versionFromWire(arena: Allocator, wire: WireVersion) Allocator.Error!types.VersionInfo {
     return .{
         .name = wire.name orelse "",
         .create_time = wire.createTime orelse "",
@@ -501,6 +605,7 @@ fn versionFromWire(wire: WireVersion) types.VersionInfo {
         .state = state(wire.state),
         .etag = wire.etag orelse "",
         .client_specified_payload_checksum = wire.clientSpecifiedPayloadChecksum orelse false,
+        .kms_key_versions = try keyVersionsFromWire(arena, wire),
     };
 }
 
@@ -564,14 +669,14 @@ test "golden: the create body, global and regional" {
     );
     try testing.expectEqualStrings(
         "{\"replication\":{\"userManaged\":{\"replicas\":[{\"location\":\"europe-west1\"},{\"location\":\"us-east1\"}]}}}",
-        try encodeSecret(a, .{ .replication = .{ .user_managed = &.{ "europe-west1", "us-east1" } } }, false),
+        try encodeSecret(a, .{ .replication = .{ .user_managed = &.{ .{ .location = "europe-west1" }, .{ .location = "us-east1" } } } }, false),
     );
     // A regional secret sends no replication: the location in the path
     // decides, and production refuses the field outright.
     try testing.expectEqualStrings("{}", try encodeSecret(a, .{}, true));
     try testing.expectEqualStrings(
         "{\"labels\":{\"zig-gcp-test\":\"1\",\"team\":\"payments\"}}",
-        try encodeSecret(a, .{ .labels = labels, .replication = .{ .user_managed = &.{"ignored"} } }, true),
+        try encodeSecret(a, .{ .labels = labels, .replication = .{ .user_managed = &.{.{ .location = "ignored" }} } }, true),
     );
 }
 
@@ -653,13 +758,13 @@ test "golden: update bodies and masks, one field at a time and all at once" {
         },
     };
     for (cases) |case| {
-        try testing.expectEqualStrings(case[1], try updateMask(a, case[0]));
-        try testing.expectEqualStrings(case[2], try encodeUpdate(a, case[0]));
+        try testing.expectEqualStrings(case[1], try updateMask(a, case[0], false));
+        try testing.expectEqualStrings(case[2], try encodeUpdate(a, case[0], false));
         try testing.expect(!case[0].isEmpty());
     }
     const nothing: types.SecretUpdate = .{ .etag = "\"e\"" };
     try testing.expect(nothing.isEmpty());
-    try testing.expectEqualStrings("", try updateMask(a, nothing));
+    try testing.expectEqualStrings("", try updateMask(a, nothing, false));
 }
 
 test "golden: a version change's body, with and without an etag" {
@@ -728,6 +833,100 @@ test "decode version: a destruction scheduled, as production sent it" {
     try testing.expectEqualStrings("2026-10-03T13:04:03.889502667Z", got.scheduled_destroy_time);
     try testing.expectEqualStrings("", got.destroy_time);
     try testing.expectEqualStrings("", (try decodeVersion(arena.allocator(), "{\"state\":\"ENABLED\"}")).scheduled_destroy_time);
+}
+
+test "golden: keys on create and update, global, user-managed and regional" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const g = "projects/p/locations/global/keyRings/r/cryptoKeys/g";
+    const east = "projects/p/locations/us-east1/keyRings/r/cryptoKeys/e";
+    const central = "projects/p/locations/us-central1/keyRings/r/cryptoKeys/c";
+    try testing.expectEqualStrings(
+        "{\"replication\":{\"automatic\":{\"customerManagedEncryption\":{\"kmsKeyName\":\"" ++ g ++ "\"}}}}",
+        try encodeSecret(a, .{ .kms_key = g }, false),
+    );
+    try testing.expectEqualStrings(
+        "{\"replication\":{\"userManaged\":{\"replicas\":[{\"location\":\"us-east1\",\"customerManagedEncryption\":{\"kmsKeyName\":\"" ++ east ++ "\"}},{\"location\":\"us-central1\",\"customerManagedEncryption\":{\"kmsKeyName\":\"" ++ central ++ "\"}}]}}}",
+        try encodeSecret(a, .{ .replication = .{ .user_managed = &.{ .{ .location = "us-east1", .kms_key = east }, .{ .location = "us-central1", .kms_key = central } } } }, false),
+    );
+    try testing.expectEqualStrings(
+        "{\"customerManagedEncryption\":{\"kmsKeyName\":\"" ++ central ++ "\"}}",
+        try encodeSecret(a, .{ .kms_key = central }, true),
+    );
+
+    // An automatic secret's key goes inside its replication, whole.
+    try testing.expectEqualStrings("replication", try updateMask(a, .{ .kms_key = .{ .set = g } }, false));
+    try testing.expectEqualStrings(
+        "{\"replication\":{\"automatic\":{\"customerManagedEncryption\":{\"kmsKeyName\":\"" ++ g ++ "\"}}}}",
+        try encodeUpdate(a, .{ .kms_key = .{ .set = g } }, false),
+    );
+    try testing.expectEqualStrings("{\"replication\":{\"automatic\":{}}}", try encodeUpdate(a, .{ .kms_key = .clear }, false));
+    // A regional secret's is a field of its own, cleared by leaving it out.
+    try testing.expectEqualStrings("customer_managed_encryption", try updateMask(a, .{ .kms_key = .clear }, true));
+    try testing.expectEqualStrings("{}", try encodeUpdate(a, .{ .kms_key = .clear }, true));
+    try testing.expectEqualStrings(
+        "{\"customerManagedEncryption\":{\"kmsKeyName\":\"" ++ central ++ "\"}}",
+        try encodeUpdate(a, .{ .kms_key = .{ .set = central } }, true),
+    );
+    // A user-managed secret's go replica by replica.
+    try testing.expectEqualStrings("replication", try updateMask(a, .{ .replica_keys = &.{.{ .location = "us-east1" }} }, false));
+    try testing.expectEqualStrings(
+        "{\"replication\":{\"userManaged\":{\"replicas\":[{\"location\":\"us-east1\"}]}}}",
+        try encodeUpdate(a, .{ .replica_keys = &.{.{ .location = "us-east1" }} }, false),
+    );
+    try testing.expect(!(types.SecretUpdate{ .replica_keys = &.{} }).isEmpty());
+}
+
+test "decode: keys and key versions, as production sent them on 2026-10-02" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const automatic = try decodeSecret(a,
+        \\{"createTime":"2026-10-02T13:03:11.101713Z","etag":"\"165cdb2789e3b6\"","name":"projects/82150720798/secrets/zigps-smf-2b9e3c6d-k-auto-g",
+        \\ "replication":{"automatic":{"customerManagedEncryption":{"kmsKeyName":"projects/extractctl/locations/global/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-g"}}}}
+    );
+    try testing.expectEqualStrings("projects/extractctl/locations/global/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-g", automatic.kms_key.?);
+    try testing.expectEqual(0, automatic.replicas.len);
+
+    const user_managed = try decodeSecret(a,
+        \\{"createTime":"2026-10-02T13:03:12.043865Z","etag":"\"165cdb27985c7d\"","name":"projects/82150720798/secrets/zigps-smf-2b9e3c6d-k-um",
+        \\ "replication":{"userManaged":{"replicas":[{"customerManagedEncryption":{"kmsKeyName":"projects/extractctl/locations/us-central1/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-r"},"location":"us-central1"}]}}}
+    );
+    try testing.expectEqual(null, user_managed.kms_key);
+    try testing.expectEqualStrings("us-central1", user_managed.replicas[0].location);
+    try testing.expectEqualStrings("projects/extractctl/locations/us-central1/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-r", user_managed.replicas[0].kms_key.?);
+
+    const regional = try decodeSecret(a,
+        \\{"createTime":"2026-10-02T13:03:12.858543Z","customerManagedEncryption":{"kmsKeyName":"projects/extractctl/locations/us-central1/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-r"},
+        \\ "etag":"\"165cdb27a37ca7\"","name":"projects/82150720798/locations/us-central1/secrets/zigps-smf-2b9e3c6d-k-reg"}
+    );
+    try testing.expectEqualStrings("projects/extractctl/locations/us-central1/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-r", regional.kms_key.?);
+    // A secret without keys, as every other body in this file.
+    try testing.expectEqual(null, (try decodeSecret(a, "{\"replication\":{\"automatic\":{}}}")).kms_key);
+
+    const v_auto = try decodeVersion(a,
+        \\{"createTime":"2026-10-02T13:03:15.513622Z","etag":"\"165cdb27cba116\"","name":"projects/82150720798/secrets/zigps-smf-2b9e3c6d-k-auto-g/versions/1",
+        \\ "replicationStatus":{"automatic":{"customerManagedEncryption":{"kmsKeyVersionName":"projects/extractctl/locations/global/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-g/cryptoKeyVersions/1"}}},"state":"ENABLED"}
+    );
+    try testing.expectEqual(1, v_auto.kms_key_versions.len);
+    try testing.expectEqual(null, v_auto.kms_key_versions[0].location);
+    try testing.expect(std.mem.endsWith(u8, v_auto.kms_key_versions[0].name, "/cryptoKeyVersions/1"));
+
+    const v_um = try decodeVersion(a,
+        \\{"createTime":"2026-10-02T13:03:16.475283Z","etag":"\"165cdb27da4d93\"","name":"projects/82150720798/secrets/zigps-smf-2b9e3c6d-k-um/versions/1",
+        \\ "replicationStatus":{"userManaged":{"replicas":[{"customerManagedEncryption":{"kmsKeyVersionName":"projects/extractctl/locations/us-central1/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-r/cryptoKeyVersions/1"},"location":"us-central1"}]}},"state":"ENABLED"}
+    );
+    try testing.expectEqualStrings("us-central1", v_um.kms_key_versions[0].location.?);
+
+    const v_reg = try decodeVersion(a,
+        \\{"createTime":"2026-10-02T13:03:17.277069Z","customerManagedEncryption":{"kmsKeyVersionName":"projects/extractctl/locations/us-central1/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-r/cryptoKeyVersions/1"},
+        \\ "etag":"\"165cdb27e6898d\"","name":"projects/82150720798/locations/us-central1/secrets/zigps-smf-2b9e3c6d-k-reg/versions/1","state":"ENABLED"}
+    );
+    try testing.expectEqual(1, v_reg.kms_key_versions.len);
+    // Google's own encryption: none, the replication status empty.
+    try testing.expectEqual(0, (try decodeVersion(a, "{\"replicationStatus\":{\"automatic\":{}}}")).kms_key_versions.len);
+    try testing.expectEqual(0, (try decodeVersion(a, "{\"replicationStatus\":{\"userManaged\":{\"replicas\":[{\"location\":\"us-east1\"}]}}}")).kms_key_versions.len);
 }
 
 test "decode secret page: tokens, counts and what is left out" {

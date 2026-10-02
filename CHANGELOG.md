@@ -52,11 +52,27 @@ including the ones that did not change.
   location, the version, the time, and the secret or version as the
   change left it, with a `key` for telling repeats apart, from the
   messages production sent on 2026-10-02.
+- secret_manager: customer-managed encryption keys. `SecretConfig.kms_key`
+  names an automatic secret's key, in `global`, or a regional secret's,
+  in its location; **breaking:** `Replication.user_managed` is now a
+  list of `Replica` (`location`, optional `kms_key`), every replica keyed
+  in its own location or none. `SecretUpdate.kms_key` and `replica_keys`
+  change the keys for versions added afterwards. `SecretInfo` reads
+  `kms_key` and `replicas` back, `VersionInfo.kms_key_versions` the key
+  version that wrapped each version. Key names and locations, and keys
+  on some replicas only, are refused before sending. **Breaking, for an
+  exhaustive switch:** `secret_manager.Error` gains `KeyUnavailable`,
+  for every refusal Cloud KMS makes (a key missing or not granted at
+  create or update; a key version disabled, scheduled for destruction,
+  or no longer granted at `access` or `addVersion`), told apart from a
+  disabled secret version by production's message.
 - examples: `secret_rotation` sets a secret's topic and rotation up and
   answers each rotation with a new version and a moved alias.
-- docs: the Secret Manager guide covers updates, preconditions,
-  aliases, expiry, delayed destruction, notifications and rotation,
-  with every rule as measured.
+- docs: the Secret Manager guide is now `docs/secret-manager/`: the
+  overview, changing a secret (updates, preconditions, aliases, expiry,
+  delayed destruction), notifications and rotation, and encryption keys,
+  with every rule as measured, and that a version's state reaches
+  `access` eventually.
 - ci: a nightly `heavy-secret_manager` fuzz job runs the model property
   of updates, conditions, topics, rotations and version changes against
   a new `FakeSecrets`.

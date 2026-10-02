@@ -62,7 +62,7 @@ Three kinds of result are not `Owned(T)`, and their guides say how they
 are freed: a download's `storage.DownloadResult`, which reports on bytes
 already written into the caller's writer and holds no memory; a
 `pubsub.Publisher` receipt, which is released with `release`; and Secret
-Manager's `SecretValue`, which [wipes its memory](secret-manager.md#the-bytes)
+Manager's `SecretValue`, which [wipes its memory](secret-manager/README.md#the-bytes)
 when it is released.
 
 ## Errors and diagnostics
@@ -121,7 +121,7 @@ What else is safe to repeat depends on the call, and each module says:
   idempotency token make a repeat harmless: see
   [Preconditions and retries](storage/writing-objects.md#preconditions-and-retries).
 - **Secret Manager** fetches a secret again when its bytes fail their
-  checksum, see [Checksums](secret-manager.md#checksums), and retries
+  checksum, see [Checksums](secret-manager/README.md#checksums), and retries
   `addVersion`, which can store the same bytes twice, unless
   `Options.retry_add_version` is false.
 - **IAM policy writes**, on every resource, are retried only under an

@@ -57,9 +57,21 @@
 //!   when one came due: advance the time by the period, or, without one,
 //!   remove the rotation; and move the etag.
 //!
-//! Not modelled yet: customer-managed keys (501), list filters and paging,
-//! expiry actually deleting a secret, a scheduled destruction coming due,
-//! publishing events.
+//! - Customer-managed keys: automatic replication takes a key in `global`,
+//!   a replica one in its own location, every replica one or none, and a
+//!   regional secret one in its location, each refused in production's
+//!   words; a key `setKey` names missing or ungranted is refused at create
+//!   and update ("Permission denied on Cloud KMS resource [KEY] ..."). A
+//!   version records the key version that wrapped it, `KEY/cryptoKeyVersions/1`,
+//!   and a key `setKey` names disabled refuses `addVersion` and `access`
+//!   ("Failed precondition on Cloud KMS resource ..."), as an ungranted one
+//!   does with the permission message. A patch of `replication` changes a
+//!   global secret's keys and nothing else; `customer_managed_encryption`
+//!   a regional one's.
+//!
+//! Not modelled: list filters and paging, expiry actually deleting a
+//! secret, a scheduled destruction coming due, publishing events, KMS key
+//! rotation.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -82,8 +94,20 @@ pub const FakeSecrets = struct {
     requests: u32 = 0,
     /// Topics Secret Manager could not publish to; any other is fine.
     topic_states: std.StringHashMapUnmanaged(TopicState) = .empty,
+    /// Keys Cloud KMS refuses; any other is usable.
+    key_states: std.StringHashMapUnmanaged(KeyState) = .empty,
 
     pub const TopicState = enum { missing, unpublishable };
+
+    pub const KeyState = enum { missing, ungranted, disabled };
+
+    const ReplicaKey = struct { location: []const u8, key: ?[]const u8 };
+
+    /// A global secret's replication: automatic with its key, or the
+    /// replicas with theirs.
+    const Repl = union(enum) { automatic: ?[]const u8, user_managed: []const ReplicaKey };
+
+    const KeyVersionRec = struct { location: ?[]const u8, name: []const u8 };
 
     pub const Reply = struct { status: u16, body: []const u8 };
 
@@ -94,8 +118,10 @@ pub const FakeSecrets = struct {
         name: []const u8,
         create_s: i64,
         etag: u64,
-        /// The replication as created, echoed back; null for regional.
-        replication: ?[]const u8,
+        /// Null for a regional secret.
+        replication: ?Repl,
+        /// A regional secret's key.
+        regional_key: ?[]const u8 = null,
         labels: Map = .empty,
         annotations: Map = .empty,
         aliases: Aliases = .empty,
@@ -116,6 +142,7 @@ pub const FakeSecrets = struct {
         create_s: i64,
         scheduled_s: ?i64 = null,
         destroy_s: ?i64 = null,
+        key_versions: []const KeyVersionRec = &.{},
     };
 
     pub fn init(gpa: Allocator) FakeSecrets {
@@ -142,6 +169,12 @@ pub const FakeSecrets = struct {
     pub fn setTopic(self: *FakeSecrets, topic: []const u8, state: TopicState) Allocator.Error!void {
         const a = self.store.allocator();
         try self.topic_states.put(a, try a.dupe(u8, topic), state);
+    }
+
+    /// Makes Cloud KMS refuse `key`, named in full.
+    pub fn setKey(self: *FakeSecrets, key: []const u8, state: KeyState) Allocator.Error!void {
+        const a = self.store.allocator();
+        try self.key_states.put(a, try a.dupe(u8, key), state);
     }
 
     /// What production did when a rotation came due: the next time moves on
@@ -209,11 +242,20 @@ pub const FakeSecrets = struct {
         var draft: Draft = .{};
         if (fields.replication) |r| {
             if (target.location != null) return fail(arena, 400, "INVALID_ARGUMENT", "Secret.replication should not be provided.");
-            draft.replication = try Stringify.valueAlloc(arena, r, .{});
+            draft.replication = switch (try self.readReplication(arena, r)) {
+                .ok => |repl| repl,
+                .refused => |refused| return refused,
+            };
         } else if (target.location == null) {
             return fail(arena, 400, "INVALID_ARGUMENT", "Secret.replication must be provided.");
         }
-        if (fields.unsupported) |what| return unsupported(arena, what);
+        if (fields.cmek) |v| {
+            const location = target.location orelse return invalidArgument(arena);
+            draft.regional_key = switch (try self.readRegionalKey(arena, v, location)) {
+                .ok => |k| k,
+                .refused => |refused| return refused,
+            };
+        }
         if (fields.topics) |v| {
             draft.topics = switch (try self.readTopics(arena, v)) {
                 .ok => |t| t,
@@ -247,7 +289,7 @@ pub const FakeSecrets = struct {
             .name = try a.dupe(u8, name),
             .create_s = self.now_s,
             .etag = self.etag(),
-            .replication = if (draft.replication) |r| try a.dupe(u8, r) else null,
+            .replication = null,
         };
         try self.commit(stored, draft);
         try self.secrets.put(a, try a.dupe(u8, key), stored);
@@ -271,6 +313,8 @@ pub const FakeSecrets = struct {
             .topics = s.topics,
             .rotation_next_s = s.rotation_next_s,
             .rotation_period_s = s.rotation_period_s,
+            .replication = s.replication,
+            .regional_key = s.regional_key,
         };
         // Production publishes to every topic a patch names before it
         // judges anything else.
@@ -293,12 +337,22 @@ pub const FakeSecrets = struct {
                     try std.fmt.allocPrint(arena, "Field '{s}' is immutable and cannot be updated.", .{field}),
                 ),
                 .replication => {
-                    if (s.replication == null) return fail(arena, 400, "INVALID_ARGUMENT", "Field mask paths starting with \"replication\" are not supported in updates of regional secret.");
+                    const current = s.replication orelse return fail(arena, 400, "INVALID_ARGUMENT", "Field mask paths starting with \"replication\" are not supported in updates of regional secret.");
                     const sent = fields.replication orelse return invalidArgument(arena);
-                    const text = try Stringify.valueAlloc(arena, sent, .{});
-                    if (!std.mem.eql(u8, text, s.replication.?)) return fail(arena, 400, "INVALID_ARGUMENT", "Existing secret has automatic replication, but requested secret does not. Updating secret replication is not supported.");
+                    const repl = switch (try self.readReplication(arena, sent)) {
+                        .ok => |r| r,
+                        .refused => |refused| return refused,
+                    };
+                    if (!sameShape(current, repl)) return fail(arena, 400, "INVALID_ARGUMENT", "Existing secret has automatic replication, but requested secret does not. Updating secret replication is not supported.");
+                    draft.replication = repl;
                 },
-                .unsupported => |what| return unsupported(arena, what),
+                .cmek => {
+                    const location = regionOf(s.name) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Field mask paths starting with \"customer_managed_encryption\" are not supported in updates of global secret.");
+                    draft.regional_key = if (fields.cmek) |v| switch (try self.readRegionalKey(arena, v, location)) {
+                        .ok => |k| k,
+                        .refused => |refused| return refused,
+                    } else null;
+                },
                 .labels => draft.labels = if (fields.labels) |v| switch (try readMap(arena, v, "labels")) {
                     .ok => |m| m,
                     .refused => |r| return r,
@@ -354,8 +408,24 @@ pub const FakeSecrets = struct {
             const want = std.fmt.parseInt(u32, sum, 10) catch return invalidArgument(arena);
             if (core.crc32c.hash(data) != want) return fail(arena, 400, "INVALID_ARGUMENT", "Provided SecretPayload.data crc32c does not match calculated crc32c.");
         }
+        // Each key wraps the new version's data key with its primary
+        // version, here always the first.
+        var records: std.ArrayListUnmanaged(KeyVersionRec) = .empty;
+        for (try self.keysOf(arena, s)) |entry| {
+            if (self.key_states.get(entry.key)) |state| return switch (state) {
+                .missing, .ungranted => permissionDenied(arena, try std.fmt.allocPrint(arena, "{s}/cryptoKeyVersions/1", .{entry.key})),
+                .disabled => fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(
+                    arena,
+                    "Failed precondition on Cloud KMS resource []. KMS error message: [{s}/cryptoKeyVersions/1 is not enabled, current state is: DISABLED.]",
+                    .{entry.key},
+                )),
+            };
+            try records.append(arena, .{ .location = entry.location, .name = try std.fmt.allocPrint(arena, "{s}/cryptoKeyVersions/1", .{entry.key}) });
+        }
         const a = self.store.allocator();
-        try s.versions.append(a, .{ .etag = self.etag(), .state = .ENABLED, .data = try a.dupe(u8, data), .create_s = self.now_s });
+        const kept = try a.alloc(KeyVersionRec, records.items.len);
+        for (records.items, kept) |r, *k| k.* = .{ .location = if (r.location) |l| try a.dupe(u8, l) else null, .name = try a.dupe(u8, r.name) };
+        try s.versions.append(a, .{ .etag = self.etag(), .state = .ENABLED, .data = try a.dupe(u8, data), .create_s = self.now_s, .key_versions = kept });
         return .{ .status = 200, .body = try self.versionJson(arena, s, s.versions.items.len) };
     }
 
@@ -374,6 +444,18 @@ pub const FakeSecrets = struct {
                 const resolved = try self.resolve(arena, s, ref);
                 const n = resolved.ok orelse return resolved.refused.?;
                 const v = s.versions.items[n - 1];
+                for (v.key_versions) |kv| {
+                    const key = kv.name[0 .. std.mem.lastIndexOf(u8, kv.name, "/cryptoKeyVersions/") orelse kv.name.len];
+                    const state = self.key_states.get(key) orelse continue;
+                    return switch (state) {
+                        .missing, .ungranted => permissionDenied(arena, kv.name),
+                        .disabled => fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(
+                            arena,
+                            "Failed precondition on Cloud KMS resource [{s}]. KMS error message: [{s} is not enabled, current state is: DISABLED.]",
+                            .{ kv.name, kv.name },
+                        )),
+                    };
+                }
                 if (v.state != .ENABLED) return fail(
                     arena,
                     400,
@@ -469,7 +551,8 @@ pub const FakeSecrets = struct {
 
     /// What a create or patch would leave, before it is committed.
     const Draft = struct {
-        replication: ?[]const u8 = null,
+        replication: ?Repl = null,
+        regional_key: ?[]const u8 = null,
         labels: Map = .empty,
         annotations: Map = .empty,
         aliases: Aliases = .empty,
@@ -498,6 +581,15 @@ pub const FakeSecrets = struct {
         s.topics = topics;
         s.rotation_next_s = draft.rotation_next_s;
         s.rotation_period_s = draft.rotation_period_s;
+        s.regional_key = if (draft.regional_key) |k| try a.dupe(u8, k) else null;
+        s.replication = if (draft.replication) |r| switch (r) {
+            .automatic => |k| .{ .automatic = if (k) |key| try a.dupe(u8, key) else null },
+            .user_managed => |replicas| blk: {
+                const copy = try a.alloc(ReplicaKey, replicas.len);
+                for (replicas, copy) |r_, *c| c.* = .{ .location = try a.dupe(u8, r_.location), .key = if (r_.key) |k| try a.dupe(u8, k) else null };
+                break :blk .{ .user_managed = copy };
+            },
+        } else null;
     }
 
     /// The rules production holds a secret's settings to, judged on the
@@ -584,10 +676,33 @@ pub const FakeSecrets = struct {
         try jw.write(s.name);
         if (s.replication) |r| {
             try jw.objectField("replication");
-            try jw.beginWriteRaw();
-            try w.writeAll(r);
-            jw.endWriteRaw();
+            try jw.beginObject();
+            switch (r) {
+                .automatic => |key| {
+                    try jw.objectField("automatic");
+                    try jw.beginObject();
+                    if (key) |k| try writeKeyField(&jw, "kmsKeyName", k);
+                    try jw.endObject();
+                },
+                .user_managed => |replicas| {
+                    try jw.objectField("userManaged");
+                    try jw.beginObject();
+                    try jw.objectField("replicas");
+                    try jw.beginArray();
+                    for (replicas) |replica| {
+                        try jw.beginObject();
+                        if (replica.key) |k| try writeKeyField(&jw, "kmsKeyName", k);
+                        try jw.objectField("location");
+                        try jw.write(replica.location);
+                        try jw.endObject();
+                    }
+                    try jw.endArray();
+                    try jw.endObject();
+                },
+            }
+            try jw.endObject();
         }
+        if (s.regional_key) |k| try writeKeyField(&jw, "kmsKeyName", k);
         try jw.objectField("createTime");
         try writeTime(&jw, s.create_s);
         inline for (.{ .{ "labels", s.labels }, .{ "annotations", s.annotations } }) |entry| {
@@ -666,13 +781,37 @@ pub const FakeSecrets = struct {
         }
         try jw.objectField("state");
         try jw.write(@tagName(v.state));
-        if (s.replication != null) {
+        if (s.replication) |r| {
             try jw.objectField("replicationStatus");
             try jw.beginObject();
-            try jw.objectField("automatic");
-            try jw.beginObject();
+            switch (r) {
+                .automatic => {
+                    try jw.objectField("automatic");
+                    try jw.beginObject();
+                    if (v.key_versions.len > 0) try writeKeyField(jw, "kmsKeyVersionName", v.key_versions[0].name);
+                    try jw.endObject();
+                },
+                .user_managed => |replicas| {
+                    try jw.objectField("userManaged");
+                    try jw.beginObject();
+                    try jw.objectField("replicas");
+                    try jw.beginArray();
+                    for (replicas) |replica| {
+                        try jw.beginObject();
+                        for (v.key_versions) |kv| if (std.mem.eql(u8, kv.location orelse "", replica.location)) {
+                            try writeKeyField(jw, "kmsKeyVersionName", kv.name);
+                        };
+                        try jw.objectField("location");
+                        try jw.write(replica.location);
+                        try jw.endObject();
+                    }
+                    try jw.endArray();
+                    try jw.endObject();
+                },
+            }
             try jw.endObject();
-            try jw.endObject();
+        } else if (v.key_versions.len > 0) {
+            try writeKeyField(jw, "kmsKeyVersionName", v.key_versions[0].name);
         }
         try jw.objectField("etag");
         try jw.print("\"\\\"{x}\\\"\"", .{v.etag});
@@ -723,6 +862,106 @@ pub const FakeSecrets = struct {
             } };
         }
         return .{ .ok = out };
+    }
+
+    const ReplResult = union(enum) { ok: Repl, refused: Reply };
+    const KeyResult = union(enum) { ok: ?[]const u8, refused: Reply };
+
+    /// A global secret's replication from a body, held to production's
+    /// rules for its keys.
+    fn readReplication(self: *FakeSecrets, arena: Allocator, value: std.json.Value) Allocator.Error!ReplResult {
+        if (value != .object) return .{ .refused = try invalidArgument(arena) };
+        if (value.object.get("automatic")) |automatic| {
+            const key = try cmekName(arena, automatic, "kmsKeyName") orelse return .{ .ok = .{ .automatic = null } };
+            if (!std.mem.eql(u8, keyLocation(key), "global")) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
+                arena,
+                "Automatic replication policy can only be configured with Cloud KMS keys in location [global]. Requested: [{s}]",
+                .{key},
+            )) };
+            if (try self.keyRefusal(arena, key)) |refused| return .{ .refused = refused };
+            return .{ .ok = .{ .automatic = key } };
+        }
+        const um = value.object.get("userManaged") orelse return .{ .refused = try invalidArgument(arena) };
+        if (um != .object) return .{ .refused = try invalidArgument(arena) };
+        const list = um.object.get("replicas") orelse return .{ .refused = try invalidArgument(arena) };
+        if (list != .array or list.array.items.len == 0) return .{ .refused = try invalidArgument(arena) };
+        const out = try arena.alloc(ReplicaKey, list.array.items.len);
+        var keyed: usize = 0;
+        for (list.array.items, out) |item, *replica| {
+            if (item != .object) return .{ .refused = try invalidArgument(arena) };
+            const loc = item.object.get("location") orelse return .{ .refused = try invalidArgument(arena) };
+            if (loc != .string) return .{ .refused = try invalidArgument(arena) };
+            const key = try cmekName(arena, item, "kmsKeyName");
+            replica.* = .{ .location = loc.string, .key = key };
+            if (key) |k| {
+                keyed += 1;
+                if (!std.mem.eql(u8, keyLocation(k), loc.string)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
+                    arena,
+                    "User-managed replica in location [{s}] can only be configured with Cloud KMS keys in location [{s}]. Requested: [{s}]",
+                    .{ loc.string, loc.string, k },
+                )) };
+            }
+        }
+        if (keyed != 0 and keyed != out.len) {
+            for (out) |r| if (r.key == null) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
+                arena,
+                "If a customer_managed_encryption is provided, it must be provided for all replicas. Missing configuration for [{s}].",
+                .{r.location},
+            )) };
+        }
+        for (out) |r| if (r.key) |k| if (try self.keyRefusal(arena, k)) |refused| return .{ .refused = refused };
+        return .{ .ok = .{ .user_managed = out } };
+    }
+
+    /// A regional secret's key from a body's `customerManagedEncryption`.
+    fn readRegionalKey(self: *FakeSecrets, arena: Allocator, value: std.json.Value, location: []const u8) Allocator.Error!KeyResult {
+        if (value != .object) return .{ .refused = try invalidArgument(arena) };
+        const name = value.object.get("kmsKeyName") orelse value.object.get("kms_key_name") orelse return .{ .ok = null };
+        if (name != .string) return .{ .refused = try invalidArgument(arena) };
+        if (name.string.len == 0) return .{ .ok = null };
+        const key = name.string;
+        if (!std.mem.eql(u8, keyLocation(key), location)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
+            arena,
+            "Secret in location [{s}] can only be configured with Cloud KMS keys in location [{s}]. Requested: [{s}]",
+            .{ location, location, key },
+        )) };
+        if (try self.keyRefusal(arena, key)) |refused| return .{ .refused = refused };
+        return .{ .ok = key };
+    }
+
+    /// A key Cloud KMS refuses when a create or update names it.
+    fn keyRefusal(self: *FakeSecrets, arena: Allocator, key: []const u8) Allocator.Error!?Reply {
+        const state = self.key_states.get(key) orelse return null;
+        return switch (state) {
+            .missing, .ungranted => try permissionDenied(arena, key),
+            .disabled => null,
+        };
+    }
+
+    const KeyEntry = struct { location: ?[]const u8, key: []const u8 };
+
+    /// The keys a new version of `s` is wrapped with, where.
+    fn keysOf(self: *FakeSecrets, arena: Allocator, s: *const Stored) Allocator.Error![]const KeyEntry {
+        _ = self;
+        if (s.regional_key) |k| {
+            const out = try arena.alloc(KeyEntry, 1);
+            out[0] = .{ .location = null, .key = k };
+            return out;
+        }
+        const r = s.replication orelse return &.{};
+        switch (r) {
+            .automatic => |key| {
+                const k = key orelse return &.{};
+                const out = try arena.alloc(KeyEntry, 1);
+                out[0] = .{ .location = null, .key = k };
+                return out;
+            },
+            .user_managed => |replicas| {
+                var out: std.ArrayListUnmanaged(KeyEntry) = .empty;
+                for (replicas) |replica| if (replica.key) |k| try out.append(arena, .{ .location = replica.location, .key = k });
+                return out.items;
+            },
+        }
     }
 
     fn etag(self: *FakeSecrets) u64 {
@@ -827,7 +1066,7 @@ const Fields = struct {
     replication: ?std.json.Value = null,
     topics: ?std.json.Value = null,
     rotation: ?std.json.Value = null,
-    unsupported: ?[]const u8 = null,
+    cmek: ?std.json.Value = null,
     expire_s: ?i64 = null,
 };
 
@@ -868,7 +1107,7 @@ fn parseBody(arena: Allocator, body: []const u8) Allocator.Error!Parsed {
         } else if (eqlAny(k, &.{"rotation"})) {
             f.rotation = v;
         } else if (eqlAny(k, &.{ "customerManagedEncryption", "customer_managed_encryption" })) {
-            f.unsupported = k;
+            f.cmek = v;
         } else if (eqlAny(k, &.{ "name", "createTime", "create_time", "tags", "secretType", "secret_type", "policyMember", "policy_member" })) {
             // Ignored on patch, or immutable: the mask decides.
         } else {
@@ -890,13 +1129,13 @@ const Path = union(enum) {
     ttl,
     delay,
     replication,
+    cmek,
     topics,
     rotation,
     rotation_next,
     rotation_period,
     ignored,
     immutable: []const u8,
-    unsupported: []const u8,
 };
 
 /// A mask path as production reads it, in either case; null for one it
@@ -916,7 +1155,7 @@ fn canonicalPath(raw: []const u8) ?Path {
     if (eqlAny(raw, &.{"rotation"})) return .rotation;
     if (eqlAny(raw, &.{ "rotation.next_rotation_time", "rotation.nextRotationTime" })) return .rotation_next;
     if (eqlAny(raw, &.{ "rotation.rotation_period", "rotation.rotationPeriod" })) return .rotation_period;
-    if (eqlAny(raw, &.{ "customer_managed_encryption", "customerManagedEncryption" })) return .{ .unsupported = raw };
+    if (eqlAny(raw, &.{ "customer_managed_encryption", "customerManagedEncryption" })) return .cmek;
     return null;
 }
 
@@ -1087,8 +1326,59 @@ fn stale(arena: Allocator) Allocator.Error!FakeSecrets.Reply {
     return fail(arena, 400, "FAILED_PRECONDITION", "The etag provided in the request does not match the resource's current etag. Please retry the whole read-modify-write with exponential backoff.");
 }
 
-fn unsupported(arena: Allocator, what: []const u8) Allocator.Error!FakeSecrets.Reply {
-    return fail(arena, 501, "UNIMPLEMENTED", try std.fmt.allocPrint(arena, "FakeSecrets does not model {s} yet", .{what}));
+fn permissionDenied(arena: Allocator, resource: []const u8) Allocator.Error!FakeSecrets.Reply {
+    return fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(
+        arena,
+        "Permission denied on Cloud KMS resource [{s}] (or it does not exist). Please grant cloudkms.cryptoKeyVersions.useToDecrypt and cloudkms.cryptoKeyVersions.useToEncrypt permissions (roles/cloudkms.cryptoKeyEncrypterDecrypter) to the Secret Manager service identity. See https://cloud.google.com/secret-manager/docs/cmek for more information.",
+        .{resource},
+    ));
+}
+
+/// The key a `{"customerManagedEncryption": {field: ...}}` inside `holder`
+/// names, or null when there is none.
+fn cmekName(arena: Allocator, holder: std.json.Value, field: []const u8) Allocator.Error!?[]const u8 {
+    _ = arena;
+    if (holder != .object) return null;
+    const cme = holder.object.get("customerManagedEncryption") orelse holder.object.get("customer_managed_encryption") orelse return null;
+    if (cme != .object) return null;
+    const name = cme.object.get(field) orelse return null;
+    return if (name == .string and name.string.len > 0) name.string else null;
+}
+
+/// The location part of a key named in full.
+fn keyLocation(key: []const u8) []const u8 {
+    var parts = std.mem.splitScalar(u8, key, '/');
+    _ = parts.next();
+    _ = parts.next();
+    _ = parts.next();
+    return parts.next() orelse "";
+}
+
+/// The location of a regional secret's name, or null for a global one.
+fn regionOf(name: []const u8) ?[]const u8 {
+    const marker = "/locations/";
+    const at = std.mem.indexOf(u8, name, marker) orelse return null;
+    const rest = name[at + marker.len ..];
+    return rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
+}
+
+fn sameShape(a: FakeSecrets.Repl, b: FakeSecrets.Repl) bool {
+    switch (a) {
+        .automatic => return b == .automatic,
+        .user_managed => |ra| {
+            if (b != .user_managed or b.user_managed.len != ra.len) return false;
+            for (ra, b.user_managed) |x, y| if (!std.mem.eql(u8, x.location, y.location)) return false;
+            return true;
+        },
+    }
+}
+
+fn writeKeyField(jw: *Stringify, field: []const u8, value: []const u8) Stringify.Error!void {
+    try jw.objectField("customerManagedEncryption");
+    try jw.beginObject();
+    try jw.objectField(field);
+    try jw.write(value);
+    try jw.endObject();
 }
 
 const testing = std.testing;
@@ -1220,7 +1510,7 @@ test "FakeSecrets: what production refuses, refused in its words" {
         .{ .PATCH, base ++ "/s?updateMask=version_destroy_ttl", "{\"versionDestroyTtl\":\"86399s\"}", 400, "at least [24h]" },
         .{ .PATCH, base ++ "/s?updateMask=labels", "{\"labels\":{},\"etag\":\"\\\"0\\\"\"}", 400, "etag provided" },
         .{ .PATCH, base ++ "/s?updateMask=labels", "{\"noSuchField\":1}", 400, "Unknown name" },
-        .{ .PATCH, base ++ "/s?updateMask=customer_managed_encryption", "{}", 501, "does not model" },
+        .{ .PATCH, base ++ "/s?updateMask=customer_managed_encryption", "{}", 400, "not supported in updates of global secret" },
         .{ .DELETE, base ++ "/s?etag=%220%22", "", 400, "etag provided" },
         .{ .GET, base ++ "/missing", "", 404, "not found" },
         .{ .POST, base ++ "/s/versions/latest:destroy", "{}", 400, "expected format" },
@@ -1594,5 +1884,144 @@ test "heavy property secret updates, conditions and version changes: the secret 
         "\x00\x02\x02\x02\x00\x01\x0f\x01\x0f\x01\x01\x01\x02\x01\x01\x01\x00",
         "\x01\x02\x02\x00\x01\x01\x01\x02\x02\x02\x01\x03\x01\x02\x01\x03\x02\x02\x01",
         "\x00\x00\x01\x05\x01\x05\x02\x01\x00\x01\x01\x01\x02\x00\x01\x02",
+    } });
+}
+
+test "FakeSecrets: keys through the real client, global, user-managed and regional" {
+    const g = "projects/p/locations/global/keyRings/r/cryptoKeys/g";
+    const g2 = "projects/p/locations/global/keyRings/r/cryptoKeys/g2";
+    const east = "projects/p/locations/us-east1/keyRings/r/cryptoKeys/e";
+    const east2 = "projects/p/locations/us-east1/keyRings/r/cryptoKeys/e2";
+    const central = "projects/p/locations/us-central1/keyRings/r/cryptoKeys/c";
+    {
+        var r: Rig = undefined;
+        try r.init(null);
+        defer r.deinit();
+        const secret = r.client.secret("auto");
+        var created = try secret.create(.{ .kms_key = g });
+        created.deinit();
+        var v1 = try secret.addVersion("one");
+        defer v1.deinit();
+        try testing.expectEqualStrings(g ++ "/cryptoKeyVersions/1", v1.value.kms_key_versions[0].name);
+
+        // A disabled key: no access, no new version; back, and both work.
+        try r.fake.setKey(g, .disabled);
+        try testing.expectError(error.KeyUnavailable, secret.access(.{ .number = 1 }));
+        try testing.expectError(error.KeyUnavailable, secret.addVersion("two"));
+        _ = r.fake.key_states.remove(g);
+        var back = try secret.access(.{ .number = 1 });
+        back.deinit();
+
+        // A new key wraps new versions only.
+        var moved = try secret.update(.{ .kms_key = .{ .set = g2 } });
+        defer moved.deinit();
+        try testing.expectEqualStrings(g2, moved.value.kms_key.?);
+        var v2 = try secret.addVersion("two");
+        defer v2.deinit();
+        try testing.expectEqualStrings(g2 ++ "/cryptoKeyVersions/1", v2.value.kms_key_versions[0].name);
+        var again = try secret.version(.{ .number = 1 }).get();
+        defer again.deinit();
+        try testing.expectEqualStrings(g ++ "/cryptoKeyVersions/1", again.value.kms_key_versions[0].name);
+        var plain = try secret.update(.{ .kms_key = .clear });
+        defer plain.deinit();
+        try testing.expectEqual(null, plain.value.kms_key);
+        var v3 = try secret.addVersion("three");
+        defer v3.deinit();
+        try testing.expectEqual(0, v3.value.kms_key_versions.len);
+
+        // An ungranted key is refused before anything is made.
+        try r.fake.setKey(g2, .ungranted);
+        try testing.expectError(error.KeyUnavailable, r.client.secret("other").create(.{ .kms_key = g2 }));
+        try testing.expectError(error.NotFound, r.client.secret("other").get());
+        try testing.expectError(error.KeyUnavailable, secret.update(.{ .kms_key = .{ .set = g2 } }));
+        // A user-managed shape cannot be put on an automatic secret.
+        try testing.expectError(error.InvalidArgument, secret.update(.{ .replica_keys = &.{.{ .location = "us-east1", .kms_key = east }} }));
+    }
+    {
+        var r: Rig = undefined;
+        try r.init(null);
+        defer r.deinit();
+        const secret = r.client.secret("um");
+        var created = try secret.create(.{ .replication = .{ .user_managed = &.{ .{ .location = "us-east1", .kms_key = east }, .{ .location = "us-central1", .kms_key = central } } } });
+        defer created.deinit();
+        try testing.expectEqual(2, created.value.replicas.len);
+        try testing.expectEqualStrings(central, created.value.replicas[1].kms_key.?);
+        var v1 = try secret.addVersion("one");
+        defer v1.deinit();
+        try testing.expectEqual(2, v1.value.kms_key_versions.len);
+        try testing.expectEqualStrings("us-east1", v1.value.kms_key_versions[0].location.?);
+
+        var moved = try secret.update(.{ .replica_keys = &.{ .{ .location = "us-east1", .kms_key = east2 }, .{ .location = "us-central1", .kms_key = central } } });
+        defer moved.deinit();
+        try testing.expectEqualStrings(east2, moved.value.replicas[0].kms_key.?);
+        // The locations are fixed.
+        try testing.expectError(error.InvalidArgument, secret.update(.{ .replica_keys = &.{.{ .location = "us-east1", .kms_key = east2 }} }));
+    }
+    {
+        var r: Rig = undefined;
+        try r.init("us-central1");
+        defer r.deinit();
+        const secret = r.client.secret("reg");
+        var created = try secret.create(.{ .kms_key = central });
+        defer created.deinit();
+        try testing.expectEqualStrings(central, created.value.kms_key.?);
+        var v1 = try secret.addVersion("one");
+        defer v1.deinit();
+        try testing.expectEqualStrings(central ++ "/cryptoKeyVersions/1", v1.value.kms_key_versions[0].name);
+        try testing.expectEqual(null, v1.value.kms_key_versions[0].location);
+        var cleared = try secret.update(.{ .kms_key = .clear });
+        defer cleared.deinit();
+        try testing.expectEqual(null, cleared.value.kms_key);
+    }
+}
+
+fn keyConfigProperty(_: void, input: []const u8) !void {
+    const types = @import("types.zig");
+    var g: test_util.ByteGen = .init(input);
+    const regional = g.boolean();
+    var r: Rig = undefined;
+    try r.init(if (regional) "us-central1" else null);
+    defer r.deinit();
+    const locations = [_][]const u8{ "us-east1", "us-central1", "global" };
+    const keys = [_]?[]const u8{
+        null,
+        "projects/p/locations/global/keyRings/r/cryptoKeys/k",
+        "projects/p/locations/us-east1/keyRings/r/cryptoKeys/k",
+        "projects/p/locations/us-central1/keyRings/r/cryptoKeys/k",
+        "projects/p/keyRings/r/cryptoKeys/k",
+    };
+    var replicas: [3]types.Replica = undefined;
+    const n = g.intRange(u8, 0, 3);
+    for (replicas[0..n]) |*rep| rep.* = .{ .location = locations[g.intRange(u8, 0, 1)], .kms_key = keys[g.intRange(u8, 0, keys.len - 1)] };
+    const config: types.SecretConfig = .{
+        .replication = if (n == 0) .automatic else .{ .user_managed = replicas[0..n] },
+        .kms_key = keys[g.intRange(u8, 0, keys.len - 1)],
+    };
+    const before = r.fake.requests;
+    if (r.client.secret("k").create(config)) |created| {
+        var c = created;
+        c.deinit();
+    } else |err| {
+        // What the client lets through, the server takes: a refusal is
+        // always the client's own, before sending, or one of the cases
+        // only production can judge.
+        try testing.expectEqual(error.InvalidArgument, err);
+        if (r.fake.requests != before) {
+            // The client sent it: only a repeated location is the server's
+            // to refuse, which the client does not check.
+            if (n < 2 or !std.mem.eql(u8, replicas[0].location, replicas[1].location)) {
+                std.debug.print("sent and refused: {s}\n", .{r.diag.message()});
+                return error.TestClientLetThroughWhatTheServerRefuses;
+            }
+        }
+    }
+}
+
+test "fuzz key configurations: what the client sends, the server takes" {
+    try test_util.fuzzBytes({}, keyConfigProperty, .{ .corpus = &.{
+        "",
+        "\x00\x02\x00\x01\x01\x03\x01",
+        "\x01\x00\x03",
+        "\x00\x01\x00\x02\x01",
     } });
 }

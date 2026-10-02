@@ -60,6 +60,12 @@ pub fn create(self: Secret, config: types.SecretConfig) Error!types.Owned(types.
     errdefer result.deinit();
     const response = try rpc.executeMapped(c, result.arena, .{ .method = .POST, .path = path, .body = body }, .{
         .topics = config.topics.len > 0,
+        // Secret Manager checks a key, and its grant, before it creates
+        // anything.
+        .keys = config.kms_key != null or switch (config.replication) {
+            .automatic => false,
+            .user_managed => |replicas| replicas.len > 0 and replicas[0].kms_key != null,
+        },
     });
     result.value = codec.decodeSecret(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(c, err, "secret");
@@ -92,17 +98,19 @@ pub fn update(self: Secret, changes: types.SecretUpdate) Error!types.Owned(types
 
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
-    const mask = try codec.updateMask(scratch.allocator(), changes);
+    const regional = c.location != null;
+    const mask = try codec.updateMask(scratch.allocator(), changes, regional);
     const path = try names.updatePath(scratch.allocator(), c.parent(), self.id, mask);
-    const body = try codec.encodeUpdate(scratch.allocator(), changes);
+    const body = try codec.encodeUpdate(scratch.allocator(), changes, regional);
 
     var result: types.Owned(types.SecretInfo) = try .init(c.gpa);
     errdefer result.deinit();
     const response = try rpc.executeMapped(c, result.arena, .{ .method = .PATCH, .path = path, .body = body }, .{
         .stale_etag = changes.etag != null,
         // Secret Manager checks every topic an update names, by publishing
-        // to it, and only then.
+        // to it, and only then; and a key it names, likewise.
         .topics = changes.topics == .set,
+        .keys = changes.kms_key == .set or changes.replica_keys != null,
     });
     result.value = codec.decodeSecret(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(c, err, "secret");
@@ -244,7 +252,9 @@ pub fn listVersions(self: Secret, options: types.ListOptions) Error!types.Owned(
 /// `data` is borrowed: the only copy this library makes is the base64 in the
 /// request body, which is wiped before the call returns. Wiping the caller's
 /// own copy is the caller's business. A CRC-32C of the raw bytes travels
-/// with them, so the server refuses anything that arrives changed.
+/// with them, so the server refuses anything that arrives changed. On a
+/// secret with a Cloud KMS key whose primary version is disabled, or that
+/// the service agent may not use, it is `error.KeyUnavailable`.
 pub fn addVersion(self: Secret, data: []const u8) Error!types.Owned(types.VersionInfo) {
     const c = self.client;
     rpc.begin(c);
@@ -272,7 +282,7 @@ pub fn addVersion(self: Secret, data: []const u8) Error!types.Owned(types.Versio
 
     var result: types.Owned(types.VersionInfo) = try .init(c.gpa);
     errdefer result.deinit();
-    const response = try rpc.execute(c, result.arena, .{
+    const response = try rpc.executeMapped(c, result.arena, .{
         .method = .POST,
         .path = path,
         .body = body,
@@ -280,7 +290,7 @@ pub fn addVersion(self: Secret, data: []const u8) Error!types.Owned(types.Versio
         // whether that is better than losing them.
         .retry = c.retry_add_version,
         .wipe = true,
-    });
+    }, .{ .keys = true });
     result.value = codec.decodeVersion(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(c, err, "version");
     if (!result.value.client_specified_payload_checksum) {
@@ -501,7 +511,7 @@ test "golden: create, global and regional" {
 
     var labelled = try h.client.secret("db-password").create(.{
         .labels = &.{.{ .key = "zig-gcp-test", .value = "1" }},
-        .replication = .{ .user_managed = &.{ "europe-west1", "us-east1" } },
+        .replication = .{ .user_managed = &.{ .{ .location = "europe-west1" }, .{ .location = "us-east1" } } },
     });
     defer labelled.deinit();
     try h.expectRequest(
@@ -516,7 +526,7 @@ test "golden: create, global and regional" {
     defer regional.deinit();
     // A regional create sends no replication, whatever the config says.
     var there = try regional.client.secret("db-password").create(.{
-        .replication = .{ .user_managed = &.{"europe-west1"} },
+        .replication = .{ .user_managed = &.{.{ .location = "europe-west1" }} },
     });
     defer there.deinit();
     try regional.expectRequest(
@@ -587,7 +597,7 @@ test "create: what the server refuses, and what never reaches it" {
     }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "at least one location") != null);
     try testing.expectError(error.InvalidLocation, h.client.secret("db-password").create(.{
-        .replication = .{ .user_managed = &.{"Europe-West1"} },
+        .replication = .{ .user_managed = &.{.{ .location = "Europe-West1" }} },
     }));
     try testing.expectError(error.InvalidResourceId, h.client.secret("db.password").create(.{}));
     try testing.expectError(error.InvalidResourceId, h.client.secret("").get());
@@ -967,4 +977,82 @@ test "topics and rotation: what never reaches the server" {
     try testing.expectError(error.InvalidArgument, secret.create(.{ .rotation = .{ .next_time = "2027-01-01T00:00:00Z" } }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "needs topics") != null);
     try h.expectRequestCount(0);
+}
+
+test "keys: what never reaches the server" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    var regional: Harness = undefined;
+    try regional.init(&.{}, .{ .location = "us-central1" });
+    defer regional.deinit();
+    const g = "projects/p/locations/global/keyRings/r/cryptoKeys/g";
+    const east = "projects/p/locations/us-east1/keyRings/r/cryptoKeys/e";
+    const central = "projects/p/locations/us-central1/keyRings/r/cryptoKeys/c";
+
+    const Create = struct { *Harness, types.SecretConfig, []const u8 };
+    for ([_]Create{
+        .{ &h, .{ .kms_key = central }, "must be there too" },
+        .{ &h, .{ .kms_key = "projects/p/keyRings/r/cryptoKeys/g" }, "named in full" },
+        .{ &h, .{ .kms_key = g ++ "/cryptoKeyVersions/1" }, "named in full" },
+        .{ &h, .{ .replication = .{ .user_managed = &.{.{ .location = "us-east1" }} }, .kms_key = east }, "per replica" },
+        .{ &h, .{ .replication = .{ .user_managed = &.{.{ .location = "us-east1", .kms_key = central }} } }, "must be there too" },
+        .{ &h, .{ .replication = .{ .user_managed = &.{ .{ .location = "us-east1", .kms_key = east }, .{ .location = "us-central1" } } } }, "or none does" },
+        .{ &regional, .{ .kms_key = g }, "must be there too" },
+    }) |case| {
+        try testing.expectError(error.InvalidArgument, case[0].client.secret("db-password").create(case[1]));
+        if (std.mem.indexOf(u8, case[0].diag.message(), case[2]) == null) {
+            std.debug.print("diagnostics \"{s}\" lack \"{s}\"\n", .{ case[0].diag.message(), case[2] });
+            return error.TestUnexpectedDiagnostics;
+        }
+    }
+    const Update = struct { *Harness, types.SecretUpdate, []const u8 };
+    for ([_]Update{
+        .{ &h, .{ .kms_key = .{ .set = central } }, "must be there too" },
+        .{ &regional, .{ .kms_key = .{ .set = g } }, "must be there too" },
+        .{ &regional, .{ .replica_keys = &.{.{ .location = "us-central1", .kms_key = central }} }, "no replicas" },
+        .{ &h, .{ .replica_keys = &.{.{ .location = "us-east1", .kms_key = east }}, .kms_key = .clear }, "not both" },
+        .{ &h, .{ .replica_keys = &.{} }, "every replica" },
+        .{ &h, .{ .replica_keys = &.{.{ .location = "US-EAST1" }} }, "location id" },
+        .{ &h, .{ .replica_keys = &.{ .{ .location = "us-east1", .kms_key = east }, .{ .location = "us-central1" } } }, "or none does" },
+    }) |case| {
+        try testing.expectError(error.InvalidArgument, case[0].client.secret("db-password").update(case[1]));
+        if (std.mem.indexOf(u8, case[0].diag.message(), case[2]) == null) {
+            std.debug.print("diagnostics \"{s}\" lack \"{s}\"\n", .{ case[0].diag.message(), case[2] });
+            return error.TestUnexpectedDiagnostics;
+        }
+    }
+    try h.expectRequestCount(0);
+    try regional.expectRequestCount(0);
+}
+
+test "a key Cloud KMS refuses is KeyUnavailable, where a key is used" {
+    const ungranted: Reply = .{ .respond = .{ .status = 400, .body =
+        \\{"error":{"code":400,"message":"Permission denied on Cloud KMS resource [projects/extractctl/locations/us-central1/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-r2] (or it does not exist). Please grant cloudkms.cryptoKeyVersions.useToDecrypt and cloudkms.cryptoKeyVersions.useToEncrypt permissions (roles/cloudkms.cryptoKeyEncrypterDecrypter) to the Secret Manager service identity. See https://cloud.google.com/secret-manager/docs/cmek for more information.","status":"FAILED_PRECONDITION"}}
+    } };
+    const disabled: Reply = .{ .respond = .{ .status = 400, .body =
+        \\{"error":{"code":400,"message":"Failed precondition on Cloud KMS resource [projects/extractctl/locations/global/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-g/cryptoKeyVersions/1]. KMS error message: [projects/extractctl/locations/global/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-g/cryptoKeyVersions/1 is not enabled, current state is: DISABLED.]","status":"FAILED_PRECONDITION"}}
+    } };
+    const primary_disabled: Reply = .{ .respond = .{ .status = 400, .body =
+        \\{"error":{"code":400,"message":"Failed precondition on Cloud KMS resource []. KMS error message: [projects/extractctl/locations/global/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-g/cryptoKeyVersions/2 is not enabled, current state is: DISABLED.]","status":"FAILED_PRECONDITION"}}
+    } };
+    const version_disabled: Reply = .{ .respond = .{ .status = 400, .body =
+        \\{"error":{"code":400,"message":"Secret Version [projects/82150720798/secrets/db-password/versions/2] is in DISABLED state.","status":"FAILED_PRECONDITION"}}
+    } };
+    var h: Harness = undefined;
+    try h.init(&.{ ungranted, ungranted, disabled, primary_disabled, version_disabled, disabled }, .{ .location = "us-central1" });
+    defer h.deinit();
+    const secret = h.client.secret("db-password");
+    const key = "projects/extractctl/locations/us-central1/keyRings/zigps-smf-2b9e3c6d/cryptoKeys/zigps-smf-2b9e3c6d-r2";
+
+    try testing.expectError(error.KeyUnavailable, secret.create(.{ .kms_key = key }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "cryptoKeyEncrypterDecrypter") != null);
+    try testing.expectError(error.KeyUnavailable, secret.update(.{ .kms_key = .{ .set = key } }));
+    try testing.expectError(error.KeyUnavailable, secret.access(.{ .number = 1 }));
+    try testing.expectError(error.KeyUnavailable, secret.addVersion("s3cr3t"));
+    // A disabled secret version is what it was.
+    try testing.expectError(error.FailedPrecondition, secret.access(.{ .number = 2 }));
+    // A call that names no key never maps one.
+    try testing.expectError(error.FailedPrecondition, secret.update(.{ .labels = .clear }));
+    try h.expectRequestCount(6);
 }

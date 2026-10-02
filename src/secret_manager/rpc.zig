@@ -81,6 +81,14 @@ pub fn isTopicRefusal(err: anyerror, diag: *const core.Diagnostics) bool {
     };
 }
 
+/// Whether a failed call was refused by Cloud KMS for the secret's key:
+/// production's two `FAILED_PRECONDITION` messages, "Permission denied on
+/// Cloud KMS resource [...]" and "Failed precondition on Cloud KMS
+/// resource [...]", measured on 2026-10-02.
+pub fn isKeyRefusal(err: anyerror, diag: *const core.Diagnostics) bool {
+    return err == error.FailedPrecondition and std.mem.indexOf(u8, diag.message(), "on Cloud KMS resource [") != null;
+}
+
 /// Which refusals a call maps to errors of their own.
 pub const Mapping = struct {
     /// The call carries an etag: a stale one is `error.Aborted`.
@@ -88,6 +96,9 @@ pub const Mapping = struct {
     /// The call names topics: one Secret Manager cannot publish to is
     /// `error.TopicNotPublishable`.
     topics: bool = false,
+    /// The call uses the secret's key: a key Cloud KMS refuses is
+    /// `error.KeyUnavailable`.
+    keys: bool = false,
 };
 
 /// `execute`, mapping the refusals `mapping` names and leaving every
@@ -101,6 +112,7 @@ pub fn executeMapped(client: *Client, response: *std.heap.ArenaAllocator, call: 
 fn mapped(err: Error, diag: *const core.Diagnostics, mapping: Mapping) Error {
     if (mapping.stale_etag and isStaleEtag(err, diag)) return error.Aborted;
     if (mapping.topics and isTopicRefusal(err, diag)) return error.TopicNotPublishable;
+    if (mapping.keys and isKeyRefusal(err, diag)) return error.KeyUnavailable;
     return err;
 }
 
@@ -201,21 +213,31 @@ pub fn checkConfig(client: *Client, config: types.SecretConfig) Error!void {
         try checkRotation(client, r);
         if (config.topics.len == 0) return refuse(client, "a rotation needs topics, which Secret Manager tells when it is time", .{});
     }
+    if (config.kms_key) |key| {
+        if (client.location == null and config.replication == .user_managed) {
+            return refuse(client, "a user-managed secret names a key per replica, not kms_key", .{});
+        }
+        try checkKey(client, key, client.location orelse "global");
+    }
+    if (client.location == null) switch (config.replication) {
+        .automatic => {},
+        .user_managed => |replicas| try checkReplicaKeys(client, replicas),
+    };
     // A regional secret sends no replication at all, so there is nothing
     // there to check.
     if (client.location != null) return;
     switch (config.replication) {
         .automatic => {},
-        .user_managed => |locations| {
-            if (locations.len == 0) {
+        .user_managed => |replicas| {
+            if (replicas.len == 0) {
                 if (client.diagnostics) |d| d.print(
                     "invalid replication: user-managed replication needs at least one location",
                     .{},
                 );
                 return error.InvalidArgument;
             }
-            for (locations) |location| {
-                if (validate.isLocation(location)) continue;
+            for (replicas) |replica| {
+                if (validate.isLocation(replica.location)) continue;
                 if (client.diagnostics) |d| d.print(
                     "invalid replication location: expected a location id such as \"europe-west1\"",
                     .{},
@@ -271,7 +293,44 @@ pub fn checkUpdate(client: *Client, changes: types.SecretUpdate) Error!void {
         },
         .keep, .clear => {},
     }
+    switch (changes.kms_key) {
+        .set => |key| try checkKey(client, key, client.location orelse "global"),
+        .keep, .clear => {},
+    }
+    if (changes.replica_keys) |replicas| {
+        if (client.location != null) return refuse(client, "a regional secret has no replicas: its key is kms_key", .{});
+        if (changes.kms_key != .keep) return refuse(client, "kms_key is an automatic secret's key, replica_keys a user-managed one's: not both", .{});
+        if (replicas.len == 0) return refuse(client, "replica_keys names every replica the secret has", .{});
+        for (replicas, 1..) |r, n| if (!validate.isLocation(r.location)) {
+            return refuse(client, "replica {d}: expected a location id such as \"europe-west1\"", .{n});
+        };
+        try checkReplicaKeys(client, replicas);
+    }
     if (changes.etag) |etag| try checkEtag(client, etag);
+}
+
+/// A key named in full, in the location the secret's bytes are kept in:
+/// production refuses a key anywhere else.
+fn checkKey(client: *Client, key: []const u8, location: []const u8) Error!void {
+    const at = validate.kmsKeyLocation(key) orelse
+        return refuse(client, "a Cloud KMS key is named in full, projects/P/locations/L/keyRings/R/cryptoKeys/K", .{});
+    if (!std.mem.eql(u8, at, location)) return refuse(
+        client,
+        "the key is in {s}, and this secret's bytes are kept in {s}: the key must be there too",
+        .{ at, location },
+    );
+}
+
+/// Every replica keyed in its own location, or none keyed, as production
+/// requires.
+fn checkReplicaKeys(client: *Client, replicas: []const types.Replica) Error!void {
+    var keyed: usize = 0;
+    for (replicas) |r| {
+        const key = r.kms_key orelse continue;
+        keyed += 1;
+        try checkKey(client, key, r.location);
+    }
+    if (keyed != 0 and keyed != replicas.len) return refuse(client, "every replica has a key, or none does", .{});
 }
 
 fn checkTopics(client: *Client, topics: []const []const u8) Error!void {
