@@ -82,6 +82,39 @@ pub fn metadataFault(entries: []const types.Metadata) ?MetadataFault {
     return null;
 }
 
+/// The ceiling on a folder path in a hierarchical-namespace bucket, in
+/// bytes of UTF-8, slashes and the trailing slash included: the documented
+/// 512 bytes. Cloud Storage's own refusal says characters, and counted
+/// ASCII when measured (2026-10-02), so which it counts for multibyte
+/// names only the server knows.
+pub const max_folder_path_bytes = 512;
+/// Folders nest at most 50 levels deep.
+pub const max_folder_depth = 50;
+
+/// What is wrong with a folder path, or null. `path` ends with the
+/// trailing slash the handle appends when it is missing. Cloud Storage
+/// itself takes `./`, `../` and `/` verbatim, as measured, which no caller
+/// can want: a folder literally named `..` reads like a path traversal
+/// everywhere it is printed. So dot segments and empty segments are
+/// refused here, beside the documented limits.
+pub fn folderPathProblem(path: []const u8) ?[]const u8 {
+    if (path.len == 0) return "the path is empty";
+    if (path.len > max_folder_path_bytes) return "the path is over 512 bytes, slashes included";
+    if (!std.unicode.utf8ValidateSlice(path)) return "the path is not UTF-8";
+    if (std.mem.indexOfAny(u8, path, "\r\n") != null) return "the path holds a carriage return or line feed";
+    var depth: usize = 0;
+    const trimmed = if (path[path.len - 1] == '/') path[0 .. path.len - 1] else path;
+    var segments = std.mem.splitScalar(u8, trimmed, '/');
+    while (segments.next()) |segment| {
+        depth += 1;
+        if (segment.len == 0) return "a segment is empty, which Cloud Storage reads as a parent that cannot exist";
+        if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, ".."))
+            return "a segment is \".\" or \"..\", which Cloud Storage takes verbatim and nothing can address safely";
+    }
+    if (depth > max_folder_depth) return "the path is over 50 levels deep";
+    return null;
+}
+
 /// User agents become a header value: printable ASCII.
 pub fn isUserAgent(text: []const u8) bool {
     if (text.len == 0) return false;
@@ -138,6 +171,12 @@ fn namesProperty(_: void, input: []const u8) !void {
     if (isBucketName(input)) {
         try testing.expect(std.mem.indexOfAny(u8, input, "/ \t\r\n") == null);
     }
+    if (folderPathProblem(input) == null) {
+        try testing.expect(input.len >= 1 and input.len <= max_folder_path_bytes);
+        try testing.expect(std.mem.indexOfAny(u8, input, "\r\n") == null);
+        try testing.expect(std.mem.indexOf(u8, input, "//") == null);
+        try testing.expect(input[0] != '/');
+    }
 }
 
 test "fuzz name validation is total and safe" {
@@ -149,7 +188,34 @@ test "fuzz name validation is total and safe" {
         "my-bucket",
         "a b",
         "\xff\xfe",
+        "a/b/",
+        "../",
+        "a//b/",
     } });
+}
+
+test "folder paths: the measured limits, and the names the server takes that no caller can want" {
+    try testing.expect(folderPathProblem("a/") == null);
+    try testing.expect(folderPathProblem("a/b/c/") == null);
+    try testing.expect(folderPathProblem("caf\xc3\xa9/") == null);
+    try testing.expect(folderPathProblem("...a/") == null);
+    try testing.expect(folderPathProblem("s" ** 511 ++ "/") == null);
+    const deep50 = "d/" ** 50;
+    try testing.expect(folderPathProblem(deep50) == null);
+
+    try testing.expect(folderPathProblem("") != null);
+    try testing.expect(folderPathProblem("/") != null);
+    try testing.expect(folderPathProblem("./") != null);
+    try testing.expect(folderPathProblem("../") != null);
+    try testing.expect(folderPathProblem("a/./b/") != null);
+    try testing.expect(folderPathProblem("a/../") != null);
+    try testing.expect(folderPathProblem("/a/") != null);
+    try testing.expect(folderPathProblem("a//b/") != null);
+    try testing.expect(folderPathProblem("s" ** 512 ++ "/") != null);
+    try testing.expect(folderPathProblem(deep50 ++ "x/") != null);
+    try testing.expect(folderPathProblem("a\rb/") != null);
+    try testing.expect(folderPathProblem("a\nb/") != null);
+    try testing.expect(folderPathProblem("bad\xffutf8/") != null);
 }
 
 test "metadataFault finds an empty key and a repeated one" {

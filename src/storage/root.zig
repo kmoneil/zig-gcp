@@ -14,6 +14,7 @@ const core = @import("core");
 pub const Client = @import("Client.zig");
 pub const Bucket = @import("Bucket.zig");
 pub const Object = @import("Object.zig");
+pub const Folder = @import("Folder.zig");
 pub const Endpoint = @import("Endpoint.zig");
 
 pub const TokenProvider = core.TokenProvider;
@@ -55,6 +56,10 @@ pub const Downloaded = @import("types.zig").Downloaded;
 pub const GetOptions = @import("types.zig").GetOptions;
 pub const ListOptions = @import("types.zig").ListOptions;
 pub const Metadata = @import("types.zig").Metadata;
+pub const FolderInfo = @import("types.zig").FolderInfo;
+pub const FolderPage = @import("types.zig").FolderPage;
+pub const FolderListOptions = @import("types.zig").FolderListOptions;
+pub const StorageLayout = @import("types.zig").StorageLayout;
 pub const ObjectInfo = @import("types.zig").ObjectInfo;
 pub const ObjectPage = @import("types.zig").ObjectPage;
 pub const PageOptions = @import("types.zig").PageOptions;
@@ -121,6 +126,8 @@ test {
     _ = @import("Endpoint.zig");
     _ = @import("notifications.zig");
     _ = @import("events.zig");
+    _ = @import("Folder.zig");
+    _ = @import("folders.zig");
     _ = @import("Object.zig");
     _ = @import("checkpoint.zig");
     _ = @import("codec.zig");

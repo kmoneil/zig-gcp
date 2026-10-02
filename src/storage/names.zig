@@ -131,6 +131,63 @@ fn writeOperations(w: *Writer, bucket: []const u8, request: OperationRequest) Wr
     }
 }
 
+/// What a folder request asks beside the bucket. The folder travels as one
+/// strictly encoded segment, slashes included, as its selfLink spells it.
+pub const FolderRequest = union(enum) {
+    /// `/folders`, with `recursive=true` when asked: missing parents are
+    /// created along the way.
+    insert: bool,
+    /// `/folders/{folder}`, with its metageneration conditions: a get or a
+    /// delete.
+    item: struct { folder: []const u8, preconditions: types.Preconditions = .{} },
+    /// `/folders` with the listing's query.
+    list: types.FolderListOptions,
+};
+
+/// `/storage/v1/b/{bucket}/folders`, one folder, or the listing.
+pub fn foldersPath(arena: Allocator, bucket: []const u8, request: FolderRequest) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeFolders(&out.writer, bucket, request) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeFolders(w: *Writer, bucket: []const u8, request: FolderRequest) Writer.Error!void {
+    try w.writeAll("/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/folders");
+    switch (request) {
+        .insert => |recursive| if (recursive) {
+            var params: query.Params = .init(w);
+            try params.add("recursive", "true");
+        },
+        .item => |item| {
+            try w.writeByte('/');
+            try query.writeStrictSegment(w, item.folder);
+            var params: query.Params = .init(w);
+            try writePreconditions(&params, item.preconditions);
+        },
+        .list => |options| {
+            var params: query.Params = .init(w);
+            try params.addOptional("prefix", options.prefix);
+            if (options.directory_mode) try params.add("delimiter", "/");
+            try params.addOptional("startOffset", options.start_offset);
+            try params.addOptional("endOffset", options.end_offset);
+            try params.addNonZero("pageSize", options.page_size);
+            try params.addOptional("pageToken", options.page_token);
+        },
+    }
+}
+
+/// `/storage/v1/b/{bucket}/storageLayout`.
+pub fn storageLayoutPath(arena: Allocator, bucket: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeAll("/storage/v1/b/") catch return error.OutOfMemory;
+    query.writeStrictSegment(w, bucket) catch return error.OutOfMemory;
+    w.writeAll("/storageLayout") catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
 /// `/storage/v1/b/{bucket}/notificationConfigs`, or one of them by `id`.
 pub fn notificationsPath(arena: Allocator, bucket: []const u8, id: ?[]const u8) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
@@ -194,6 +251,7 @@ pub fn objectsPath(arena: Allocator, bucket: []const u8, options: types.ListOpti
         .match_glob = options.match_glob,
         .versions = options.versions,
         .soft_deleted = options.soft_deleted,
+        .folders_as_prefixes = options.include_folders_as_prefixes,
         .page_size = options.page_size,
         .page_token = options.page_token,
     }) catch return error.OutOfMemory;
@@ -467,6 +525,7 @@ const Parts = struct {
     match_glob: ?[]const u8 = null,
     versions: bool = false,
     soft_deleted: bool = false,
+    folders_as_prefixes: bool = false,
     copy_source_acl: bool = false,
     restore_token: ?[]const u8 = null,
     kms_key_name: ?[]const u8 = null,
@@ -499,6 +558,7 @@ fn write(w: *Writer, parts: Parts) Writer.Error!void {
     try params.addOptional("matchGlob", parts.match_glob);
     if (parts.versions) try params.add("versions", "true");
     if (parts.soft_deleted) try params.add("softDeleted", "true");
+    if (parts.folders_as_prefixes) try params.add("includeFoldersAsPrefixes", "true");
     if (parts.copy_source_acl) try params.add("copySourceAcl", "true");
     try params.addOptional("restoreToken", parts.restore_token);
     try params.addNonZero("maxResults", parts.page_size);
@@ -583,6 +643,30 @@ test "media and upload paths" {
         "/upload/storage/v1/b/my-bucket/o?uploadType=multipart",
         try uploadMultipartPath(gpa, "my-bucket", .{}, null),
     );
+}
+
+test "folder and layout paths encode the folder as one segment" {
+    const gpa = testing.allocator;
+    try expectPath("/storage/v1/b/b/folders", try foldersPath(gpa, "b", .{ .insert = false }));
+    try expectPath("/storage/v1/b/b/folders?recursive=true", try foldersPath(gpa, "b", .{ .insert = true }));
+    try expectPath("/storage/v1/b/b/folders/a%2Fb%2F", try foldersPath(gpa, "b", .{ .item = .{ .folder = "a/b/" } }));
+    try expectPath(
+        "/storage/v1/b/b%25c/folders/caf%C3%A9%2F?ifMetagenerationMatch=3",
+        try foldersPath(gpa, "b%c", .{ .item = .{ .folder = "caf\xc3\xa9/", .preconditions = .{ .if_metageneration_match = 3 } } }),
+    );
+    try expectPath("/storage/v1/b/b/folders", try foldersPath(gpa, "b", .{ .list = .{} }));
+    try expectPath(
+        "/storage/v1/b/b/folders?prefix=n1%2F&delimiter=%2F&startOffset=a&endOffset=z&pageSize=1&pageToken=t%2B",
+        try foldersPath(gpa, "b", .{ .list = .{
+            .prefix = "n1/",
+            .directory_mode = true,
+            .start_offset = "a",
+            .end_offset = "z",
+            .page_size = 1,
+            .page_token = "t+",
+        } }),
+    );
+    try expectPath("/storage/v1/b/my-bucket/storageLayout", try storageLayoutPath(gpa, "my-bucket"));
 }
 
 test "object listing paths" {

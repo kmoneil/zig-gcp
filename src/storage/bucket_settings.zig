@@ -135,6 +135,22 @@ pub fn checkConfig(diag: ?*core.Diagnostics, config: types.BucketConfig) CheckEr
     try checkLabels(diag, config.labels);
     try checkLifecycle(diag, config.lifecycle);
     if (config.public_access_prevention) |value| try checkPublicAccessPrevention(diag, value);
+    // What a hierarchical namespace excludes, each in Cloud Storage's own
+    // words, as it refused them on 2026-10-02.
+    if (config.hierarchical_namespace) {
+        if (config.uniform_bucket_level_access == false) {
+            return refuse(diag, "Hierarchical namespace buckets must use uniform bucket-level access.", .{});
+        }
+        if (config.versioning) {
+            return refuse(diag, "Versioning is not supported for hierarchical namespace buckets.", .{});
+        }
+        if (config.retention_period_s != null) {
+            return refuse(diag, "Retention policy is not supported for hierarchical namespace buckets.", .{});
+        }
+        if (config.object_retention) {
+            return refuse(diag, "Object retention config is not supported for hierarchical namespace buckets.", .{});
+        }
+    }
 }
 
 /// An update: something to change, and every new value valid.
@@ -429,9 +445,22 @@ fn writeConfig(jw: *Stringify, name: []const u8, config: types.BucketConfig) Str
         try jw.endObject();
     }
     if (config.lifecycle.len > 0) try writeLifecycle(jw, config.lifecycle);
-    try writeIamConfiguration(jw, config.uniform_bucket_level_access, config.public_access_prevention);
+    // A hierarchical namespace needs uniform access, so asking for one asks
+    // for both unless the caller said otherwise, which the checks refused.
+    const uniform = if (config.hierarchical_namespace and config.uniform_bucket_level_access == null)
+        true
+    else
+        config.uniform_bucket_level_access;
+    try writeIamConfiguration(jw, uniform, config.public_access_prevention);
     if (config.retention_period_s) |seconds| try writeRetentionPolicy(jw, seconds);
     if (config.default_event_based_hold) try writeDefaultHold(jw, true);
+    if (config.hierarchical_namespace) {
+        try jw.objectField("hierarchicalNamespace");
+        try jw.beginObject();
+        try jw.objectField("enabled");
+        try jw.write(true);
+        try jw.endObject();
+    }
     try jw.endObject();
 }
 

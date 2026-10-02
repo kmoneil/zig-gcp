@@ -4,6 +4,38 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.30.0 (unreleased)
+
+- storage: folders, for buckets created with
+  `BucketConfig.hierarchical_namespace`. `Bucket.folder(path)` is a handle:
+  `create` (with `recursive` for the missing parents), `get` and `delete`,
+  each under an optional metageneration condition on the delete;
+  `Bucket.listFolders` pages them, filtered by a prefix, bounded by
+  offsets, or kept to one level in `directory_mode`. Uploads, composes and
+  copies create their missing parent folders, which outlive their objects,
+  as measured on 2026-10-02; folders are never removed on their own.
+  `Bucket.storageLayout` answers whether any bucket is hierarchical with
+  only `storage.objects.list` permission.
+  `ListOptions.include_folders_as_prefixes` lists folders (and, on flat
+  buckets, managed folders) in `prefixes` beside the objects, with the `/`
+  delimiter production requires. A hierarchical namespace needs uniform
+  bucket-level access, which asking for one sends along, and excludes
+  versioning, retention policies and object retention, each refused before
+  sending in production's own words; an update naming it would be answered
+  200 and silently dropped, as measured, so none can be sent. Checked
+  before sending, with `error.InvalidFolderName`: paths over 512 bytes or
+  50 levels, and the `.`, `..` and empty segments production accepts
+  verbatim and nothing can address safely; a missing trailing slash is
+  normalized, as the server itself normalizes. A folder create whose
+  answer was lost is read back rather than sent again, since the
+  idempotency token dedupes none of these writes, as measured; a repeated
+  delete answers `error.NotFound`. **Breaking, for an exhaustive switch:**
+  `storage.Error` gains `InvalidFolderName`, `FolderNotEmpty`,
+  `ParentFolderMissing` and `HierarchicalNamespaceRequired`, the last
+  three read from the one 409 `conflict` production answers every folder
+  refusal with, told apart by its message, as measured.
+- core, auth, pubsub and secret_manager: unchanged.
+
 ## 0.29.0 (2026-10-02)
 
 - secret_manager: `Secret.update` changes a secret's labels,

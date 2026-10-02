@@ -158,6 +158,11 @@ pub const FakeMultipart = struct {
         /// Body bytes the media reads delivered: half the body for a cut,
         /// none for an answer that was lost.
         media_bytes: u64 = 0,
+        folder_creates: u32 = 0,
+        folder_reads: u32 = 0,
+        folder_deletes: u32 = 0,
+        folder_lists: u32 = 0,
+        layout_reads: u32 = 0,
         moves: u32 = 0,
         restores: u32 = 0,
         session_starts: u32 = 0,
@@ -179,7 +184,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification, folder, layout };
 
     pub const Fault = enum {
         none,
@@ -503,6 +508,11 @@ pub const FakeMultipart = struct {
             .resumable => if (method == .POST) .session_start else return error.HttpProtocolError,
             .insert => if (method == .POST) .insert else return error.HttpProtocolError,
             .bucket => |b| if (b.notification != null) .notification else .bucket,
+            .folders => switch (method) {
+                .POST, .GET, .DELETE => .folder,
+                else => return error.HttpProtocolError,
+            },
+            .layout => if (method == .GET) .layout else return error.HttpProtocolError,
             .restore => if (method == .POST) .restore else return error.HttpProtocolError,
             .session => switch (method) {
                 .PUT => .session_put,
@@ -524,7 +534,7 @@ pub const FakeMultipart = struct {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
             .session => if (kind == .session_put) sessionPart(headers) else 0,
-            .move, .resumable, .insert, .bucket, .restore => 0,
+            .move, .resumable, .insert, .bucket, .restore, .folders, .layout => 0,
         };
         if (try self.billingRefusal(target, url, headers, arena)) |refusal| return refusal;
         if (try keyRefusal(kind, target, url, headers, arena)) |refusal| return refusal;
@@ -596,6 +606,8 @@ pub const FakeMultipart = struct {
                 const r = try self.buckets.serve(method, t, body, arena);
                 break :bucket Reply{ .status = r.status, .body = r.body };
             },
+            .folders => |t| try self.serveFolders(method, t, body, arena),
+            .layout => |bucket| try self.serveLayout(bucket, arena),
             .restore => |t| try self.restoreObject(t, arena),
             .session => |id| if (kind == .session_put)
                 try self.sessionPut(id, headers, body, fault, arena)
@@ -1188,7 +1200,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification, .folder, .layout => unreachable,
         }
     }
 
@@ -1556,7 +1568,156 @@ pub const FakeMultipart = struct {
         };
         const o = try self.store(target.bucket, meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip(), keys.key_sha256, keys.kms_key_name, holds);
         o.retention = retention;
+        try self.ensureParents(target.bucket, meta.name);
         return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, true) };
+    }
+
+    /// Folders, as production answered on 2026-10-02: every conflict is a
+    /// 409 told apart only by its message (exists, a missing parent, a
+    /// non-empty delete, a flat bucket), a repeat delete is 404, a stale
+    /// metageneration the storage-wide 412, a missing trailing slash is
+    /// appended, a create over an object's exact name is "exists", and the
+    /// idempotency token dedupes nothing, which `tokenRefusal` enforces by
+    /// refusing it here outright. Listing sorts, pages by the last name
+    /// served, and takes only the `/` delimiter and prefixes ending in `/`.
+    /// Emptiness is judged against the bucket's folders and this fake's
+    /// one shared object list.
+    fn serveFolders(self: *FakeMultipart, method: Method, target: FoldersTarget, body: []const u8, arena: Allocator) Allocator.Error!Reply {
+        if (self.buckets.resource(target.bucket) == null) return bucket_missing;
+        if (!self.buckets.isHns(target.bucket)) {
+            return folderConflict(arena, "The bucket does not support hierarchical namespace.");
+        }
+        if (target.folder) |folder| switch (method) {
+            .GET => {
+                self.counts.folder_reads += 1;
+                const state = self.buckets.folderState(target.bucket, folder) orelse return folder_missing;
+                return .{ .status = 200, .body = try renderFolder(arena, target.bucket, folder, state) };
+            },
+            .DELETE => {
+                self.counts.folder_deletes += 1;
+                const state = self.buckets.folderState(target.bucket, folder) orelse return folder_missing;
+                if (target.if_metageneration_match) |m| if (m != state.metageneration) return folder_condition_failed;
+                if (try self.folderHasChildren(target.bucket, folder, arena)) {
+                    return folderConflict(arena, "The folder you tried to delete is not empty.");
+                }
+                _ = self.buckets.dropFolder(target.bucket, folder);
+                return .{ .status = 204 };
+            },
+            else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"this fake serves no such folder request\"}}" },
+        };
+        switch (method) {
+            .POST => {
+                self.counts.folder_creates += 1;
+                const meta = std.json.parseFromSliceLeaky(struct { name: []const u8 = "" }, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Parse Error\",\"errors\":[{\"reason\":\"invalid\"}]}}" },
+                };
+                if (meta.name.len == 0) return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"No folder name\",\"errors\":[{\"reason\":\"invalid\"}]}}" };
+                // The server appends a missing trailing slash, as measured.
+                const folder = if (meta.name[meta.name.len - 1] == '/')
+                    meta.name
+                else
+                    try std.mem.concat(arena, u8, &.{ meta.name, "/" });
+                if (self.buckets.folderState(target.bucket, folder) != null or self.liveIndex(folder) != null) {
+                    return folderConflict(arena, "The folder you tried to create already exists.");
+                }
+                var i: usize = 0;
+                while (std.mem.indexOfScalarPos(u8, folder[0 .. folder.len - 1], i, '/')) |at| : (i = at + 1) {
+                    const parent = folder[0 .. at + 1];
+                    if (self.buckets.folderState(target.bucket, parent) == null) {
+                        if (!target.recursive) return folderConflict(arena, "The parent folder does not exist.");
+                        _ = try self.buckets.putFolder(target.bucket, parent);
+                    }
+                }
+                _ = try self.buckets.putFolder(target.bucket, folder);
+                const state = self.buckets.folderState(target.bucket, folder).?;
+                return .{ .status = 200, .body = try renderFolder(arena, target.bucket, folder, state) };
+            },
+            .GET => {
+                self.counts.folder_lists += 1;
+                if (target.delimiter) |d| if (!std.mem.eql(u8, d, "/")) {
+                    return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Delimiter must be '/'.\",\"errors\":[{\"reason\":\"invalid\"}]}}" };
+                };
+                const prefix = target.prefix orelse "";
+                if (prefix.len > 0 and prefix[prefix.len - 1] != '/') {
+                    return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Prefix must end with '/'.\",\"errors\":[{\"reason\":\"invalid\"}]}}" };
+                }
+                const all = try self.buckets.folderPaths(target.bucket, arena);
+                var selected: std.ArrayList([]const u8) = .empty;
+                for (all) |name| {
+                    if (!std.mem.startsWith(u8, name, prefix)) continue;
+                    if (target.delimiter != null) {
+                        // The prefix folder itself, or one level below it.
+                        const rest = name[prefix.len..];
+                        if (rest.len > 0 and std.mem.indexOfScalar(u8, rest[0 .. rest.len - 1], '/') != null) continue;
+                    }
+                    if (target.start_offset) |start| if (std.mem.order(u8, name, start) == .lt) continue;
+                    if (target.end_offset) |end| if (std.mem.order(u8, name, end) != .lt) continue;
+                    if (target.page_token) |token| if (std.mem.order(u8, name, token) != .gt) continue;
+                    try selected.append(arena, name);
+                }
+                const limit = if (target.page_size == 0) 1000 else @min(target.page_size, 1000);
+                const served = selected.items[0..@min(selected.items.len, limit)];
+                var out: std.Io.Writer.Allocating = .init(arena);
+                const w = &out.writer;
+                w.writeAll("{\"kind\":\"storage#folders\"") catch return error.OutOfMemory;
+                if (served.len > 0) {
+                    w.writeAll(",\"items\":[") catch return error.OutOfMemory;
+                    for (served, 0..) |name, n| {
+                        if (n > 0) w.writeByte(',') catch return error.OutOfMemory;
+                        const state = self.buckets.folderState(target.bucket, name).?;
+                        w.writeAll(try renderFolder(arena, target.bucket, name, state)) catch return error.OutOfMemory;
+                    }
+                    w.writeByte(']') catch return error.OutOfMemory;
+                }
+                if (served.len < selected.items.len) {
+                    w.writeAll(",\"nextPageToken\":") catch return error.OutOfMemory;
+                    var jw: std.json.Stringify = .{ .writer = w };
+                    jw.write(served[served.len - 1]) catch return error.OutOfMemory;
+                }
+                w.writeByte('}') catch return error.OutOfMemory;
+                return .{ .status = 200, .body = out.written() };
+            },
+            else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"this fake serves no such folder request\"}}" },
+        }
+    }
+
+    /// Whether anything sits under the folder: a child folder, or a live
+    /// object whose name begins with it.
+    fn folderHasChildren(self: *const FakeMultipart, bucket: []const u8, folder: []const u8, arena: Allocator) Allocator.Error!bool {
+        for (try self.buckets.folderPaths(bucket, arena)) |name| {
+            if (name.len > folder.len and std.mem.startsWith(u8, name, folder)) return true;
+        }
+        for (self.objects.items) |o| {
+            if (std.mem.startsWith(u8, o.name, folder)) return true;
+        }
+        return false;
+    }
+
+    /// Hierarchical buckets create an upload's missing parents, implicit
+    /// folders indistinguishable from created ones, as measured. Modelled
+    /// for the one-request insert, the path the tests upload by; the other
+    /// write paths do not create parents here.
+    fn ensureParents(self: *FakeMultipart, bucket: []const u8, object_name: []const u8) Allocator.Error!void {
+        if (!self.buckets.isHns(bucket)) return;
+        var i: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, object_name, i, '/')) |at| : (i = at + 1) {
+            _ = try self.buckets.putFolder(bucket, object_name[0 .. at + 1]);
+        }
+    }
+
+    fn serveLayout(self: *FakeMultipart, bucket: []const u8, arena: Allocator) Allocator.Error!Reply {
+        self.counts.layout_reads += 1;
+        const resource = self.buckets.resource(bucket) orelse return bucket_missing;
+        const location = if (resource.get("location")) |v| (if (v == .string) v.string else "US") else "US";
+        const location_type = if (resource.get("locationType")) |v| (if (v == .string) v.string else "region") else "region";
+        var out: std.Io.Writer.Allocating = .init(arena);
+        const w = &out.writer;
+        w.print("{{\"kind\":\"storage#storageLayout\",\"bucket\":\"{s}\",\"location\":\"{s}\",\"locationType\":\"{s}\"", .{ bucket, location, location_type }) catch return error.OutOfMemory;
+        // Production leaves the namespace out for a flat bucket entirely.
+        if (self.buckets.isHns(bucket)) w.writeAll(",\"hierarchicalNamespace\":{\"enabled\":true}") catch return error.OutOfMemory;
+        w.writeByte('}') catch return error.OutOfMemory;
+        return .{ .status = 200, .body = out.written() };
     }
 
     fn sessionCancel(self: *FakeMultipart, id: []const u8) Reply {
@@ -1854,6 +2015,66 @@ fn clobbered(arena: Allocator, kind: FakeMultipart.Kind, target: Target, content
         .insert => try insertedName(arena, content_type, body),
         else => null,
     };
+}
+
+const bucket_missing: FakeMultipart.Reply = .{ .status = 404, .body =
+    \\{"error":{"code":404,"message":"The specified bucket does not exist.","errors":[{"message":"The specified bucket does not exist.","domain":"global","reason":"notFound"}]}}
+};
+const folder_missing: FakeMultipart.Reply = .{ .status = 404, .body =
+    \\{"error":{"code":404,"errors":[{"domain":"global","message":"The folder does not exist.","reason":"notFound"}],"message":"The folder does not exist."}}
+};
+const folder_condition_failed: FakeMultipart.Reply = .{ .status = 412, .body =
+    \\{"error":{"code":412,"errors":[{"domain":"global","location":"If-Match","locationType":"header","message":"At least one of the pre-conditions you specified did not hold.","reason":"conditionNotMet"}],"message":"At least one of the pre-conditions you specified did not hold."}}
+};
+
+/// A folder 409, in production's shape: the message says which conflict.
+fn folderConflict(arena: Allocator, message: []const u8) Allocator.Error!FakeMultipart.Reply {
+    return .{ .status = 409, .body = try std.fmt.allocPrint(
+        arena,
+        "{{\"error\":{{\"code\":409,\"errors\":[{{\"domain\":\"global\",\"message\":\"{s}\",\"reason\":\"conflict\"}}],\"message\":\"{s}\"}}}}",
+        .{ message, message },
+    ) };
+}
+
+/// One folder resource, as production renders it.
+fn renderFolder(arena: Allocator, bucket: []const u8, folder: []const u8, state: FakeBuckets.FolderState) Allocator.Error![]const u8 {
+    var link: std.Io.Writer.Allocating = .init(arena);
+    link.writer.writeAll("https://www.googleapis.com/storage/v1/b/") catch return error.OutOfMemory;
+    core.query.writeStrictSegment(&link.writer, bucket) catch return error.OutOfMemory;
+    link.writer.writeAll("/folders/") catch return error.OutOfMemory;
+    core.query.writeStrictSegment(&link.writer, folder) catch return error.OutOfMemory;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    writeFolder(&jw, bucket, folder, link.written(), state, arena) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeFolder(
+    jw: *std.json.Stringify,
+    bucket: []const u8,
+    folder: []const u8,
+    self_link: []const u8,
+    state: FakeBuckets.FolderState,
+    arena: Allocator,
+) !void {
+    try jw.beginObject();
+    try jw.objectField("bucket");
+    try jw.write(bucket);
+    try jw.objectField("createTime");
+    try jw.write(state.create_time);
+    try jw.objectField("id");
+    try jw.write(try std.mem.concat(arena, u8, &.{ bucket, "/", folder }));
+    try jw.objectField("kind");
+    try jw.write("storage#folder");
+    try jw.objectField("metageneration");
+    try jw.write(try std.fmt.allocPrint(arena, "{d}", .{state.metageneration}));
+    try jw.objectField("name");
+    try jw.write(folder);
+    try jw.objectField("selfLink");
+    try jw.write(self_link);
+    try jw.objectField("updateTime");
+    try jw.write(state.create_time);
+    try jw.endObject();
 }
 
 fn freeKept(gpa: Allocator, k: *FakeMultipart.Kept) void {
@@ -2209,8 +2430,28 @@ const Target = union(enum) {
     move: MoveTarget,
     resumable: ResumableTarget,
     insert: InsertTarget,
+    folders: FoldersTarget,
+    /// A `.../storageLayout` read's bucket.
+    layout: []const u8,
     /// A session URL's id.
     session: []const u8,
+};
+
+/// `/storage/v1/b/{bucket}/folders`, or one folder: an insert, a get, a
+/// delete or a listing, told apart by the method and whether a folder is
+/// named.
+const FoldersTarget = struct {
+    bucket: []const u8,
+    /// Null for the collection.
+    folder: ?[]const u8 = null,
+    recursive: bool = false,
+    prefix: ?[]const u8 = null,
+    delimiter: ?[]const u8 = null,
+    start_offset: ?[]const u8 = null,
+    end_offset: ?[]const u8 = null,
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+    if_metageneration_match: ?u64 = null,
 };
 
 /// What a URL names, decoded. Anything this fake does not serve is
@@ -2273,6 +2514,43 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
             else
                 return error.HttpProtocolError;
             return .{ .bucket = target };
+        };
+        if (std.mem.indexOfScalar(u8, after, '/')) |slash| if (std.mem.startsWith(u8, after[slash..], "/folders")) {
+            var target: FoldersTarget = .{ .bucket = try decode(arena, after[0..slash]) };
+            const tail = after[slash + "/folders".len ..];
+            if (tail.len == 0) {
+                // The collection.
+            } else if (tail[0] == '/' and tail.len > 1 and std.mem.indexOfScalar(u8, tail[1..], '/') == null) {
+                target.folder = try decode(arena, tail[1..]);
+            } else return error.HttpProtocolError;
+            if (query.len > 0) {
+                var params = std.mem.splitScalar(u8, query, '&');
+                while (params.next()) |param| {
+                    if (std.mem.eql(u8, param, "recursive=true")) {
+                        target.recursive = true;
+                    } else if (std.mem.startsWith(u8, param, "prefix=")) {
+                        target.prefix = try decode(arena, param["prefix=".len..]);
+                    } else if (std.mem.startsWith(u8, param, "delimiter=")) {
+                        target.delimiter = try decode(arena, param["delimiter=".len..]);
+                    } else if (std.mem.startsWith(u8, param, "startOffset=")) {
+                        target.start_offset = try decode(arena, param["startOffset=".len..]);
+                    } else if (std.mem.startsWith(u8, param, "endOffset=")) {
+                        target.end_offset = try decode(arena, param["endOffset=".len..]);
+                    } else if (std.mem.startsWith(u8, param, "pageSize=")) {
+                        target.page_size = std.fmt.parseInt(u32, param["pageSize=".len..], 10) catch return error.HttpProtocolError;
+                    } else if (std.mem.startsWith(u8, param, "pageToken=")) {
+                        target.page_token = try decode(arena, param["pageToken=".len..]);
+                    } else if (std.mem.startsWith(u8, param, "ifMetagenerationMatch=")) {
+                        target.if_metageneration_match = std.fmt.parseInt(u64, param["ifMetagenerationMatch=".len..], 10) catch return error.HttpProtocolError;
+                    } else if (std.mem.startsWith(u8, param, "userProject=")) {
+                        // Already read by billingRefusal.
+                    } else return error.HttpProtocolError;
+                }
+            }
+            return .{ .folders = target };
+        };
+        if (std.mem.indexOfScalar(u8, after, '/')) |slash| if (std.mem.eql(u8, after[slash..], "/storageLayout")) {
+            return .{ .layout = try decode(arena, after[0..slash]) };
         };
     }
     if (std.mem.startsWith(u8, path, "/storage/v1/b/") and std.mem.endsWith(u8, path, "/lockRetentionPolicy")) {

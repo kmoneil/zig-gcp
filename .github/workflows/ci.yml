@@ -329,6 +329,11 @@ jobs:
         # property of key configurations (milestone 3), about 1 ms a run,
         # runs there too. The secret_manager job gained an event decoder
         # property, 0.11 ms a run on a Mac, about 8 minutes at 4500K.
+        # Folders (10-02, milestone 1) added a path property through
+        # production's rules to heavy-storage, 2.2 ms a run on a Mac (2K
+        # and 12K on a built binary), about 6 ms at that job's CI ratio:
+        # roughly 2.4 minutes at 24K, inside the pending re-size from the
+        # 10-02 and 10-03 nightlies.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 900K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }

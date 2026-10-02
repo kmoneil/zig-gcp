@@ -47,6 +47,15 @@
 //!   publish to, for the topics `setTopic` names. Whether prefixes keep
 //!   configurations from overlapping was not measured: here they do not.
 //!
+//! - Hierarchical namespace and folders (2026-10-02): the setting is
+//!   create-time only, needs uniform bucket-level access and excludes
+//!   versioning, retention policies and object retention, each refused 400
+//!   `invalid` in production's words; a PATCH naming it answers 200,
+//!   silently drops the field, and still moves the metageneration, as
+//!   measured. The folder state lives here per bucket; the semantics (409
+//!   conflicts, listing, implicit creation) are served by `FakeMultipart`,
+//!   which also knows the objects.
+//!
 //! IAM, as measured on 2026-10-01: a new bucket's policy holds the legacy
 //! bindings to `projectOwner:`, `projectEditor:` and `projectViewer:` its
 //! project (four with uniform access, two without); the etag is the
@@ -120,6 +129,16 @@ pub const FakeBuckets = struct {
         /// Its IAM bindings as Cloud Storage keeps them, or null until the
         /// first write, while the legacy ones stand.
         bindings: ?[]const core.iam.Binding = null,
+        /// Folders are real resources here. Create-time only.
+        hns: bool = false,
+        /// The folders, by their full path with the trailing slash, in
+        /// creation order; listing sorts.
+        folders: std.StringArrayHashMapUnmanaged(FolderState) = .empty,
+    };
+
+    pub const FolderState = struct {
+        metageneration: u64 = 1,
+        create_time: []const u8 = "2026-10-02T19:10:28.285Z",
     };
 
     /// What a bucket URL names.
@@ -247,14 +266,40 @@ pub const FakeBuckets = struct {
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             if (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "location") or std.mem.eql(u8, key, "storageClass")) continue;
+            if (std.mem.eql(u8, key, "hierarchicalNamespace")) continue; // judged below, against the whole body
             self.apply(&next, key, entry.value_ptr.*, true) catch |err| switch (err) {
                 error.Invalid => return self.refused(arena),
                 error.OutOfMemory => return error.OutOfMemory,
             };
         }
-        try self.buckets.put(a, owned_name, .{ .resource = next, .metageneration = 1, .project = try a.dupe(u8, project) });
+        // A hierarchical namespace, judged against what the rest of the
+        // body asked for, each refusal in production's words (2026-10-02).
+        const hns = hnsAsked(fields);
+        if (hns) {
+            if (!uniformAccess(next)) return self.invalid(arena, "Hierarchical namespace buckets must use uniform bucket-level access.");
+            if (versioningOn(next)) return self.invalid(arena, "Versioning is not supported for hierarchical namespace buckets.");
+            if (next.get("retentionPolicy") != null) return self.invalid(arena, "Retention policy is not supported for hierarchical namespace buckets.");
+            if (object_retention) return self.invalid(arena, "Object retention config is not supported for hierarchical namespace buckets.");
+            try next.put(a, "hierarchicalNamespace", try flagObject(a, "enabled", true));
+        }
+        try self.buckets.put(a, owned_name, .{ .resource = next, .metageneration = 1, .project = try a.dupe(u8, project), .hns = hns });
         self.next_generation += 1;
         return .{ .status = 200, .body = try render(arena, next) };
+    }
+
+    /// Whether a create's body asks for a hierarchical namespace.
+    fn hnsAsked(fields: ObjectMap) bool {
+        const value = fields.get("hierarchicalNamespace") orelse return false;
+        const inner = objectOf(value) orelse return false;
+        const enabled = inner.get("enabled") orelse return false;
+        return enabled == .bool and enabled.bool;
+    }
+
+    fn versioningOn(bucket_resource: ObjectMap) bool {
+        const value = bucket_resource.get("versioning") orelse return false;
+        const inner = objectOf(value) orelse return false;
+        const enabled = inner.get("enabled") orelse return false;
+        return enabled == .bool and enabled.bool;
     }
 
     fn patch(self: *FakeBuckets, name: []const u8, target: Target, body: []const u8, arena: Allocator) Error!Reply {
@@ -273,6 +318,9 @@ pub const FakeBuckets = struct {
         var next = try cloneObject(a, stored.resource);
         var it = fields.iterator();
         while (it.next()) |entry| {
+            // Measured: a patch naming hierarchicalNamespace answers 200,
+            // drops the field silently, and still moves the metageneration.
+            if (std.mem.eql(u8, entry.key_ptr.*, "hierarchicalNamespace")) continue;
             self.apply(&next, entry.key_ptr.*, entry.value_ptr.*, false) catch |err| switch (err) {
                 error.Invalid => return self.refused(arena),
                 error.OutOfMemory => return error.OutOfMemory,
@@ -319,6 +367,46 @@ pub const FakeBuckets = struct {
     pub fn notifications(self: *const FakeBuckets, bucket: []const u8) []const ObjectMap {
         const stored = self.buckets.getPtr(bucket) orelse return &.{};
         return stored.notifications.items;
+    }
+
+    /// Whether the bucket has a hierarchical namespace. A missing bucket
+    /// has none.
+    pub fn isHns(self: *const FakeBuckets, bucket: []const u8) bool {
+        const stored = self.buckets.getPtr(bucket) orelse return false;
+        return stored.hns;
+    }
+
+    /// The folder's state, or null.
+    pub fn folderState(self: *const FakeBuckets, bucket: []const u8, folder: []const u8) ?FolderState {
+        const stored = self.buckets.getPtr(bucket) orelse return null;
+        return stored.folders.get(folder);
+    }
+
+    /// Adds the folder, returning false when it was already there.
+    pub fn putFolder(self: *FakeBuckets, bucket: []const u8, folder: []const u8) Allocator.Error!bool {
+        const stored = self.buckets.getPtr(bucket) orelse return false;
+        if (stored.folders.contains(folder)) return false;
+        const a = self.arena.allocator();
+        try stored.folders.put(a, try a.dupe(u8, folder), .{});
+        return true;
+    }
+
+    /// Removes the folder, returning whether it was there.
+    pub fn dropFolder(self: *FakeBuckets, bucket: []const u8, folder: []const u8) bool {
+        const stored = self.buckets.getPtr(bucket) orelse return false;
+        return stored.folders.orderedRemove(folder);
+    }
+
+    /// The bucket's folder paths, sorted, in `arena`'s memory.
+    pub fn folderPaths(self: *const FakeBuckets, bucket: []const u8, arena: Allocator) Allocator.Error![]const []const u8 {
+        const stored = self.buckets.getPtr(bucket) orelse return &.{};
+        const out = try arena.dupe([]const u8, stored.folders.keys());
+        std.mem.sort([]const u8, out, {}, stringLess);
+        return out;
+    }
+
+    fn stringLess(_: void, left: []const u8, right: []const u8) bool {
+        return std.mem.lessThan(u8, left, right);
     }
 
     fn serveNotification(self: *FakeBuckets, method: Method, bucket: []const u8, target: NotificationTarget, body: []const u8, arena: Allocator) Error!Reply {

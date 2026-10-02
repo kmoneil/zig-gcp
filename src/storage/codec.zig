@@ -296,6 +296,63 @@ const WireObjectPage = struct {
     nextPageToken: ?[]const u8 = null,
 };
 
+/// One Folder resource. A folder that names no path cannot be addressed,
+/// so it is `InvalidResponse`.
+pub fn decodeFolder(arena: Allocator, body: []const u8) DecodeError!types.FolderInfo {
+    return folderFromWire(try parseWire(WireFolder, arena, body));
+}
+
+/// One page of `folders.list`. A list of none has no `items`; there is no
+/// `prefixes` side, directory mode or not, as measured.
+pub fn decodeFolderPage(arena: Allocator, body: []const u8) DecodeError!types.FolderPage {
+    const wire = try parseWire(struct {
+        items: ?[]const WireFolder = null,
+        nextPageToken: ?[]const u8 = null,
+    }, arena, body);
+    const listed = wire.items orelse &.{};
+    const folders = try arena.alloc(types.FolderInfo, listed.len);
+    for (listed, folders) |w, *info| info.* = try folderFromWire(w);
+    return .{ .folders = folders, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+const WireFolder = struct {
+    name: ?[]const u8 = null,
+    bucket: ?[]const u8 = null,
+    metageneration: ?std.json.Value = null,
+    /// `createTime`/`updateTime`, where objects say `timeCreated`/`updated`:
+    /// the discovery document is right and the folders overview wrong, as
+    /// measured on 2026-10-02.
+    createTime: ?[]const u8 = null,
+    updateTime: ?[]const u8 = null,
+};
+
+fn folderFromWire(wire: WireFolder) DecodeError!types.FolderInfo {
+    return .{
+        .name = nonEmpty(wire.name) orelse return error.InvalidResponse,
+        .bucket = wire.bucket orelse "",
+        .metageneration = try u64FromValue(wire.metageneration),
+        .create_time = wire.createTime orelse "",
+        .update_time = wire.updateTime orelse "",
+    };
+}
+
+/// How a bucket stores names, from `buckets.getStorageLayout`. Cloud
+/// Storage leaves `hierarchicalNamespace` out for a flat bucket;
+/// fake-gcs-server sends `enabled: false` for every bucket, a bucket made
+/// hierarchical included.
+pub fn decodeStorageLayout(arena: Allocator, body: []const u8) DecodeError!types.StorageLayout {
+    const wire = try parseWire(struct {
+        location: ?[]const u8 = null,
+        locationType: ?[]const u8 = null,
+        hierarchicalNamespace: ?struct { enabled: ?bool = null } = null,
+    }, arena, body);
+    return .{
+        .location = wire.location orelse "",
+        .location_type = wire.locationType orelse "",
+        .hierarchical_namespace = if (wire.hierarchicalNamespace) |h| h.enabled orelse false else false,
+    };
+}
+
 const WireBucket = struct {
     name: ?[]const u8 = null,
     location: ?[]const u8 = null,
@@ -320,6 +377,7 @@ const WireBucket = struct {
     retentionPolicy: ?WireRetentionPolicy = null,
     defaultEventBasedHold: ?bool = null,
     objectRetention: ?struct { mode: ?[]const u8 = null } = null,
+    hierarchicalNamespace: ?struct { enabled: ?bool = null } = null,
 };
 
 const WireRetentionPolicy = struct {
@@ -421,6 +479,7 @@ fn bucketFromWire(arena: Allocator, wire: WireBucket) DecodeError!types.BucketIn
         .retention_policy = try retentionPolicyFromWire(wire.retentionPolicy),
         .default_event_based_hold = wire.defaultEventBasedHold orelse false,
         .object_retention = if (wire.objectRetention) |o| std.mem.eql(u8, o.mode orelse "", "Enabled") else false,
+        .hierarchical_namespace = if (wire.hierarchicalNamespace) |h| h.enabled orelse false else false,
     };
 }
 

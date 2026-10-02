@@ -97,6 +97,24 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// update that changes nothing. `Diagnostics` says which. Nothing was
     /// sent.
     InvalidBucketSettings,
+    /// A folder path breaks the rules: empty, missing its trailing slash
+    /// after an empty segment, a `.` or `..` segment (Cloud Storage takes
+    /// `./` and `../` verbatim, as measured, and nothing good comes of
+    /// them), not UTF-8, a carriage return or line feed, over 512 bytes
+    /// with its slashes, or deeper than 50 levels. `Diagnostics` says
+    /// which. Nothing was sent.
+    InvalidFolderName,
+    /// Deleting a folder with anything under it: an object, or a child
+    /// folder. HTTP 409, told apart from `AlreadyExists` by Cloud
+    /// Storage's message. Never retried.
+    FolderNotEmpty,
+    /// Creating a folder whose parent does not exist, without `recursive`.
+    /// HTTP 409, told apart by the message. Never retried.
+    ParentFolderMissing,
+    /// A folder call on a bucket without hierarchical namespace, which
+    /// only a create can turn on. HTTP 409, told apart by the message.
+    /// Never retried.
+    HierarchicalNamespaceRequired,
     /// A notification configuration breaks a rule Cloud Storage holds it
     /// to, or one it would silently get wrong: a topic Pub/Sub would not
     /// name, an empty or repeated event type, more than 5 custom
