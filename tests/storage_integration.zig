@@ -1163,6 +1163,18 @@ test "keys: an emulator takes a customer-supplied key and a Cloud KMS key on eve
     composed.deinit();
 }
 
+test "IAM: fake-gcs-server serves no bucket IAM call, so each is NotFound" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    const b = f.bucket();
+    try testing.expectError(error.NotFound, b.iamPolicy());
+    try testing.expectError(error.NotFound, b.addIamBinding("roles/storage.objectViewer", "user:a@example.com"));
+    try testing.expectError(error.NotFound, b.testIamPermissions(&.{"storage.buckets.get"}));
+}
+
 test "notifications: create, read back, list and delete a configuration" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;

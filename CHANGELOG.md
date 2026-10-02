@@ -31,7 +31,21 @@ including the ones that did not change.
   member already there is not added again. A policy written always
   carries `bindings`, and says version 3 whenever a binding has a
   condition, which every service requires. Not breaking.
-- auth, secret_manager, storage: unchanged.
+- storage: IAM on buckets: `Bucket.iamPolicy`, `setIamPolicy`,
+  `addIamBinding`, `removeIamBinding` and `testIamPermissions`, through
+  a billed handle's project as every call, on `core.iam` as Pub/Sub's.
+  Cloud Storage refuses a write under a stale etag with the 412
+  `conditionNotMet` every failed precondition has, told apart by its
+  message, so that one is `error.Aborted`, as on every other resource;
+  the other two 412s an IAM write meets, a condition without uniform
+  access and a public member under public access prevention, stay
+  `error.FailedPrecondition`. The etag is the bucket's metageneration, as
+  measured, so any bucket update makes a policy read before it stale.
+  `Scope` gains `.full_control`, which reading and writing a bucket's
+  policy needs, as `.cloud_platform` does. `storage.iam` re-exports
+  `core.iam`. Not breaking, except for an exhaustive `switch` over
+  `Scope`.
+- auth, secret_manager: unchanged.
 
 ## 0.27.0 (2026-10-01)
 

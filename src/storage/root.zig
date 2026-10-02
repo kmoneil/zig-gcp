@@ -25,6 +25,9 @@ pub const RetryPolicy = core.RetryPolicy;
 pub const Diagnostics = core.Diagnostics;
 pub const Error = @import("errors.zig").Error;
 pub const ApiError = core.ApiError;
+/// IAM policies as buckets read and write them: `Policy`, `Binding`, and
+/// the helpers that change a policy, such as `withMember`.
+pub const iam = core.iam;
 
 pub const Owned = @import("types.zig").Owned;
 pub const Checkpoint = @import("checkpoint.zig").Checkpoint;
@@ -127,6 +130,7 @@ test {
     _ = @import("encryption.zig");
     _ = @import("gzip_download.zig");
     _ = @import("gzip_upload.zig");
+    _ = @import("iam.zig");
     _ = @import("idempotency.zig");
     _ = @import("retention.zig");
     _ = @import("errors.zig");

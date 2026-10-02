@@ -148,6 +148,41 @@ fn writeNotifications(w: *Writer, bucket: []const u8, id: ?[]const u8) Writer.Er
     }
 }
 
+/// `/storage/v1/b/{bucket}/iam`, asking for policy version 3 when `read`:
+/// the only version that shows conditions as they are, and a bucket answers
+/// an unconditioned policy as version 1 whatever was asked.
+pub fn bucketIamPath(arena: Allocator, bucket: []const u8, read: bool) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeBucketIam(&out.writer, bucket, read) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeBucketIam(w: *Writer, bucket: []const u8, read: bool) Writer.Error!void {
+    try w.writeAll("/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/iam");
+    if (read) {
+        var params: query.Params = .init(w);
+        try params.add("optionsRequestedPolicyVersion", "3");
+    }
+}
+
+/// `/storage/v1/b/{bucket}/iam/testPermissions`, one `permissions`
+/// parameter for each name.
+pub fn bucketTestPermissionsPath(arena: Allocator, bucket: []const u8, permissions: []const []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeBucketTestPermissions(&out.writer, bucket, permissions) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeBucketTestPermissions(w: *Writer, bucket: []const u8, permissions: []const []const u8) Writer.Error!void {
+    try w.writeAll("/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/iam/testPermissions");
+    var params: query.Params = .init(w);
+    for (permissions) |permission| try params.add("permissions", permission);
+}
+
 /// `/storage/v1/b/{bucket}/o` with listing options.
 pub fn objectsPath(arena: Allocator, bucket: []const u8, options: types.ListOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);

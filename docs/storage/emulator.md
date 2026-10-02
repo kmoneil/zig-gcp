@@ -68,5 +68,12 @@ trusted on. The differences it found:
   reads them; production's own messages are what its unit tests hold it
   to.
 
+- It has no IAM: every bucket IAM call falls through to its object
+  routes and is `error.NotFound`, for a bucket that exists; with a
+  bucket named `storage` present, a policy write is 400 "invalid
+  uploadType" instead. Bucket IAM is tested against an in-memory fake
+  that holds Cloud Storage's rules as measured, and against Cloud
+  Storage itself.
+
 [Integration tests](../development.md#integration-tests) says how to run
 the emulator, and both suites.
