@@ -42,15 +42,33 @@ pub fn isConcurrentChange(err: anyerror, diag: *const core.Diagnostics) bool {
     return err == error.FailedPrecondition and std.mem.startsWith(u8, diag.message(), mismatch);
 }
 
-/// A bucket, as `core.iam.update` reads and writes its policy.
+/// A bucket, or one of its managed folders, as `core.iam.update` reads and
+/// writes its policy. A managed folder's policy is its own: its etag does
+/// not move with the bucket, unlike a bucket's, and a fresh one has no
+/// bindings at all, legacy or otherwise, as measured on 2026-10-02.
 pub const Resource = struct {
     client: *Client,
     bucket: []const u8,
+    /// Null: the bucket itself.
+    managed_folder: ?[]const u8 = null,
+
+    /// The managed folder's path with its trailing slash, as every request
+    /// names it, in `arena`'s memory when one is appended.
+    fn normalizedFolder(r: Resource, arena: std.mem.Allocator) std.mem.Allocator.Error!?[]const u8 {
+        const folder = r.managed_folder orelse return null;
+        if (folder.len > 0 and folder[folder.len - 1] == '/') return folder;
+        return try std.mem.concat(arena, u8, &.{ folder, "/" });
+    }
+
+    fn iamPath(r: Resource, arena: std.mem.Allocator, read: bool) std.mem.Allocator.Error![]u8 {
+        if (try r.normalizedFolder(arena)) |folder| return names.managedFolderIamPath(arena, r.bucket, folder, read);
+        return names.bucketIamPath(arena, r.bucket, read);
+    }
 
     pub fn readPolicy(r: Resource) Error!types.Owned(Policy) {
         var scratch: std.heap.ArenaAllocator = .init(r.client.gpa);
         defer scratch.deinit();
-        const path = try names.bucketIamPath(scratch.allocator(), r.bucket, true);
+        const path = try r.iamPath(scratch.allocator(), true);
         var result: types.Owned(Policy) = try .init(r.client.gpa);
         errdefer result.deinit();
         const body = try rpc.execute(r.client, result.arena, .{ .method = .GET, .path = path });
@@ -65,7 +83,7 @@ pub const Resource = struct {
         var scratch: std.heap.ArenaAllocator = .init(r.client.gpa);
         defer scratch.deinit();
         const a = scratch.allocator();
-        const path = try names.bucketIamPath(a, r.bucket, false);
+        const path = try r.iamPath(a, false);
         const conditional = if (policy.etag) |etag| etag.len > 0 else false;
         var token: idempotency.Token = undefined;
         token.init(r.client);
@@ -133,7 +151,10 @@ pub fn testPermissions(r: Resource, permissions: []const []const u8) Error!types
     }
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
-    const path = try names.bucketTestPermissionsPath(scratch.allocator(), r.bucket, permissions);
+    const path = if (try r.normalizedFolder(scratch.allocator())) |folder|
+        try names.managedFolderTestPermissionsPath(scratch.allocator(), r.bucket, folder, permissions)
+    else
+        try names.bucketTestPermissionsPath(scratch.allocator(), r.bucket, permissions);
     var result: types.Owned([]const []const u8) = try .init(c.gpa);
     errdefer result.deinit();
     const body = try rpc.execute(c, result.arena, .{ .method = .GET, .path = path });

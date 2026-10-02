@@ -36,6 +36,7 @@ Google, not only what Google documents, and where the emulators differ.
 | [Buckets](storage/buckets.md) | Settings and lifecycle rules, versions and soft delete, retention and holds, requester pays, IAM |
 | [Encryption keys](storage/encryption.md) | Customer-supplied keys and Cloud KMS keys |
 | [Notifications](storage/notifications.md) | A Pub/Sub message for every change to a bucket's objects, and what each change publishes |
+| [Folders](storage/folders.md) | Hierarchical buckets, atomic tree renames, and managed folders with policies of their own |
 | [The emulator](storage/emulator.md) | What fake-gcs-server does differently, and how the tests make up for it |
 
 ## 🔑 Secret Manager

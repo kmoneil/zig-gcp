@@ -139,6 +139,20 @@ pub const FakeBuckets = struct {
         /// The folders, by their full path with the trailing slash, in
         /// creation order; listing sorts.
         folders: std.StringArrayHashMapUnmanaged(FolderState) = .empty,
+        /// The managed folders, by their full path, each with a policy of
+        /// its own.
+        managed: std.StringArrayHashMapUnmanaged(ManagedState) = .empty,
+    };
+
+    pub const ManagedState = struct {
+        metageneration: u64 = 1,
+        create_time: []const u8 = "2026-10-02T19:13:41.557Z",
+        /// The policy's own etag counter: CAA= fresh, moved only by policy
+        /// writes, never by the bucket, as measured.
+        policy_writes: u64 = 0,
+        /// Null until the first write: a fresh policy has no bindings at
+        /// all, as measured.
+        bindings: ?[]const core.iam.Binding = null,
     };
 
     pub const FolderState = struct {
@@ -464,6 +478,59 @@ pub const FakeBuckets = struct {
 
     fn stringLess(_: void, left: []const u8, right: []const u8) bool {
         return std.mem.lessThan(u8, left, right);
+    }
+
+    /// Whether the bucket has uniform bucket-level access, which managed
+    /// folders require.
+    pub fn isUniform(self: *const FakeBuckets, bucket: []const u8) bool {
+        const stored = self.buckets.getPtr(bucket) orelse return false;
+        return uniformAccess(stored.resource);
+    }
+
+    /// The managed folder's state, or null.
+    pub fn managedState(self: *const FakeBuckets, bucket: []const u8, folder: []const u8) ?*ManagedState {
+        const stored = self.buckets.getPtr(bucket) orelse return null;
+        return stored.managed.getPtr(folder);
+    }
+
+    /// Adds the managed folder, returning false when it was already there.
+    pub fn putManaged(self: *FakeBuckets, bucket: []const u8, folder: []const u8) Allocator.Error!bool {
+        const stored = self.buckets.getPtr(bucket) orelse return false;
+        if (stored.managed.contains(folder)) return false;
+        const a = self.arena.allocator();
+        try stored.managed.put(a, try a.dupe(u8, folder), .{});
+        return true;
+    }
+
+    /// Removes the managed folder, returning whether it was there.
+    pub fn dropManaged(self: *FakeBuckets, bucket: []const u8, folder: []const u8) bool {
+        const stored = self.buckets.getPtr(bucket) orelse return false;
+        return stored.managed.orderedRemove(folder);
+    }
+
+    /// The bucket's managed folder paths, sorted, in `arena`'s memory.
+    pub fn managedPaths(self: *const FakeBuckets, bucket: []const u8, arena: Allocator) Allocator.Error![]const []const u8 {
+        const stored = self.buckets.getPtr(bucket) orelse return &.{};
+        const out = try arena.dupe([]const u8, stored.managed.keys());
+        std.mem.sort([]const u8, out, {}, stringLess);
+        return out;
+    }
+
+    /// Keeps a managed folder's written bindings, in this arena's memory.
+    pub fn keepManagedBindings(self: *FakeBuckets, state: *ManagedState, bindings: []const core.iam.Binding) Allocator.Error!void {
+        const a = self.arena.allocator();
+        const kept = try a.alloc(core.iam.Binding, bindings.len);
+        for (bindings, kept) |from, *to| {
+            const members = try a.alloc([]const u8, from.members.len);
+            for (from.members, members) |m, *out| out.* = try a.dupe(u8, m);
+            to.* = .{
+                .role = try a.dupe(u8, from.role),
+                .members = members,
+                .condition = if (from.condition) |c| try a.dupe(u8, c) else null,
+            };
+        }
+        state.bindings = kept;
+        state.policy_writes += 1;
     }
 
     fn serveNotification(self: *FakeBuckets, method: Method, bucket: []const u8, target: NotificationTarget, body: []const u8, arena: Allocator) Error!Reply {
@@ -1084,7 +1151,7 @@ fn answer(arena: Allocator, status: u16, reason: []const u8, message: []const u8
 
 /// The etag Cloud Storage gives a bucket's policy: its metageneration, as
 /// a protocol buffer's first field (`CAE=` for 1), in base64.
-fn etagOf(buf: *[24]u8, metageneration: u64) []const u8 {
+pub fn etagOf(buf: *[24]u8, metageneration: u64) []const u8 {
     var raw: [11]u8 = undefined;
     raw[0] = 0x08;
     var n: usize = 1;
@@ -1099,7 +1166,7 @@ fn etagOf(buf: *[24]u8, metageneration: u64) []const u8 {
 }
 
 /// The metageneration an etag names, or null for bytes that are no etag.
-fn metagenerationOfEtag(raw: []const u8) ?u64 {
+pub fn metagenerationOfEtag(raw: []const u8) ?u64 {
     if (raw.len < 2 or raw[0] != 0x08) return null;
     var value: u64 = 0;
     var shift: u6 = 0;

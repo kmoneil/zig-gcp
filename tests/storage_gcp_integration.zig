@@ -57,6 +57,13 @@
 //! GCP_TEST_KMS_KEY, a key in us-central1 whose grant to the project's
 //! Cloud Storage service agent is in place, and skips without it.
 //!
+//! The folders tests make hierarchical and uniform-access buckets of their
+//! own like the others. The managed folder grant test runs as a second
+//! principal, and skips without GCP_TEST_SA_TOKEN, a token for a throwaway
+//! service account with no roles at all, and GCP_TEST_SA_MEMBER, its
+//! `serviceAccount:` member form: the grant on the managed folder is the
+//! only access it has, which is the point.
+//!
 //! The retention test makes a bucket of its own like the others, with an
 //! unlocked retention policy it removes before it ends and holds it
 //! releases, so the bucket can go. Settings reach requests unevenly for
@@ -3459,8 +3466,17 @@ const BucketFixture = struct {
         return false;
     }
 
-    /// Deletes the bucket, if the test made it, then frees the fixture.
+    /// Deletes the bucket, if the test made it, then frees the fixture. A
+    /// failed test can leave managed folders behind, which keep the bucket
+    /// from going, so they are swept first.
     fn deinit(f: *BucketFixture) void {
+        if (f.bucket().listManagedFolders(.{ .page_size = 100 })) |listed| {
+            var page = listed;
+            defer page.deinit();
+            for (page.value.managed_folders) |managed| {
+                f.bucket().managedFolder(managed.name).delete(.{ .allow_non_empty = true }) catch {};
+            }
+        } else |_| {}
         f.bucket().delete() catch |err| switch (err) {
             error.NotFound => {},
             else => std.debug.print("cleanup: could not delete bucket {s}: {t}\n", .{ &f.name, err }),
@@ -4517,4 +4533,297 @@ test "61. IAM: without uniform access, two legacy bindings and a condition refus
     var held = b.testIamPermissions(&.{"storage.buckets.get"}) catch |err| return f.report(err);
     defer held.deinit();
     try testing.expectEqual(1, held.value.len);
+}
+
+test "62. folders: real in a hierarchical bucket, implicit from uploads, listed, deleted as measured" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = f.bucket().create(.{
+        .location = "us-central1",
+        .soft_delete_retention_s = 0,
+        .hierarchical_namespace = true,
+    }) catch |err| return f.report(err);
+    defer created.deinit();
+    try testing.expect(created.value.hierarchical_namespace);
+    const b = f.bucket();
+
+    // The layout answers with only object list permission needed.
+    var layout = b.storageLayout() catch |err| return f.report(err);
+    defer layout.deinit();
+    try testing.expect(layout.value.hierarchical_namespace);
+
+    // Creates, their conflicts, and the server's own normalization.
+    var top = b.folder("a").create(.{}) catch |err| return f.report(err);
+    defer top.deinit();
+    try testing.expectEqualStrings("a/", top.value.name);
+    try testing.expectEqual(1, top.value.metageneration);
+    try testing.expectError(error.AlreadyExists, b.folder("a/").create(.{}));
+    try testing.expectError(error.ParentFolderMissing, b.folder("a/b/c/").create(.{}));
+    var deep = b.folder("a/b/c/").create(.{ .recursive = true }) catch |err| return f.report(err);
+    defer deep.deinit();
+    try testing.expectError(error.AlreadyExists, b.folder("a/b/c/").create(.{ .recursive = true }));
+
+    // Implicit folders appear with an upload and outlive its object.
+    const generation = try f.put("ia/ib/ic.txt", "x");
+    var implicit = b.folder("ia/ib/").get() catch |err| return f.report(err);
+    defer implicit.deinit();
+    b.object("ia/ib/ic.txt").delete(.{ .generation = generation }) catch |err| return f.report(err);
+    var still = b.folder("ia/ib/").get() catch |err| return f.report(err);
+    defer still.deinit();
+
+    // Listing: pages of one, the subtree under a prefix, directory mode,
+    // and folders as prefixes beside objects.
+    var walked: usize = 0;
+    var token_buffer: [512]u8 = undefined;
+    var token: ?[]const u8 = null;
+    while (true) {
+        var page = b.listFolders(.{ .page_size = 1, .page_token = token }) catch |err| return f.report(err);
+        defer page.deinit();
+        walked += page.value.folders.len;
+        const next = page.value.next_page_token orelse break;
+        @memcpy(token_buffer[0..next.len], next);
+        token = token_buffer[0..next.len];
+    }
+    try testing.expectEqual(5, walked); // a/, a/b/, a/b/c/, ia/, ia/ib/
+    var dir = b.listFolders(.{ .prefix = "a/", .directory_mode = true }) catch |err| return f.report(err);
+    defer dir.deinit();
+    try testing.expectEqual(2, dir.value.folders.len);
+    var prefixes = b.listObjects(.{ .delimiter = "/", .include_folders_as_prefixes = true }) catch |err| return f.report(err);
+    defer prefixes.deinit();
+    try testing.expectEqual(2, prefixes.value.prefixes.len);
+
+    // Deletes: non-empty, a stale condition, done, and the repeat's 404.
+    try testing.expectError(error.FolderNotEmpty, b.folder("a/").delete(.{}));
+    try testing.expectError(error.FailedPrecondition, b.folder("a/b/c/").delete(.{ .if_metageneration_match = 999999 }));
+    b.folder("a/b/c/").delete(.{ .if_metageneration_match = 1 }) catch |err| return f.report(err);
+    try testing.expectError(error.NotFound, b.folder("a/b/c/").delete(.{}));
+    for ([_][]const u8{ "a/b/", "a/", "ia/ib/", "ia/" }) |name| {
+        b.folder(name).delete(.{}) catch |err| return f.report(err);
+    }
+}
+
+test "63. folders: a flat bucket has none, and a rename moves the tree, its objects, and keeps its times" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = f.bucket().create(.{
+        .location = "us-central1",
+        .soft_delete_retention_s = 0,
+        .hierarchical_namespace = true,
+    }) catch |err| return f.report(err);
+    defer created.deinit();
+    const b = f.bucket();
+
+    // A tree with children and objects.
+    for (0..8) |i| {
+        var name_buffer: [16]u8 = undefined;
+        const child = try std.fmt.bufPrint(&name_buffer, "ra/c{d}/", .{i});
+        var made = b.folder(child).create(.{ .recursive = i == 0 }) catch |err| return f.report(err);
+        made.deinit();
+    }
+    _ = try f.put("ra/c0/one.txt", "one");
+    var source = b.folder("ra/").get() catch |err| return f.report(err);
+    defer source.deinit();
+
+    // The honored precondition refuses stale; the rename then lands and
+    // the folder keeps its create time and metageneration.
+    try testing.expectError(error.FailedPrecondition, b.folder("ra/").renameTo("rb/", .{ .if_source_metageneration_match = 999999 }));
+    var renamed = b.folder("ra/").renameTo("rb/", .{ .if_source_metageneration_match = source.value.metageneration }) catch |err| return f.report(err);
+    defer renamed.deinit();
+    try testing.expectEqualStrings("rb/", renamed.value.name);
+    try testing.expectEqualStrings(source.value.create_time, renamed.value.create_time);
+    try testing.expectEqual(source.value.metageneration, renamed.value.metageneration);
+    try testing.expectError(error.NotFound, b.folder("ra/").get());
+    var moved = b.object("rb/c0/one.txt").get(.{}) catch |err| return f.report(err);
+    defer moved.deinit();
+
+    // Conflicts: a missing source, a taken destination, an object's name.
+    try testing.expectError(error.NotFound, b.folder("gone/").renameTo("anywhere/", .{}));
+    var blocker = b.folder("blocker/").create(.{}) catch |err| return f.report(err);
+    blocker.deinit();
+    try testing.expectError(error.AlreadyExists, b.folder("rb/").renameTo("blocker/", .{}));
+    _ = try f.put("objname", "x");
+    var onto_object = b.folder("blocker/").renameTo("objname/", .{}) catch |err| return f.report(err);
+    defer onto_object.deinit();
+
+    // The operation is followed by its id, and listed.
+    var started = b.folder("rb/").startRenameTo("rc/", .{}) catch |err| return f.report(err);
+    defer started.deinit();
+    var waited: u32 = 0;
+    var done = while (true) {
+        var op = b.operation(started.value.id) catch |err| return f.report(err);
+        if (op.value.done) break op;
+        op.deinit();
+        waited += 1;
+        if (waited > 60) return error.TestRenameNeverFinished;
+        try testing.io.sleep(.fromMilliseconds(500), .awake);
+    };
+    defer done.deinit();
+    try testing.expectEqual(.rename_folder, done.value.kind);
+    try testing.expectEqualStrings("rc/", done.value.folder.?.name);
+    var operations = b.listOperations(.{}) catch |err| return f.report(err);
+    defer operations.deinit();
+    try testing.expect(operations.value.operations.len >= 2);
+
+    // A flat bucket refuses folders in one word this library reads.
+    var flat_name: [19]u8 = undefined;
+    var flat_random: [4]u8 = undefined;
+    testing.io.random(&flat_random);
+    _ = try std.fmt.bufPrint(&flat_name, "zigps-flat-{x}", .{flat_random});
+    const flat = f.client.bucket(&flat_name);
+    var flat_created = flat.create(.{ .location = "us-central1", .soft_delete_retention_s = 0 }) catch |err| return f.report(err);
+    defer flat_created.deinit();
+    defer flat.delete() catch |err| std.debug.print("cleanup: could not delete bucket {s}: {t}\n", .{ &flat_name, err });
+    try testing.expectError(error.HierarchicalNamespaceRequired, flat.folder("a/").create(.{}));
+    try testing.expectError(error.HierarchicalNamespaceRequired, flat.listFolders(.{}));
+
+    // Emptied bottom-up so the bucket can go.
+    for ([_][]const u8{ "rc/c0/one.txt", "objname" }) |name| {
+        var info = b.object(name).get(.{}) catch |err| return f.report(err);
+        defer info.deinit();
+        b.object(name).delete(.{ .generation = info.value.generation }) catch |err| return f.report(err);
+    }
+    var everything = b.listFolders(.{}) catch |err| return f.report(err);
+    defer everything.deinit();
+    var index = everything.value.folders.len;
+    while (index > 0) {
+        index -= 1;
+        b.folder(everything.value.folders[index].name).delete(.{}) catch |err| return f.report(err);
+    }
+}
+
+test "64. managed folders: created, listed, deleted as measured, and a policy of their own" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = f.bucket().create(.{
+        .location = "us-central1",
+        .soft_delete_retention_s = 0,
+        .uniform_bucket_level_access = true,
+    }) catch |err| return f.report(err);
+    defer created.deinit();
+    const b = f.bucket();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var made = b.managedFolder("m1").create() catch |err| return f.report(err);
+    defer made.deinit();
+    try testing.expectEqualStrings("m1/", made.value.name);
+    try testing.expectError(error.AlreadyExists, b.managedFolder("m1/").create());
+    // A child before its parents, as documented and measured.
+    var child = b.managedFolder("child/of/missing/").create() catch |err| return f.report(err);
+    defer child.deinit();
+
+    var page = b.listManagedFolders(.{ .prefix = "child/" }) catch |err| return f.report(err);
+    defer page.deinit();
+    try testing.expectEqual(1, page.value.managed_folders.len);
+
+    // Non-empty: an object under the prefix; allowNonEmpty bypasses.
+    const generation = try f.put("m1/inside.txt", "x");
+    try testing.expectError(error.FolderNotEmpty, b.managedFolder("m1/").delete(.{}));
+    try testing.expectError(error.FailedPrecondition, b.managedFolder("m1/").delete(.{ .allow_non_empty = true, .if_metageneration_match = 999999 }));
+    b.managedFolder("m1/").delete(.{ .allow_non_empty = true }) catch |err| return f.report(err);
+    b.object("m1/inside.txt").delete(.{ .generation = generation }) catch |err| return f.report(err);
+
+    // The policy: bare and its own, stale writes told apart, conditions
+    // taken, only Cloud Storage's roles.
+    const mf = b.managedFolder("child/of/missing/");
+    var fresh = mf.iamPolicy() catch |err| return f.report(err);
+    defer fresh.deinit();
+    try testing.expectEqualStrings("CAA=", fresh.value.etag.?);
+    try testing.expectEqual(0, fresh.value.bindings.len);
+    var service_agent = f.client.serviceAgent() catch |err| return f.report(err);
+    defer service_agent.deinit();
+    const member = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{service_agent.value});
+    var granted = mf.addIamBinding("roles/storage.objectViewer", member) catch |err| return f.report(err);
+    defer granted.deinit();
+    try testing.expect(granted.value.grants("roles/storage.objectViewer", member));
+    // The bucket moving does not move this etag.
+    var labelled = b.update(.{ .labels = .{ .change = &.{.{ .key = "zigps-touch", .value = "1" }} } }) catch |err| return f.report(err);
+    labelled.deinit();
+    var after = mf.iamPolicy() catch |err| return f.report(err);
+    defer after.deinit();
+    try testing.expectEqualStrings(granted.value.etag.?, after.value.etag.?);
+    try testing.expectError(error.Aborted, mf.setIamPolicy(.{ .etag = "CAA=", .bindings = &.{} }));
+    // A member that exists: Cloud Storage refuses a binding to a
+    // principal it cannot find, "User ... does not exist.", as measured.
+    var conditional = after.value;
+    conditional.bindings = try std.mem.concat(a, core.iam.Binding, &.{ after.value.bindings, &.{.{
+        .role = "roles/storage.objectCreator",
+        .members = &.{member},
+        .condition = "{\"title\":\"until 2030\",\"expression\":\"request.time < timestamp(\\\"2030-01-01T00:00:00Z\\\")\"}",
+    }} });
+    var conditioned = mf.setIamPolicy(conditional) catch |err| return f.report(err);
+    defer conditioned.deinit();
+    try testing.expectEqual(3, conditioned.value.version);
+    try testing.expectError(error.InvalidArgument, mf.addIamBinding("roles/pubsub.viewer", member));
+    try testing.expectEqualStrings("Role roles/pubsub.viewer is not supported for this resource.", f.diag.message());
+
+    var held = mf.testIamPermissions(&.{ "storage.objects.get", "storage.managedFolders.get" }) catch |err| return f.report(err);
+    defer held.deinit();
+    try testing.expectEqual(2, held.value.len);
+    try testing.expectError(error.InvalidArgument, mf.testIamPermissions(&.{"storage.buckets.get"}));
+    try testing.expectEqualStrings("Invalid argument.", f.diag.message());
+
+    b.managedFolder("child/of/missing/").delete(.{}) catch |err| return f.report(err);
+}
+
+test "65. managed folders: a grant scopes another principal's reads to the prefix (GCP_TEST_SA_TOKEN, GCP_TEST_SA_MEMBER)" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const sa_token_text = f.env.get("GCP_TEST_SA_TOKEN") orelse return error.SkipZigTest;
+    const sa_member = f.env.get("GCP_TEST_SA_MEMBER") orelse return error.SkipZigTest;
+    var created = f.bucket().create(.{
+        .location = "us-central1",
+        .soft_delete_retention_s = 0,
+        .uniform_bucket_level_access = true,
+    }) catch |err| return f.report(err);
+    defer created.deinit();
+    const b = f.bucket();
+
+    var made = b.managedFolder("scope/").create() catch |err| return f.report(err);
+    defer made.deinit();
+    const in_generation = try f.put("scope/in.txt", "in");
+    const out_generation = try f.put("outside.txt", "out");
+    var granted = b.managedFolder("scope/").addIamBinding("roles/storage.objectViewer", std.mem.trim(u8, sa_member, &std.ascii.whitespace)) catch |err| return f.report(err);
+    defer granted.deinit();
+
+    // The other principal: a client of its own, reading as the grant
+    // scopes it, once the grant lands (seconds, as grants here measured).
+    var sa_token: storage.StaticToken = .{ .token = std.mem.trim(u8, sa_token_text, &std.ascii.whitespace) };
+    var sa_diag: storage.Diagnostics = .{};
+    var sa_client = storage.Client.init(testing.allocator, testing.io, .{
+        .token_provider = sa_token.provider(),
+        .transport = f.http.transport(),
+        .diagnostics = &sa_diag,
+        .user_agent = Fixture.user_agent,
+    }) catch |err| return f.report(err);
+    defer sa_client.deinit();
+    const sb = sa_client.bucket(&f.name);
+    var waited: u32 = 0;
+    var scoped = while (true) {
+        break sb.object("scope/in.txt").get(.{}) catch |err| {
+            if (err == error.PermissionDenied and waited < 120) {
+                waited += 5;
+                try testing.io.sleep(.fromSeconds(5), .awake);
+                continue;
+            }
+            return f.report(err);
+        };
+    };
+    defer scoped.deinit();
+    std.debug.print("managed folder grant reached reads in <= {d} s\n", .{waited});
+    try testing.expectError(error.PermissionDenied, sb.object("outside.txt").get(.{}));
+    // A prefix-scoped list is allowed; the bucket-wide one is not.
+    var scoped_list = sb.listObjects(.{ .prefix = "scope/" }) catch |err| return f.report(err);
+    defer scoped_list.deinit();
+    try testing.expectEqual(1, scoped_list.value.objects.len);
+    try testing.expectError(error.PermissionDenied, sb.listObjects(.{}));
+
+    b.object("scope/in.txt").delete(.{ .generation = in_generation }) catch |err| return f.report(err);
+    b.object("outside.txt").delete(.{ .generation = out_generation }) catch |err| return f.report(err);
+    b.managedFolder("scope/").delete(.{}) catch |err| return f.report(err);
 }

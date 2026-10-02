@@ -54,6 +54,30 @@ including the ones that did not change.
   `destination_folder` and finished `folder`, and the bulk-restore counts
   as before; `FolderInfo` reads `pending_rename_operation_id` while a
   rename holds the folder.
+- storage: managed folders, on any bucket with uniform bucket-level
+  access: prefixes that carry IAM policies of their own, additively with
+  the bucket's. `Bucket.managedFolder(path)` creates, reads and deletes
+  one (`allow_non_empty` bypasses the emptiness rule, with the
+  setIamPolicy permission), `Bucket.listManagedFolders` pages them, and
+  the five IAM calls buckets have work the same here, a concurrent change
+  `error.Aborted` included. A fresh policy has no bindings at all, and
+  its etag is the policy's own: it does not move with the bucket, unlike
+  a bucket's, as measured on 2026-10-02. A bucket without uniform access
+  refuses every call with the same 412 a stale precondition gets, told
+  apart by the message `Diagnostics` keeps. Checked before sending, as
+  production enforces or silently accepts them: paths over 1,024 bytes or
+  15 levels, carriage returns and line feeds, the
+  `.well-known/acme-challenge/` prefix, and the dot and empty segments
+  production takes verbatim. In a hierarchical bucket, creating a managed
+  folder creates its folders, and deleting it leaves them standing, as
+  measured. A create whose answer was lost is read back, never sent
+  again; a non-empty delete is `error.FolderNotEmpty`, told from
+  `AlreadyExists` by the message.
+- examples: `gcs_folders.zig` reads a bucket's layout, makes, lists,
+  renames and deletes folders, and grants on managed folders, from the
+  command line.
+- docs: `docs/storage/folders.md`, with every rule as measured, and the
+  emulator page says fake-gcs-server has none of this but `storageLayout`.
 - core: `errors.fromRpcCode` maps the numeric `google.rpc.Code` a
   long-running operation's failure carries onto the canonical errors. Not
   breaking: `ApiError` is unchanged.

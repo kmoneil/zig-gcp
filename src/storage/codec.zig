@@ -338,6 +338,33 @@ fn folderFromWire(wire: WireFolder) DecodeError!types.FolderInfo {
     };
 }
 
+/// One ManagedFolder resource: the Folder shape, under its own kind.
+pub fn decodeManagedFolder(arena: Allocator, body: []const u8) DecodeError!types.ManagedFolderInfo {
+    return managedFolderFromWire(try parseWire(WireFolder, arena, body));
+}
+
+/// One page of `managedFolders.list`. A list of none has no `items`.
+pub fn decodeManagedFolderPage(arena: Allocator, body: []const u8) DecodeError!types.ManagedFolderPage {
+    const wire = try parseWire(struct {
+        items: ?[]const WireFolder = null,
+        nextPageToken: ?[]const u8 = null,
+    }, arena, body);
+    const listed = wire.items orelse &.{};
+    const managed = try arena.alloc(types.ManagedFolderInfo, listed.len);
+    for (listed, managed) |w, *info| info.* = try managedFolderFromWire(w);
+    return .{ .managed_folders = managed, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+fn managedFolderFromWire(wire: WireFolder) DecodeError!types.ManagedFolderInfo {
+    return .{
+        .name = nonEmpty(wire.name) orelse return error.InvalidResponse,
+        .bucket = wire.bucket orelse "",
+        .metageneration = try u64FromValue(wire.metageneration),
+        .create_time = wire.createTime orelse "",
+        .update_time = wire.updateTime orelse "",
+    };
+}
+
 /// How a bucket stores names, from `buckets.getStorageLayout`. Cloud
 /// Storage leaves `hierarchicalNamespace` out for a flat bucket;
 /// fake-gcs-server sends `enabled: false` for every bucket, a bucket made

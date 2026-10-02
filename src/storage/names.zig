@@ -178,6 +178,76 @@ fn writeFolders(w: *Writer, bucket: []const u8, request: FolderRequest) Writer.E
     }
 }
 
+/// What a managed folder request asks beside the bucket.
+pub const ManagedFolderRequest = union(enum) {
+    /// `/managedFolders`: a create, whose body names the path.
+    insert,
+    /// `/managedFolders/{managedFolder}`: a get or a delete, the delete
+    /// with `allowNonEmpty` when asked.
+    item: struct {
+        folder: []const u8,
+        preconditions: types.Preconditions = .{},
+        allow_non_empty: bool = false,
+    },
+    /// `/managedFolders` with the listing's query.
+    list: types.ManagedFolderListOptions,
+};
+
+/// `/storage/v1/b/{bucket}/managedFolders`, one of them, or the listing.
+pub fn managedFoldersPath(arena: Allocator, bucket: []const u8, request: ManagedFolderRequest) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeManagedFolders(&out.writer, bucket, request) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeManagedFolders(w: *Writer, bucket: []const u8, request: ManagedFolderRequest) Writer.Error!void {
+    try w.writeAll("/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    try w.writeAll("/managedFolders");
+    switch (request) {
+        .insert => {},
+        .item => |item| {
+            try w.writeByte('/');
+            try query.writeStrictSegment(w, item.folder);
+            var params: query.Params = .init(w);
+            if (item.allow_non_empty) try params.add("allowNonEmpty", "true");
+            try writePreconditions(&params, item.preconditions);
+        },
+        .list => |options| {
+            var params: query.Params = .init(w);
+            try params.addOptional("prefix", options.prefix);
+            try params.addNonZero("pageSize", options.page_size);
+            try params.addOptional("pageToken", options.page_token);
+        },
+    }
+}
+
+/// `/storage/v1/b/{bucket}/managedFolders/{managedFolder}/iam`, asking for
+/// policy version 3 on a read, as the bucket's path does.
+pub fn managedFolderIamPath(arena: Allocator, bucket: []const u8, folder: []const u8, read: bool) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    writeManagedFolders(w, bucket, .{ .item = .{ .folder = folder } }) catch return error.OutOfMemory;
+    w.writeAll("/iam") catch return error.OutOfMemory;
+    if (read) {
+        var params: query.Params = .init(w);
+        params.add("optionsRequestedPolicyVersion", "3") catch return error.OutOfMemory;
+    }
+    return out.toOwnedSlice();
+}
+
+/// `.../managedFolders/{managedFolder}/iam/testPermissions`, one
+/// `permissions` parameter for each name.
+pub fn managedFolderTestPermissionsPath(arena: Allocator, bucket: []const u8, folder: []const u8, permissions: []const []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    writeManagedFolders(w, bucket, .{ .item = .{ .folder = folder } }) catch return error.OutOfMemory;
+    w.writeAll("/iam/testPermissions") catch return error.OutOfMemory;
+    var params: query.Params = .init(w);
+    for (permissions) |permission| params.add("permissions", permission) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
 /// `/storage/v1/b/{bucket}/folders/{source}/renameTo/folders/{destination}`:
 /// an atomic rename of the folder and everything under it. The condition is
 /// `ifSourceMetagenerationMatch`, the one production honors: the reference
@@ -709,6 +779,31 @@ test "folder and layout paths encode the folder as one segment" {
     try expectPath(
         "/storage/v1/b/b%25c/folders/a%2Fb%2F/renameTo/folders/c%20d%2F?ifSourceMetagenerationMatch=7",
         try renameFolderPath(gpa, "b%c", "a/b/", "c d/", 7),
+    );
+}
+
+test "managed folder paths encode the folder as one segment, IAM included" {
+    const gpa = testing.allocator;
+    try expectPath("/storage/v1/b/b/managedFolders", try managedFoldersPath(gpa, "b", .insert));
+    try expectPath("/storage/v1/b/b/managedFolders/m1%2F", try managedFoldersPath(gpa, "b", .{ .item = .{ .folder = "m1/" } }));
+    try expectPath(
+        "/storage/v1/b/b/managedFolders/teams%2Fdata%2F?allowNonEmpty=true&ifMetagenerationMatch=2",
+        try managedFoldersPath(gpa, "b", .{ .item = .{
+            .folder = "teams/data/",
+            .allow_non_empty = true,
+            .preconditions = .{ .if_metageneration_match = 2 },
+        } }),
+    );
+    try expectPath("/storage/v1/b/b/managedFolders", try managedFoldersPath(gpa, "b", .{ .list = .{} }));
+    try expectPath(
+        "/storage/v1/b/b/managedFolders?prefix=teams%2F&pageSize=2&pageToken=t%2B",
+        try managedFoldersPath(gpa, "b", .{ .list = .{ .prefix = "teams/", .page_size = 2, .page_token = "t+" } }),
+    );
+    try expectPath("/storage/v1/b/b/managedFolders/m1%2F/iam?optionsRequestedPolicyVersion=3", try managedFolderIamPath(gpa, "b", "m1/", true));
+    try expectPath("/storage/v1/b/b/managedFolders/m1%2F/iam", try managedFolderIamPath(gpa, "b", "m1/", false));
+    try expectPath(
+        "/storage/v1/b/b/managedFolders/m1%2F/iam/testPermissions?permissions=storage.objects.get&permissions=storage.managedFolders.get",
+        try managedFolderTestPermissionsPath(gpa, "b", "m1/", &.{ "storage.objects.get", "storage.managedFolders.get" }),
     );
 }
 

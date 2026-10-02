@@ -9,9 +9,11 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const Folder = @import("Folder.zig");
+const ManagedFolder = @import("ManagedFolder.zig");
 const Object = @import("Object.zig");
 const bucket_settings = @import("bucket_settings.zig");
 const folders_impl = @import("folders.zig");
+const managed_folders_impl = @import("managed_folders.zig");
 const codec = @import("codec.zig");
 const iam = @import("iam.zig");
 const idempotency = @import("idempotency.zig");
@@ -399,6 +401,26 @@ pub fn object(self: Bucket, name: []const u8) Object {
 /// names, and must not outlive them.
 pub fn folder(self: Bucket, path: []const u8) Folder {
     return .{ .client = self.client, .bucket = self.name, .name = path, .billing_project = self.billing_project };
+}
+
+/// A handle for the managed folder at `path` in this bucket, which must
+/// have uniform bucket-level access. Sends nothing. The handle borrows the
+/// client and both names, and must not outlive them.
+pub fn managedFolder(self: Bucket, path: []const u8) ManagedFolder {
+    return .{ .client = self.client, .bucket = self.name, .name = path, .billing_project = self.billing_project };
+}
+
+/// One page of the bucket's managed folders, every level of them: no
+/// delimiter and no offsets here, unlike `listFolders`.
+pub fn listManagedFolders(self: Bucket, options: types.ManagedFolderListOptions) Error!types.Owned(types.ManagedFolderPage) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).listManagedFoldersBilled(options);
+}
+
+fn listManagedFoldersBilled(self: Bucket, options: types.ManagedFolderListOptions) Error!types.Owned(types.ManagedFolderPage) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return managed_folders_impl.list(self.client, self.name, options);
 }
 
 /// One page of the bucket's folders, every level of them unless

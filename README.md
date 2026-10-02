@@ -50,7 +50,7 @@ Pub/Sub, Cloud Storage and Secret Manager, with credentials that find themselves
 | | Module | Covers | Status |
 | :-: | --- | --- | --- |
 | 📨 | [`pubsub`](docs/pubsub/README.md) | Pub/Sub v1: publish one call at a time or batched from many tasks; pull, a worker loop that manages leases, and exactly-once delivery; topics and subscriptions, with their IAM policies | beta |
-| 🪣 | [`storage`](docs/storage/README.md) | Cloud Storage: objects of any size, streamed, parallel, resumable and checksummed both ways; preconditions, compose and server-side copies; buckets, versions, soft delete, retention and holds, IAM; signed URLs and POST policies; encryption keys; Pub/Sub notifications | experimental |
+| 🪣 | [`storage`](docs/storage/README.md) | Cloud Storage: objects of any size, streamed, parallel, resumable and checksummed both ways; preconditions, compose and server-side copies; buckets, versions, soft delete, retention and holds, IAM; folders, tree renames and managed folders; signed URLs and POST policies; encryption keys; Pub/Sub notifications | experimental |
 | 🔑 | [`secret_manager`](docs/secret-manager/README.md) | Secret Manager v1: a secret's bytes, verified and wiped after use; versions; secrets global or regional, their settings, notifications, rotation, encryption keys and IAM policies | experimental |
 | 🪪 | [`auth`](docs/auth.md) | Credentials for the other modules: the metadata server, gcloud's login, service account keys, workload identity federation and impersonation; signing on this machine or through IAM | experimental |
 | ⚙️ | [`core`](docs/essentials.md) | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, IAM policies, the `TokenProvider` and `Signer` seams, and test fakes. Each service re-exports what its callers need. | beta |
@@ -144,7 +144,7 @@ says how.
 | 🪪 [Credentials](docs/auth.md) | Where `findDefault` looks, every kind of credential, quota projects and signing |
 | 🔏 [IAM](docs/iam.md) | Granting, revoking and testing permissions on buckets, topics, subscriptions and secrets |
 | 📨 [Pub/Sub](docs/pubsub/README.md) | Publishing at volume, a worker loop, exactly-once delivery, subscription settings, IAM, limits |
-| 🪣 [Cloud Storage](docs/storage/README.md) | Transfers of any size, checksums and gzip, safe writes, signed URLs, buckets, retention, encryption keys, notifications |
+| 🪣 [Cloud Storage](docs/storage/README.md) | Transfers of any size, checksums and gzip, safe writes, signed URLs, buckets, retention, encryption keys, notifications, folders |
 | 🔑 [Secret Manager](docs/secret-manager/README.md) | Reading secrets safely, changing them under an etag, notifications and rotation, regional secrets |
 | 🛠️ [Development](docs/development.md) | Building, testing, fuzzing, coverage, and every integration suite |
 
@@ -163,6 +163,7 @@ The [documentation index](docs/README.md) lists every page.
 | [`gcs_cp`](examples/gcs_cp.zig) | Copies files to and from Cloud Storage in constant memory: parallel, resumable, compressed, under keys | `zig build example-gcs_cp -- backup.tar gs://my-bucket/backup.tar` |
 | [`gcs_sign`](examples/gcs_sign.zig) | Signs a URL, or prints an HTML form with a POST policy | `zig build example-gcs_sign -- gs://my-bucket/reports/q3.txt` |
 | [`gcs_notify`](examples/gcs_notify.zig) | Sets up a bucket's notifications, and watches the changes come in, decoded | `zig build example-gcs_notify -- setup my-bucket my-project uploads` |
+| [`gcs_folders`](examples/gcs_folders.zig) | Works a hierarchical bucket's folders, renames trees, and grants on managed folders | `zig build example-gcs_folders -- ls my-bucket reports/` |
 | [`iam`](examples/iam.zig) | Reads, grants, revokes and tests permissions on a bucket, topic, subscription or secret | `zig build example-iam -- get gs://my-bucket` |
 | [`secret_rotation`](examples/secret_rotation.zig) | Rotates a secret when Secret Manager says it is time, through its topic | `zig build example-secret_rotation -- setup my-project db-password rotations` |
 

@@ -958,6 +958,39 @@ pub const FolderListOptions = struct {
     page_token: ?[]const u8 = null,
 };
 
+/// A managed folder: a prefix that carries an IAM policy of its own, on
+/// any bucket with uniform bucket-level access. The policies add up: the
+/// bucket's, then each enclosing managed folder's.
+pub const ManagedFolderInfo = struct {
+    /// The full path with its trailing slash, such as `teams/data/`.
+    name: []const u8,
+    bucket: []const u8,
+    /// What `ifMetagenerationMatch` conditions compare. The IAM policy's
+    /// etag is its own and does NOT move with the bucket, unlike a
+    /// bucket's, as measured on 2026-10-02.
+    metageneration: u64,
+    /// RFC 3339, as sent by the server.
+    create_time: []const u8 = "",
+    update_time: []const u8 = "",
+};
+
+pub const ManagedFolderPage = struct {
+    managed_folders: []const ManagedFolderInfo,
+    /// Pass as `page_token` to get the next page. Null on the last page.
+    next_page_token: ?[]const u8,
+};
+
+/// What `Bucket.listManagedFolders` lists: no delimiter and no offsets,
+/// unlike folders.
+pub const ManagedFolderListOptions = struct {
+    /// Only managed folders whose paths begin with this.
+    prefix: ?[]const u8 = null,
+    /// Results per page. 0 lets the server choose.
+    page_size: u32 = 0,
+    /// `next_page_token` from the previous page; null for the first page.
+    page_token: ?[]const u8 = null,
+};
+
 /// How a bucket stores names, from `Bucket.storageLayout`: the one bucket
 /// read `storage.objects.list` permission is enough for, which is how a
 /// caller without bucket metadata access asks "is this bucket

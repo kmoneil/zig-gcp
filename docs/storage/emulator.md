@@ -74,6 +74,12 @@ trusted on. The differences it found:
   uploadType" instead. Bucket IAM is tested against an in-memory fake
   that holds Cloud Storage's rules as measured, and against Cloud
   Storage itself.
+- It has no folders and no managed folders: a create naming
+  `hierarchicalNamespace` is taken and the field dropped, `storageLayout`
+  answers `enabled: false` for every bucket, and the folders, managed
+  folders and operations routes are plain 404s. Everything in
+  [Folders](folders.md) is tested against the in-memory fake and against
+  Cloud Storage itself; only `Bucket.storageLayout` runs on the emulator.
 
 [Integration tests](../development.md#integration-tests) says how to run
 the emulator, and both suites.

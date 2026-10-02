@@ -170,6 +170,13 @@ pub const FakeMultipart = struct {
         operation_reads: u32 = 0,
         operation_cancels: u32 = 0,
         layout_reads: u32 = 0,
+        managed_creates: u32 = 0,
+        managed_reads: u32 = 0,
+        managed_deletes: u32 = 0,
+        managed_lists: u32 = 0,
+        managed_iam_reads: u32 = 0,
+        managed_iam_writes: u32 = 0,
+        managed_iam_tests: u32 = 0,
         moves: u32 = 0,
         restores: u32 = 0,
         session_starts: u32 = 0,
@@ -191,7 +198,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification, folder, operation, layout };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification, folder, managed, operation, layout };
 
     pub const Fault = enum {
         none,
@@ -519,6 +526,10 @@ pub const FakeMultipart = struct {
                 .POST, .GET, .DELETE => .folder,
                 else => return error.HttpProtocolError,
             },
+            .managed => switch (method) {
+                .POST, .GET, .DELETE, .PUT => .managed,
+                else => return error.HttpProtocolError,
+            },
             .operations => |o| switch (method) {
                 .GET => if (o.cancel) return error.HttpProtocolError else Kind.operation,
                 .POST => if (o.cancel) Kind.operation else return error.HttpProtocolError,
@@ -546,7 +557,7 @@ pub const FakeMultipart = struct {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
             .session => if (kind == .session_put) sessionPart(headers) else 0,
-            .move, .resumable, .insert, .bucket, .restore, .folders, .operations, .layout => 0,
+            .move, .resumable, .insert, .bucket, .restore, .folders, .managed, .operations, .layout => 0,
         };
         if (try self.billingRefusal(target, url, headers, arena)) |refusal| return refusal;
         if (try keyRefusal(kind, target, url, headers, arena)) |refusal| return refusal;
@@ -619,6 +630,7 @@ pub const FakeMultipart = struct {
                 break :bucket Reply{ .status = r.status, .body = r.body };
             },
             .folders => |t| try self.serveFolders(method, t, body, arena),
+            .managed => |t| try self.serveManaged(method, t, body, arena),
             .operations => |t| try self.serveOperations(method, t, arena),
             .layout => |bucket| try self.serveLayout(bucket, arena),
             .restore => |t| try self.restoreObject(t, arena),
@@ -1213,7 +1225,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification, .folder, .operation, .layout => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification, .folder, .managed, .operation, .layout => unreachable,
         }
     }
 
@@ -1712,6 +1724,169 @@ pub const FakeMultipart = struct {
         }
     }
 
+    /// Managed folders, as production answered on 2026-10-02: creates need
+    /// uniform bucket-level access (412 told apart by message), a child
+    /// before its parents is fine, a repeat create 409, a non-empty delete
+    /// 409 unless `allowNonEmpty`, a stale metageneration the storage-wide
+    /// 412, and in a hierarchical bucket the create makes the folders too,
+    /// which the delete leaves standing. The policy starts bare at etag
+    /// CAA=, moved only by its own writes, never by the bucket; a stale
+    /// etag write is the storage-wide 412, a role outside Cloud Storage's
+    /// a 400 in production's words, and a bucket permission in a
+    /// testIamPermissions production's bare 400 "Invalid argument.".
+    /// Bindings are kept as written, the empty ones dropped; whether
+    /// members are merged per role is the library's business before the
+    /// write. A missing managed folder's 404 message is this fake's own:
+    /// production's exact words went unmeasured.
+    fn serveManaged(self: *FakeMultipart, method: Method, target: ManagedTarget, body: []const u8, arena: Allocator) Allocator.Error!Reply {
+        if (self.buckets.resource(target.bucket) == null) return bucket_missing;
+        if (!self.buckets.isUniform(target.bucket)) return .{ .status = 412, .body =
+        \\{"error":{"code":412,"errors":[{"domain":"global","location":"If-Match","locationType":"header","message":"Uniform bucket-level access is required to be enabled on the bucket in order to perform this operation. Read more at https://cloud.google.com/storage/docs/uniform-bucket-level-access","reason":"conditionNotMet"}],"message":"Uniform bucket-level access is required to be enabled on the bucket in order to perform this operation. Read more at https://cloud.google.com/storage/docs/uniform-bucket-level-access"}}
+        };
+        if (target.iam) |iam_target| {
+            const folder = target.folder.?;
+            const state = self.buckets.managedState(target.bucket, folder) orelse return managed_missing;
+            switch (iam_target) {
+                .policy => |requested| switch (method) {
+                    .GET => {
+                        self.counts.managed_iam_reads += 1;
+                        return .{ .status = 200, .body = try renderManagedPolicy(arena, target.bucket, folder, state, requested orelse 1) };
+                    },
+                    .PUT => {
+                        self.counts.managed_iam_writes += 1;
+                        return self.writeManagedPolicy(target.bucket, folder, state, body, arena);
+                    },
+                    else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"this fake serves no such managed folder request\"}}" },
+                },
+                .test_permissions => |permissions| {
+                    if (method != .GET) return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"this fake serves no such managed folder request\"}}" };
+                    self.counts.managed_iam_tests += 1;
+                    return managedTestPermissions(arena, permissions);
+                },
+            }
+        }
+        if (target.folder) |folder| switch (method) {
+            .GET => {
+                self.counts.managed_reads += 1;
+                const state = self.buckets.managedState(target.bucket, folder) orelse return managed_missing;
+                return .{ .status = 200, .body = try renderManagedFolder(arena, target.bucket, folder, state) };
+            },
+            .DELETE => {
+                self.counts.managed_deletes += 1;
+                const state = self.buckets.managedState(target.bucket, folder) orelse return managed_missing;
+                if (target.if_metageneration_match) |m| if (m != state.metageneration) return folder_condition_failed;
+                if (!target.allow_non_empty and try self.managedHasContents(target.bucket, folder, arena)) {
+                    return folderConflict(arena, "The managed folder you tried to delete is not empty.");
+                }
+                _ = self.buckets.dropManaged(target.bucket, folder);
+                // The associated folders stay, as measured.
+                return .{ .status = 204 };
+            },
+            else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"this fake serves no such managed folder request\"}}" },
+        };
+        switch (method) {
+            .POST => {
+                self.counts.managed_creates += 1;
+                const meta = std.json.parseFromSliceLeaky(struct { name: []const u8 = "" }, arena, body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Parse Error\",\"errors\":[{\"reason\":\"invalid\"}]}}" },
+                };
+                if (meta.name.len == 0) return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Required\",\"errors\":[{\"reason\":\"required\"}]}}" };
+                // A missing trailing slash is normalized, as measured.
+                const folder = if (meta.name[meta.name.len - 1] == '/')
+                    meta.name
+                else
+                    try std.mem.concat(arena, u8, &.{ meta.name, "/" });
+                if (!try self.buckets.putManaged(target.bucket, folder)) {
+                    return folderConflict(arena, "The specified managed folder already exists.");
+                }
+                // A hierarchical bucket gets the folders along the path too.
+                try self.ensureParents(target.bucket, folder);
+                if (self.buckets.isHns(target.bucket)) _ = try self.buckets.putFolder(target.bucket, folder);
+                const state = self.buckets.managedState(target.bucket, folder).?;
+                return .{ .status = 200, .body = try renderManagedFolder(arena, target.bucket, folder, state) };
+            },
+            .GET => {
+                self.counts.managed_lists += 1;
+                const prefix = target.prefix orelse "";
+                const all = try self.buckets.managedPaths(target.bucket, arena);
+                var selected: std.ArrayList([]const u8) = .empty;
+                for (all) |name| {
+                    if (!std.mem.startsWith(u8, name, prefix)) continue;
+                    if (target.page_token) |token| if (std.mem.order(u8, name, token) != .gt) continue;
+                    try selected.append(arena, name);
+                }
+                const limit = if (target.page_size == 0) 1000 else @min(target.page_size, 1000);
+                const served = selected.items[0..@min(selected.items.len, limit)];
+                var out: std.Io.Writer.Allocating = .init(arena);
+                const w = &out.writer;
+                w.writeAll("{\"kind\":\"storage#managedFolders\"") catch return error.OutOfMemory;
+                if (served.len > 0) {
+                    w.writeAll(",\"items\":[") catch return error.OutOfMemory;
+                    for (served, 0..) |name, n| {
+                        if (n > 0) w.writeByte(',') catch return error.OutOfMemory;
+                        const state = self.buckets.managedState(target.bucket, name).?;
+                        w.writeAll(try renderManagedFolder(arena, target.bucket, name, state)) catch return error.OutOfMemory;
+                    }
+                    w.writeByte(']') catch return error.OutOfMemory;
+                }
+                if (served.len < selected.items.len) {
+                    w.writeAll(",\"nextPageToken\":") catch return error.OutOfMemory;
+                    var token_string: std.json.Stringify = .{ .writer = w };
+                    token_string.write(served[served.len - 1]) catch return error.OutOfMemory;
+                }
+                w.writeByte('}') catch return error.OutOfMemory;
+                return .{ .status = 200, .body = out.written() };
+            },
+            else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"this fake serves no such managed folder request\"}}" },
+        }
+    }
+
+    /// Whether anything is under the managed folder: an object, or a child
+    /// managed folder.
+    fn managedHasContents(self: *const FakeMultipart, bucket: []const u8, folder: []const u8, arena: Allocator) Allocator.Error!bool {
+        for (try self.buckets.managedPaths(bucket, arena)) |name| {
+            if (name.len > folder.len and std.mem.startsWith(u8, name, folder)) return true;
+        }
+        for (self.objects.items) |o| {
+            if (std.mem.startsWith(u8, o.name, folder)) return true;
+        }
+        return false;
+    }
+
+    /// A policy written whole, as production took and refused them.
+    fn writeManagedPolicy(self: *FakeMultipart, bucket: []const u8, folder: []const u8, state: *FakeBuckets.ManagedState, body: []const u8, arena: Allocator) Allocator.Error!Reply {
+        const fake_buckets = @import("fake_buckets.zig");
+        const policy = core.iam.decode(arena, body) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidResponse => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"Invalid policy\",\"errors\":[{\"reason\":\"invalid\"}]}}" },
+        };
+        if (policy.etag) |etag| if (etag.len > 0) {
+            var raw: [16]u8 = undefined;
+            const size = std.base64.standard.Decoder.calcSizeForSlice(etag) catch return managed_bad_etag;
+            if (size > raw.len) return managed_bad_etag;
+            std.base64.standard.Decoder.decode(raw[0..size], etag) catch return managed_bad_etag;
+            const writes = fake_buckets.metagenerationOfEtag(raw[0..size]) orelse return managed_bad_etag;
+            if (writes > state.policy_writes) return managed_bad_etag;
+            if (writes != state.policy_writes) return folder_condition_failed;
+        };
+        for (policy.bindings) |binding| {
+            if (!std.mem.startsWith(u8, binding.role, "roles/storage.")) {
+                return .{ .status = 400, .body = try std.fmt.allocPrint(
+                    arena,
+                    "{{\"error\":{{\"code\":400,\"errors\":[{{\"domain\":\"global\",\"message\":\"Role {s} is not supported for this resource.\",\"reason\":\"invalid\"}}],\"message\":\"Role {s} is not supported for this resource.\"}}}}",
+                    .{ binding.role, binding.role },
+                ) };
+            }
+        }
+        var kept: std.ArrayList(core.iam.Binding) = .empty;
+        for (policy.bindings) |binding| {
+            if (binding.members.len > 0) try kept.append(arena, binding);
+        }
+        try self.buckets.keepManagedBindings(state, kept.items);
+        return .{ .status = 200, .body = try renderManagedPolicy(arena, bucket, folder, state, 3) };
+    }
+
     /// The operations resource, serving the renames this fake started.
     /// Each get advances a pending rename one touch, which is how a test's
     /// polls walk it to done; cancel marks the request and changes nothing,
@@ -2100,7 +2275,10 @@ fn tokenRefusal(kind: FakeMultipart.Kind, method: Method, headers: []const Heade
     if (headerValue(headers, "X-Goog-Gcs-Idempotency-Token") == null) return null;
     const takes_token = switch (kind) {
         .delete, .move, .insert, .session_start, .restore, .patch => true,
-        .bucket, .notification, .operation => method != .GET,
+        // A managed folder's policy write carries one, as every IAM write
+        // does; its create and delete send none, since production
+        // deduplicates neither, as measured.
+        .bucket, .notification, .operation, .managed => method != .GET,
         else => false,
     };
     if (takes_token) return null;
@@ -2157,6 +2335,143 @@ const bucket_missing: FakeMultipart.Reply = .{ .status = 404, .body =
 const folder_missing: FakeMultipart.Reply = .{ .status = 404, .body =
     \\{"error":{"code":404,"errors":[{"domain":"global","message":"The folder does not exist.","reason":"notFound"}],"message":"The folder does not exist."}}
 };
+/// Production's exact words for a missing managed folder went unmeasured:
+/// this message is the fake's own, under the measured status and reason.
+const managed_missing: FakeMultipart.Reply = .{ .status = 404, .body =
+    \\{"error":{"code":404,"errors":[{"domain":"global","message":"The specified managed folder does not exist.","reason":"notFound"}],"message":"The specified managed folder does not exist."}}
+};
+const managed_bad_etag: FakeMultipart.Reply = .{ .status = 400, .body =
+    \\{"error":{"code":400,"message":"Invalid etag - must use etag from GetPolicy response.","errors":[{"reason":"invalid"}]}}
+};
+
+/// One managed folder resource, as production renders it.
+fn renderManagedFolder(arena: Allocator, bucket: []const u8, folder: []const u8, state: *const FakeBuckets.ManagedState) Allocator.Error![]const u8 {
+    var link: std.Io.Writer.Allocating = .init(arena);
+    link.writer.writeAll("https://www.googleapis.com/storage/v1/b/") catch return error.OutOfMemory;
+    core.query.writeStrictSegment(&link.writer, bucket) catch return error.OutOfMemory;
+    link.writer.writeAll("/managedFolders/") catch return error.OutOfMemory;
+    core.query.writeStrictSegment(&link.writer, folder) catch return error.OutOfMemory;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    writeManagedFolderJson(&jw, bucket, folder, link.written(), state, arena) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeManagedFolderJson(
+    jw: *std.json.Stringify,
+    bucket: []const u8,
+    folder: []const u8,
+    self_link: []const u8,
+    state: *const FakeBuckets.ManagedState,
+    arena: Allocator,
+) !void {
+    try jw.beginObject();
+    try jw.objectField("bucket");
+    try jw.write(bucket);
+    try jw.objectField("createTime");
+    try jw.write(state.create_time);
+    try jw.objectField("id");
+    try jw.write(try std.mem.concat(arena, u8, &.{ bucket, "/", folder }));
+    try jw.objectField("kind");
+    try jw.write("storage#managedFolder");
+    try jw.objectField("metageneration");
+    try jw.write(try std.fmt.allocPrint(arena, "{d}", .{state.metageneration}));
+    try jw.objectField("name");
+    try jw.write(folder);
+    try jw.objectField("selfLink");
+    try jw.write(self_link);
+    try jw.objectField("updateTime");
+    try jw.write(state.create_time);
+    try jw.endObject();
+}
+
+/// The policy as production renders it: fresh ones carry no bindings and
+/// no version at all, written ones a version of 1, or 3 for a condition.
+fn renderManagedPolicy(arena: Allocator, bucket: []const u8, folder: []const u8, state: *const FakeBuckets.ManagedState, requested: u32) Allocator.Error![]const u8 {
+    const fake_buckets = @import("fake_buckets.zig");
+    var etag_buf: [24]u8 = undefined;
+    const etag = fake_buckets.etagOf(&etag_buf, state.policy_writes);
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    const bindings = state.bindings orelse {
+        w.print("{{\"etag\":\"{s}\",\"kind\":\"storage#policy\",\"resourceId\":\"projects/_/buckets/{s}/managedFolders/", .{ etag, bucket }) catch return error.OutOfMemory;
+        w.writeAll(folder) catch return error.OutOfMemory;
+        w.writeAll("\"}") catch return error.OutOfMemory;
+        return out.written();
+    };
+    var conditional = false;
+    for (bindings) |b| conditional = conditional or b.condition != null;
+    const version: u32 = if (conditional and requested >= 3) 3 else 1;
+    var jw: std.json.Stringify = .{ .writer = w };
+    jw.beginObject() catch return error.OutOfMemory;
+    writeManagedPolicyRest(&jw, bucket, folder, version, etag, bindings, arena) catch return error.OutOfMemory;
+    jw.endObject() catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn writeManagedPolicyRest(
+    jw: *std.json.Stringify,
+    bucket: []const u8,
+    folder: []const u8,
+    version: u32,
+    etag: []const u8,
+    bindings: []const core.iam.Binding,
+    arena: Allocator,
+) !void {
+    try jw.objectField("bindings");
+    try jw.beginArray();
+    for (bindings) |b| {
+        try jw.beginObject();
+        try jw.objectField("members");
+        try jw.write(b.members);
+        try jw.objectField("role");
+        try jw.write(b.role);
+        if (b.condition) |condition| if (version >= 3) {
+            try jw.objectField("condition");
+            try jw.beginWriteRaw();
+            try jw.writer.writeAll(condition);
+            jw.endWriteRaw();
+        };
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.objectField("etag");
+    try jw.write(etag);
+    try jw.objectField("kind");
+    try jw.write("storage#policy");
+    try jw.objectField("resourceId");
+    try jw.write(try std.mem.concat(arena, u8, &.{ "projects/_/buckets/", bucket, "/managedFolders/", folder }));
+    try jw.objectField("version");
+    try jw.write(version);
+}
+
+/// `testPermissions` on a managed folder: the caps buckets have, and
+/// production's bare refusal of a bucket permission, as measured.
+fn managedTestPermissions(arena: Allocator, permissions: []const []const u8) Allocator.Error!FakeMultipart.Reply {
+    const invalid: FakeMultipart.Reply = .{ .status = 400, .body =
+    \\{"error":{"code":400,"errors":[{"domain":"global","message":"Invalid argument.","reason":"invalid"}],"message":"Invalid argument."}}
+    };
+    if (permissions.len == 0 or permissions.len > 84) return .{ .status = 400, .body =
+    \\{"error":{"code":400,"errors":[{"domain":"global","message":"Must specify <= 84 permissions.","reason":"invalid"}],"message":"Must specify <= 84 permissions."}}
+    };
+    for (permissions, 0..) |p, i| {
+        if (std.mem.startsWith(u8, p, "storage.buckets.")) return invalid;
+        for (permissions[0..i]) |earlier| if (std.mem.eql(u8, earlier, p)) return .{ .status = 400, .body =
+        \\{"error":{"code":400,"errors":[{"domain":"global","message":"Duplicate permissions must not be specified.","reason":"invalid"}],"message":"Duplicate permissions must not be specified."}}
+        };
+    }
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeAll("{\"kind\":\"storage#testIamPermissionsResponse\",\"permissions\":[") catch return error.OutOfMemory;
+    for (permissions, 0..) |p, i| {
+        if (i > 0) w.writeByte(',') catch return error.OutOfMemory;
+        var jw: std.json.Stringify = .{ .writer = w };
+        jw.write(p) catch return error.OutOfMemory;
+    }
+    w.writeAll("]}") catch return error.OutOfMemory;
+    return .{ .status = 200, .body = out.written() };
+}
+
 const operation_missing: FakeMultipart.Reply = .{ .status = 404, .body =
     \\{"error":{"code":404,"errors":[{"domain":"global","message":"The specified long-running operation does not exist.","reason":"notFound"}],"message":"The specified long-running operation does not exist."}}
 };
@@ -2568,6 +2883,7 @@ const Target = union(enum) {
     resumable: ResumableTarget,
     insert: InsertTarget,
     folders: FoldersTarget,
+    managed: ManagedTarget,
     operations: OpsTarget,
     /// A `.../storageLayout` read's bucket.
     layout: []const u8,
@@ -2600,6 +2916,23 @@ const OpsTarget = struct {
     bucket: []const u8,
     id: ?[]const u8 = null,
     cancel: bool = false,
+};
+
+/// `/storage/v1/b/{bucket}/managedFolders`, one of them, or its IAM.
+const ManagedTarget = struct {
+    bucket: []const u8,
+    /// Null for the collection.
+    folder: ?[]const u8 = null,
+    iam: ?union(enum) {
+        /// The version a read asks for.
+        policy: ?u32,
+        test_permissions: []const []const u8,
+    } = null,
+    allow_non_empty: bool = false,
+    if_metageneration_match: ?u64 = null,
+    prefix: ?[]const u8 = null,
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
 };
 
 /// What a URL names, decoded. Anything this fake does not serve is
@@ -2705,6 +3038,54 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
                 }
             }
             return .{ .folders = target };
+        };
+        if (std.mem.indexOfScalar(u8, after, '/')) |slash| if (std.mem.startsWith(u8, after[slash..], "/managedFolders")) {
+            var target: ManagedTarget = .{ .bucket = try decode(arena, after[0..slash]) };
+            var tail = after[slash + "/managedFolders".len ..];
+            var version: ?u32 = null;
+            var permissions: std.ArrayList([]const u8) = .empty;
+            var test_permissions = false;
+            if (std.mem.endsWith(u8, tail, "/iam/testPermissions")) {
+                test_permissions = true;
+                tail = tail[0 .. tail.len - "/iam/testPermissions".len];
+            } else if (std.mem.endsWith(u8, tail, "/iam")) {
+                target.iam = .{ .policy = null };
+                tail = tail[0 .. tail.len - "/iam".len];
+            }
+            if (tail.len == 0) {
+                if (target.iam != null or test_permissions) return error.HttpProtocolError;
+            } else if (tail[0] == '/' and tail.len > 1 and std.mem.indexOfScalar(u8, tail[1..], '/') == null) {
+                target.folder = try decode(arena, tail[1..]);
+            } else return error.HttpProtocolError;
+            if (query.len > 0) {
+                var params = std.mem.splitScalar(u8, query, '&');
+                while (params.next()) |param| {
+                    if (std.mem.startsWith(u8, param, "prefix=")) {
+                        target.prefix = try decode(arena, param["prefix=".len..]);
+                    } else if (std.mem.startsWith(u8, param, "pageSize=")) {
+                        target.page_size = std.fmt.parseInt(u32, param["pageSize=".len..], 10) catch return error.HttpProtocolError;
+                    } else if (std.mem.startsWith(u8, param, "pageToken=")) {
+                        target.page_token = try decode(arena, param["pageToken=".len..]);
+                    } else if (std.mem.eql(u8, param, "allowNonEmpty=true")) {
+                        target.allow_non_empty = true;
+                    } else if (std.mem.startsWith(u8, param, "ifMetagenerationMatch=")) {
+                        target.if_metageneration_match = std.fmt.parseInt(u64, param["ifMetagenerationMatch=".len..], 10) catch return error.HttpProtocolError;
+                    } else if (std.mem.startsWith(u8, param, "optionsRequestedPolicyVersion=")) {
+                        version = std.fmt.parseInt(u32, param["optionsRequestedPolicyVersion=".len..], 10) catch return error.HttpProtocolError;
+                    } else if (std.mem.startsWith(u8, param, "permissions=")) {
+                        try permissions.append(arena, try decode(arena, param["permissions=".len..]));
+                    } else if (std.mem.startsWith(u8, param, "userProject=")) {
+                        // Already read by billingRefusal.
+                    } else return error.HttpProtocolError;
+                }
+            }
+            if (test_permissions) {
+                target.iam = .{ .test_permissions = permissions.items };
+            } else if (target.iam != null and version != null) {
+                target.iam = .{ .policy = version };
+            }
+            if ((target.iam != null or test_permissions) and target.folder == null) return error.HttpProtocolError;
+            return .{ .managed = target };
         };
         if (std.mem.indexOfScalar(u8, after, '/')) |slash| if (std.mem.startsWith(u8, after[slash..], "/operations")) {
             var target: OpsTarget = .{ .bucket = try decode(arena, after[0..slash]) };
