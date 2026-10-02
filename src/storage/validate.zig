@@ -115,6 +115,37 @@ pub fn folderPathProblem(path: []const u8) ?[]const u8 {
     return null;
 }
 
+/// A managed folder path holds at most this many bytes of UTF-8; Cloud
+/// Storage's refusal says characters and counted ASCII when measured
+/// (2026-10-02), the documentation says bytes.
+pub const max_managed_folder_bytes = 1024;
+/// Managed folders nest at most 15 levels deep.
+pub const max_managed_folder_depth = 15;
+
+/// What is wrong with a managed folder path, or null. The same stance as
+/// `folderPathProblem` on the dot and empty segments production takes
+/// verbatim, plus the rules Cloud Storage itself refused, each measured:
+/// carriage returns and line feeds, the ACME prefix, 1,024 bytes, and 15
+/// levels.
+pub fn managedFolderPathProblem(path: []const u8) ?[]const u8 {
+    if (path.len == 0) return "the path is empty";
+    if (path.len > max_managed_folder_bytes) return "the path is over 1,024 bytes, slashes included";
+    if (!std.unicode.utf8ValidateSlice(path)) return "the path is not UTF-8";
+    if (std.mem.indexOfAny(u8, path, "\r\n") != null) return "the path holds a carriage return or line feed, which Cloud Storage refuses";
+    if (std.mem.startsWith(u8, path, ".well-known/acme-challenge/")) return "ACME HTTP challenges are not supported, as Cloud Storage says";
+    var depth: usize = 0;
+    const trimmed = if (path[path.len - 1] == '/') path[0 .. path.len - 1] else path;
+    var segments = std.mem.splitScalar(u8, trimmed, '/');
+    while (segments.next()) |segment| {
+        depth += 1;
+        if (segment.len == 0) return "a segment is empty";
+        if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, ".."))
+            return "a segment is \".\" or \"..\", which Cloud Storage takes verbatim and nothing can address safely";
+    }
+    if (depth > max_managed_folder_depth) return "the path is over 15 levels deep";
+    return null;
+}
+
 /// User agents become a header value: printable ASCII.
 pub fn isUserAgent(text: []const u8) bool {
     if (text.len == 0) return false;
@@ -216,6 +247,26 @@ test "folder paths: the measured limits, and the names the server takes that no 
     try testing.expect(folderPathProblem("a\rb/") != null);
     try testing.expect(folderPathProblem("a\nb/") != null);
     try testing.expect(folderPathProblem("bad\xffutf8/") != null);
+}
+
+test "managed folder paths: the measured limits, and the shared dot-segment stance" {
+    try testing.expect(managedFolderPathProblem("m1/") == null);
+    try testing.expect(managedFolderPathProblem("teams/data/") == null);
+    try testing.expect(managedFolderPathProblem("m" ** 1023 ++ "/") == null);
+    const deep15 = "d/" ** 15;
+    try testing.expect(managedFolderPathProblem(deep15) == null);
+    try testing.expect(managedFolderPathProblem("not-acme/.well-known/acme-challenge/") == null);
+
+    try testing.expect(managedFolderPathProblem("") != null);
+    try testing.expect(managedFolderPathProblem("m" ** 1024 ++ "/") != null);
+    try testing.expect(managedFolderPathProblem(deep15 ++ "x/") != null);
+    try testing.expect(managedFolderPathProblem("a\rb/") != null);
+    try testing.expect(managedFolderPathProblem("a\nb/") != null);
+    try testing.expect(managedFolderPathProblem(".well-known/acme-challenge/x/") != null);
+    try testing.expect(managedFolderPathProblem("./") != null);
+    try testing.expect(managedFolderPathProblem("../") != null);
+    try testing.expect(managedFolderPathProblem("a//b/") != null);
+    try testing.expect(managedFolderPathProblem("bad\xffutf8/") != null);
 }
 
 test "metadataFault finds an empty key and a repeated one" {

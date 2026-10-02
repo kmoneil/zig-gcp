@@ -41,6 +41,7 @@ pub fn refinedConflict(err: anyerror, diag: *const core.Diagnostics) ?Error {
     if (err != error.AlreadyExists) return null;
     const message = diag.message();
     if (std.mem.startsWith(u8, message, "The folder you tried to delete is not empty")) return error.FolderNotEmpty;
+    if (std.mem.startsWith(u8, message, "The managed folder you tried to delete is not empty")) return error.FolderNotEmpty;
     if (std.mem.startsWith(u8, message, "The parent folder does not exist")) return error.ParentFolderMissing;
     if (std.mem.startsWith(u8, message, "The bucket does not support hierarchical namespace")) return error.HierarchicalNamespaceRequired;
     return null;
@@ -993,6 +994,14 @@ fn pathsProperty(_: void, bytes: []const u8) !void {
         defer renamed.deinit();
         try testing.expectEqualStrings("renamed-leg/", renamed.value.name);
         try testing.expectError(error.NotFound, b.folder(made.value.name).get());
+        // A managed folder rides the same path: created, granted, deleted.
+        const viewer = "serviceAccount:service-82150720798@gs-project-accounts.iam.gserviceaccount.com";
+        var mf = try b.managedFolder("renamed-leg/").create();
+        defer mf.deinit();
+        var granted = try b.managedFolder("renamed-leg/").addIamBinding("roles/storage.objectViewer", viewer);
+        defer granted.deinit();
+        try testing.expect(granted.value.grants("roles/storage.objectViewer", viewer));
+        try b.managedFolder("renamed-leg/").delete(.{});
         try b.folder("renamed-leg/").delete(.{});
         try testing.expectError(error.NotFound, b.folder("renamed-leg/").get());
     } else |err| {

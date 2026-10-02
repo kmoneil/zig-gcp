@@ -52,6 +52,7 @@ it differs from Cloud Storage.
 | [Writing objects](writing-objects.md) | Preconditions and retries, metadata after the upload, compose, and copies that change what they carry |
 | [Signed URLs and POST policies](signed-urls.md) | One request, or one kind of browser upload, without credentials |
 | [Buckets](buckets.md) | Settings and lifecycle rules, versions and soft delete, retention and holds, requester pays, IAM |
+| [Folders](folders.md) | Hierarchical buckets, folders and atomic tree renames, and managed folders with policies of their own |
 | [Encryption keys](encryption.md) | Customer-supplied keys and Cloud KMS keys |
 | [Notifications](notifications.md) | A Pub/Sub message for every change to a bucket's objects, decoded |
 | [The emulator](emulator.md) | What fake-gcs-server does differently, and how the tests cover it |
