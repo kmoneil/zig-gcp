@@ -69,6 +69,31 @@ pub fn fromResponse(http_status: u16, status: []const u8) ApiError {
     return by_status.get(status) orelse fromHttpStatus(http_status);
 }
 
+/// Maps a numeric `google.rpc.Code`, as a long-running operation's `error`
+/// carries one. The numbering is canonical and fixed; anything unlisted is
+/// `Unknown`, as a status string this library does not know would be.
+pub fn fromRpcCode(code: i64) ApiError {
+    return switch (code) {
+        1 => error.ServerCancelled,
+        2 => error.Unknown,
+        3 => error.InvalidArgument,
+        4 => error.DeadlineExceeded,
+        5 => error.NotFound,
+        6 => error.AlreadyExists,
+        7 => error.PermissionDenied,
+        8 => error.ResourceExhausted,
+        9 => error.FailedPrecondition,
+        10 => error.Aborted,
+        11 => error.OutOfRange,
+        12 => error.Unimplemented,
+        13 => error.Internal,
+        14 => error.Unavailable,
+        15 => error.DataLoss,
+        16 => error.Unauthenticated,
+        else => error.Unknown,
+    };
+}
+
 /// Maps an HTTP status alone, for error bodies that are not JSON, such as a
 /// proxy's HTML page.
 pub fn fromHttpStatus(http_status: u16) ApiError {
@@ -306,6 +331,23 @@ test "error table: each API status maps to its error" {
             try testing.expectEqual(c[2], fromHttpStatus(c[1]));
         }
     }
+}
+
+test "error mapping: every canonical rpc code, and the unlisted ones" {
+    try std.testing.expectEqual(error.ServerCancelled, fromRpcCode(1));
+    try std.testing.expectEqual(error.InvalidArgument, fromRpcCode(3));
+    try std.testing.expectEqual(error.NotFound, fromRpcCode(5));
+    try std.testing.expectEqual(error.AlreadyExists, fromRpcCode(6));
+    try std.testing.expectEqual(error.PermissionDenied, fromRpcCode(7));
+    try std.testing.expectEqual(error.ResourceExhausted, fromRpcCode(8));
+    try std.testing.expectEqual(error.FailedPrecondition, fromRpcCode(9));
+    try std.testing.expectEqual(error.Aborted, fromRpcCode(10));
+    try std.testing.expectEqual(error.Unavailable, fromRpcCode(14));
+    try std.testing.expectEqual(error.Unauthenticated, fromRpcCode(16));
+    try std.testing.expectEqual(error.Unknown, fromRpcCode(0));
+    try std.testing.expectEqual(error.Unknown, fromRpcCode(2));
+    try std.testing.expectEqual(error.Unknown, fromRpcCode(17));
+    try std.testing.expectEqual(error.Unknown, fromRpcCode(-1));
 }
 
 test "error mapping: the other canonical statuses" {

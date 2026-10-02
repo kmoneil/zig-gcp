@@ -97,6 +97,11 @@ pub const FakeBuckets = struct {
     /// `//pubsub.googleapis.com/` name. Every other topic exists, and Cloud
     /// Storage's service agent may publish to it.
     topics: std.StringHashMapUnmanaged(TopicState) = .empty,
+    /// Every rename ever started, done ones included: operations stay
+    /// listable. `FakeMultipart` runs them; the state lives here with the
+    /// folders they move.
+    renames: std.ArrayListUnmanaged(RenameOp) = .empty,
+    next_operation: u32 = 1,
 
     pub const TopicState = enum {
         /// No such topic.
@@ -140,6 +145,58 @@ pub const FakeBuckets = struct {
         metageneration: u64 = 1,
         create_time: []const u8 = "2026-10-02T19:10:28.285Z",
     };
+
+    /// One folder rename, as an operation: pending for `pending` touches (a
+    /// poll of the operation, or a write it blocks), then performed. The
+    /// renamed folders keep their create times and metagenerations, as
+    /// measured.
+    pub const RenameOp = struct {
+        bucket: []const u8,
+        id: []const u8,
+        source: []const u8,
+        destination: []const u8,
+        pending: u32,
+        done: bool = false,
+        requested_cancellation: bool = false,
+    };
+
+    /// Records a started rename and returns its index in `renames`.
+    pub fn startRenameOp(self: *FakeBuckets, bucket: []const u8, source: []const u8, destination: []const u8, pending: u32) Allocator.Error!usize {
+        const a = self.arena.allocator();
+        const id = try std.fmt.allocPrint(a, "CiRmYWtlcmVuYW1l{d}QAQ", .{self.next_operation});
+        self.next_operation += 1;
+        try self.renames.append(a, .{
+            .bucket = try a.dupe(u8, bucket),
+            .id = id,
+            .source = try a.dupe(u8, source),
+            .destination = try a.dupe(u8, destination),
+            .pending = pending,
+        });
+        return self.renames.items.len - 1;
+    }
+
+    /// The bucket's rename of this id, or null.
+    pub fn renameOp(self: *FakeBuckets, bucket: []const u8, id: []const u8) ?*RenameOp {
+        for (self.renames.items) |*op| {
+            if (std.mem.eql(u8, op.bucket, bucket) and std.mem.eql(u8, op.id, id)) return op;
+        }
+        return null;
+    }
+
+    /// Moves every folder under `source` to `destination`, states kept.
+    pub fn renameFolders(self: *FakeBuckets, bucket: []const u8, source: []const u8, destination: []const u8) Allocator.Error!void {
+        const stored = self.buckets.getPtr(bucket) orelse return;
+        const a = self.arena.allocator();
+        var moved: std.StringArrayHashMapUnmanaged(FolderState) = .empty;
+        for (stored.folders.keys(), stored.folders.values()) |name, state| {
+            const kept = if (std.mem.startsWith(u8, name, source))
+                try std.mem.concat(a, u8, &.{ destination, name[source.len..] })
+            else
+                name;
+            try moved.put(a, kept, state);
+        }
+        stored.folders = moved;
+    }
 
     /// What a bucket URL names.
     pub const Target = struct {

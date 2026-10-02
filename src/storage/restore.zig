@@ -68,7 +68,7 @@ pub fn restoreObject(
 /// same on every retry of it, so a start whose answer was lost is not
 /// started twice. It carries one whatever `Options.idempotency_tokens`
 /// says: its retries depend on it.
-pub fn bulkRestore(client: *Client, bucket: []const u8, options: types.BulkRestoreOptions) Error!types.Owned(types.Operation) {
+pub fn bulkRestore(client: *Client, bucket: []const u8, options: types.BulkRestoreOptions) Error!types.Owned(types.OperationInfo) {
     try checkBulkRestore(client.diagnostics, options);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
@@ -78,7 +78,7 @@ pub fn bulkRestore(client: *Client, bucket: []const u8, options: types.BulkResto
     idempotency.make(client.io, &token);
     const headers = [_]core.transport.Header{.{ .name = idempotency.header_name, .value = &token }};
 
-    var result: types.Owned(types.Operation) = try .init(client.gpa);
+    var result: types.Owned(types.OperationInfo) = try .init(client.gpa);
     errdefer result.deinit();
     const response = try rpc.execute(client, result.arena, .{ .method = .POST, .path = path, .body = body, .headers = &headers });
     result.value = codec.decodeOperation(result.arena.allocator(), response) catch |err|
@@ -87,13 +87,13 @@ pub fn bulkRestore(client: *Client, bucket: []const u8, options: types.BulkResto
 }
 
 /// One operation of the bucket's.
-pub fn operation(client: *Client, bucket: []const u8, id: []const u8) Error!types.Owned(types.Operation) {
+pub fn operation(client: *Client, bucket: []const u8, id: []const u8) Error!types.Owned(types.OperationInfo) {
     try checkOperationId(client, id);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
     const path = try names.operationsPath(scratch.allocator(), bucket, .{ .get = id });
 
-    var result: types.Owned(types.Operation) = try .init(client.gpa);
+    var result: types.Owned(types.OperationInfo) = try .init(client.gpa);
     errdefer result.deinit();
     const response = try rpc.execute(client, result.arena, .{ .method = .GET, .path = path });
     result.value = codec.decodeOperation(result.arena.allocator(), response) catch |err|

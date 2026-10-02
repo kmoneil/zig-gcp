@@ -3870,7 +3870,7 @@ test "52. soft delete: objects restored one and many at a time, and the bucket i
 }
 
 /// Polls an operation until it is done, backing off from 5 to 30 s.
-fn waitForOperation(f: *BucketFixture, id: []const u8, limit_s: u32) !storage.Operation {
+fn waitForOperation(f: *BucketFixture, id: []const u8, limit_s: u32) !storage.OperationInfo {
     var waited: u32 = 0;
     var pause: u32 = 5;
     while (waited <= limit_s) : (waited += pause) {

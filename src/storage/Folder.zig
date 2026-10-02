@@ -44,6 +44,14 @@ pub const DeleteOptions = struct {
     if_metageneration_match: ?u64 = null,
 };
 
+pub const RenameOptions = struct {
+    /// Rename only while the source's metageneration is this. The one
+    /// condition production honors on a rename: the reference page's
+    /// `ifMetagenerationMatch` is silently ignored, and the rename runs,
+    /// as measured on 2026-10-02, so this library never sends it.
+    if_source_metageneration_match: ?u64 = null,
+};
+
 /// This handle, billing `project` for every request it makes, as
 /// `Bucket.withBillingProject` says.
 pub fn withBillingProject(self: Folder, project: []const u8) Folder {
@@ -103,6 +111,37 @@ pub fn delete(self: Folder, options: DeleteOptions) Error!void {
     return folders.delete(billed.client, billed.bucket, billed.name, .{
         .if_metageneration_match = options.if_metageneration_match,
     });
+}
+
+/// Renames this folder, its child folders, its objects and its managed
+/// folders to `destination`, one atomic metadata change, and waits for the
+/// operation to finish, polling under the client's backoff up to its
+/// retry policy's attempts: a small tree is done in the first answer, and
+/// 300 folders took under a second, as measured. While it runs, writes
+/// under either path answer a retryable 429, which this library's own
+/// retries wait out. The renamed folder keeps its create time and
+/// metageneration. A destination folder that exists is
+/// `error.AlreadyExists` at once; an object of the destination's name is
+/// no conflict. A rename cannot be canceled, and is never sent twice: a
+/// transient failure says in `Diagnostics` how to see whether it started.
+pub fn renameTo(self: Folder, destination: []const u8, options: RenameOptions) Error!types.Owned(types.FolderInfo) {
+    var client: Client = undefined;
+    const billed = try self.billing(&client);
+    rpc.begin(billed.client);
+    try rpc.checkBucketName(billed.client, billed.bucket);
+    return folders.rename(billed.client, billed.bucket, billed.name, destination, options.if_source_metageneration_match);
+}
+
+/// `renameTo` without the wait: the operation as the start answered it,
+/// `done` already for a small tree. `Bucket.operation` follows it by
+/// `OperationInfo.id`; the finished operation carries the destination as
+/// `OperationInfo.folder`.
+pub fn startRenameTo(self: Folder, destination: []const u8, options: RenameOptions) Error!types.Owned(types.OperationInfo) {
+    var client: Client = undefined;
+    const billed = try self.billing(&client);
+    rpc.begin(billed.client);
+    try rpc.checkBucketName(billed.client, billed.bucket);
+    return folders.startRename(billed.client, billed.bucket, billed.name, destination, options.if_source_metageneration_match);
 }
 
 test {

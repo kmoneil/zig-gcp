@@ -34,7 +34,30 @@ including the ones that did not change.
   `ParentFolderMissing` and `HierarchicalNamespaceRequired`, the last
   three read from the one 409 `conflict` production answers every folder
   refusal with, told apart by its message, as measured.
-- core, auth, pubsub and secret_manager: unchanged.
+- storage: `Folder.renameTo` renames a folder, its child folders, its
+  objects and its managed folders to a new path, one atomic metadata
+  change that keeps each folder's create time and metageneration, and
+  waits the long-running operation out: a small tree is done in the very
+  first answer, and 300 folders took under a second, as measured on
+  2026-10-02. `startRenameTo` returns the operation instead, for
+  `Bucket.operation` to follow. While a rename runs, writes under either
+  path answer a retryable 429, which this library's retries wait out. The
+  one precondition is `ifSourceMetagenerationMatch`: the reference page's
+  `ifMetagenerationMatch` spelling is silently ignored and the rename
+  runs, as measured, so this library never sends it. A rename is never
+  sent twice (a repeat of one that landed is a plain 404 for the gone
+  source), and cannot be canceled; a destination folder that exists
+  refuses at once, while an object of that name is no conflict.
+  **Breaking:** `storage.Operation` is now `OperationInfo`, with an
+  `OperationKind` (`bulk_restore`, `rename_folder`, `unknown`) read from
+  the operation's metadata, a rename's `source_folder`,
+  `destination_folder` and finished `folder`, and the bulk-restore counts
+  as before; `FolderInfo` reads `pending_rename_operation_id` while a
+  rename holds the folder.
+- core: `errors.fromRpcCode` maps the numeric `google.rpc.Code` a
+  long-running operation's failure carries onto the canonical errors. Not
+  breaking: `ApiError` is unchanged.
+- auth, pubsub and secret_manager: unchanged.
 
 ## 0.29.0 (2026-10-02)
 

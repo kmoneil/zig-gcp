@@ -142,6 +142,10 @@ pub const FakeMultipart = struct {
     /// move repeated after one that landed answers 412, not 404. Which
     /// Cloud Storage does, no documentation says.
     move_checks_destination_first: bool = false,
+    /// Touches (operation polls, or writes a rename blocks with 429) before
+    /// a started rename finishes. 0 answers `done` in the first response,
+    /// as production answered a small tree; a 300-folder tree took 3 polls.
+    rename_pending: u32 = 0,
     counts: Counts = .{},
 
     pub const Counts = struct {
@@ -162,6 +166,9 @@ pub const FakeMultipart = struct {
         folder_reads: u32 = 0,
         folder_deletes: u32 = 0,
         folder_lists: u32 = 0,
+        folder_renames: u32 = 0,
+        operation_reads: u32 = 0,
+        operation_cancels: u32 = 0,
         layout_reads: u32 = 0,
         moves: u32 = 0,
         restores: u32 = 0,
@@ -184,7 +191,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification, folder, layout };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification, folder, operation, layout };
 
     pub const Fault = enum {
         none,
@@ -512,6 +519,11 @@ pub const FakeMultipart = struct {
                 .POST, .GET, .DELETE => .folder,
                 else => return error.HttpProtocolError,
             },
+            .operations => |o| switch (method) {
+                .GET => if (o.cancel) return error.HttpProtocolError else Kind.operation,
+                .POST => if (o.cancel) Kind.operation else return error.HttpProtocolError,
+                else => return error.HttpProtocolError,
+            },
             .layout => if (method == .GET) .layout else return error.HttpProtocolError,
             .restore => if (method == .POST) .restore else return error.HttpProtocolError,
             .session => switch (method) {
@@ -534,7 +546,7 @@ pub const FakeMultipart = struct {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
             .session => if (kind == .session_put) sessionPart(headers) else 0,
-            .move, .resumable, .insert, .bucket, .restore, .folders, .layout => 0,
+            .move, .resumable, .insert, .bucket, .restore, .folders, .operations, .layout => 0,
         };
         if (try self.billingRefusal(target, url, headers, arena)) |refusal| return refusal;
         if (try keyRefusal(kind, target, url, headers, arena)) |refusal| return refusal;
@@ -607,6 +619,7 @@ pub const FakeMultipart = struct {
                 break :bucket Reply{ .status = r.status, .body = r.body };
             },
             .folders => |t| try self.serveFolders(method, t, body, arena),
+            .operations => |t| try self.serveOperations(method, t, arena),
             .layout => |bucket| try self.serveLayout(bucket, arena),
             .restore => |t| try self.restoreObject(t, arena),
             .session => |id| if (kind == .session_put)
@@ -1200,7 +1213,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification, .folder, .layout => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification, .folder, .operation, .layout => unreachable,
         }
     }
 
@@ -1548,6 +1561,7 @@ pub const FakeMultipart = struct {
             else => return bad,
         };
         if (meta.name.len == 0) return bad;
+        if (try self.renameBlock(target.bucket, meta.name)) |blocked| return blocked;
         const held = if (self.liveIndex(meta.name)) |i|
             target.conditions.check(&self.objects.items[i]) == .hold
         else
@@ -1586,6 +1600,22 @@ pub const FakeMultipart = struct {
         if (self.buckets.resource(target.bucket) == null) return bucket_missing;
         if (!self.buckets.isHns(target.bucket)) {
             return folderConflict(arena, "The bucket does not support hierarchical namespace.");
+        }
+        if (target.rename_destination) |destination| {
+            if (method != .POST) return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"this fake serves no such folder request\"}}" };
+            self.counts.folder_renames += 1;
+            const source = target.folder.?;
+            const state = self.buckets.folderState(target.bucket, source) orelse return folder_missing;
+            if (target.if_source_metageneration_match) |m| if (m != state.metageneration) return folder_condition_failed;
+            // A destination folder that exists refuses at once, with no
+            // operation; an object of the name is no conflict, as measured.
+            if (self.buckets.folderState(target.bucket, destination) != null) {
+                return folderConflict(arena, "The folder you tried to create already exists.");
+            }
+            const index = try self.buckets.startRenameOp(target.bucket, source, destination, self.rename_pending);
+            const op = &self.buckets.renames.items[index];
+            if (op.pending == 0) try self.finishRename(op);
+            return .{ .status = 200, .body = try self.renderOperation(arena, op) };
         }
         if (target.folder) |folder| switch (method) {
             .GET => {
@@ -1680,6 +1710,110 @@ pub const FakeMultipart = struct {
             },
             else => return .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"this fake serves no such folder request\"}}" },
         }
+    }
+
+    /// The operations resource, serving the renames this fake started.
+    /// Each get advances a pending rename one touch, which is how a test's
+    /// polls walk it to done; cancel marks the request and changes nothing,
+    /// since a rename cannot be canceled (docs; unmeasured in production).
+    fn serveOperations(self: *FakeMultipart, method: Method, target: OpsTarget, arena: Allocator) Allocator.Error!Reply {
+        if (self.buckets.resource(target.bucket) == null) return bucket_missing;
+        const id = target.id orelse {
+            self.counts.operation_reads += 1;
+            var out: std.Io.Writer.Allocating = .init(arena);
+            const w = &out.writer;
+            w.writeAll("{\"kind\":\"storage#operations\"") catch return error.OutOfMemory;
+            var any = false;
+            for (self.buckets.renames.items) |*op| {
+                if (!std.mem.eql(u8, op.bucket, target.bucket)) continue;
+                w.writeAll(if (any) "," else ",\"operations\":[") catch return error.OutOfMemory;
+                any = true;
+                w.writeAll(try self.renderOperation(arena, op)) catch return error.OutOfMemory;
+            }
+            if (any) w.writeByte(']') catch return error.OutOfMemory;
+            w.writeByte('}') catch return error.OutOfMemory;
+            return .{ .status = 200, .body = out.written() };
+        };
+        const op = self.buckets.renameOp(target.bucket, id) orelse return operation_missing;
+        // The kind mapping let only a GET through without cancel, and only
+        // a POST with it.
+        _ = method;
+        if (target.cancel) {
+            self.counts.operation_cancels += 1;
+            op.requested_cancellation = true;
+            return .{ .status = 200, .body = "{}" };
+        }
+        self.counts.operation_reads += 1;
+        try self.advanceRename(op);
+        return .{ .status = 200, .body = try self.renderOperation(arena, op) };
+    }
+
+    /// Moves the folders and this fake's objects, and marks the rename done.
+    fn finishRename(self: *FakeMultipart, op: *FakeBuckets.RenameOp) Allocator.Error!void {
+        try self.buckets.renameFolders(op.bucket, op.source, op.destination);
+        for (self.objects.items) |*o| {
+            if (!std.mem.startsWith(u8, o.name, op.source)) continue;
+            const renamed = try std.mem.concat(self.gpa, u8, &.{ op.destination, o.name[op.source.len..] });
+            self.gpa.free(o.name);
+            o.name = renamed;
+        }
+        op.done = true;
+    }
+
+    /// One touch of a pending rename: time passing, as the fake counts it.
+    fn advanceRename(self: *FakeMultipart, op: *FakeBuckets.RenameOp) Allocator.Error!void {
+        if (op.done) return;
+        if (op.pending > 0) op.pending -= 1;
+        if (op.pending == 0) try self.finishRename(op);
+    }
+
+    /// The 429 every write under a renaming tree answers, with production's
+    /// words; the attempt also advances the rename, as time would.
+    fn renameBlock(self: *FakeMultipart, bucket: []const u8, object_name: []const u8) Allocator.Error!?Reply {
+        for (self.buckets.renames.items) |*op| {
+            if (op.done or !std.mem.eql(u8, op.bucket, bucket)) continue;
+            if (!std.mem.startsWith(u8, object_name, op.source) and !std.mem.startsWith(u8, object_name, op.destination)) continue;
+            try self.advanceRename(op);
+            if (op.done) continue;
+            return .{ .status = 429, .body =
+            \\{"error":{"code":429,"errors":[{"domain":"global","message":"Write operation conflicts with in-progress folder rename. Clients may automatically retry the operation until this transient error disappears.","reason":"quotaExceeded"}],"message":"Write operation conflicts with in-progress folder rename. Clients may automatically retry the operation until this transient error disappears."}}
+            };
+        }
+        return null;
+    }
+
+    /// One operation document, in the shape production answered on
+    /// 2026-10-02: RenameFolderMetadata, and the control-plane Folder as
+    /// the response once done.
+    fn renderOperation(self: *FakeMultipart, arena: Allocator, op: *const FakeBuckets.RenameOp) Allocator.Error![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(arena);
+        const w = &out.writer;
+        w.print("{{\"done\":{},\"kind\":\"storage#operation\",\"metadata\":{{\"@type\":\"type.googleapis.com/google.storage.control.v2.RenameFolderMetadata\"," ++
+            "\"commonMetadata\":{{\"createTime\":\"2026-10-02T19:27:56.736Z\"", .{op.done}) catch return error.OutOfMemory;
+        if (op.done) w.writeAll(",\"endTime\":\"2026-10-02T19:27:57.326Z\"") catch return error.OutOfMemory;
+        w.print(",\"progressPercent\":{d},\"requestedCancellation\":{},\"type\":\"rename-folder\",\"updateTime\":\"2026-10-02T19:27:57.326Z\"}}", .{
+            @as(u8, if (op.done) 100 else 1),
+            op.requested_cancellation,
+        }) catch return error.OutOfMemory;
+        w.writeAll(",\"destinationFolderId\":") catch return error.OutOfMemory;
+        var destination_string: std.json.Stringify = .{ .writer = w };
+        destination_string.write(op.destination) catch return error.OutOfMemory;
+        w.writeAll(",\"sourceFolderId\":") catch return error.OutOfMemory;
+        var source_string: std.json.Stringify = .{ .writer = w };
+        source_string.write(op.source) catch return error.OutOfMemory;
+        w.print("}},\"name\":\"projects/_/buckets/{s}/operations/{s}\"", .{ op.bucket, op.id }) catch return error.OutOfMemory;
+        if (op.done) {
+            const state = self.buckets.folderState(op.bucket, op.destination) orelse FakeBuckets.FolderState{};
+            w.print(",\"response\":{{\"@type\":\"type.googleapis.com/google.storage.control.v2.Folder\",\"createTime\":\"{s}\",\"metageneration\":\"{d}\",\"name\":\"projects/_/buckets/{s}/folders/", .{
+                state.create_time,
+                state.metageneration,
+                op.bucket,
+            }) catch return error.OutOfMemory;
+            w.writeAll(op.destination) catch return error.OutOfMemory;
+            w.writeAll("\",\"updateTime\":\"2026-10-02T19:27:57.256Z\"}") catch return error.OutOfMemory;
+        }
+        w.print(",\"selfLink\":\"https://www.googleapis.com/storage/v1/b/{s}/operations/{s}\"}}", .{ op.bucket, op.id }) catch return error.OutOfMemory;
+        return out.written();
     }
 
     /// Whether anything sits under the folder: a child folder, or a live
@@ -1966,7 +2100,7 @@ fn tokenRefusal(kind: FakeMultipart.Kind, method: Method, headers: []const Heade
     if (headerValue(headers, "X-Goog-Gcs-Idempotency-Token") == null) return null;
     const takes_token = switch (kind) {
         .delete, .move, .insert, .session_start, .restore, .patch => true,
-        .bucket, .notification => method != .GET,
+        .bucket, .notification, .operation => method != .GET,
         else => false,
     };
     if (takes_token) return null;
@@ -2022,6 +2156,9 @@ const bucket_missing: FakeMultipart.Reply = .{ .status = 404, .body =
 };
 const folder_missing: FakeMultipart.Reply = .{ .status = 404, .body =
     \\{"error":{"code":404,"errors":[{"domain":"global","message":"The folder does not exist.","reason":"notFound"}],"message":"The folder does not exist."}}
+};
+const operation_missing: FakeMultipart.Reply = .{ .status = 404, .body =
+    \\{"error":{"code":404,"errors":[{"domain":"global","message":"The specified long-running operation does not exist.","reason":"notFound"}],"message":"The specified long-running operation does not exist."}}
 };
 const folder_condition_failed: FakeMultipart.Reply = .{ .status = 412, .body =
     \\{"error":{"code":412,"errors":[{"domain":"global","location":"If-Match","locationType":"header","message":"At least one of the pre-conditions you specified did not hold.","reason":"conditionNotMet"}],"message":"At least one of the pre-conditions you specified did not hold."}}
@@ -2431,6 +2568,7 @@ const Target = union(enum) {
     resumable: ResumableTarget,
     insert: InsertTarget,
     folders: FoldersTarget,
+    operations: OpsTarget,
     /// A `.../storageLayout` read's bucket.
     layout: []const u8,
     /// A session URL's id.
@@ -2444,6 +2582,8 @@ const FoldersTarget = struct {
     bucket: []const u8,
     /// Null for the collection.
     folder: ?[]const u8 = null,
+    /// `{folder}/renameTo/folders/{rename_destination}`.
+    rename_destination: ?[]const u8 = null,
     recursive: bool = false,
     prefix: ?[]const u8 = null,
     delimiter: ?[]const u8 = null,
@@ -2452,6 +2592,14 @@ const FoldersTarget = struct {
     page_size: u32 = 0,
     page_token: ?[]const u8 = null,
     if_metageneration_match: ?u64 = null,
+    if_source_metageneration_match: ?u64 = null,
+};
+
+/// `/storage/v1/b/{bucket}/operations`, one of them, or its cancel.
+const OpsTarget = struct {
+    bucket: []const u8,
+    id: ?[]const u8 = null,
+    cancel: bool = false,
 };
 
 /// What a URL names, decoded. Anything this fake does not serve is
@@ -2520,6 +2668,13 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
             const tail = after[slash + "/folders".len ..];
             if (tail.len == 0) {
                 // The collection.
+            } else if (tail.len > 1 and tail[0] == '/' and std.mem.indexOf(u8, tail[1..], "/renameTo/folders/") != null) {
+                const inner = tail[1..];
+                const at = std.mem.indexOf(u8, inner, "/renameTo/folders/").?;
+                const destination = inner[at + "/renameTo/folders/".len ..];
+                if (at == 0 or destination.len == 0 or std.mem.indexOfScalar(u8, destination, '/') != null) return error.HttpProtocolError;
+                target.folder = try decode(arena, inner[0..at]);
+                target.rename_destination = try decode(arena, destination);
             } else if (tail[0] == '/' and tail.len > 1 and std.mem.indexOfScalar(u8, tail[1..], '/') == null) {
                 target.folder = try decode(arena, tail[1..]);
             } else return error.HttpProtocolError;
@@ -2542,12 +2697,27 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
                         target.page_token = try decode(arena, param["pageToken=".len..]);
                     } else if (std.mem.startsWith(u8, param, "ifMetagenerationMatch=")) {
                         target.if_metageneration_match = std.fmt.parseInt(u64, param["ifMetagenerationMatch=".len..], 10) catch return error.HttpProtocolError;
+                    } else if (std.mem.startsWith(u8, param, "ifSourceMetagenerationMatch=")) {
+                        target.if_source_metageneration_match = std.fmt.parseInt(u64, param["ifSourceMetagenerationMatch=".len..], 10) catch return error.HttpProtocolError;
                     } else if (std.mem.startsWith(u8, param, "userProject=")) {
                         // Already read by billingRefusal.
                     } else return error.HttpProtocolError;
                 }
             }
             return .{ .folders = target };
+        };
+        if (std.mem.indexOfScalar(u8, after, '/')) |slash| if (std.mem.startsWith(u8, after[slash..], "/operations")) {
+            var target: OpsTarget = .{ .bucket = try decode(arena, after[0..slash]) };
+            const tail = after[slash + "/operations".len ..];
+            if (tail.len == 0) {
+                // The listing; its paging is served whole here.
+            } else if (tail[0] == '/' and std.mem.endsWith(u8, tail, "/cancel") and tail.len > "/cancel".len + 1) {
+                target.id = try decode(arena, tail[1 .. tail.len - "/cancel".len]);
+                target.cancel = true;
+            } else if (tail[0] == '/' and tail.len > 1 and std.mem.indexOfScalar(u8, tail[1..], '/') == null) {
+                target.id = try decode(arena, tail[1..]);
+            } else return error.HttpProtocolError;
+            return .{ .operations = target };
         };
         if (std.mem.indexOfScalar(u8, after, '/')) |slash| if (std.mem.eql(u8, after[slash..], "/storageLayout")) {
             return .{ .layout = try decode(arena, after[0..slash]) };
