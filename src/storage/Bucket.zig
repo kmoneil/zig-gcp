@@ -8,8 +8,10 @@ const std = @import("std");
 const core = @import("core");
 
 const Client = @import("Client.zig");
+const Folder = @import("Folder.zig");
 const Object = @import("Object.zig");
 const bucket_settings = @import("bucket_settings.zig");
+const folders_impl = @import("folders.zig");
 const codec = @import("codec.zig");
 const iam = @import("iam.zig");
 const idempotency = @import("idempotency.zig");
@@ -391,6 +393,46 @@ pub fn object(self: Bucket, name: []const u8) Object {
     return .{ .client = self.client, .bucket = self.name, .name = name, .billing_project = self.billing_project };
 }
 
+/// A handle for the folder at `path` in this bucket, which must have
+/// hierarchical namespace: `BucketConfig.hierarchical_namespace`, at
+/// create time only. Sends nothing. The handle borrows the client and both
+/// names, and must not outlive them.
+pub fn folder(self: Bucket, path: []const u8) Folder {
+    return .{ .client = self.client, .bucket = self.name, .name = path, .billing_project = self.billing_project };
+}
+
+/// One page of the bucket's folders, every level of them unless
+/// `directory_mode` keeps to one. A folder is listed whether it was
+/// created deliberately or by an upload's path. Only a
+/// hierarchical-namespace bucket has any: a flat bucket is
+/// `error.HierarchicalNamespaceRequired`.
+pub fn listFolders(self: Bucket, options: types.FolderListOptions) Error!types.Owned(types.FolderPage) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).listFoldersBilled(options);
+}
+
+fn listFoldersBilled(self: Bucket, options: types.FolderListOptions) Error!types.Owned(types.FolderPage) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return folders_impl.list(self.client, self.name, options);
+}
+
+/// How the bucket stores names: its location, and whether folders are real
+/// resources here. The one bucket read `storage.objects.list` permission
+/// is enough for, so a caller without bucket metadata access can still ask
+/// "is this bucket hierarchical?". fake-gcs-server answers it too, saying
+/// false for every bucket.
+pub fn storageLayout(self: Bucket) Error!types.Owned(types.StorageLayout) {
+    var client: Client = undefined;
+    return (try self.billing(&client)).storageLayoutBilled();
+}
+
+fn storageLayoutBilled(self: Bucket) Error!types.Owned(types.StorageLayout) {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return folders_impl.layout(self.client, self.name);
+}
+
 /// A V4 signed URL for the bucket itself, through the XML API: a GET lists
 /// its objects as XML, with `prefix` and `delimiter` as signed query
 /// parameters. Everything else is as `Object.signedUrl` says.
@@ -448,6 +490,12 @@ fn listObjectsBilled(self: Bucket, options: types.ListOptions) Error!types.Owned
     try rpc.checkBucketName(self.client, self.name);
     if (options.versions and options.soft_deleted) {
         if (self.client.diagnostics) |d| d.print("versions and soft_deleted cannot be listed together: soft-deleted objects are no versions", .{});
+        return error.InvalidArgument;
+    }
+    // Cloud Storage: "Including folders as prefixes is only supported when
+    // the delimiter is set to '/'." Refused here before sending.
+    if (options.include_folders_as_prefixes and !std.mem.eql(u8, options.delimiter orelse "", "/")) {
+        if (self.client.diagnostics) |d| d.print("include_folders_as_prefixes needs the \"/\" delimiter, the only one Cloud Storage takes with it", .{});
         return error.InvalidArgument;
     }
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);

@@ -12,6 +12,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
+const folders = @import("folders.zig");
 const iam = @import("iam.zig");
 const notifications = @import("notifications.zig");
 const retention = @import("retention.zig");
@@ -207,6 +208,7 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
         hint(client, err);
         if (retained(e, err)) return error.ObjectRetained;
         if (notifications.isNotPublishable(err, e.diagnostics.?)) return error.TopicNotPublishable;
+        if (folders.refinedConflict(err, e.diagnostics.?)) |refined| return refined;
         return err;
     };
 }
@@ -243,6 +245,7 @@ pub fn executeDiscard(client: *Client, call: Call) Error!void {
     return e.executeDiscard(billed_call) catch |err| {
         hint(client, err);
         if (retained(e, err)) return error.ObjectRetained;
+        if (folders.refinedConflict(err, e.diagnostics.?)) |refined| return refined;
         return err;
     };
 }

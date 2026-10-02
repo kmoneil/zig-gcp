@@ -1175,6 +1175,30 @@ test "IAM: fake-gcs-server serves no bucket IAM call, so each is NotFound" {
     try testing.expectError(error.NotFound, b.testIamPermissions(&.{"storage.buckets.get"}));
 }
 
+test "folders: fake-gcs-server has none, and its layout calls every bucket flat" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    // The emulator takes the create and silently drops the namespace, so
+    // this bucket comes back flat however it was asked for.
+    var created = try f.bucket().create(.{ .hierarchical_namespace = true });
+    defer created.deinit();
+    const b = f.bucket();
+
+    // storageLayout is the emulator's one folders-adjacent route, and it
+    // answers enabled: false for every bucket (1.56.1).
+    var layout = try b.storageLayout();
+    defer layout.deinit();
+    try testing.expect(!layout.value.hierarchical_namespace);
+    try testing.expect(layout.value.location.len > 0);
+
+    // The folders routes do not exist: every call is a plain 404.
+    try testing.expectError(error.NotFound, b.folder("a/").create(.{}));
+    try testing.expectError(error.NotFound, b.folder("a/").get());
+    try testing.expectError(error.NotFound, b.listFolders(.{}));
+    try testing.expectError(error.NotFound, b.folder("a/").delete(.{}));
+}
+
 test "notifications: create, read back, list and delete a configuration" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;

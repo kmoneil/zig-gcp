@@ -115,6 +115,11 @@ pub const ListOptions = struct {
     /// Only names matching this glob, such as `logs/**/*.gz`: `*` matches
     /// within a folder, `**` across folders.
     match_glob: ?[]const u8 = null,
+    /// Add folders to `prefixes` whether or not objects sit under them: a
+    /// hierarchical-namespace bucket's folders, and any bucket's managed
+    /// folders. Cloud Storage takes it only with the `/` delimiter, so
+    /// without one it is refused before sending, as measured 2026-10-02.
+    include_folders_as_prefixes: bool = false,
 };
 
 pub const ObjectPage = struct {
@@ -701,6 +706,15 @@ pub const BucketConfig = struct {
     /// the project that keeps it from being deleted. Needs
     /// `storage.buckets.enableObjectRetention`.
     object_retention: bool = false,
+    /// Folders become real resources: `Bucket.folder` creates, lists,
+    /// deletes and renames them, and an upload creates its parents.
+    /// Create-time only: a later update naming it answers 200 and silently
+    /// drops it, as measured 2026-10-02, so none is ever sent. It needs
+    /// uniform bucket-level access, which is sent along unless
+    /// `uniform_bucket_level_access` says false, and it excludes
+    /// versioning, retention policies and object retention, refused here
+    /// in the server's words.
+    hierarchical_namespace: bool = false,
 };
 
 /// A bucket's retention policy: every object is kept at least `period_s`
@@ -750,6 +764,8 @@ pub const BucketInfo = struct {
     /// being restorable. Null for a live one.
     soft_delete_time: ?[]const u8 = null,
     hard_delete_time: ?[]const u8 = null,
+    /// Folders are real resources in this bucket.
+    hierarchical_namespace: bool = false,
 
     pub const SoftDelete = struct {
         retention_s: u32,
@@ -883,6 +899,61 @@ pub const BucketPage = struct {
     buckets: []const BucketInfo,
     /// Pass as `page_token` to get the next page. Null on the last page.
     next_page_token: ?[]const u8,
+};
+
+/// A folder in a hierarchical-namespace bucket, as `Folder.create`, `get`
+/// and `Bucket.listFolders` return it. Folders have no etag and no
+/// generation: the metageneration is the only precondition handle.
+pub const FolderInfo = struct {
+    /// The full path with its trailing slash, such as `a/b/`.
+    name: []const u8,
+    bucket: []const u8,
+    /// What `ifMetagenerationMatch` conditions compare. A rename keeps it,
+    /// and the create time, as measured.
+    metageneration: u64,
+    /// RFC 3339, as sent by the server: `createTime`, not the
+    /// `timeCreated` objects carry. An implicit folder's is its first
+    /// object's write.
+    create_time: []const u8 = "",
+    update_time: []const u8 = "",
+};
+
+pub const FolderPage = struct {
+    folders: []const FolderInfo,
+    /// Pass as `page_token` to get the next page. Null on the last page.
+    next_page_token: ?[]const u8,
+};
+
+/// What `Bucket.listFolders` lists. Unlike object listing, a folders list
+/// has no `prefixes` side: folders come back in `folders` either way.
+pub const FolderListOptions = struct {
+    /// Only folders whose paths begin with this. Cloud Storage requires it
+    /// to end with `/`, so anything else is refused before sending.
+    prefix: ?[]const u8 = null,
+    /// The prefix folder itself and the folders one level below it, rather
+    /// than the whole subtree: the `/` delimiter, the only one the server
+    /// takes.
+    directory_mode: bool = false,
+    /// Lexicographic bounds on the paths: start included, end excluded.
+    start_offset: ?[]const u8 = null,
+    end_offset: ?[]const u8 = null,
+    /// Results per page, at most 1,000. 0 lets the server choose.
+    page_size: u32 = 0,
+    /// `next_page_token` from the previous page; null for the first page.
+    page_token: ?[]const u8 = null,
+};
+
+/// How a bucket stores names, from `Bucket.storageLayout`: the one bucket
+/// read `storage.objects.list` permission is enough for, which is how a
+/// caller without bucket metadata access asks "is this bucket
+/// hierarchical?".
+pub const StorageLayout = struct {
+    location: []const u8,
+    /// Such as "region", "dual-region" or "multi-region".
+    location_type: []const u8,
+    /// Folders are real resources here. Cloud Storage leaves the field out
+    /// for a flat bucket; fake-gcs-server sends false for every bucket.
+    hierarchical_namespace: bool = false,
 };
 
 /// The request a signed URL allows. A signed POST can only start a
