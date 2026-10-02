@@ -43,7 +43,7 @@ Against production, pass a `.token_provider` as well:
 | --- | --- |
 | [Subscribing](subscribing.md) | `Subscriber`, a worker loop that extends leases, bounds work and shuts down cleanly; exactly-once delivery |
 | [Publishing](publishing.md) | `Publisher`, which batches messages from many tasks; ordering keys; compression |
-| [Topics and subscriptions](topics-and-subscriptions.md) | Dead letters, retry policies, filters, retention, expiration and labels; updates; topic IAM |
+| [Topics and subscriptions](topics-and-subscriptions.md) | Dead letters, retry policies, filters, retention, expiration and labels; updates; IAM |
 
 **On this page:** [Handles and calls](#handles-and-calls) ·
 [Pulling](#pulling) · [Retries](#retries) · [Limits](#limits) ·
@@ -56,7 +56,7 @@ short id such as `orders`. Creating one sends nothing. The operations:
 
 | `Client` | `Topic` | `Subscription` |
 | --- | --- | --- |
-| `listTopics`, `listSubscriptions` | `create`, `get`, `update`, `delete`, `publish`, and `iamPolicy`, `setIamPolicy`, `addIamBinding` | `create`, `get`, `update`, `delete`, `pull`, `ack`, `modifyAckDeadline`, `nack`, and `ackWithResults`, `modifyAckDeadlineWithResults`, `nackWithResults` |
+| `listTopics`, `listSubscriptions` | `create`, `get`, `update`, `delete`, `publish`, and the [IAM calls](topics-and-subscriptions.md#iam) | `create`, `get`, `update`, `delete`, `pull`, `ack`, `modifyAckDeadline`, `nack`, and `ackWithResults`, `modifyAckDeadlineWithResults`, `nackWithResults`, and the [IAM calls](topics-and-subscriptions.md#iam) |
 
 See [`examples/publish.zig`](../../examples/publish.zig),
 [`examples/publisher.zig`](../../examples/publisher.zig) and
@@ -124,6 +124,7 @@ emulator does not fail later in production.
 | Exactly-once: a late lease extension | taken | refused |
 | Exactly-once: a second ack of an acknowledged message | refused | taken |
 | Publishing to a deleted topic | refused at once | taken for 0.7 to 14 s in nine runs, and once for over 90 s |
+| IAM calls (0.8.36) | 501 `UNIMPLEMENTED`, `error.Unimplemented` | the policy |
 
 [Topics and subscriptions](topics-and-subscriptions.md#what-the-emulator-and-production-do)
 lists how the two treat settings and updates.

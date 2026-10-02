@@ -4,6 +4,35 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.28.0 (unreleased)
+
+- pubsub: IAM on subscriptions: `Subscription.iamPolicy`,
+  `setIamPolicy`, `addIamBinding`, `removeIamBinding` and
+  `testIamPermissions`, and on topics the last two. `pubsub.iam`
+  re-exports `core.iam`, for building a policy. Not breaking.
+- pubsub: the topic IAM calls of 0.27.0 change behavior. `addIamBinding`
+  waits a jittered backoff before starting over after a concurrent
+  change, as IAM asks, and compares members as Pub/Sub stores them, the
+  address of a `user:`, `serviceAccount:`, `group:` or `domain:` member
+  in any case, since production lowercases it: a grant that differs only
+  in case writes nothing. `setIamPolicy` retries a write only when it
+  carries an etag, and sends one without an etag once. Refused before
+  sending, with `error.InvalidArgument`, where production would refuse
+  them with the same error: a conditional binding, which Pub/Sub does not
+  take; a role of no known form; a member whose prefix is not one Pub/Sub
+  takes, cased as it requires; and a `deleted:` member granted. Not
+  breaking.
+- core: `iam` gains `sameMember`, `withoutMember`, `encodePolicy` (a
+  policy bare, as Cloud Storage takes it), `Change` and `update` (the
+  read-modify-write loop that grants or revokes once), the checks
+  `roleProblem`, `memberProblem` and `permissionsProblem`, and
+  `encodePermissions` and `decodePermissions`; `Policy.hasConditions`.
+  `grants` and `withMember` compare members with `sameMember`, and a
+  member already there is not added again. A policy written always
+  carries `bindings`, and says version 3 whenever a binding has a
+  condition, which every service requires. Not breaking.
+- auth, secret_manager, storage: unchanged.
+
 ## 0.27.0 (2026-10-01)
 
 - storage: Pub/Sub notifications. `Bucket.createNotification`,

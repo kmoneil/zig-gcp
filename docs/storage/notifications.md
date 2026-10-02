@@ -43,7 +43,7 @@ switch (event.value.kind) {
 - **The grant.** Without the publisher role, or without the topic,
   `createNotification` is `error.TopicNotPublishable`. A fresh grant
   took a few seconds to apply when measured.
-  [Topic IAM](../pubsub/topics-and-subscriptions.md#topic-iam) says how
+  [IAM](../pubsub/topics-and-subscriptions.md#iam) says how
   `addIamBinding` grants it.
 - **A create is safe to retry.** A repeated create makes a second
   configuration, idempotency token or not, so the bucket's

@@ -49,7 +49,7 @@ Pub/Sub, Cloud Storage and Secret Manager, with credentials that find themselves
 
 | | Module | Covers | Status |
 | :-: | --- | --- | --- |
-| 📨 | [`pubsub`](docs/pubsub/README.md) | Pub/Sub v1: publish one call at a time or batched from many tasks; pull, a worker loop that manages leases, and exactly-once delivery; topics, subscriptions and topic IAM | beta |
+| 📨 | [`pubsub`](docs/pubsub/README.md) | Pub/Sub v1: publish one call at a time or batched from many tasks; pull, a worker loop that manages leases, and exactly-once delivery; topics and subscriptions, with their IAM policies | beta |
 | 🪣 | [`storage`](docs/storage/README.md) | Cloud Storage: objects of any size, streamed, parallel, resumable and checksummed both ways; preconditions, compose and server-side copies; buckets, versions, soft delete, retention and holds; signed URLs and POST policies; encryption keys; Pub/Sub notifications | experimental |
 | 🔑 | [`secret_manager`](docs/secret-manager.md) | Secret Manager v1: a secret's bytes, verified and wiped after use; versions; secrets global or regional | experimental |
 | 🪪 | [`auth`](docs/auth.md) | Credentials for the other modules: the metadata server, gcloud's login, service account keys, workload identity federation and impersonation; signing on this machine or through IAM | experimental |
@@ -142,7 +142,7 @@ says how.
 | --- | --- |
 | 🧭 [Essentials](docs/essentials.md) | Clients and handles, results and memory, errors and `Diagnostics`, retries and time limits, logging, testing with fakes |
 | 🪪 [Credentials](docs/auth.md) | Where `findDefault` looks, every kind of credential, quota projects and signing |
-| 📨 [Pub/Sub](docs/pubsub/README.md) | Publishing at volume, a worker loop, exactly-once delivery, subscription settings, topic IAM, limits |
+| 📨 [Pub/Sub](docs/pubsub/README.md) | Publishing at volume, a worker loop, exactly-once delivery, subscription settings, IAM, limits |
 | 🪣 [Cloud Storage](docs/storage/README.md) | Transfers of any size, checksums and gzip, safe writes, signed URLs, buckets, retention, encryption keys, notifications |
 | 🔑 [Secret Manager](docs/secret-manager.md) | Reading secrets safely, checksums, regional secrets |
 | 🛠️ [Development](docs/development.md) | Building, testing, fuzzing, coverage, and every integration suite |

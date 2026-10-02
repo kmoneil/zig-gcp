@@ -10,6 +10,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const iam = @import("iam.zig");
 const logging = @import("logging.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
@@ -88,6 +89,59 @@ pub fn delete(self: Subscription) Error!void {
     defer scratch.deinit();
     const path = try url.resourcePath(scratch.allocator(), c.project_id, .subscriptions, self.id, "");
     return rpc.executeDiscard(c, .{ .method = .DELETE, .path = path });
+}
+
+/// The subscription's IAM policy, asked for as version 3. A fresh
+/// subscription's is empty, with the etag "ACAB". Needs
+/// `pubsub.subscriptions.getIamPolicy`. The emulator answers every IAM call
+/// `error.Unimplemented`.
+pub fn iamPolicy(self: Subscription) Error!Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return r.readPolicy();
+}
+
+/// Writes `policy` as the subscription's, whole, and returns it as stored,
+/// as `Topic.setIamPolicy` does. Pub/Sub takes no conditional bindings: one
+/// is `error.InvalidArgument`, before sending. Needs
+/// `pubsub.subscriptions.setIamPolicy`.
+pub fn setIamPolicy(self: Subscription, policy: core.iam.Policy) Error!Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return iam.set(r, policy);
+}
+
+/// Grants `member` the role `role` on the subscription, unless it holds it
+/// already without a condition, as `Topic.addIamBinding` does. A
+/// dead-letter policy needs one: Pub/Sub's service agent,
+/// `serviceAccount:service-{project number}@gcp-sa-pubsub.iam.gserviceaccount.com`,
+/// with `roles/pubsub.subscriber` here and `roles/pubsub.publisher` on the
+/// dead-letter topic. A subscription refuses the topic-only
+/// `roles/pubsub.publisher` with `error.InvalidArgument`. Needs
+/// `pubsub.subscriptions.getIamPolicy` and `setIamPolicy`.
+pub fn addIamBinding(self: Subscription, role: []const u8, member: []const u8) Error!Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return iam.change(r, .{ .grant = .{ .role = role, .member = member } });
+}
+
+/// Takes `member` out of the subscription's binding of `role` without a
+/// condition, unless it is not there, as `Topic.removeIamBinding` does.
+pub fn removeIamBinding(self: Subscription, role: []const u8, member: []const u8) Error!Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return iam.change(r, .{ .revoke = .{ .role = role, .member = member } });
+}
+
+/// The permissions the caller holds on the subscription, of `permissions`,
+/// as `Topic.testIamPermissions` answers them: such as
+/// `pubsub.subscriptions.consume`.
+pub fn testIamPermissions(self: Subscription, permissions: []const []const u8) Error!Owned([]const []const u8) {
+    const r = try self.iamResource();
+    return iam.testPermissions(r, permissions);
+}
+
+fn iamResource(self: Subscription) Error!iam.Resource {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "subscription", self.id);
+    return .{ .client = c, .collection = .subscriptions, .id = self.id };
 }
 
 /// Pulls up to `options.max_messages` messages. With no messages available
