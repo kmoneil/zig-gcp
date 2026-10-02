@@ -33,6 +33,12 @@ pub const iam = core.iam;
 pub const Owned = @import("types.zig").Owned;
 pub const ChecksumMode = @import("types.zig").ChecksumMode;
 pub const Label = @import("types.zig").Label;
+pub const Annotation = @import("types.zig").Annotation;
+pub const Alias = @import("types.zig").Alias;
+pub const Expiry = @import("types.zig").Expiry;
+pub const SecretUpdate = @import("types.zig").SecretUpdate;
+/// Keep, set or clear a setting in an update, as `SecretUpdate` takes it.
+pub const Change = @import("types.zig").Change;
 pub const ListOptions = @import("types.zig").ListOptions;
 pub const Replication = @import("types.zig").Replication;
 pub const SecretConfig = @import("types.zig").SecretConfig;
@@ -60,6 +66,7 @@ test {
     _ = @import("Version.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
+    _ = @import("fake_secrets.zig");
     _ = @import("faults.zig");
     _ = @import("iam.zig");
     _ = @import("logging.zig");

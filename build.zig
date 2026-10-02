@@ -127,6 +127,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "pubsub", .module = mod },
+                .{ .name = "secret_manager", .module = secret_manager },
                 .{ .name = "core", .module = core },
             },
         }),

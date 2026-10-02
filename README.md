@@ -181,7 +181,7 @@ variables are set.
   drops, cuts and stalls the connection; 28 Cloud Storage tests against
   fake-gcs-server, 62 against real buckets, where uploads and downloads
   cut off mid-body, or ended with their process, resume against Google
-  itself, and 19 that sign URLs and POST policies for one; 12 Secret
+  itself, and 19 that sign URLs and POST policies for one; 20 Secret
   Manager tests against a real project, since it has no emulator; 10
   auth tests against Google's token, STS and IAM Credentials endpoints;
   and a run on a Compute Engine VM, where the metadata server is the one

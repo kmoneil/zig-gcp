@@ -4,6 +4,45 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.29.0 (unreleased)
+
+- secret_manager: `Secret.update` changes a secret's labels,
+  annotations, version aliases, expiry and version destruction delay,
+  each set or cleared, under an optional etag, through `SecretUpdate`
+  and `Change`. Lists are replaced whole, as production allows nothing
+  else; an update that changes nothing is refused before sending, since
+  production would still move the etag. `SecretConfig` takes
+  annotations, an expiry and a destruction delay on create.
+  `SecretInfo` reads `annotations`, `aliases`, `expire_time` and
+  `version_destroy_delay_s` back, with `annotation(key)` and
+  `alias(name)`; `VersionInfo` reads `scheduled_destroy_time`. New types
+  `Annotation`, `Alias` and `Expiry`. Not breaking: every new field has
+  a default.
+- secret_manager: etag preconditions. `Secret.deleteIf`, and
+  `Version.enableIf`, `disableIf` and `destroyIf`, change only what is
+  still as read. A stale etag is `error.Aborted`: production answers it
+  with the 400 `FAILED_PRECONDITION` a disabled version also gets, told
+  apart by its message. Not breaking.
+- secret_manager: checked before sending, as production enforced them
+  on 2026-10-02, with `error.InvalidArgument`: labels (64; keys and
+  values of 63 characters and 128 bytes, lowercase), annotation keys
+  (up to 64 characters, which the docs put at 63) and their 16,384
+  bytes in all, aliases (50; names of 63 characters, a letter first,
+  refusing `latest` and `NEW` exactly), expiry (60 seconds to 100 years)
+  and the destruction delay (1 to 1,000 days). `VersionRef.alias` is
+  held to the alias rule too, so an alias that cannot exist, such as
+  `1a` or one of 64 characters, is `error.InvalidResourceId` before
+  sending rather than `error.NotFound` from the server. `destroy`
+  documents a delayed destruction: the version stays `.disabled` until
+  its `scheduled_destroy_time`, and a second destroy is
+  `error.FailedPrecondition`.
+- docs: the Secret Manager guide covers updates, preconditions,
+  aliases, expiry and delayed destruction, with every rule as measured.
+- ci: a nightly `heavy-secret_manager` fuzz job runs the model property
+  of updates, conditions and version changes against a new
+  `FakeSecrets`.
+- core, auth, pubsub and storage: unchanged.
+
 ## 0.28.0 (2026-10-02)
 
 - pubsub: IAM on subscriptions: `Subscription.iamPolicy`,

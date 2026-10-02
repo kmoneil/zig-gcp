@@ -320,7 +320,11 @@ jobs:
         # answers to heavy-storage, about 6 ms a run on a Mac and 16 on CI
         # at that job's ratio, so it drops from 37K to 33K. Retention and
         # holds (09-30) added another, about 23 ms a run on a Mac and 60 on
-        # CI, so it drops to 24K.
+        # CI, so it drops to 24K. Secret updates and etag conditions
+        # (10-02) added a model property of updates, conditions and version
+        # changes against FakeSecrets, 21.6 ms a run on a Mac (2K and 20K
+        # on a built binary), about 60 on CI at heavy-storage's ratio: it
+        # runs in heavy-secret_manager, at 80K for about 80 minutes.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 900K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
@@ -330,6 +334,7 @@ jobs:
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 65K }
           - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 8M }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 4500K }
+          - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 80K }
           - { job: storage, module: storage, filter: fuzz, iterations: 1600K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 4800K }
           - { job: heavy-storage, module: storage, filter: heavy property, iterations: 24K }

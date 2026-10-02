@@ -102,50 +102,82 @@ pub fn get(self: Version) Error!types.Owned(types.VersionInfo) {
     return result;
 }
 
-/// Makes a disabled version accessible again. Takes a version number.
+/// Makes a disabled version accessible again, and cancels a destruction
+/// scheduled for it. Takes a version number.
 pub fn enable(self: Version) Error!types.Owned(types.VersionInfo) {
-    return self.change("enable", ":enable");
+    return self.change("enable", ":enable", null);
 }
 
 /// Keeps the version and its bytes, but refuses to serve them: accessing a
-/// disabled version answers `error.FailedPrecondition`. Takes a version
-/// number.
+/// disabled version answers `error.FailedPrecondition`. Cancels a
+/// destruction scheduled for it. Takes a version number.
 pub fn disable(self: Version) Error!types.Owned(types.VersionInfo) {
-    return self.change("disable", ":disable");
+    return self.change("disable", ":disable", null);
 }
 
-/// Destroys the bytes. The version stays, with its state and the time it
-/// was destroyed, but what it held is gone for good. Takes a version
-/// number.
+/// Destroys the bytes. Takes a version number.
+///
+/// On a secret without a destruction delay, the bytes go at once: the
+/// version stays, `.destroyed`, with the time, but what it held is gone for
+/// good. On a secret with one (`version_destroy_delay_s`), the version is
+/// `.disabled` until its `scheduled_destroy_time`, when the bytes go;
+/// `enable` or `disable` before then cancels it.
 ///
 /// Unlike `enable` and `disable`, this one is not idempotent: a second
 /// destroy answers `error.FailedPrecondition`, with "SecretVersion.state is
-/// already DESTROYED". A destroy whose answer was lost and then retried
-/// reports that, which means the first attempt worked.
+/// already DESTROYED", or "SecretVersion is already scheduled for
+/// DESTRUCTION." during a delay. A destroy whose answer was lost and then
+/// retried reports one of those, which means the first attempt worked.
 pub fn destroy(self: Version) Error!types.Owned(types.VersionInfo) {
-    return self.change("destroy", ":destroy");
+    return self.change("destroy", ":destroy", null);
+}
+
+/// `enable`, only if the version's etag is still `etag`, as a read
+/// returned it: a version changed since is `error.Aborted`, and stays as
+/// it is. Every change to a version moves its etag, one that changes
+/// nothing included, and a retry whose first attempt landed reports
+/// `error.Aborted` too.
+pub fn enableIf(self: Version, etag: []const u8) Error!types.Owned(types.VersionInfo) {
+    return self.change("enable", ":enable", etag);
+}
+
+/// `disable`, only if the version's etag is still `etag`, as `enableIf`.
+pub fn disableIf(self: Version, etag: []const u8) Error!types.Owned(types.VersionInfo) {
+    return self.change("disable", ":disable", etag);
+}
+
+/// `destroy`, only if the version's etag is still `etag`, as `enableIf`.
+pub fn destroyIf(self: Version, etag: []const u8) Error!types.Owned(types.VersionInfo) {
+    return self.change("destroy", ":destroy", etag);
 }
 
 /// The three calls that change a version's state. Each takes an explicit
 /// number: "whatever is latest right now" is the wrong target for a change
-/// that lasts, and production refuses `latest` for these three anyway.
-fn change(self: Version, what: []const u8, suffix: []const u8) Error!types.Owned(types.VersionInfo) {
+/// that lasts, and production refuses `latest` and aliases for these three
+/// anyway.
+fn change(self: Version, what: []const u8, suffix: []const u8, etag: ?[]const u8) Error!types.Owned(types.VersionInfo) {
     const c = self.client;
     rpc.begin(c);
     try rpc.checkSecretId(c, self.secret_id);
     const number = try rpc.requireNumber(c, self.ref, what);
+    if (etag) |e| try rpc.checkEtag(c, e);
 
     var scratch: std.heap.ArenaAllocator = .init(c.gpa);
     defer scratch.deinit();
     const path = try names.versionPath(scratch.allocator(), c.parent(), self.secret_id, .{ .number = number }, suffix);
+    const body = try codec.encodeEtag(scratch.allocator(), etag);
 
     var result: types.Owned(types.VersionInfo) = try .init(c.gpa);
     errdefer result.deinit();
     // Enabling an enabled version and disabling a disabled one are both
     // answered with 200 and the same state, so a lost answer costs nothing
     // to ask again. Destroying twice is not; `destroy` says so.
-    const body = try rpc.execute(c, result.arena, .{ .method = .POST, .path = path, .body = "{}" });
-    result.value = codec.decodeVersion(result.arena.allocator(), body) catch |err|
+    const call: rpc.Call = .{ .method = .POST, .path = path, .body = body };
+    const response = if (etag != null)
+        try rpc.executeConditional(c, result.arena, call)
+    else
+        try rpc.execute(c, result.arena, call);
+    result.value = codec.decodeVersion(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(c, err, "version");
     return result;
 }
@@ -620,4 +652,100 @@ test "access: a payload too big for the arena's spare room is OutOfMemory" {
     );
     defer testing.allocator.free(body);
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{body});
+}
+
+test "golden: enableIf, disableIf and destroyIf send the etag as read" {
+    const scheduled: Reply = .{ .respond = .{ .body =
+        \\{"createTime":"2026-10-02T13:04:00.785586Z","etag":"\"165cdb2aae0e82\"",
+        \\ "name":"projects/82150720798/secrets/db-password/versions/3","replicationStatus":{"automatic":{}},
+        \\ "scheduledDestroyTime":"2026-10-03T13:04:03.889502667Z","state":"DISABLED"}
+    } };
+    const enabled: Reply = .{ .respond = .{ .body =
+        \\{"name":"projects/82150720798/secrets/db-password/versions/3","state":"ENABLED","etag":"\"165cdb2acc0eed\""}
+    } };
+    var h: Harness = undefined;
+    try h.init(&.{ scheduled, enabled, enabled }, .{ .location = "europe-west3" });
+    defer h.deinit();
+    const v = h.client.secret("db-password").version(.{ .number = 3 });
+
+    var destroyed = try v.destroyIf("\"165cdb272dd24f\"");
+    defer destroyed.deinit();
+    try h.expectRequest(
+        0,
+        .POST,
+        "https://secretmanager.europe-west3.rep.googleapis.com/v1/projects/extractctl/locations/europe-west3/secrets/db-password/versions/3:destroy",
+        "{\"etag\":\"\\\"165cdb272dd24f\\\"\"}",
+    );
+    // A secret with a destruction delay keeps the version, disabled, until then.
+    try testing.expectEqual(.disabled, destroyed.value.state);
+    try testing.expectEqualStrings("2026-10-03T13:04:03.889502667Z", destroyed.value.scheduled_destroy_time);
+
+    var back = try v.enableIf(destroyed.value.etag);
+    defer back.deinit();
+    try h.expectRequest(
+        1,
+        .POST,
+        "https://secretmanager.europe-west3.rep.googleapis.com/v1/projects/extractctl/locations/europe-west3/secrets/db-password/versions/3:enable",
+        "{\"etag\":\"\\\"165cdb2aae0e82\\\"\"}",
+    );
+    try testing.expectEqualStrings("", back.value.scheduled_destroy_time);
+
+    var plain = try v.disable();
+    defer plain.deinit();
+    try h.expectRequest(
+        2,
+        .POST,
+        "https://secretmanager.europe-west3.rep.googleapis.com/v1/projects/extractctl/locations/europe-west3/secrets/db-password/versions/3:disable",
+        "{}",
+    );
+}
+
+test "conditional version changes: stale is Aborted, and what never goes out" {
+    const stale: Reply = .{ .respond = .{ .status = 400, .body =
+        \\{"error":{"code":400,"message":"The etag provided in the request does not match the resource's current etag. Please retry the whole read-modify-write with exponential backoff.","status":"FAILED_PRECONDITION"}}
+    } };
+    const scheduled_twice: Reply = .{ .respond = .{ .status = 400, .body =
+        \\{"error":{"code":400,"message":"SecretVersion is already scheduled for DESTRUCTION.","status":"FAILED_PRECONDITION"}}
+    } };
+    var h: Harness = undefined;
+    try h.init(&.{ stale, stale, scheduled_twice }, .{});
+    defer h.deinit();
+    const v = h.client.secret("db-password").version(.{ .number = 2 });
+
+    try testing.expectError(error.Aborted, v.disableIf("\"old\""));
+    try testing.expectError(error.Aborted, v.enableIf("\"old\""));
+    // A second destroy during a delay is a precondition, not a conflict.
+    try testing.expectError(error.FailedPrecondition, v.destroyIf("\"current\""));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "already scheduled") != null);
+
+    try testing.expectError(error.InvalidArgument, v.destroyIf(""));
+    try testing.expectError(error.ExplicitVersionRequired, h.client.secret("db-password").version(.latest).enableIf("\"e\""));
+    try testing.expectError(error.ExplicitVersionRequired, h.client.secret("db-password").version(.{ .alias = "prod" }).destroyIf("\"e\""));
+    try h.expectRequestCount(3);
+}
+
+test "conditional version changes: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                .{ .respond = .{ .body = "{\"name\":\"projects/1/secrets/db-password/versions/2\",\"state\":\"DISABLED\",\"etag\":\"\\\"e2\\\"\",\"scheduledDestroyTime\":\"2026-10-03T13:04:03Z\"}" } },
+                .{ .respond = .{ .body = "{\"name\":\"projects/1/secrets/db-password/versions/2\",\"state\":\"ENABLED\"}" } },
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: test_util.FakeTokenProvider = .{};
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "extractctl",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+            const v = client.secret("db-password").version(.{ .number = 2 });
+            var a = try v.destroyIf("\"e1\"");
+            a.deinit();
+            var b = try v.enableIf("\"e2\"");
+            b.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
 }

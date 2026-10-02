@@ -2,9 +2,11 @@
 //! mode. Results come wrapped in core's `Owned`, re-exported here.
 
 const std = @import("std");
+const core = @import("core");
 const names = @import("names.zig");
 
-pub const Owned = @import("core").Owned;
+pub const Owned = core.Owned;
+pub const Change = core.Change;
 
 /// Which version of a secret a call acts on.
 pub const VersionRef = union(enum) {
@@ -27,9 +29,40 @@ pub const ChecksumMode = enum {
     off,
 };
 
+/// A label: for selecting and billing. Keys are 1 to 63 characters,
+/// starting with a lowercase or uncased letter, then lowercase letters,
+/// digits, `_` and `-`; values the same, 0 to 63 characters, any first
+/// character; each at most 128 bytes. At most 64 on a secret.
 pub const Label = struct {
     key: []const u8,
     value: []const u8,
+};
+
+/// An annotation: metadata for tools, not for selecting. Keys are 1 to 64
+/// characters of ASCII letters and digits, with `.`, `_` and `-` between
+/// them; values anything. Keys and values together hold at most 16,384
+/// bytes on a secret.
+pub const Annotation = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+/// A version alias: a name that `VersionRef.alias` reads through, such as
+/// `prod`. Names are 1 to 63 characters, a letter and then letters, digits,
+/// `_` and `-`, and not `latest` or `NEW`; case matters. At most 50 on a
+/// secret, each naming a version that exists, destroyed ones included.
+pub const Alias = struct {
+    name: []const u8,
+    version: u64,
+};
+
+/// When a secret is deleted, with every version, without a trace.
+pub const Expiry = union(enum) {
+    /// An RFC 3339 time, such as `2027-01-01T00:00:00Z`: at least 60
+    /// seconds and at most 100 years from now, by the server's clock.
+    at: []const u8,
+    /// Seconds from now: 60 to 3,153,600,000 (100 years).
+    after_s: u64,
 };
 
 /// Where a global secret's bytes are stored. Immutable after creation, and
@@ -45,6 +78,41 @@ pub const SecretConfig = struct {
     /// Left out when the client has a location: a regional secret takes none.
     replication: Replication = .automatic,
     labels: []const Label = &.{},
+    annotations: []const Annotation = &.{},
+    /// Null: the secret never expires.
+    expiry: ?Expiry = null,
+    /// How long a destroyed version waits, disabled, before its bytes go:
+    /// 86,400 to 86,400,000 seconds (1 to 1,000 days). Null: at once.
+    version_destroy_delay_s: ?u64 = null,
+};
+
+/// What `Secret.update` changes. Every field left at `.keep` stays as it
+/// is; at least one must change. A list given with `.set` replaces the
+/// whole list on the server, which keeps nothing of the old one: to change
+/// one label, read the secret, change the list, and set it.
+pub const SecretUpdate = struct {
+    /// `.set` replaces every label, `&.{}` or `.clear` removes them all.
+    labels: Change([]const Label) = .keep,
+    annotations: Change([]const Annotation) = .keep,
+    aliases: Change([]const Alias) = .keep,
+    /// `.clear`: the secret no longer expires.
+    expiry: Change(Expiry) = .keep,
+    /// `.clear`: versions destroyed from now on go at once. Versions
+    /// already scheduled keep their time.
+    version_destroy_delay_s: Change(u64) = .keep,
+    /// Change the secret only if its etag is still this one, as read: a
+    /// changed secret is `error.Aborted` and nothing changes. Null: no
+    /// condition.
+    etag: ?[]const u8 = null,
+
+    /// Whether the update changes anything at all.
+    pub fn isEmpty(self: SecretUpdate) bool {
+        inline for (@typeInfo(SecretUpdate).@"struct".fields) |field| {
+            if (comptime std.mem.eql(u8, field.name, "etag")) continue;
+            if (@field(self, field.name) != .keep) return false;
+        }
+        return true;
+    }
 };
 
 pub const ListOptions = struct {
@@ -67,13 +135,39 @@ pub const SecretInfo = struct {
     name: []const u8,
     /// RFC 3339, as sent by the server. `core.timestamp.parse` converts it.
     create_time: []const u8,
+    /// Pass to `Secret.update` or `Secret.deleteIf` to change the secret
+    /// only if nothing else has since. Every change moves it, one that
+    /// changes nothing included; a version's changes do not.
     etag: []const u8,
     labels: []const Label,
+    annotations: []const Annotation = &.{},
+    aliases: []const Alias = &.{},
+    /// RFC 3339, in UTC; "" when the secret never expires.
+    expire_time: []const u8 = "",
+    /// Null: destroyed versions go at once. Whole seconds; a fraction
+    /// someone else set is dropped.
+    version_destroy_delay_s: ?u64 = null,
 
     /// The value of the label named `key`, or null.
     pub fn label(self: SecretInfo, key: []const u8) ?[]const u8 {
         for (self.labels) |l| {
             if (std.mem.eql(u8, l.key, key)) return l.value;
+        }
+        return null;
+    }
+
+    /// The value of the annotation named `key`, or null.
+    pub fn annotation(self: SecretInfo, key: []const u8) ?[]const u8 {
+        for (self.annotations) |a| {
+            if (std.mem.eql(u8, a.key, key)) return a.value;
+        }
+        return null;
+    }
+
+    /// The version the alias `name` names, or null. Case matters.
+    pub fn alias(self: SecretInfo, name: []const u8) ?u64 {
+        for (self.aliases) |a| {
+            if (std.mem.eql(u8, a.name, name)) return a.version;
         }
         return null;
     }
@@ -98,7 +192,13 @@ pub const VersionInfo = struct {
     create_time: []const u8,
     /// "" unless the version is destroyed.
     destroy_time: []const u8,
+    /// A version whose secret delays destruction is `.disabled` until
+    /// this time, RFC 3339, and then destroyed; "" when none is scheduled.
+    /// Enabling or disabling it cancels the destruction.
+    scheduled_destroy_time: []const u8 = "",
     state: State,
+    /// Pass to `enableIf`, `disableIf` or `destroyIf` to change the
+    /// version only if nothing else has since.
     etag: []const u8,
     /// Whether the checksum stored with this version came from the client.
     /// False means the server computed it.
