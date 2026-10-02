@@ -119,26 +119,15 @@ const Fixture = struct {
     }
 
     /// Grants Pub/Sub's service agent `role` on one of this test's own
-    /// topics or subscriptions, whose policy starts empty, by replacing that
-    /// policy. The grant goes when the test deletes the resource. The
-    /// client has no IAM calls, so this goes through its transport.
-    fn grantServiceAgent(f: *Fixture, project_number: []const u8, kind: []const u8, id_: []const u8, role: []const u8) !void {
-        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const url = try std.fmt.allocPrint(a, "{s}/v1/projects/{s}/{s}/{s}:setIamPolicy", .{ f.client.base_url, f.client.project_id, kind, id_ });
-        const body = try std.fmt.allocPrint(
-            a,
-            "{{\"policy\":{{\"bindings\":[{{\"role\":\"{s}\",\"members\":[\"serviceAccount:service-{s}@gcp-sa-pubsub.iam.gserviceaccount.com\"]}}]}}}}",
-            .{ role, project_number },
-        );
-        var http: pubsub.transport.HttpTransport = .init(testing.allocator, testing.io, "zig-pubsub-integration/0.1");
-        defer http.deinit();
-        const res = try http.transport().send(.{ .method = .POST, .url = url, .bearer = f.token.token, .body = body, .timeout_ms = 30_000 }, a);
-        if (res.status != 200) {
-            std.debug.print("setIamPolicy on {s}/{s}: HTTP {d}: {s}\n", .{ kind, id_, res.status, res.body });
-            return error.TestGrantRefused;
-        }
+    /// topics or subscriptions, through the library's `addIamBinding`. The
+    /// grant goes when the test deletes the resource.
+    fn grantServiceAgent(f: *Fixture, project_number: []const u8, kind: enum { topic, subscription }, id_: []const u8, role: []const u8) !void {
+        const member = try std.fmt.allocPrint(f.arena.allocator(), "serviceAccount:service-{s}@gcp-sa-pubsub.iam.gserviceaccount.com", .{project_number});
+        var policy = switch (kind) {
+            .topic => f.client.topic(id_).addIamBinding(role, member),
+            .subscription => f.client.subscription(id_).addIamBinding(role, member),
+        } catch |err| return f.fail(err);
+        policy.deinit();
     }
 };
 
@@ -1070,8 +1059,8 @@ test "dead-lettering: after the last attempt, a message moves on, marked with wh
         .dead_letter_policy = .{ .topic = dead.id, .max_delivery_attempts = 5 },
     });
     if (project_number) |number| {
-        try f.grantServiceAgent(number, "topics", dead.id, "roles/pubsub.publisher");
-        try f.grantServiceAgent(number, "subscriptions", sub.id, "roles/pubsub.subscriber");
+        try f.grantServiceAgent(number, .topic, dead.id, "roles/pubsub.publisher");
+        try f.grantServiceAgent(number, .subscription, sub.id, "roles/pubsub.subscriber");
     }
     _ = try publishOne(&f, topic, .{ .data = "doomed" }, .{});
 
@@ -1092,6 +1081,87 @@ test "dead-lettering: after the last attempt, a message moves on, marked with wh
     try testing.expectEqualStrings("doomed", m.data);
     try testing.expectEqualStrings("5", attributeOf(m.attributes, "CloudPubSubDeadLetterSourceDeliveryCount").?);
     try testing.expectEqualStrings(sub.id, attributeOf(m.attributes, "CloudPubSubDeadLetterSourceSubscription").?);
+}
+
+test "IAM: the emulator answers every call Unimplemented; production grants once, revokes once, tests, and takes two grants at once" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("iam");
+    const sub = try f.createSubscription("iam-sub", .{ .topic_id = topic.id });
+    if (!f.production) {
+        try testing.expectError(error.Unimplemented, topic.iamPolicy());
+        try testing.expectError(error.Unimplemented, sub.iamPolicy());
+        try testing.expectError(error.Unimplemented, sub.addIamBinding("roles/pubsub.viewer", "user:a@example.com"));
+        try testing.expectError(error.Unimplemented, topic.testIamPermissions(&.{"pubsub.topics.get"}));
+        return;
+    }
+    // The member is Pub/Sub's service agent, named by the project's number.
+    const number = f.env.get("PUBSUB_TEST_PROJECT_NUMBER") orelse return error.SkipZigTest;
+    const a = f.arena.allocator();
+    const agent = try std.fmt.allocPrint(a, "serviceAccount:service-{s}@gcp-sa-pubsub.iam.gserviceaccount.com", .{number});
+    const shouting = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{try std.ascii.allocUpperString(a, agent["serviceAccount:".len..])});
+    const role = "roles/pubsub.viewer";
+
+    var fresh = sub.iamPolicy() catch |err| return f.fail(err);
+    defer fresh.deinit();
+    try testing.expectEqualStrings("ACAB", fresh.value.etag.?);
+    try testing.expectEqual(0, fresh.value.bindings.len);
+
+    var granted = sub.addIamBinding(role, agent) catch |err| return f.fail(err);
+    defer granted.deinit();
+    try testing.expect(granted.value.grants(role, agent));
+    // Held already, asked in capitals: nothing written, so the etag stands.
+    var again = sub.addIamBinding(role, shouting) catch |err| return f.fail(err);
+    defer again.deinit();
+    try testing.expectEqualStrings(granted.value.etag.?, again.value.etag.?);
+
+    var held = sub.testIamPermissions(&.{ "pubsub.subscriptions.get", "pubsub.subscriptions.consume" }) catch |err| return f.fail(err);
+    defer held.deinit();
+    try testing.expectEqual(2, held.value.len);
+
+    var revoked = sub.removeIamBinding(role, shouting) catch |err| return f.fail(err);
+    defer revoked.deinit();
+    try testing.expect(!revoked.value.grants(role, agent));
+    var gone = sub.removeIamBinding(role, agent) catch |err| return f.fail(err);
+    defer gone.deinit();
+    try testing.expectEqualStrings(revoked.value.etag.?, gone.value.etag.?);
+
+    // Refused here, as production refuses it.
+    try testing.expectError(error.InvalidArgument, sub.setIamPolicy(.{ .bindings = &.{.{ .role = role, .members = &.{agent}, .condition = "{\"title\":\"t\",\"expression\":\"true\"}" }} }));
+
+    // A write under an etag another write has moved on is Aborted.
+    var stale = topic.iamPolicy() catch |err| return f.fail(err);
+    defer stale.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    var first = topic.setIamPolicy(try pubsub.iam.withMember(scratch.allocator(), stale.value, role, agent)) catch |err| return f.fail(err);
+    first.deinit();
+    try testing.expectError(error.Aborted, topic.setIamPolicy(try pubsub.iam.withMember(scratch.allocator(), stale.value, "roles/pubsub.subscriber", agent)));
+
+    // Two clients granting on one topic at once both land: each starts
+    // over when the other came in between.
+    var other = try pubsub.Client.init(testing.allocator, testing.io, .{
+        .project_id = f.client.project_id,
+        .token_provider = f.token.provider(),
+        .user_agent = "zig-pubsub-integration/0.1",
+    });
+    defer other.deinit();
+    const Grant = struct {
+        fn run(t: pubsub.Topic, r: []const u8, member: []const u8) pubsub.Error!void {
+            var p = try t.addIamBinding(r, member);
+            p.deinit();
+        }
+    };
+    var one = try testing.io.concurrent(Grant.run, .{ topic, "roles/pubsub.subscriber", agent });
+    var two = try testing.io.concurrent(Grant.run, .{ other.topic(topic.id), "roles/pubsub.editor", agent });
+    const one_result = one.await(testing.io);
+    const two_result = two.await(testing.io);
+    one_result catch |err| return f.fail(err);
+    two_result catch |err| return f.fail(err);
+    var final = topic.iamPolicy() catch |err| return f.fail(err);
+    defer final.deinit();
+    for ([_][]const u8{ role, "roles/pubsub.subscriber", "roles/pubsub.editor" }) |r| try testing.expect(final.value.grants(r, agent));
 }
 
 test "filter: only messages whose attributes match are delivered" {

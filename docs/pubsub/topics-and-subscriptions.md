@@ -5,7 +5,7 @@
 **On this page:** [Subscription settings](#subscription-settings) ·
 [Updates](#updates) · [Topic settings](#topic-settings) ·
 [What the emulator and production do](#what-the-emulator-and-production-do) ·
-[Topic IAM](#topic-iam)
+[IAM](#iam)
 
 ## Subscription settings
 
@@ -93,11 +93,19 @@ topic ("not mutable"), and answers each update as described here: a
 cleared expiration goes back to 31 days, `.never` to none, a cleared
 retention to 7 days, and a cleared topic retention to none.
 
-## Topic IAM
+## IAM
 
-A topic's IAM policy says who may do what with it, such as publish to
-it. `Topic.iamPolicy` reads it, `setIamPolicy` writes it, and
-`addIamBinding` grants one member one role:
+A topic's or a subscription's IAM policy says who may do what with it,
+such as publish to the topic or consume from the subscription. Both take
+the same five calls:
+
+| Call | What it does |
+| --- | --- |
+| `iamPolicy()` | The policy, asked for as version 3. A fresh one is empty, with the etag `ACAB`. |
+| `setIamPolicy(policy)` | Writes the whole policy, and answers it as stored |
+| `addIamBinding(role, member)` | Grants one member one role, unless the member already holds it |
+| `removeIamBinding(role, member)` | Takes the member out of the role, unless it is not there |
+| `testIamPermissions(permissions)` | The permissions the caller holds, of those asked |
 
 ```zig
 var policy = try client.topic("uploads").addIamBinding(
@@ -107,22 +115,64 @@ var policy = try client.topic("uploads").addIamBinding(
 defer policy.deinit();
 ```
 
-`addIamBinding` grants the role unless the member already holds it
-without a condition, and returns the policy as it then is. It reads the policy, adds the member
-to the role's binding that has no condition, or to a new one, and writes
-the policy back under the read's etag; when another change came in
-between, the write fails with `error.Aborted`, and it starts over, up to
-the retry policy's attempts. Bindings with conditions are kept as read
-and written back as they came. A fresh grant took a few seconds to apply
-when measured.
+`addIamBinding` and `removeIamBinding` read the policy, change the
+role's binding that has no condition, and write the policy back under
+the read's etag. When another change came in between, the write fails
+with `error.Aborted`, and they start over after a jittered wait, up to
+the retry policy's attempts; when the policy already says what they
+would make it say, nothing is written. Members compare as Pub/Sub
+stores them: the address of a `user:`, `serviceAccount:`, `group:` or
+`domain:` member is lowercased, so granting `user:Alice@example.com` to
+a policy that holds `user:alice@example.com` writes nothing. Bindings
+with conditions are kept as read and written back as they came.
 
-`setIamPolicy` takes a policy `iamPolicy` read, changed: its etag makes
-the write fail with `error.Aborted` if the policy changed since, rather
-than undo that change. The policy is a `core.iam.Policy`, with its
-`version`, `etag`, `bindings` and `grants(role, member)`. The calls need
-`pubsub.topics.getIamPolicy` and `pubsub.topics.setIamPolicy`; the
-emulator keeps no policy.
+`setIamPolicy` takes a policy `iamPolicy` read, changed, as a
+`pubsub.iam.Policy`, with helpers such as `pubsub.iam.withMember`: its
+etag makes the write fail with `error.Aborted` if the policy changed
+since, rather than undo that change. A write that carries an etag is
+retried after a transient failure, and one whose first answer was lost
+then reports `error.Aborted` although it landed: read the policy again.
+A write without an etag is sent once.
+
+Refused before sending, with `error.InvalidArgument` and the reason in
+`Diagnostics`: a conditional binding, which Pub/Sub refuses ("Can't set
+conditional policy on this resource"); a role that is not
+`roles/NAME`, `projects/P/roles/NAME` or `organizations/O/roles/NAME`; a
+member whose prefix is not one Pub/Sub takes, cased as it requires
+(`ServiceAccount:` is refused); a `deleted:` member granted (one may be
+revoked); and permissions to test that are none, over 100, named twice
+or a wildcard.
+
+<details>
+<summary><b>📏 Measured against Pub/Sub on 2026-10-01</b></summary>
+
+- Every write moves the etag, one that changes nothing included. A write
+  under an older etag is 409 `ABORTED`, "There were concurrent policy
+  changes. Please retry the whole read-modify-write with exponential
+  backoff.".
+- A principal that does not exist is refused ("User X does not exist.",
+  and likewise for service accounts, groups and domains); a workforce
+  principal of a pool that does not exist fails with 500 on every try.
+- A binding with no members is dropped, a member named twice is stored
+  once, and two bindings of one role without a condition are merged.
+- Topics and subscriptions take Pub/Sub's own roles and the basic roles
+  (`roles/viewer`, `roles/editor`); a subscription refuses the topic-only
+  `roles/pubsub.publisher`.
+- `testIamPermissions` takes at most 100 permissions, all Pub/Sub's own,
+  and echoes one named twice; on a topic or subscription that does not
+  exist it is 404, not the empty set Google's documentation promises.
+- Two clients granting on one topic at once both landed, each starting
+  over when the other came in between.
+
+</details>
+
+The calls need `pubsub.topics.getIamPolicy` and `setIamPolicy`, or the
+same on `pubsub.subscriptions`; `testIamPermissions` needs nothing. The
+emulator answers every IAM call 501, `error.Unimplemented`.
 
 Cloud Storage publishes a bucket's [notifications](../storage/notifications.md)
 only to a topic its service agent holds `roles/pubsub.publisher` on, and
-this is the call that grants it.
+a dead-letter policy forwards only once Pub/Sub's own service agent
+holds `roles/pubsub.publisher` on the dead-letter topic and
+`roles/pubsub.subscriber` on the subscription: `addIamBinding` grants
+each.

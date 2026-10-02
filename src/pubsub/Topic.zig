@@ -8,6 +8,7 @@ const std = @import("std");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const iam = @import("iam.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
 const url = @import("url.zig");
@@ -71,82 +72,67 @@ pub fn delete(self: Topic) Error!void {
     return rpc.executeDiscard(c, .{ .method = .DELETE, .path = path });
 }
 
-/// The topic's IAM policy, conditional bindings included. Needs
-/// `pubsub.topics.getIamPolicy`. The emulator keeps none.
+/// The topic's IAM policy, asked for as version 3. A fresh topic's is
+/// empty, with the etag "ACAB". Needs `pubsub.topics.getIamPolicy`. The
+/// emulator answers every IAM call `error.Unimplemented`.
 pub fn iamPolicy(self: Topic) Error!Owned(core.iam.Policy) {
-    const c = self.client;
-    rpc.begin(c);
-    try rpc.checkId(c, "topic", self.id);
-    return getPolicy(c, self.id);
+    const r = try self.iamResource();
+    return r.readPolicy();
 }
 
-/// Writes `policy` as the topic's, and returns it as written. Pass a policy
-/// `iamPolicy` read, changed: its etag makes the write fail with
+/// Writes `policy` as the topic's, whole, and returns it as stored. Pass a
+/// policy `iamPolicy` read, changed: its etag makes the write fail with
 /// `error.Aborted` if the policy changed since, rather than undo that
-/// change. Needs `pubsub.topics.setIamPolicy`.
+/// change. A write that carries an etag is retried; one whose first answer
+/// was lost then reports `error.Aborted` although it landed, so read the
+/// policy again. One without an etag is sent once. Pub/Sub takes no
+/// conditional bindings: one is `error.InvalidArgument`, before sending.
+/// Needs `pubsub.topics.setIamPolicy`.
 pub fn setIamPolicy(self: Topic, policy: core.iam.Policy) Error!Owned(core.iam.Policy) {
-    const c = self.client;
-    rpc.begin(c);
-    try rpc.checkId(c, "topic", self.id);
-    return setPolicy(c, self.id, policy);
+    const r = try self.iamResource();
+    return iam.set(r, policy);
 }
 
 /// Grants `member` the role `role` on the topic, unless it holds it
-/// already, and returns the policy as it then is. It reads the policy,
-/// adds the member, and writes it back under the read's etag, starting
-/// over when another change came in between, up to the retry policy's
-/// attempts. A bucket's notifications need it: `role` is
-/// `roles/pubsub.publisher`, and `member` is `serviceAccount:` and the
+/// already without a condition, and returns the policy as it then is. It
+/// reads the policy, adds the member, and writes it back under the read's
+/// etag, starting over after a jittered wait when another change came in
+/// between, up to the retry policy's attempts. Members compare as Pub/Sub
+/// stores them, the address of a `user:`, `serviceAccount:`, `group:` or
+/// `domain:` member in any case. A bucket's notifications need it: `role`
+/// is `roles/pubsub.publisher`, and `member` is `serviceAccount:` and the
 /// address `storage.Client.serviceAgent` gives. A fresh grant took a few
 /// seconds to apply when measured. Needs `pubsub.topics.getIamPolicy` and
 /// `pubsub.topics.setIamPolicy`.
 pub fn addIamBinding(self: Topic, role: []const u8, member: []const u8) Error!Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return iam.change(r, .{ .grant = .{ .role = role, .member = member } });
+}
+
+/// Takes `member` out of the topic's binding of `role` without a
+/// condition, unless it is not there, and returns the policy as it then
+/// is, the same way `addIamBinding` grants.
+pub fn removeIamBinding(self: Topic, role: []const u8, member: []const u8) Error!Owned(core.iam.Policy) {
+    const r = try self.iamResource();
+    return iam.change(r, .{ .revoke = .{ .role = role, .member = member } });
+}
+
+/// The permissions the caller holds on the topic, of `permissions`: 1 to
+/// 100 of Pub/Sub's own, such as `pubsub.topics.publish`. A permission of
+/// another service, or one that does not exist, is refused with
+/// `error.InvalidArgument`; a missing topic is `error.NotFound`. Meant for
+/// building permission-aware tools, not for authorization checks: Google
+/// says it may "fail open".
+pub fn testIamPermissions(self: Topic, permissions: []const []const u8) Error!Owned([]const []const u8) {
+    const r = try self.iamResource();
+    return iam.testPermissions(r, permissions);
+}
+
+fn iamResource(self: Topic) Error!iam.Resource {
     const c = self.client;
     rpc.begin(c);
     try rpc.checkId(c, "topic", self.id);
-    if (role.len == 0 or member.len == 0) {
-        if (c.diagnostics) |d| d.print("a binding names a role, such as roles/pubsub.publisher, and a member, such as serviceAccount:name@project.iam.gserviceaccount.com", .{});
-        return error.InvalidArgument;
-    }
-    var attempt: u32 = 0;
-    while (true) {
-        attempt += 1;
-        var read = try getPolicy(c, self.id);
-        if (read.value.grants(role, member)) return read;
-        defer read.deinit();
-        var scratch: std.heap.ArenaAllocator = .init(c.gpa);
-        defer scratch.deinit();
-        const next = try core.iam.withMember(scratch.allocator(), read.value, role, member);
-        return setPolicy(c, self.id, next) catch |err| {
-            // Another change came between the read and the write.
-            if (err == error.Aborted and attempt < c.retry.max_attempts) continue;
-            return err;
-        };
-    }
-}
-
-fn getPolicy(c: *Client, id: []const u8) Error!Owned(core.iam.Policy) {
-    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
-    defer scratch.deinit();
-    const path = try url.resourcePath(scratch.allocator(), c.project_id, .topics, id, ":getIamPolicy?options.requestedPolicyVersion=3");
-    return fetchPolicy(c, .{ .method = .GET, .path = path });
-}
-
-fn setPolicy(c: *Client, id: []const u8, policy: core.iam.Policy) Error!Owned(core.iam.Policy) {
-    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
-    defer scratch.deinit();
-    const a = scratch.allocator();
-    const path = try url.resourcePath(a, c.project_id, .topics, id, ":setIamPolicy");
-    return fetchPolicy(c, .{ .method = .POST, .path = path, .body = try core.iam.encodeSet(a, policy) });
-}
-
-fn fetchPolicy(c: *Client, call: rpc.Call) Error!Owned(core.iam.Policy) {
-    var result: Owned(core.iam.Policy) = try .init(c.gpa);
-    errdefer result.deinit();
-    const body = try rpc.execute(c, result.arena, call);
-    result.value = core.iam.decode(result.arena.allocator(), body) catch |err|
-        return rpc.decodeFailed(c, err, "IAM policy");
-    return result;
+    return .{ .client = c, .collection = .topics, .id = self.id };
 }
 
 /// Publishes `messages` in one HTTP request. The returned ids match the order
