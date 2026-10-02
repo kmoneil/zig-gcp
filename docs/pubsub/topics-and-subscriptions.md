@@ -175,4 +175,5 @@ only to a topic its service agent holds `roles/pubsub.publisher` on, and
 a dead-letter policy forwards only once Pub/Sub's own service agent
 holds `roles/pubsub.publisher` on the dead-letter topic and
 `roles/pubsub.subscriber` on the subscription: `addIamBinding` grants
-each.
+each. [IAM on every resource](../iam.md) compares the four resources
+that take these calls.

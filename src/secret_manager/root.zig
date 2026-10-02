@@ -26,6 +26,9 @@ pub const RetryPolicy = core.RetryPolicy;
 pub const Diagnostics = core.Diagnostics;
 pub const Error = @import("errors.zig").Error;
 pub const ApiError = core.ApiError;
+/// IAM policies as secrets read and write them: `Policy`, `Binding`, and
+/// the helpers that change a policy, such as `withMember`.
+pub const iam = core.iam;
 
 pub const Owned = @import("types.zig").Owned;
 pub const ChecksumMode = @import("types.zig").ChecksumMode;
@@ -58,6 +61,7 @@ test {
     _ = @import("codec.zig");
     _ = @import("errors.zig");
     _ = @import("faults.zig");
+    _ = @import("iam.zig");
     _ = @import("logging.zig");
     _ = @import("names.zig");
     _ = @import("rpc.zig");

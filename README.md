@@ -51,7 +51,7 @@ Pub/Sub, Cloud Storage and Secret Manager, with credentials that find themselves
 | :-: | --- | --- | --- |
 | 📨 | [`pubsub`](docs/pubsub/README.md) | Pub/Sub v1: publish one call at a time or batched from many tasks; pull, a worker loop that manages leases, and exactly-once delivery; topics and subscriptions, with their IAM policies | beta |
 | 🪣 | [`storage`](docs/storage/README.md) | Cloud Storage: objects of any size, streamed, parallel, resumable and checksummed both ways; preconditions, compose and server-side copies; buckets, versions, soft delete, retention and holds, IAM; signed URLs and POST policies; encryption keys; Pub/Sub notifications | experimental |
-| 🔑 | [`secret_manager`](docs/secret-manager.md) | Secret Manager v1: a secret's bytes, verified and wiped after use; versions; secrets global or regional | experimental |
+| 🔑 | [`secret_manager`](docs/secret-manager.md) | Secret Manager v1: a secret's bytes, verified and wiped after use; versions; secrets global or regional, and their IAM policies | experimental |
 | 🪪 | [`auth`](docs/auth.md) | Credentials for the other modules: the metadata server, gcloud's login, service account keys, workload identity federation and impersonation; signing on this machine or through IAM | experimental |
 | ⚙️ | [`core`](docs/essentials.md) | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, IAM policies, the `TokenProvider` and `Signer` seams, and test fakes. Each service re-exports what its callers need. | beta |
 
@@ -142,6 +142,7 @@ says how.
 | --- | --- |
 | 🧭 [Essentials](docs/essentials.md) | Clients and handles, results and memory, errors and `Diagnostics`, retries and time limits, logging, testing with fakes |
 | 🪪 [Credentials](docs/auth.md) | Where `findDefault` looks, every kind of credential, quota projects and signing |
+| 🔏 [IAM](docs/iam.md) | Granting, revoking and testing permissions on buckets, topics, subscriptions and secrets |
 | 📨 [Pub/Sub](docs/pubsub/README.md) | Publishing at volume, a worker loop, exactly-once delivery, subscription settings, IAM, limits |
 | 🪣 [Cloud Storage](docs/storage/README.md) | Transfers of any size, checksums and gzip, safe writes, signed URLs, buckets, retention, encryption keys, notifications |
 | 🔑 [Secret Manager](docs/secret-manager.md) | Reading secrets safely, checksums, regional secrets |
@@ -162,6 +163,7 @@ The [documentation index](docs/README.md) lists every page.
 | [`gcs_cp`](examples/gcs_cp.zig) | Copies files to and from Cloud Storage in constant memory: parallel, resumable, compressed, under keys | `zig build example-gcs_cp -- backup.tar gs://my-bucket/backup.tar` |
 | [`gcs_sign`](examples/gcs_sign.zig) | Signs a URL, or prints an HTML form with a POST policy | `zig build example-gcs_sign -- gs://my-bucket/reports/q3.txt` |
 | [`gcs_notify`](examples/gcs_notify.zig) | Sets up a bucket's notifications, and watches the changes come in, decoded | `zig build example-gcs_notify -- setup my-bucket my-project uploads` |
+| [`iam`](examples/iam.zig) | Reads, grants, revokes and tests permissions on a bucket, topic, subscription or secret | `zig build example-iam -- get gs://my-bucket` |
 
 `publish`, `publisher` and `worker` use the emulator when
 `PUBSUB_EMULATOR_HOST` is set, and otherwise a token in

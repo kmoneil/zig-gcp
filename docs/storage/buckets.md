@@ -385,4 +385,6 @@ handle names its project on every IAM call, as on every other.
 </details>
 
 fake-gcs-server has no IAM: every call there is `error.NotFound`.
+[IAM on every resource](../iam.md) compares the four resources that take
+these calls.
 
