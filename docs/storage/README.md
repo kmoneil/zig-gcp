@@ -51,7 +51,7 @@ it differs from Cloud Storage.
 | [Checksums and compression](checksums-and-compression.md) | CRC-32C in both directions, objects stored gzip-compressed, and compressing on upload |
 | [Writing objects](writing-objects.md) | Preconditions and retries, metadata after the upload, compose, and copies that change what they carry |
 | [Signed URLs and POST policies](signed-urls.md) | One request, or one kind of browser upload, without credentials |
-| [Buckets](buckets.md) | Settings and lifecycle rules, versions and soft delete, retention and holds, requester pays |
+| [Buckets](buckets.md) | Settings and lifecycle rules, versions and soft delete, retention and holds, requester pays, IAM |
 | [Encryption keys](encryption.md) | Customer-supplied keys and Cloud KMS keys |
 | [Notifications](notifications.md) | A Pub/Sub message for every change to a bucket's objects, decoded |
 | [The emulator](emulator.md) | What fake-gcs-server does differently, and how the tests cover it |
@@ -83,9 +83,11 @@ it differs from Cloud Storage.
 | `bucket.createNotification(config)`, `.getNotification(id)`, `.listNotifications()`, `.deleteNotification(id)` | Pub/Sub messages for every change to the bucket's objects | [Notifications](notifications.md) |
 | `storage.decodeEvent(gpa, message, options)` | One of those messages, as a `pubsub.Subscriber` receives it, read into an `ObjectEvent` | [Notifications](notifications.md) |
 | `client.serviceAgent()` | The account a Cloud KMS key, or a notification's topic, must be granted to | [Encryption keys](encryption.md#cloud-kms-keys) |
+| `bucket.iamPolicy()`, `.setIamPolicy(policy)`, `.addIamBinding(role, member)`, `.removeIamBinding(role, member)`, `.testIamPermissions(permissions)` | Who may do what with the bucket and its objects | [IAM](buckets.md#iam) |
 
 The default OAuth scope is `devstorage.read_write`; `Options.scope`
-picks `.read_only` or `.cloud_platform` instead. Not in this version:
+picks `.read_only`, `.full_control` (which a bucket's IAM policy needs)
+or `.cloud_platform` instead. Not in this version:
 the JSON API's PUT, which replaces a whole resource (`updateMetadata`
 and `Bucket.update` patch, which merges), parallel composite uploads,
 and gRPC.

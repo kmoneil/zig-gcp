@@ -12,6 +12,7 @@ const core = @import("core");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
+const iam = @import("iam.zig");
 const notifications = @import("notifications.zig");
 const retention = @import("retention.zig");
 const validate = @import("validate.zig");
@@ -25,12 +26,17 @@ pub const Scope = enum {
     read_only,
     /// The broad scope, for credentials already fixed to it.
     cloud_platform,
+    /// Cloud Storage's own full scope, which reading and writing a
+    /// bucket's IAM policy needs, as `.cloud_platform` does: the API names
+    /// only those two for them.
+    full_control,
 
     pub fn url(self: Scope) []const u8 {
         return switch (self) {
             .read_write => "https://www.googleapis.com/auth/devstorage.read_write",
             .read_only => "https://www.googleapis.com/auth/devstorage.read_only",
             .cloud_platform => "https://www.googleapis.com/auth/cloud-platform",
+            .full_control => "https://www.googleapis.com/auth/devstorage.full_control",
         };
     }
 };
@@ -201,6 +207,26 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
         hint(client, err);
         if (retained(e, err)) return error.ObjectRetained;
         if (notifications.isNotPublishable(err, e.diagnostics.?)) return error.TopicNotPublishable;
+        return err;
+    };
+}
+
+/// `execute` for a bucket IAM write. Cloud Storage refuses a policy written
+/// under an etag the bucket has moved past with the same 412
+/// `conditionNotMet` as any failed precondition, told apart only by its
+/// message: that one is another change made in between, `error.Aborted`,
+/// as Pub/Sub and Secret Manager answer it.
+pub fn executeIamWrite(client: *Client, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
+    const path = try billedPath(client, call.path);
+    defer if (path) |p| client.gpa.free(p);
+    var billed_call = call;
+    if (path) |p| billed_call.path = p;
+    if (billed_call.quota_project == null) billed_call.quota_project = client.billing_project;
+    var local: core.Diagnostics = .{};
+    const e = engineWith(client, &local);
+    return e.execute(response, billed_call) catch |err| {
+        hint(client, err);
+        if (iam.isConcurrentChange(err, e.diagnostics.?)) return error.Aborted;
         return err;
     };
 }

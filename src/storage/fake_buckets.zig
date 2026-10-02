@@ -47,6 +47,21 @@
 //!   publish to, for the topics `setTopic` names. Whether prefixes keep
 //!   configurations from overlapping was not measured: here they do not.
 //!
+//! IAM, as measured on 2026-10-01: a new bucket's policy holds the legacy
+//! bindings to `projectOwner:`, `projectEditor:` and `projectViewer:` its
+//! project (four with uniform access, two without); the etag is the
+//! metageneration as Cloud Storage writes it, so any bucket update makes
+//! an older one stale; a write under a stale etag is 412 "At least one of
+//! the pre-conditions you specified did not hold.", a condition without
+//! uniform access and a public member under public access prevention are
+//! 412 too, each in its own words; only Cloud Storage's roles and custom
+//! ones are taken; addresses are stored lowercased, members merged into
+//! one binding per role and condition, empty bindings dropped, and a
+//! write without `bindings` removes them all; a version 1 read renames a
+//! conditional role `_withcond_`; `testIamPermissions` takes at most 84,
+//! none twice, Cloud Storage's own, and answers every one held. Whether a
+//! principal exists is not modelled: every well-formed one is taken.
+//!
 //! Letters beyond ASCII pass in labels, since this fake has no Unicode
 //! tables; Cloud Storage refuses the uppercase ones. Fields this library
 //! never sends are refused, so a misspelled one fails the test.
@@ -55,7 +70,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const ObjectMap = std.json.ObjectMap;
-const Method = @import("core").transport.Method;
+const core = @import("core");
+const Method = core.transport.Method;
 
 pub const FakeBuckets = struct {
     /// Every bucket and every value in it. Replaced values are left here
@@ -89,6 +105,9 @@ pub const FakeBuckets = struct {
         notification_creates: u32 = 0,
         notification_reads: u32 = 0,
         notification_deletes: u32 = 0,
+        iam_reads: u32 = 0,
+        iam_writes: u32 = 0,
+        iam_tests: u32 = 0,
     };
 
     const Stored = struct {
@@ -96,6 +115,11 @@ pub const FakeBuckets = struct {
         metageneration: u64,
         /// Its notification configurations, oldest first.
         notifications: std.ArrayListUnmanaged(ObjectMap) = .empty,
+        /// The project it was created in, which its legacy bindings name.
+        project: []const u8 = "extractctl",
+        /// Its IAM bindings as Cloud Storage keeps them, or null until the
+        /// first write, while the legacy ones stand.
+        bindings: ?[]const core.iam.Binding = null,
     };
 
     /// What a bucket URL names.
@@ -111,6 +135,15 @@ pub const FakeBuckets = struct {
         object_retention: bool = false,
         /// `.../notificationConfigs`, or one of them.
         notification: ?NotificationTarget = null,
+        /// `.../iam` or `.../iam/testPermissions`.
+        iam: ?IamTarget = null,
+    };
+
+    pub const IamTarget = union(enum) {
+        /// `.../iam`, with the version a read asks for.
+        policy: ?u32,
+        /// `.../iam/testPermissions`, with the permissions asked.
+        test_permissions: []const []const u8,
     };
 
     pub const NotificationTarget = union(enum) {
@@ -145,9 +178,10 @@ pub const FakeBuckets = struct {
         const name = target.name orelse {
             if (method != .POST or target.project == null) return error.HttpProtocolError;
             self.counts.creates += 1;
-            return self.create(body, target.object_retention, arena);
+            return self.create(body, target.object_retention, target.project.?, arena);
         };
         if (target.notification) |n| return self.serveNotification(method, name, n, body, arena);
+        if (target.iam) |iam| return self.serveIam(method, name, iam, body, arena);
         if (target.lock) {
             if (method != .POST) return error.HttpProtocolError;
             self.counts.locks += 1;
@@ -172,7 +206,7 @@ pub const FakeBuckets = struct {
         }
     }
 
-    fn create(self: *FakeBuckets, body: []const u8, object_retention: bool, arena: Allocator) Error!Reply {
+    fn create(self: *FakeBuckets, body: []const u8, object_retention: bool, project: []const u8, arena: Allocator) Error!Reply {
         const a = self.arena.allocator();
         const parsed = std.json.parseFromSliceLeaky(Value, arena, body, .{}) catch return self.invalid(arena, "Parse Error");
         const fields = objectOf(parsed) orelse return self.invalid(arena, "the body is not an object");
@@ -218,7 +252,7 @@ pub const FakeBuckets = struct {
                 error.OutOfMemory => return error.OutOfMemory,
             };
         }
-        try self.buckets.put(a, owned_name, .{ .resource = next, .metageneration = 1 });
+        try self.buckets.put(a, owned_name, .{ .resource = next, .metageneration = 1, .project = try a.dupe(u8, project) });
         self.next_generation += 1;
         return .{ .status = 200, .body = try render(arena, next) };
     }
@@ -322,6 +356,75 @@ pub const FakeBuckets = struct {
                 }
             },
         }
+    }
+
+    fn serveIam(self: *FakeBuckets, method: Method, bucket: []const u8, target: IamTarget, body: []const u8, arena: Allocator) Error!Reply {
+        const stored = self.buckets.getPtr(bucket) orelse return notFound();
+        switch (target) {
+            .policy => |requested| switch (method) {
+                .GET => {
+                    self.counts.iam_reads += 1;
+                    return .{ .status = 200, .body = try renderPolicy(arena, bucket, stored, requested orelse 1) };
+                },
+                .PUT => {
+                    self.counts.iam_writes += 1;
+                    return self.setPolicy(bucket, stored, body, arena);
+                },
+                else => return error.HttpProtocolError,
+            },
+            .test_permissions => |permissions| {
+                if (method != .GET) return error.HttpProtocolError;
+                self.counts.iam_tests += 1;
+                return testPermissions(arena, permissions);
+            },
+        }
+    }
+
+    /// A policy written whole, refused as Cloud Storage refused each case.
+    fn setPolicy(self: *FakeBuckets, bucket: []const u8, stored: *Stored, body: []const u8, arena: Allocator) Error!Reply {
+        const policy = core.iam.decode(arena, body) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidResponse => return answer(arena, 400, "invalid", "The role name must be in the form \"roles/{role}\", \"organizations/{organization_id}/roles/{role}\", or \"projects/{project_id}/roles/{role}\"."),
+        };
+        if (policy.etag) |etag| if (etag.len > 0) {
+            var raw: [16]u8 = undefined;
+            const size = std.base64.standard.Decoder.calcSizeForSlice(etag) catch return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for ByteString: {s}", .{etag}));
+            if (size > raw.len) return answer(arena, 400, "invalid", "Invalid etag - must use etag from GetPolicy response.");
+            std.base64.standard.Decoder.decode(raw[0..size], etag) catch return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for ByteString: {s}", .{etag}));
+            const meta = metagenerationOfEtag(raw[0..size]) orelse return answer(arena, 400, "invalid", "Invalid etag - must use etag from GetPolicy response.");
+            if (meta > stored.metageneration) return answer(arena, 400, "invalid", "Invalid etag - must use etag from GetPolicy response.");
+            if (meta != stored.metageneration) return answer(arena, 412, "conditionNotMet", "At least one of the pre-conditions you specified did not hold.");
+        };
+        const uniform = uniformAccess(stored.resource);
+        const prevention = publicAccessPrevented(stored.resource);
+        for (policy.bindings) |b| {
+            if (core.iam.roleProblem(b.role) != null) return answer(arena, 400, "invalid", "The role name must be in the form \"roles/{role}\", \"organizations/{organization_id}/roles/{role}\", or \"projects/{project_id}/roles/{role}\".");
+            if (std.mem.startsWith(u8, b.role, "roles/") and !std.mem.startsWith(u8, b.role, "roles/storage.")) {
+                return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Role {s} is not supported for this resource.", .{b.role}));
+            }
+            for (b.members) |m| {
+                if (std.mem.eql(u8, m, "allUsers") or std.mem.eql(u8, m, "allAuthenticatedUsers")) {
+                    if (prevention) return answer(arena, 412, "conditionNotMet", "The member bindings allUsers and allAuthenticatedUsers are not allowed since public access prevention is enforced.");
+                    continue;
+                }
+                if (std.mem.eql(u8, m, "user:")) return answer(arena, 400, "invalid", "The email address of a user in the IAM policy is empty.");
+                for ([_][]const u8{ "projectOwner:", "projectEditor:", "projectViewer:" }) |prefix| {
+                    if (!std.mem.startsWith(u8, m, prefix)) continue;
+                    const project = m[prefix.len..];
+                    if (!std.mem.eql(u8, project, stored.project)) return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Project {s} does not exist.", .{project}));
+                }
+                if (core.iam.memberProblem(m, .{ .project_values = true, .deleted = true }) != null) {
+                    return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "The member {s} is of an unknown type. Please set a valid type prefix for the member.", .{m}));
+                }
+            }
+        }
+        if (policy.hasConditions()) {
+            if (!uniform) return answer(arena, 412, "conditionNotMet", "To set IAM conditions in this bucket, enable uniform bucket-level access. This ensures that all object access is controlled uniformly at the bucket-level without individual, object-level permissions. Learn more at https://cloud.google.com/storage/docs/uniform-bucket-level-access");
+            if (policy.version < 3) return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Specified policy version ({d}) must be at least 3 based on the policy's contents. For more information, please refer to https://cloud.google.com/iam/help/allow-policies/versions.", .{policy.version}));
+        }
+        stored.bindings = try storedBindings(self.arena.allocator(), policy.bindings);
+        try self.bump(stored);
+        return .{ .status = 200, .body = try renderPolicy(arena, bucket, stored, 3) };
     }
 
     /// A configuration's create or delete moves the bucket's metageneration.
@@ -832,6 +935,174 @@ fn answer(arena: Allocator, status: u16, reason: []const u8, message: []const u8
         .errors = .{.{ .message = message, .domain = "global", .reason = reason }},
     } }, .{});
     return .{ .status = status, .body = body };
+}
+
+/// The etag Cloud Storage gives a bucket's policy: its metageneration, as
+/// a protocol buffer's first field (`CAE=` for 1), in base64.
+fn etagOf(buf: *[24]u8, metageneration: u64) []const u8 {
+    var raw: [11]u8 = undefined;
+    raw[0] = 0x08;
+    var n: usize = 1;
+    var m = metageneration;
+    while (m >= 0x80) : (m >>= 7) {
+        raw[n] = @as(u8, @truncate(m)) | 0x80;
+        n += 1;
+    }
+    raw[n] = @truncate(m);
+    n += 1;
+    return std.base64.standard.Encoder.encode(buf, raw[0..n]);
+}
+
+/// The metageneration an etag names, or null for bytes that are no etag.
+fn metagenerationOfEtag(raw: []const u8) ?u64 {
+    if (raw.len < 2 or raw[0] != 0x08) return null;
+    var value: u64 = 0;
+    var shift: u6 = 0;
+    for (raw[1..], 1..) |byte, i| {
+        value |= @as(u64, byte & 0x7f) << shift;
+        if (byte & 0x80 == 0) return if (i == raw.len - 1) value else null;
+        if (shift >= 56) return null;
+        shift += 7;
+    }
+    return null;
+}
+
+fn uniformAccess(resource: ObjectMap) bool {
+    const iam = objectOf(resource.get("iamConfiguration") orelse return false) orelse return false;
+    const ubla = objectOf(iam.get("uniformBucketLevelAccess") orelse return false) orelse return false;
+    const on = ubla.get("enabled") orelse return false;
+    return on == .bool and on.bool;
+}
+
+fn publicAccessPrevented(resource: ObjectMap) bool {
+    const iam = objectOf(resource.get("iamConfiguration") orelse return false) orelse return false;
+    const pap = stringOf(iam.get("publicAccessPrevention") orelse return false) orelse return false;
+    return std.mem.eql(u8, pap, "enforced");
+}
+
+/// The legacy bindings a bucket starts with, as measured: with uniform
+/// access, the object roles too.
+fn legacyBindings(arena: Allocator, stored: *const FakeBuckets.Stored) Allocator.Error![]const core.iam.Binding {
+    const owners = try arena.dupe([]const u8, &.{
+        try std.fmt.allocPrint(arena, "projectEditor:{s}", .{stored.project}),
+        try std.fmt.allocPrint(arena, "projectOwner:{s}", .{stored.project}),
+    });
+    const viewers = try arena.dupe([]const u8, &.{try std.fmt.allocPrint(arena, "projectViewer:{s}", .{stored.project})});
+    if (uniformAccess(stored.resource)) return arena.dupe(core.iam.Binding, &.{
+        .{ .role = "roles/storage.legacyBucketOwner", .members = owners },
+        .{ .role = "roles/storage.legacyBucketReader", .members = viewers },
+        .{ .role = "roles/storage.legacyObjectOwner", .members = owners },
+        .{ .role = "roles/storage.legacyObjectReader", .members = viewers },
+    });
+    return arena.dupe(core.iam.Binding, &.{
+        .{ .role = "roles/storage.legacyBucketOwner", .members = owners },
+        .{ .role = "roles/storage.legacyBucketReader", .members = viewers },
+    });
+}
+
+/// `bindings` as Cloud Storage stores them: addresses lowercased, one
+/// binding per role and condition, members once, empty bindings dropped.
+fn storedBindings(a: Allocator, bindings: []const core.iam.Binding) Allocator.Error![]const core.iam.Binding {
+    var out: std.ArrayList(core.iam.Binding) = .empty;
+    var members: std.ArrayList(std.ArrayList([]const u8)) = .empty;
+    for (bindings) |b| {
+        const index = for (out.items, 0..) |o, i| {
+            const same_condition = if (o.condition) |c| (if (b.condition) |d| std.mem.eql(u8, c, d) else false) else b.condition == null;
+            if (std.mem.eql(u8, o.role, b.role) and same_condition) break i;
+        } else blk: {
+            try out.append(a, .{ .role = try a.dupe(u8, b.role), .members = &.{}, .condition = if (b.condition) |c| try a.dupe(u8, c) else null });
+            try members.append(a, .empty);
+            break :blk out.items.len - 1;
+        };
+        for (b.members) |m| {
+            const stored_form = try lowercasedAddress(a, m);
+            for (members.items[index].items) |kept| {
+                if (std.mem.eql(u8, kept, stored_form)) break;
+            } else try members.items[index].append(a, stored_form);
+        }
+    }
+    var kept: std.ArrayList(core.iam.Binding) = .empty;
+    for (out.items, members.items) |b, list| {
+        if (list.items.len == 0) continue;
+        try kept.append(a, .{ .role = b.role, .members = list.items, .condition = b.condition });
+    }
+    return kept.items;
+}
+
+fn lowercasedAddress(a: Allocator, member: []const u8) Allocator.Error![]const u8 {
+    for ([_][]const u8{ "user:", "serviceAccount:", "group:", "domain:" }) |prefix| {
+        if (!std.mem.startsWith(u8, member, prefix)) continue;
+        const out = try a.dupe(u8, member);
+        _ = std.ascii.lowerString(out[prefix.len..], member[prefix.len..]);
+        return out;
+    }
+    return a.dupe(u8, member);
+}
+
+/// The policy as a read answers it: version 3 with its conditions when
+/// asked for 3, else version 1 with each conditional role renamed.
+fn renderPolicy(arena: Allocator, bucket: []const u8, stored: *const FakeBuckets.Stored, requested: u32) Allocator.Error![]const u8 {
+    const bindings = stored.bindings orelse try legacyBindings(arena, stored);
+    var conditional = false;
+    for (bindings) |b| conditional = conditional or b.condition != null;
+    const version: u32 = if (conditional and requested >= 3) 3 else 1;
+    var etag_buf: [24]u8 = undefined;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var jw: std.json.Stringify = .{ .writer = &out.writer };
+    writePolicy(&jw, bucket, version, etagOf(&etag_buf, stored.metageneration), bindings) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writePolicy(jw: *std.json.Stringify, bucket: []const u8, version: u32, etag: []const u8, bindings: []const core.iam.Binding) !void {
+    try jw.beginObject();
+    try jw.objectField("kind");
+    try jw.write("storage#policy");
+    try jw.objectField("resourceId");
+    try jw.print("\"projects/_/buckets/{s}\"", .{bucket});
+    try jw.objectField("version");
+    try jw.write(version);
+    try jw.objectField("etag");
+    try jw.write(etag);
+    if (bindings.len > 0) {
+        try jw.objectField("bindings");
+        try jw.beginArray();
+        for (bindings) |b| {
+            try jw.beginObject();
+            try jw.objectField("role");
+            if (b.condition != null and version < 3) {
+                try jw.print("\"{s}_withcond_4e0bd94b67e008e72efb\"", .{b.role});
+            } else try jw.write(b.role);
+            try jw.objectField("members");
+            try jw.write(b.members);
+            if (b.condition) |condition| if (version >= 3) {
+                try jw.objectField("condition");
+                try jw.beginWriteRaw();
+                try jw.writer.writeAll(condition);
+                jw.endWriteRaw();
+            };
+            try jw.endObject();
+        }
+        try jw.endArray();
+    }
+    try jw.endObject();
+}
+
+/// `testIamPermissions`, refused as Cloud Storage refused each case, and
+/// every permission held.
+fn testPermissions(arena: Allocator, permissions: []const []const u8) Allocator.Error!FakeBuckets.Reply {
+    if (permissions.len == 0) return answer(arena, 400, "required", "Required parameter: permissions");
+    if (permissions.len > 84) return answer(arena, 400, "invalid", "Must specify <= 84 permissions.");
+    for (permissions, 0..) |p, i| {
+        for (permissions[0..i]) |q| if (std.mem.eql(u8, p, q)) return answer(arena, 400, "invalid", "Duplicate permissions must not be specified.");
+    }
+    for (permissions) |p| {
+        if (std.mem.eql(u8, p, "storage.buckets.list") or std.mem.eql(u8, p, "storage.buckets.create")) return answer(arena, 400, "invalid", "Invalid argument.");
+        if (!std.mem.startsWith(u8, p, "storage.") or std.mem.indexOfScalar(u8, p, '*') != null) {
+            return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "{s} is not a valid Google Cloud Storage permission.", .{p}));
+        }
+    }
+    const body = try std.json.Stringify.valueAlloc(arena, .{ .kind = "storage#testIamPermissionsResponse", .permissions = permissions }, .{});
+    return .{ .status = 200, .body = body };
 }
 
 /// `topic` in the form Cloud Storage keeps, or null for one it refuses.

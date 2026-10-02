@@ -11,6 +11,7 @@ const Client = @import("Client.zig");
 const Object = @import("Object.zig");
 const bucket_settings = @import("bucket_settings.zig");
 const codec = @import("codec.zig");
+const iam = @import("iam.zig");
 const idempotency = @import("idempotency.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
@@ -308,6 +309,80 @@ fn deleteNotificationBilled(self: Bucket, id: []const u8) Error!void {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return notifications.delete(self.client, self.name, id);
+}
+
+/// The bucket's IAM policy, asked for as version 3, conditional bindings
+/// included. A new bucket's holds four legacy bindings to
+/// `projectOwner:`, `projectEditor:` and `projectViewer:` its project.
+/// Needs `storage.buckets.getIamPolicy`, and a token for
+/// `Scope.full_control` or `.cloud_platform`, the only scopes Cloud
+/// Storage names for it. fake-gcs-server has no IAM: `error.NotFound`.
+pub fn iamPolicy(self: Bucket) Error!types.Owned(core.iam.Policy) {
+    var client: Client = undefined;
+    const r = try (try self.billing(&client)).iamResource();
+    return r.readPolicy();
+}
+
+/// Writes `policy` as the bucket's, whole, and returns it as stored. Pass
+/// a policy `iamPolicy` read, changed: its etag makes the write fail with
+/// `error.Aborted` if the policy changed since, rather than undo that
+/// change, and any bucket update moves the etag, a label included. A
+/// write that carries an etag is retried; one whose first answer was lost
+/// then reports `error.Aborted` although it landed, so read the policy
+/// again. One without an etag is sent once. A policy without the legacy
+/// `projectOwner:` bindings can leave project owners who hold no storage
+/// role of their own unable to read it back. A condition needs uniform
+/// bucket-level access, and public access prevention refuses `allUsers`
+/// and `allAuthenticatedUsers`: both are `error.FailedPrecondition`, with
+/// Cloud Storage's words in `Diagnostics`. Needs
+/// `storage.buckets.setIamPolicy`, and the scope `iamPolicy` needs.
+pub fn setIamPolicy(self: Bucket, policy: core.iam.Policy) Error!types.Owned(core.iam.Policy) {
+    var client: Client = undefined;
+    const r = try (try self.billing(&client)).iamResource();
+    return iam.set(r, policy);
+}
+
+/// Grants `member` the role `role` on the bucket, unless it holds it
+/// already without a condition, and returns the policy as it then is. It
+/// reads the policy, adds the member, and writes it back under the read's
+/// etag, starting over after a jittered wait when another change came in
+/// between, a bucket update included, up to the retry policy's attempts.
+/// Members compare as Cloud Storage stores them, the address of a
+/// `user:`, `serviceAccount:`, `group:` or `domain:` member in any case;
+/// `projectViewer:` and its siblings take a project's ID. A bucket takes
+/// only Cloud Storage's roles. Needs `storage.buckets.getIamPolicy` and
+/// `setIamPolicy`.
+pub fn addIamBinding(self: Bucket, role: []const u8, member: []const u8) Error!types.Owned(core.iam.Policy) {
+    var client: Client = undefined;
+    const r = try (try self.billing(&client)).iamResource();
+    return iam.change(r, .{ .grant = .{ .role = role, .member = member } });
+}
+
+/// Takes `member` out of the bucket's binding of `role` without a
+/// condition, unless it is not there, and returns the policy as it then
+/// is, the same way `addIamBinding` grants.
+pub fn removeIamBinding(self: Bucket, role: []const u8, member: []const u8) Error!types.Owned(core.iam.Policy) {
+    var client: Client = undefined;
+    const r = try (try self.billing(&client)).iamResource();
+    return iam.change(r, .{ .revoke = .{ .role = role, .member = member } });
+}
+
+/// The permissions the caller holds on the bucket, of `permissions`: Cloud
+/// Storage's own, such as `storage.objects.get`, at most 84 by Cloud
+/// Storage's count, none twice, and not `storage.buckets.list` or
+/// `storage.buckets.create`, which belong to projects. A missing bucket is
+/// `error.NotFound`. Meant for building permission-aware tools, not for
+/// authorization checks. Any scope will do.
+pub fn testIamPermissions(self: Bucket, permissions: []const []const u8) Error!types.Owned([]const []const u8) {
+    var client: Client = undefined;
+    const r = try (try self.billing(&client)).iamResource();
+    return iam.testPermissions(r, permissions);
+}
+
+fn iamResource(self: Bucket) Error!iam.Resource {
+    rpc.begin(self.client);
+    try rpc.checkBucketName(self.client, self.name);
+    return .{ .client = self.client, .bucket = self.name };
 }
 
 /// A handle for the object `name` in this bucket. Sends nothing. The handle

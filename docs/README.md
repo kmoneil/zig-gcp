@@ -32,7 +32,7 @@ Google, not only what Google documents, and where the emulators differ.
 | [Checksums and compression](storage/checksums-and-compression.md) | CRC-32C in both directions and at the CPU's speed, objects stored gzip-compressed, and compressing on upload |
 | [Writing objects](storage/writing-objects.md) | Preconditions, retries and idempotency tokens, metadata after the upload, compose, and copies that change what they carry |
 | [Signed URLs and POST policies](storage/signed-urls.md) | Requests and browser uploads without credentials, and who can sign them |
-| [Buckets](storage/buckets.md) | Settings and lifecycle rules, versions and soft delete, retention and holds, requester pays |
+| [Buckets](storage/buckets.md) | Settings and lifecycle rules, versions and soft delete, retention and holds, requester pays, IAM |
 | [Encryption keys](storage/encryption.md) | Customer-supplied keys and Cloud KMS keys |
 | [Notifications](storage/notifications.md) | A Pub/Sub message for every change to a bucket's objects, and what each change publishes |
 | [The emulator](storage/emulator.md) | What fake-gcs-server does differently, and how the tests make up for it |

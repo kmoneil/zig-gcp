@@ -2256,6 +2256,13 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
     if (std.mem.eql(u8, path, "/storage/v1/b")) return .{ .bucket = try bucketTarget(arena, null, query) };
     if (std.mem.startsWith(u8, path, "/storage/v1/b/")) {
         const after = path["/storage/v1/b/".len..];
+        if (std.mem.indexOfScalar(u8, after, '/')) |slash| {
+            const tail = after[slash..];
+            const policy = std.mem.eql(u8, tail, "/iam");
+            if (policy or std.mem.eql(u8, tail, "/iam/testPermissions")) {
+                return .{ .bucket = try iamTarget(arena, try decode(arena, after[0..slash]), query, policy) };
+            }
+        }
         if (std.mem.indexOfScalar(u8, after, '/')) |slash| if (std.mem.startsWith(u8, after[slash..], "/notificationConfigs")) {
             var target = try bucketTarget(arena, try decode(arena, after[0..slash]), query);
             const tail = after[slash + "/notificationConfigs".len ..];
@@ -2381,6 +2388,26 @@ fn bucketTarget(arena: Allocator, name: ?[]const u8, query: []const u8) core.tra
             target.object_retention = true;
         } else return error.HttpProtocolError;
     }
+    return target;
+}
+
+/// A bucket's `.../iam` or `.../iam/testPermissions`: the version a read
+/// asks for, or the permissions asked, beside `userProject`.
+fn iamTarget(arena: Allocator, name: []const u8, query: []const u8, policy: bool) core.transport.Error!FakeBuckets.Target {
+    var target: FakeBuckets.Target = .{ .name = name };
+    var version: ?u32 = null;
+    var permissions: std.ArrayList([]const u8) = .empty;
+    if (query.len > 0) {
+        var params = std.mem.splitScalar(u8, query, '&');
+        while (params.next()) |param| {
+            if (policy and std.mem.startsWith(u8, param, "optionsRequestedPolicyVersion=")) {
+                version = std.fmt.parseInt(u32, param["optionsRequestedPolicyVersion=".len..], 10) catch return error.HttpProtocolError;
+            } else if (!policy and std.mem.startsWith(u8, param, "permissions=")) {
+                try permissions.append(arena, try decode(arena, param["permissions=".len..]));
+            } else if (!std.mem.startsWith(u8, param, "userProject=")) return error.HttpProtocolError;
+        }
+    }
+    target.iam = if (policy) .{ .policy = version } else .{ .test_permissions = permissions.items };
     return target;
 }
 

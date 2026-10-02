@@ -5,7 +5,7 @@
 **On this page:** [Bucket settings](#bucket-settings) ·
 [Versions and soft delete](#versions-and-soft-delete) ·
 [Retention and holds](#retention-and-holds) ·
-[Requester pays](#requester-pays)
+[Requester pays](#requester-pays) · [IAM](#iam)
 
 ## Bucket settings
 
@@ -296,3 +296,93 @@ is no bucket yet. A POST policy on a billed handle is refused with
   bucket create, which is refused too.
 
 </details>
+
+## IAM
+
+A bucket's IAM policy says who may do what with it and its objects.
+Five calls read and change it:
+
+| Call | What it does |
+| --- | --- |
+| `iamPolicy()` | The policy, asked for as version 3 |
+| `setIamPolicy(policy)` | Writes the whole policy, and answers it as stored |
+| `addIamBinding(role, member)` | Grants one member one role, unless the member already holds it |
+| `removeIamBinding(role, member)` | Takes the member out of the role, unless it is not there |
+| `testIamPermissions(permissions)` | The permissions the caller holds, of those asked |
+
+```zig
+var service_agent = try gcs.serviceAgent();
+defer service_agent.deinit();
+const member = try std.fmt.allocPrint(arena, "serviceAccount:{s}", .{service_agent.value});
+var policy = try gcs.bucket("my-bucket").addIamBinding("roles/storage.objectViewer", member);
+defer policy.deinit();
+```
+
+`addIamBinding` and `removeIamBinding` read the policy, change the
+role's binding that has no condition, and write the policy back under
+the read's etag, starting over after a jittered wait when another
+change came in between, up to the retry policy's attempts; when the
+policy already says what they would make it say, nothing is written.
+Members compare as Cloud Storage stores them, the address of a `user:`,
+`serviceAccount:`, `group:` or `domain:` member in any case. A billed
+handle names its project on every IAM call, as on every other.
+
+> [!IMPORTANT]
+> **The etag is the bucket's metageneration.** Any update of the bucket,
+> a label included, makes a policy read before it stale, and a write
+> under a stale etag is `error.Aborted`, as on every other resource:
+> read the policy again. A grant or revoke does so by itself.
+
+- **Scopes.** Reading and writing a bucket's policy need
+  `Scope.full_control` or `.cloud_platform`, the only scopes the API
+  names for them; testing permissions takes any.
+- **Conditions** need uniform bucket-level access. Without it, a
+  conditional binding is `error.FailedPrecondition`, with Cloud
+  Storage's words in `Diagnostics`; so is `allUsers` or
+  `allAuthenticatedUsers` under public access prevention. A policy with
+  a condition is written as version 3 by itself.
+- **The legacy bindings.** A new bucket's policy grants
+  `roles/storage.legacyBucketOwner` and its siblings to
+  `projectOwner:`, `projectEditor:` and `projectViewer:` the project's
+  ID. A policy written without them can leave project owners who hold no
+  storage role of their own unable to read it back.
+- **Refused before sending**, with `error.InvalidArgument`: a role or
+  member of no known form, a `projectViewer:` (or sibling) member named
+  by the project's number, a `deleted:` member granted, and permissions
+  to test that are none, twice, a wildcard, or
+  `storage.buckets.list` and `storage.buckets.create`, which belong to
+  projects.
+
+<details>
+<summary><b>📏 Measured against Cloud Storage on 2026-10-01</b></summary>
+
+- A new bucket's policy is version 1 at etag `CAE=`, the protocol
+  buffer encoding of metageneration 1, with four legacy bindings under
+  uniform access and two without. Every write moves the etag, one that
+  changes nothing included, and moves the metageneration.
+- A write under a stale etag is 412 `conditionNotMet`, "At least one of
+  the pre-conditions you specified did not hold.", the same status and
+  reason as a condition without uniform access and a public member
+  under public access prevention, each in its own words. `If-Match` is
+  ignored, stale or not. An etag that is no etag is 400 "Invalid etag -
+  must use etag from GetPolicy response."
+- A write without `bindings`, or with none, removes every binding, the
+  legacy ones too. A binding with no members is dropped, a member named
+  twice is stored once, two bindings of one role without a condition
+  are merged, and addresses are stored lowercased.
+- A bucket takes only Cloud Storage's roles: a basic role or another
+  service's is 400 "Role X is not supported for this resource.". A
+  principal that does not exist is refused ("User X does not exist.").
+  `projectViewer:` takes a project's ID, not its number.
+- `testIamPermissions` takes at most 84 permissions, refuses one named
+  twice, and takes only Cloud Storage's own. On a bucket that does not
+  exist it is 404.
+- A bucket took 8 IAM writes back to back and refused the ninth with 429
+  `rateLimitExceeded`, which the client retries.
+- Read with no version, a policy with a condition answers version 1,
+  the conditional role renamed `ROLE_withcond_HASH`.
+
+</details>
+
+fake-gcs-server has no IAM: every call there is `error.NotFound`.
+

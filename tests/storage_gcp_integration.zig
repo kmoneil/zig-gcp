@@ -4407,3 +4407,114 @@ test "59. retention: a policy and holds keep objects as measured, refused as Obj
     let_go.deinit();
     b.object("event").delete(.{}) catch |err| return f.report(err);
 }
+
+test "60. IAM: a bucket's policy read, granted once in any case, tested, revoked, conditional, refused publicly, and stale after an update" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = f.bucket().create(.{
+        .location = "us-central1",
+        .soft_delete_retention_s = 0,
+        .uniform_bucket_level_access = true,
+        .public_access_prevention = .enforced,
+    }) catch |err| return f.report(err);
+    created.deinit();
+    const b = f.bucket();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var service_agent = f.client.serviceAgent() catch |err| return f.report(err);
+    defer service_agent.deinit();
+    const member = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{service_agent.value});
+    const shouting = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{try std.ascii.allocUpperString(a, service_agent.value)});
+    const role = "roles/storage.objectViewer";
+
+    // A new bucket's legacy bindings, at its first metageneration.
+    var fresh = b.iamPolicy() catch |err| return f.report(err);
+    defer fresh.deinit();
+    try testing.expectEqualStrings("CAE=", fresh.value.etag.?);
+    try testing.expect(fresh.value.grants("roles/storage.legacyBucketOwner", try std.fmt.allocPrint(a, "projectOwner:{s}", .{f.project})));
+    try testing.expectEqual(4, fresh.value.bindings.len);
+
+    var granted = b.addIamBinding(role, member) catch |err| return f.report(err);
+    defer granted.deinit();
+    try testing.expect(granted.value.grants(role, member));
+    // Held already, asked in capitals: nothing written, so the etag stands.
+    var again = b.addIamBinding(role, shouting) catch |err| return f.report(err);
+    defer again.deinit();
+    try testing.expectEqualStrings(granted.value.etag.?, again.value.etag.?);
+
+    var held = b.testIamPermissions(&.{ "storage.buckets.get", "storage.buckets.getIamPolicy" }) catch |err| return f.report(err);
+    defer held.deinit();
+    try testing.expectEqual(2, held.value.len);
+
+    var revoked = b.removeIamBinding(role, shouting) catch |err| return f.report(err);
+    defer revoked.deinit();
+    try testing.expect(!revoked.value.grants(role, member));
+    var gone = b.removeIamBinding(role, member) catch |err| return f.report(err);
+    defer gone.deinit();
+    try testing.expectEqualStrings(revoked.value.etag.?, gone.value.etag.?);
+
+    // A condition, written as version 3 by itself.
+    var current = b.iamPolicy() catch |err| return f.report(err);
+    defer current.deinit();
+    var conditional = current.value;
+    conditional.bindings = try std.mem.concat(a, storage.iam.Binding, &.{ current.value.bindings, &.{.{
+        .role = role,
+        .members = &.{member},
+        .condition = "{\"title\":\"until 2030\",\"expression\":\"request.time < timestamp(\\\"2030-01-01T00:00:00Z\\\")\"}",
+    }} });
+    var conditioned = b.setIamPolicy(conditional) catch |err| return f.report(err);
+    defer conditioned.deinit();
+    try testing.expectEqual(3, conditioned.value.version);
+    try testing.expect(conditioned.value.hasConditions());
+
+    // A policy read before any bucket update is stale after it.
+    var before = b.iamPolicy() catch |err| return f.report(err);
+    defer before.deinit();
+    var labelled = try f.update(.{ .labels = .{ .change = &.{.{ .key = "zigps", .value = "iam" }} } });
+    labelled.deinit();
+    try testing.expectError(error.Aborted, b.setIamPolicy(before.value));
+    try testing.expectEqualStrings("conditionNotMet", f.diag.status());
+
+    // Refused by Cloud Storage, in its own words.
+    try testing.expectError(error.FailedPrecondition, b.addIamBinding(role, "allUsers"));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "public access prevention") != null);
+    try testing.expectError(error.InvalidArgument, b.addIamBinding("roles/pubsub.publisher", member));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "is not supported for this resource") != null);
+    try testing.expectError(error.InvalidArgument, b.addIamBinding(role, "user:zigps-iam-nobody@example.com"));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "does not exist") != null);
+}
+
+test "61. IAM: without uniform access, two legacy bindings and a condition refused; a requester pays bucket through its billing project" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = f.bucket().create(.{
+        .location = "us-central1",
+        .soft_delete_retention_s = 0,
+        .uniform_bucket_level_access = false,
+        .requester_pays = true,
+    }) catch |err| return f.report(err);
+    created.deinit();
+    const b = f.bucket().withBillingProject(f.project);
+
+    var fresh = b.iamPolicy() catch |err| return f.report(err);
+    defer fresh.deinit();
+    try testing.expectEqual(2, fresh.value.bindings.len);
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var conditional = fresh.value;
+    conditional.bindings = try std.mem.concat(arena_state.allocator(), storage.iam.Binding, &.{ fresh.value.bindings, &.{.{
+        .role = "roles/storage.objectViewer",
+        .members = &.{try std.fmt.allocPrint(arena_state.allocator(), "projectViewer:{s}", .{f.project})},
+        .condition = "{\"title\":\"t\",\"expression\":\"true\"}",
+    }} });
+    try testing.expectError(error.FailedPrecondition, b.setIamPolicy(conditional));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "uniform bucket-level access") != null);
+
+    var held = b.testIamPermissions(&.{"storage.buckets.get"}) catch |err| return f.report(err);
+    defer held.deinit();
+    try testing.expectEqual(1, held.value.len);
+}
