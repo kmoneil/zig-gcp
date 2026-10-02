@@ -60,6 +60,45 @@ pub fn create(self: Secret, config: types.SecretConfig) Error!types.Owned(types.
     return result;
 }
 
+/// Changes this secret's settings and returns it as it then is.
+///
+/// Every field of `changes` left at `.keep` stays as it is, and at least
+/// one must change. A list is replaced whole, since the server keeps
+/// nothing of the old one: to change one label, read the secret, change
+/// the list, and set it, with the etag the read returned so that a change
+/// made in between is `error.Aborted` rather than lost. With no etag the
+/// update is plain, and safe to retry. With one, a retry whose first
+/// attempt landed reports `error.Aborted` too: read the secret again.
+///
+/// Refused before sending, as `error.InvalidArgument`: an update that
+/// changes nothing (the server would move the etag and publish an event
+/// for it), and labels, annotations, aliases, an expiry or a delay outside
+/// the rules on their types. An alias naming a version the secret does
+/// not have is the server's `error.InvalidArgument`.
+pub fn update(self: Secret, changes: types.SecretUpdate) Error!types.Owned(types.SecretInfo) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkSecretId(c, self.id);
+    try rpc.checkUpdate(c, changes);
+
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const mask = try codec.updateMask(scratch.allocator(), changes);
+    const path = try names.updatePath(scratch.allocator(), c.parent(), self.id, mask);
+    const body = try codec.encodeUpdate(scratch.allocator(), changes);
+
+    var result: types.Owned(types.SecretInfo) = try .init(c.gpa);
+    errdefer result.deinit();
+    const call: rpc.Call = .{ .method = .PATCH, .path = path, .body = body };
+    const response = if (changes.etag != null)
+        try rpc.executeConditional(c, result.arena, call)
+    else
+        try rpc.execute(c, result.arena, call);
+    result.value = codec.decodeSecret(result.arena.allocator(), response) catch |err|
+        return rpc.decodeFailed(c, err, "secret");
+    return result;
+}
+
 /// This secret's metadata: when it was created, its labels and its etag.
 /// Nothing about its versions, and none of its bytes.
 pub fn get(self: Secret) Error!types.Owned(types.SecretInfo) {
@@ -92,6 +131,22 @@ pub fn delete(self: Secret) Error!void {
     defer scratch.deinit();
     const path = try names.secretPath(scratch.allocator(), c.parent(), self.id, "");
     return rpc.executeDiscard(c, .{ .method = .DELETE, .path = path });
+}
+
+/// Deletes this secret and every version of it, only if its etag is still
+/// `etag`, as a read returned it: a secret changed since is
+/// `error.Aborted`, and stays. A retry whose first attempt landed reports
+/// `error.NotFound`.
+pub fn deleteIf(self: Secret, etag: []const u8) Error!void {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkSecretId(c, self.id);
+    try rpc.checkEtag(c, etag);
+
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try names.deletePath(scratch.allocator(), c.parent(), self.id, etag);
+    return rpc.executeDiscardConditional(c, .{ .method = .DELETE, .path = path });
 }
 
 /// The secret's IAM policy, asked for as version 3, conditional bindings
@@ -560,6 +615,241 @@ test "secret administration: every allocation failure is OutOfMemory without lea
             var versions = try secret.listVersions(.{});
             versions.deinit();
             try secret.delete();
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+}
+
+/// Production's refusal of a write under a stale etag, word for word.
+const stale_etag_reply: Reply = .{ .respond = .{ .status = 400, .body =
+    \\{"error":{"code":400,"message":"The etag provided in the request does not match the resource's current etag. Please retry the whole read-modify-write with exponential backoff.","status":"FAILED_PRECONDITION"}}
+} };
+
+const updated_secret: Reply = .{ .respond = .{ .body =
+    \\{"annotations":{"fk":"v"},"createTime":"2026-10-02T13:04:09.628841Z","etag":"\"165cdb2b1551bc\"",
+    \\ "expireTime":"2026-10-04T13:04:09.503134Z","labels":{"team":"payments"},
+    \\ "name":"projects/82150720798/secrets/db-password","replication":{"automatic":{}},
+    \\ "versionAliases":{"prod":"1"},"versionDestroyTtl":"86400s"}
+} };
+
+test "golden: update, global and regional, with and without an etag" {
+    var h: Harness = undefined;
+    try h.init(&.{ updated_secret, updated_secret }, .{});
+    defer h.deinit();
+
+    var got = try h.client.secret("db-password").update(.{
+        .labels = .{ .set = &.{.{ .key = "team", .value = "payments" }} },
+        .aliases = .{ .set = &.{.{ .name = "prod", .version = 1 }} },
+        .expiry = .clear,
+    });
+    defer got.deinit();
+    try h.expectRequest(
+        0,
+        .PATCH,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets/db-password?updateMask=labels%2Cversion_aliases%2Cexpire_time",
+        "{\"labels\":{\"team\":\"payments\"},\"versionAliases\":{\"prod\":\"1\"}}",
+    );
+    try testing.expectEqual(1, got.value.alias("prod").?);
+    try testing.expectEqualStrings("v", got.value.annotation("fk").?);
+    try testing.expectEqual(86_400, got.value.version_destroy_delay_s.?);
+
+    var conditional = try h.client.secret("db-password").update(.{
+        .annotations = .clear,
+        .etag = "\"165cdb26afa951\"",
+    });
+    defer conditional.deinit();
+    try h.expectRequest(
+        1,
+        .PATCH,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets/db-password?updateMask=annotations",
+        "{\"etag\":\"\\\"165cdb26afa951\\\"\"}",
+    );
+
+    var regional: Harness = undefined;
+    try regional.init(&.{updated_secret}, .{ .location = "europe-west3" });
+    defer regional.deinit();
+    var there = try regional.client.secret("db-password").update(.{ .version_destroy_delay_s = .{ .set = 86_400 } });
+    defer there.deinit();
+    try regional.expectRequest(
+        0,
+        .PATCH,
+        "https://secretmanager.europe-west3.rep.googleapis.com/v1/projects/extractctl/locations/europe-west3/secrets/db-password?updateMask=version_destroy_ttl",
+        "{\"versionDestroyTtl\":\"86400s\"}",
+    );
+}
+
+test "a stale etag is Aborted; every other failed precondition stays one" {
+    const disabled: Reply = .{ .respond = .{ .status = 400, .body =
+        \\{"error":{"code":400,"message":"Secret Version [projects/1/secrets/db-password/versions/2] is in DISABLED state.","status":"FAILED_PRECONDITION"}}
+    } };
+    var h: Harness = undefined;
+    try h.init(&.{ stale_etag_reply, stale_etag_reply, disabled }, .{});
+    defer h.deinit();
+
+    try testing.expectError(error.Aborted, h.client.secret("db-password").update(.{ .labels = .clear, .etag = "\"old\"" }));
+    // The caller still sees production's words.
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "The etag provided"));
+    try testing.expectError(error.Aborted, h.client.secret("db-password").deleteIf("\"old\""));
+    // Without an etag the same status is what it says.
+    try testing.expectError(error.FailedPrecondition, h.client.secret("db-password").update(.{ .labels = .clear }));
+    // A stale etag is never retried: retrying cannot make it current.
+    try h.expectRequestCount(3);
+}
+
+test "a stale etag is Aborted even for a client with no diagnostics" {
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{ stale_etag_reply, stale_etag_reply });
+    defer fake.deinit();
+    var clock: test_util.FakeClock = .{};
+    var token: test_util.FakeTokenProvider = .{};
+    var client = try Client.init(testing.allocator, clock.io(), .{
+        .project_id = "extractctl",
+        .token_provider = token.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    try testing.expectError(error.Aborted, client.secret("db-password").update(.{ .labels = .clear, .etag = "\"old\"" }));
+    try testing.expectError(error.Aborted, client.secret("db-password").version(.{ .number = 1 }).destroyIf("\"old\""));
+}
+
+test "golden: deleteIf sends the etag as read, and what comes back" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"status\":\"NOT_FOUND\",\"message\":\"Secret [projects/1/secrets/gone] not found.\"}}" } },
+    }, .{ .location = "europe-west3" });
+    defer h.deinit();
+    try h.client.secret("db-password").deleteIf("\"165cdb26afa951\"");
+    try h.expectRequest(
+        0,
+        .DELETE,
+        "https://secretmanager.europe-west3.rep.googleapis.com/v1/projects/extractctl/locations/europe-west3/secrets/db-password?etag=%22165cdb26afa951%22",
+        null,
+    );
+    // A missing secret is NotFound before any etag is compared.
+    try testing.expectError(error.NotFound, h.client.secret("gone").deleteIf("\"165cdb26afa951\""));
+    try testing.expectError(error.InvalidArgument, h.client.secret("db-password").deleteIf(""));
+    try testing.expectError(error.InvalidResourceId, h.client.secret("a/b").deleteIf("\"e\""));
+    try h.expectRequestCount(2);
+}
+
+test "update: what never reaches the server" {
+    var h: Harness = undefined;
+    try h.init(&.{updated_secret}, .{});
+    defer h.deinit();
+    const secret = h.client.secret("db-password");
+
+    const Case = struct { types.SecretUpdate, []const u8 };
+    const many_labels = comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var labels: [65]types.Label = undefined;
+        for (&labels, 0..) |*l, i| l.* = .{ .key = std.fmt.comptimePrint("k{d}", .{i}), .value = "v" };
+        break :blk labels;
+    };
+    const many_aliases = comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var aliases: [51]types.Alias = undefined;
+        for (&aliases, 0..) |*a, i| a.* = .{ .name = std.fmt.comptimePrint("a{d}", .{i}), .version = 1 };
+        break :blk aliases;
+    };
+    const big = "x" ** (validate.max_annotation_bytes);
+    const cases = [_]Case{
+        .{ .{}, "at least one change" },
+        .{ .{ .etag = "\"e\"" }, "at least one change" },
+        .{ .{ .labels = .{ .set = &.{.{ .key = "Team", .value = "v" }} } }, "lowercase letter" },
+        .{ .{ .labels = .{ .set = &.{.{ .key = "team", .value = "A" }} } }, "lowercase letters" },
+        .{ .{ .labels = .{ .set = &.{.{ .key = "a" ** 64, .value = "v" }} } }, "63 characters" },
+        .{ .{ .labels = .{ .set = &.{ .{ .key = "a", .value = "1" }, .{ .key = "a", .value = "2" } } } }, "same key" },
+        .{ .{ .labels = .{ .set = &many_labels } }, "at most 64 labels" },
+        .{ .{ .annotations = .{ .set = &.{.{ .key = "example.com/owner", .value = "v" }} } }, "annotation 1" },
+        .{ .{ .annotations = .{ .set = &.{.{ .key = "k", .value = big }} } }, "16384 bytes" },
+        .{ .{ .annotations = .{ .set = &.{ .{ .key = "k", .value = "1" }, .{ .key = "k", .value = "2" } } } }, "same key" },
+        .{ .{ .annotations = .{ .set = &.{.{ .key = "k", .value = "\xff" }} } }, "valid UTF-8" },
+        .{ .{ .aliases = .{ .set = &.{.{ .name = "latest", .version = 1 }} } }, "neither" },
+        .{ .{ .aliases = .{ .set = &.{.{ .name = "NEW", .version = 1 }} } }, "neither" },
+        .{ .{ .aliases = .{ .set = &.{.{ .name = "1a", .version = 1 }} } }, "a letter" },
+        .{ .{ .aliases = .{ .set = &.{.{ .name = "prod", .version = 0 }} } }, "count from 1" },
+        .{ .{ .aliases = .{ .set = &.{ .{ .name = "prod", .version = 1 }, .{ .name = "prod", .version = 2 } } } }, "same name" },
+        .{ .{ .aliases = .{ .set = &many_aliases } }, "at most 50 aliases" },
+        .{ .{ .expiry = .{ .set = .{ .after_s = 59 } } }, "seconds from now" },
+        .{ .{ .expiry = .{ .set = .{ .after_s = validate.max_expiry_s + 1 } } }, "seconds from now" },
+        .{ .{ .expiry = .{ .set = .{ .at = "tomorrow" } } }, "RFC 3339" },
+        .{ .{ .version_destroy_delay_s = .{ .set = 86_399 } }, "1,000 days" },
+        .{ .{ .version_destroy_delay_s = .{ .set = 86_400_001 } }, "1,000 days" },
+        .{ .{ .labels = .clear, .etag = "" }, "never empty" },
+    };
+    for (cases) |case| {
+        try testing.expectError(error.InvalidArgument, secret.update(case[0]));
+        if (std.mem.indexOf(u8, h.diag.message(), case[1]) == null) {
+            std.debug.print("diagnostics \"{s}\" lack \"{s}\"\n", .{ h.diag.message(), case[1] });
+            return error.TestUnexpectedDiagnostics;
+        }
+    }
+    try h.expectRequestCount(0);
+
+    // The edges themselves go out: Latest and new are names production takes.
+    var edges = try secret.update(.{
+        .aliases = .{ .set = &.{ .{ .name = "Latest", .version = 1 }, .{ .name = "new", .version = 1 }, .{ .name = "a" ** 63, .version = 1 } } },
+        .annotations = .{ .set = &.{.{ .key = "a" ** 64, .value = "x" ** (validate.max_annotation_bytes - 64) }} },
+        .expiry = .{ .set = .{ .after_s = 60 } },
+    });
+    edges.deinit();
+    try h.expectRequestCount(1);
+}
+
+test "golden: create with annotations, expiry and a destruction delay" {
+    var h: Harness = undefined;
+    try h.init(&.{created_secret}, .{});
+    defer h.deinit();
+    var created = try h.client.secret("db-password").create(.{
+        .annotations = &.{.{ .key = "owner", .value = "payments" }},
+        .expiry = .{ .at = "2027-01-01T00:00:00Z" },
+        .version_destroy_delay_s = 86_400,
+    });
+    defer created.deinit();
+    try h.expectRequest(
+        0,
+        .POST,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets?secretId=db-password",
+        "{\"replication\":{\"automatic\":{}},\"annotations\":{\"owner\":\"payments\"},\"expireTime\":\"2027-01-01T00:00:00Z\",\"versionDestroyTtl\":\"86400s\"}",
+    );
+    try testing.expectError(error.InvalidArgument, h.client.secret("db-password").create(.{ .expiry = .{ .after_s = 1 } }));
+    try testing.expectError(error.InvalidArgument, h.client.secret("db-password").create(.{ .version_destroy_delay_s = 0 }));
+    try testing.expectError(error.InvalidArgument, h.client.secret("db-password").create(.{ .annotations = &.{.{ .key = "", .value = "v" }} }));
+    try h.expectRequestCount(1);
+}
+
+test "update and deleteIf: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{ updated_secret, stale_etag_reply, .{ .respond = .{ .body = "{}" } } });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var token: test_util.FakeTokenProvider = .{ .quota_project = "billing-project" };
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "extractctl",
+                .token_provider = token.provider(),
+                .transport = fake.transport(),
+            });
+            defer client.deinit();
+            const secret = client.secret("db-password");
+            var got = try secret.update(.{
+                .labels = .{ .set = &.{.{ .key = "team", .value = "payments" }} },
+                .annotations = .{ .set = &.{.{ .key = "k", .value = "v" }} },
+                .aliases = .{ .set = &.{.{ .name = "prod", .version = 1 }} },
+                .expiry = .{ .set = .{ .after_s = 3600 } },
+                .version_destroy_delay_s = .clear,
+                .etag = "\"e\"",
+            });
+            got.deinit();
+            if (secret.update(.{ .labels = .clear, .etag = "\"old\"" })) |unexpected| {
+                var u = unexpected;
+                u.deinit();
+                return error.TestExpectedAborted;
+            } else |err| switch (err) {
+                error.Aborted => {},
+                else => return err,
+            }
+            try secret.deleteIf("\"e\"");
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});

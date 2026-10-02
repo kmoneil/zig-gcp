@@ -456,6 +456,184 @@ test "regional: IAM on a regional secret, as on a global one" {
     try iamCycle(&f, secret);
 }
 
+/// Update, read back and clear every setting milestone 1 adds, and the
+/// refusal production makes that the library cannot: an alias to a
+/// version the secret does not have.
+fn updateCycle(f: *Fixture) !void {
+    const secret = try f.create("update", .{});
+    for ([_][]const u8{ "v1", "v2" }) |data| {
+        var added = secret.addVersion(data) catch |err| return f.report(err);
+        added.deinit();
+    }
+    var set = secret.update(.{
+        .labels = .{ .set = &.{ test_label, .{ .key = "team", .value = "payments" } } },
+        .annotations = .{ .set = &.{ .{ .key = "Owner", .value = "Ann <ann@example.com>" }, .{ .key = "a" ** 64, .value = "line\nbreak" } } },
+        .aliases = .{ .set = &.{ .{ .name = "prod", .version = 2 }, .{ .name = "Prod", .version = 1 }, .{ .name = "Latest", .version = 1 } } },
+        .expiry = .{ .set = .{ .after_s = 86_400 } },
+        .version_destroy_delay_s = .{ .set = 86_400 },
+    }) catch |err| return f.report(err);
+    defer set.deinit();
+    try testing.expectEqualStrings("payments", set.value.label("team").?);
+    try testing.expectEqualStrings("Ann <ann@example.com>", set.value.annotation("Owner").?);
+    try testing.expectEqualStrings("line\nbreak", set.value.annotation("a" ** 64).?);
+    try testing.expectEqual(2, set.value.alias("prod").?);
+    try testing.expectEqual(1, set.value.alias("Prod").?);
+    try testing.expect(set.value.expire_time.len > 0);
+    try testing.expectEqual(86_400, set.value.version_destroy_delay_s.?);
+
+    var read = secret.get() catch |err| return f.report(err);
+    defer read.deinit();
+    try testing.expectEqualStrings(set.value.etag, read.value.etag);
+    try testing.expectEqualStrings(set.value.expire_time, read.value.expire_time);
+
+    try testing.expectError(error.InvalidArgument, secret.update(.{ .aliases = .{ .set = &.{.{ .name = "next", .version = 3 }} } }));
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "don't exist") != null);
+
+    var cleared = secret.update(.{
+        .annotations = .clear,
+        .aliases = .clear,
+        .expiry = .clear,
+        .version_destroy_delay_s = .clear,
+    }) catch |err| return f.report(err);
+    defer cleared.deinit();
+    try testing.expectEqual(0, cleared.value.annotations.len);
+    try testing.expectEqual(0, cleared.value.aliases.len);
+    try testing.expectEqualStrings("", cleared.value.expire_time);
+    try testing.expectEqual(null, cleared.value.version_destroy_delay_s);
+    // What the update left alone stays.
+    try testing.expectEqualStrings("payments", cleared.value.label("team").?);
+
+    // An expiry given as a time is read back as that time.
+    var timed = secret.update(.{ .expiry = .{ .set = .{ .at = "2100-01-01T09:00:00-05:00" } } }) catch |err| return f.report(err);
+    defer timed.deinit();
+    try testing.expectEqualStrings("2100-01-01T14:00:00Z", timed.value.expire_time);
+}
+
+test "update: every setting set, read back and cleared" {
+    var f: Fixture = undefined;
+    if (!try f.init(false)) return error.SkipZigTest;
+    defer f.deinit();
+    try updateCycle(&f);
+}
+
+test "regional: update, as on a global secret" {
+    var f: Fixture = undefined;
+    if (!try f.init(true)) return error.SkipZigTest;
+    defer f.deinit();
+    try updateCycle(&f);
+}
+
+/// A write under an etag read before another change is `error.Aborted`,
+/// and changes nothing; under the current etag it goes through.
+fn preconditionCycle(f: *Fixture) !void {
+    const secret = try f.create("precondition", .{});
+    var added = secret.addVersion("v1") catch |err| return f.report(err);
+    defer added.deinit();
+    var first = secret.get() catch |err| return f.report(err);
+    defer first.deinit();
+    var moved = secret.update(.{ .labels = .{ .set = &.{ test_label, .{ .key = "step", .value = "1" } } }, .etag = first.value.etag }) catch |err| return f.report(err);
+    defer moved.deinit();
+    try testing.expect(!std.mem.eql(u8, first.value.etag, moved.value.etag));
+
+    try testing.expectError(error.Aborted, secret.update(.{ .labels = .{ .set = &.{test_label} }, .etag = first.value.etag }));
+    try testing.expect(std.mem.startsWith(u8, f.diag.message(), "The etag provided"));
+    try testing.expectError(error.Aborted, secret.deleteIf(first.value.etag));
+    var still = secret.get() catch |err| return f.report(err);
+    defer still.deinit();
+    try testing.expectEqualStrings("1", still.value.label("step").?);
+
+    const v = secret.version(.{ .number = 1 });
+    var disabled = v.disableIf(added.value.etag) catch |err| return f.report(err);
+    defer disabled.deinit();
+    try testing.expectEqual(.disabled, disabled.value.state);
+    try testing.expectError(error.Aborted, v.enableIf(added.value.etag));
+    try testing.expectError(error.Aborted, v.destroyIf(added.value.etag));
+    var enabled = v.enableIf(disabled.value.etag) catch |err| return f.report(err);
+    defer enabled.deinit();
+    try testing.expectEqual(.enabled, enabled.value.state);
+    // A version's changes leave the secret's etag where it was.
+    var after = secret.get() catch |err| return f.report(err);
+    defer after.deinit();
+    try testing.expectEqualStrings(moved.value.etag, after.value.etag);
+
+    secret.deleteIf(after.value.etag) catch |err| return f.report(err);
+    try testing.expectError(error.NotFound, secret.get());
+}
+
+test "preconditions: a stale etag is Aborted on update, deleteIf, enableIf, disableIf and destroyIf" {
+    var f: Fixture = undefined;
+    if (!try f.init(false)) return error.SkipZigTest;
+    defer f.deinit();
+    try preconditionCycle(&f);
+}
+
+test "regional: preconditions, as on a global secret" {
+    var f: Fixture = undefined;
+    if (!try f.init(true)) return error.SkipZigTest;
+    defer f.deinit();
+    try preconditionCycle(&f);
+}
+
+test "aliases: access through them, case and all, and a move seen" {
+    var f: Fixture = undefined;
+    if (!try f.init(false)) return error.SkipZigTest;
+    defer f.deinit();
+    const secret = try f.create("alias", .{});
+    for ([_][]const u8{ "one", "two" }) |data| {
+        var added = secret.addVersion(data) catch |err| return f.report(err);
+        added.deinit();
+    }
+    var set = secret.update(.{ .aliases = .{ .set = &.{ .{ .name = "prod", .version = 1 }, .{ .name = "Prod", .version = 2 } } } }) catch |err| return f.report(err);
+    set.deinit();
+    {
+        var lower = secret.access(.{ .alias = "prod" }) catch |err| return f.report(err);
+        defer lower.deinit();
+        try testing.expectEqualStrings("one", lower.bytes());
+        var upper = secret.access(.{ .alias = "Prod" }) catch |err| return f.report(err);
+        defer upper.deinit();
+        try testing.expectEqualStrings("two", upper.bytes());
+    }
+    try testing.expectError(error.NotFound, secret.access(.{ .alias = "stable" }));
+
+    var moved = secret.update(.{ .aliases = .{ .set = &.{.{ .name = "prod", .version = 2 }} } }) catch |err| return f.report(err);
+    moved.deinit();
+    // Production served the new version on the first try when measured;
+    // the docs call aliases eventually consistent, so allow a minute.
+    var tries: usize = 0;
+    while (true) : (tries += 1) {
+        var value = secret.access(.{ .alias = "prod" }) catch |err| return f.report(err);
+        defer value.deinit();
+        if (std.mem.eql(u8, value.bytes(), "two")) break;
+        if (tries == 60) return error.TestAliasNeverMoved;
+        try testing.io.sleep(.fromSeconds(1), .awake);
+    }
+}
+
+test "delayed destruction: scheduled, refused a second time, cancelled" {
+    var f: Fixture = undefined;
+    if (!try f.init(false)) return error.SkipZigTest;
+    defer f.deinit();
+    const secret = try f.create("delay", .{ .version_destroy_delay_s = 86_400 });
+    var added = secret.addVersion("v1") catch |err| return f.report(err);
+    added.deinit();
+    const v = secret.version(.{ .number = 1 });
+    var scheduled = v.destroy() catch |err| return f.report(err);
+    defer scheduled.deinit();
+    try testing.expectEqual(.disabled, scheduled.value.state);
+    try testing.expect(scheduled.value.scheduled_destroy_time.len > 0);
+    try testing.expectEqualStrings("", scheduled.value.destroy_time);
+    try testing.expectError(error.FailedPrecondition, v.destroy());
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "already scheduled") != null);
+    try testing.expectError(error.FailedPrecondition, secret.access(.{ .number = 1 }));
+    var back = v.enable() catch |err| return f.report(err);
+    defer back.deinit();
+    try testing.expectEqual(.enabled, back.value.state);
+    try testing.expectEqualStrings("", back.value.scheduled_destroy_time);
+    var value = secret.access(.{ .number = 1 }) catch |err| return f.report(err);
+    defer value.deinit();
+    try testing.expectEqualStrings("v1", value.bytes());
+}
+
 test "sweep: delete anything a crashed run left behind" {
     var f: Fixture = undefined;
     if (!try f.init(false)) return error.SkipZigTest;

@@ -80,16 +80,137 @@ fn writeSecret(jw: *Stringify, config: types.SecretConfig, regional: bool) Strin
         }
         try jw.endObject();
     }
-    if (config.labels.len > 0) {
-        try jw.objectField("labels");
-        try jw.beginObject();
-        for (config.labels) |label| {
-            try jw.objectField(label.key);
-            try jw.write(label.value);
-        }
-        try jw.endObject();
+    if (config.labels.len > 0) try writeLabels(jw, config.labels);
+    if (config.annotations.len > 0) try writeAnnotations(jw, config.annotations);
+    if (config.expiry) |expiry| try writeExpiry(jw, expiry);
+    if (config.version_destroy_delay_s) |s| try writeSeconds(jw, "versionDestroyTtl", s);
+    try jw.endObject();
+}
+
+fn writeLabels(jw: *Stringify, labels: []const types.Label) Stringify.Error!void {
+    try jw.objectField("labels");
+    try jw.beginObject();
+    for (labels) |label| {
+        try jw.objectField(label.key);
+        try jw.write(label.value);
     }
     try jw.endObject();
+}
+
+fn writeAnnotations(jw: *Stringify, annotations: []const types.Annotation) Stringify.Error!void {
+    try jw.objectField("annotations");
+    try jw.beginObject();
+    for (annotations) |a| {
+        try jw.objectField(a.key);
+        try jw.write(a.value);
+    }
+    try jw.endObject();
+}
+
+/// Aliases map to version numbers, which proto3 JSON writes as strings,
+/// as production answers them.
+fn writeAliases(jw: *Stringify, aliases: []const types.Alias) Stringify.Error!void {
+    try jw.objectField("versionAliases");
+    try jw.beginObject();
+    for (aliases) |a| {
+        try jw.objectField(a.name);
+        var buf: [20]u8 = undefined;
+        try jw.write(std.fmt.bufPrint(&buf, "{d}", .{a.version}) catch unreachable);
+    }
+    try jw.endObject();
+}
+
+fn writeExpiry(jw: *Stringify, expiry: types.Expiry) Stringify.Error!void {
+    switch (expiry) {
+        .at => |time| {
+            try jw.objectField("expireTime");
+            try jw.write(time);
+        },
+        .after_s => |s| try writeSeconds(jw, "ttl", s),
+    }
+}
+
+/// A duration of whole seconds, as proto3 JSON writes one: `86400s`.
+fn writeSeconds(jw: *Stringify, field: []const u8, seconds: u64) Stringify.Error!void {
+    try jw.objectField(field);
+    var buf: [24]u8 = undefined;
+    try jw.write(std.fmt.bufPrint(&buf, "{d}s", .{seconds}) catch unreachable);
+}
+
+/// The `secrets.patch` body: each field the update sets, and the etag. A
+/// field it clears is left out, which with its path in the mask is how
+/// production clears it.
+pub fn encodeUpdate(arena: Allocator, changes: types.SecretUpdate) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeUpdate(&jw, changes) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeUpdate(jw: *Stringify, changes: types.SecretUpdate) Stringify.Error!void {
+    try jw.beginObject();
+    switch (changes.labels) {
+        .set => |labels| try writeLabels(jw, labels),
+        .keep, .clear => {},
+    }
+    switch (changes.annotations) {
+        .set => |annotations| try writeAnnotations(jw, annotations),
+        .keep, .clear => {},
+    }
+    switch (changes.aliases) {
+        .set => |aliases| try writeAliases(jw, aliases),
+        .keep, .clear => {},
+    }
+    switch (changes.expiry) {
+        .set => |expiry| try writeExpiry(jw, expiry),
+        .keep, .clear => {},
+    }
+    switch (changes.version_destroy_delay_s) {
+        .set => |s| try writeSeconds(jw, "versionDestroyTtl", s),
+        .keep, .clear => {},
+    }
+    if (changes.etag) |etag| {
+        try jw.objectField("etag");
+        try jw.write(etag);
+    }
+    try jw.endObject();
+}
+
+/// The `updateMask` for `changes`: a path for every field it sets or
+/// clears, in snake_case as gcloud sends them. Production takes either
+/// case. An expiry set as a duration is `ttl`; one set as a time, or
+/// cleared, is `expire_time`, which clears it however it was set.
+pub fn updateMask(arena: Allocator, changes: types.SecretUpdate) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeMask(&out.writer, changes) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeMask(w: *Writer, changes: types.SecretUpdate) Writer.Error!void {
+    var first = true;
+    const paths = [_]struct { bool, []const u8 }{
+        .{ changes.labels != .keep, "labels" },
+        .{ changes.annotations != .keep, "annotations" },
+        .{ changes.aliases != .keep, "version_aliases" },
+        .{ changes.expiry != .keep, switch (changes.expiry) {
+            .set => |e| if (e == .after_s) "ttl" else "expire_time",
+            .keep, .clear => "expire_time",
+        } },
+        .{ changes.version_destroy_delay_s != .keep, "version_destroy_ttl" },
+    };
+    for (paths) |entry| {
+        if (!entry[0]) continue;
+        if (!first) try w.writeByte(',');
+        try w.writeAll(entry[1]);
+        first = false;
+    }
+}
+
+/// The body of a version's enable, disable or destroy: `{}`, or the etag
+/// the change is conditional on.
+pub fn encodeEtag(arena: Allocator, etag: ?[]const u8) Allocator.Error![]u8 {
+    const e = etag orelse return arena.dupe(u8, "{}");
+    return Stringify.valueAlloc(arena, .{ .etag = e }, .{});
 }
 
 /// How long `encodeAddVersion` will be, so its buffer is allocated once and
@@ -181,6 +302,10 @@ const WireSecret = struct {
     createTime: ?[]const u8 = null,
     etag: ?[]const u8 = null,
     labels: ?std.json.ArrayHashMap(?[]const u8) = null,
+    annotations: ?std.json.ArrayHashMap(?[]const u8) = null,
+    versionAliases: ?std.json.ArrayHashMap(std.json.Value) = null,
+    expireTime: ?[]const u8 = null,
+    versionDestroyTtl: ?[]const u8 = null,
 };
 
 const WireSecretPage = struct {
@@ -189,22 +314,58 @@ const WireSecretPage = struct {
     totalSize: ?i64 = null,
 };
 
-fn secretFromWire(arena: Allocator, wire: WireSecret) Allocator.Error!types.SecretInfo {
+fn secretFromWire(arena: Allocator, wire: WireSecret) DecodeError!types.SecretInfo {
     return .{
         .name = wire.name orelse "",
         .create_time = wire.createTime orelse "",
         .etag = wire.etag orelse "",
-        .labels = try labelsFromWire(arena, wire.labels),
+        .labels = try pairsFromWire(types.Label, arena, wire.labels),
+        .annotations = try pairsFromWire(types.Annotation, arena, wire.annotations),
+        .aliases = try aliasesFromWire(arena, wire.versionAliases),
+        .expire_time = wire.expireTime orelse "",
+        .version_destroy_delay_s = try wholeSeconds(wire.versionDestroyTtl),
     };
 }
 
-fn labelsFromWire(
+/// Version numbers arrive as strings, as proto3 JSON writes an int64, or
+/// as numbers, which the mapping also allows. One that is neither names
+/// no version, and a secret read wrong could send `access` astray, so it
+/// is a broken response.
+fn aliasesFromWire(
+    arena: Allocator,
+    wire: ?std.json.ArrayHashMap(std.json.Value),
+) DecodeError![]const types.Alias {
+    const map = (wire orelse return &.{}).map;
+    const out = try arena.alloc(types.Alias, map.count());
+    for (map.keys(), map.values(), out) |name, value, *alias| {
+        const version: u64 = switch (value) {
+            .integer => |n| std.math.cast(u64, n) orelse return error.InvalidResponse,
+            .string, .number_string => |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidResponse,
+            else => return error.InvalidResponse,
+        };
+        alias.* = .{ .name = name, .version = version };
+    }
+    return out;
+}
+
+/// A duration such as `86400s` or `86400.500s`, in whole seconds.
+fn wholeSeconds(text: ?[]const u8) DecodeError!?u64 {
+    const t = text orelse return null;
+    const d = core.duration.parse(t) catch return error.InvalidResponse;
+    if (d.nanoseconds < 0) return error.InvalidResponse;
+    return @intCast(@divFloor(d.nanoseconds, std.time.ns_per_s));
+}
+
+/// Labels and annotations: a map of strings on the wire, a list of
+/// `key`-`value` pairs here, in the server's order.
+fn pairsFromWire(
+    comptime T: type,
     arena: Allocator,
     wire: ?std.json.ArrayHashMap(?[]const u8),
-) Allocator.Error![]const types.Label {
+) Allocator.Error![]const T {
     const map = (wire orelse return &.{}).map;
-    const out = try arena.alloc(types.Label, map.count());
-    for (map.keys(), map.values(), out) |k, v, *label| label.* = .{ .key = k, .value = v orelse "" };
+    const out = try arena.alloc(T, map.count());
+    for (map.keys(), map.values(), out) |k, v, *pair| pair.* = .{ .key = k, .value = v orelse "" };
     return out;
 }
 
@@ -250,6 +411,7 @@ const WireVersion = struct {
     name: ?[]const u8 = null,
     createTime: ?[]const u8 = null,
     destroyTime: ?[]const u8 = null,
+    scheduledDestroyTime: ?[]const u8 = null,
     state: ?[]const u8 = null,
     etag: ?[]const u8 = null,
     clientSpecifiedPayloadChecksum: ?bool = null,
@@ -260,6 +422,7 @@ fn versionFromWire(wire: WireVersion) types.VersionInfo {
         .name = wire.name orelse "",
         .create_time = wire.createTime orelse "",
         .destroy_time = wire.destroyTime orelse "",
+        .scheduled_destroy_time = wire.scheduledDestroyTime orelse "",
         .state = state(wire.state),
         .etag = wire.etag orelse "",
         .client_specified_payload_checksum = wire.clientSpecifiedPayloadChecksum orelse false,
@@ -360,6 +523,136 @@ test "decode secret: the shape production sends" {
     const bare = try decodeSecret(arena.allocator(), "{\"name\":\"projects/1/secrets/db\"}");
     try testing.expectEqual(0, bare.labels.len);
     try testing.expectEqualStrings("", bare.etag);
+}
+
+test "golden: the create body with every setting milestone 1 adds" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "{\"replication\":{\"automatic\":{}},\"labels\":{\"team\":\"payments\"},\"annotations\":{\"owner\":\"Ann <ann@example.com>\",\"note\":\"line\\nbreak\"},\"ttl\":\"3600s\",\"versionDestroyTtl\":\"86400s\"}",
+        try encodeSecret(a, .{
+            .labels = &.{.{ .key = "team", .value = "payments" }},
+            .annotations = &.{ .{ .key = "owner", .value = "Ann <ann@example.com>" }, .{ .key = "note", .value = "line\nbreak" } },
+            .expiry = .{ .after_s = 3600 },
+            .version_destroy_delay_s = 86_400,
+        }, false),
+    );
+    try testing.expectEqualStrings(
+        "{\"expireTime\":\"2027-01-01T00:00:00Z\"}",
+        try encodeSecret(a, .{ .expiry = .{ .at = "2027-01-01T00:00:00Z" } }, true),
+    );
+}
+
+test "golden: update bodies and masks, one field at a time and all at once" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Case = struct { types.SecretUpdate, []const u8, []const u8 };
+    const cases = [_]Case{
+        .{ .{ .labels = .{ .set = &.{.{ .key = "team", .value = "payments" }} } }, "labels", "{\"labels\":{\"team\":\"payments\"}}" },
+        .{ .{ .labels = .clear }, "labels", "{}" },
+        .{ .{ .labels = .{ .set = &.{} } }, "labels", "{\"labels\":{}}" },
+        .{ .{ .annotations = .{ .set = &.{.{ .key = "k", .value = "v" }} } }, "annotations", "{\"annotations\":{\"k\":\"v\"}}" },
+        .{ .{ .annotations = .clear }, "annotations", "{}" },
+        .{ .{ .aliases = .{ .set = &.{ .{ .name = "prod", .version = 7 }, .{ .name = "Prod", .version = 18446744073709551615 } } } }, "version_aliases", "{\"versionAliases\":{\"prod\":\"7\",\"Prod\":\"18446744073709551615\"}}" },
+        .{ .{ .aliases = .clear }, "version_aliases", "{}" },
+        .{ .{ .expiry = .{ .set = .{ .at = "2027-01-01T00:00:00Z" } } }, "expire_time", "{\"expireTime\":\"2027-01-01T00:00:00Z\"}" },
+        .{ .{ .expiry = .{ .set = .{ .after_s = 60 } } }, "ttl", "{\"ttl\":\"60s\"}" },
+        // Production clears an expiry through expire_time however it was set.
+        .{ .{ .expiry = .clear }, "expire_time", "{}" },
+        .{ .{ .version_destroy_delay_s = .{ .set = 86_400_000 } }, "version_destroy_ttl", "{\"versionDestroyTtl\":\"86400000s\"}" },
+        .{ .{ .version_destroy_delay_s = .clear }, "version_destroy_ttl", "{}" },
+        .{ .{ .labels = .clear, .etag = "\"165cdb26b38bad\"" }, "labels", "{\"etag\":\"\\\"165cdb26b38bad\\\"\"}" },
+        .{
+            .{
+                .labels = .{ .set = &.{.{ .key = "a", .value = "1" }} },
+                .annotations = .clear,
+                .aliases = .{ .set = &.{.{ .name = "prod", .version = 1 }} },
+                .expiry = .{ .set = .{ .after_s = 86_400 } },
+                .version_destroy_delay_s = .clear,
+                .etag = "\"e\"",
+            },
+            "labels,annotations,version_aliases,ttl,version_destroy_ttl",
+            "{\"labels\":{\"a\":\"1\"},\"versionAliases\":{\"prod\":\"1\"},\"ttl\":\"86400s\",\"etag\":\"\\\"e\\\"\"}",
+        },
+    };
+    for (cases) |case| {
+        try testing.expectEqualStrings(case[1], try updateMask(a, case[0]));
+        try testing.expectEqualStrings(case[2], try encodeUpdate(a, case[0]));
+        try testing.expect(!case[0].isEmpty());
+    }
+    const nothing: types.SecretUpdate = .{ .etag = "\"e\"" };
+    try testing.expect(nothing.isEmpty());
+    try testing.expectEqualStrings("", try updateMask(a, nothing));
+}
+
+test "golden: a version change's body, with and without an etag" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("{}", try encodeEtag(arena.allocator(), null));
+    try testing.expectEqualStrings(
+        "{\"etag\":\"\\\"165cdb272dd24f\\\"\"}",
+        try encodeEtag(arena.allocator(), "\"165cdb272dd24f\""),
+    );
+}
+
+test "decode secret: every field production sent on 2026-10-02" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const got = try decodeSecret(a,
+        \\{"annotations":{"fk":"v"},"createTime":"2026-10-02T13:04:09.628841Z","etag":"\"165cdb2b1551bc\"",
+        \\ "expireTime":"2026-10-04T13:04:09.503134Z","labels":{"zig-gcp-test":"1","zigps-run":"63c4814f"},
+        \\ "name":"projects/82150720798/secrets/zigps-smf-63c4814f-f","replication":{"automatic":{}},
+        \\ "versionAliases":{"prod":"1"},"versionDestroyTtl":"86400s"}
+    );
+    try testing.expectEqualStrings("v", got.annotation("fk").?);
+    try testing.expectEqual(null, got.annotation("missing"));
+    try testing.expectEqual(1, got.alias("prod").?);
+    try testing.expectEqual(null, got.alias("Prod"));
+    try testing.expectEqualStrings("2026-10-04T13:04:09.503134Z", got.expire_time);
+    try testing.expectEqual(86_400, got.version_destroy_delay_s.?);
+    try testing.expectEqualStrings("1", got.label("zig-gcp-test").?);
+
+    // A fraction someone set is dropped; nothing set reads as null and "".
+    const fraction = try decodeSecret(a, "{\"versionDestroyTtl\":\"86400.500s\"}");
+    try testing.expectEqual(86_400, fraction.version_destroy_delay_s.?);
+    const bare = try decodeSecret(a, "{\"name\":\"projects/1/secrets/db\"}");
+    try testing.expectEqual(null, bare.version_destroy_delay_s);
+    try testing.expectEqualStrings("", bare.expire_time);
+    try testing.expectEqual(0, bare.annotations.len);
+    try testing.expectEqual(0, bare.aliases.len);
+    // A version number as a JSON number, as the mapping allows.
+    try testing.expectEqual(7, (try decodeSecret(a, "{\"versionAliases\":{\"x\":7}}")).alias("x").?);
+    // Aliases and durations that name nothing are a broken response.
+    for ([_][]const u8{
+        "{\"versionAliases\":{\"x\":\"seven\"}}",
+        "{\"versionAliases\":{\"x\":-1}}",
+        "{\"versionAliases\":{\"x\":true}}",
+        "{\"versionAliases\":{\"x\":1.5}}",
+        "{\"versionAliases\":[]}",
+        "{\"versionDestroyTtl\":\"1 day\"}",
+        "{\"versionDestroyTtl\":\"-1s\"}",
+        "{\"versionDestroyTtl\":86400}",
+        "{\"annotations\":{\"k\":1}}",
+    }) |body| {
+        try testing.expectError(error.InvalidResponse, decodeSecret(a, body));
+    }
+}
+
+test "decode version: a destruction scheduled, as production sent it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const got = try decodeVersion(arena.allocator(),
+        \\{"createTime":"2026-10-02T13:04:00.785586Z","etag":"\"165cdb2aae0e82\"",
+        \\ "name":"projects/82150720798/secrets/zigps-smf-63c4814f-dd/versions/1","replicationStatus":{"automatic":{}},
+        \\ "scheduledDestroyTime":"2026-10-03T13:04:03.889502667Z","state":"DISABLED"}
+    );
+    try testing.expectEqual(.disabled, got.state);
+    try testing.expectEqualStrings("2026-10-03T13:04:03.889502667Z", got.scheduled_destroy_time);
+    try testing.expectEqualStrings("", got.destroy_time);
+    try testing.expectEqualStrings("", (try decodeVersion(arena.allocator(), "{\"state\":\"ENABLED\"}")).scheduled_destroy_time);
 }
 
 test "decode secret page: tokens, counts and what is left out" {
@@ -578,6 +871,8 @@ test "fuzz decoders: arbitrary bodies never crash" {
         "{\"payload\":{\"data\":\"\\ud800\"}}",
         "{\"secrets\":[{\"name\":\"projects/1/secrets/a\",\"labels\":{\"k\":\"v\"}}],\"totalSize\":1}",
         "{\"name\":\"v/1\",\"state\":\"DESTROYED\",\"destroyTime\":\"2026-09-20T23:09:41.5Z\"}",
+        "{\"annotations\":{\"fk\":\"v\"},\"expireTime\":\"2026-10-04T13:04:09.503134Z\",\"versionAliases\":{\"prod\":\"1\"},\"versionDestroyTtl\":\"86400.500s\"}",
+        "{\"name\":\"v/1\",\"state\":\"DISABLED\",\"scheduledDestroyTime\":\"2026-10-03T13:04:03.889502667Z\"}",
         "{\"a\":[[[[[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]]]]}",
         "",
         "null",

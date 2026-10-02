@@ -50,6 +50,30 @@ pub fn createPath(arena: Allocator, parent: Parent, id: []const u8) Allocator.Er
     }.write, parent, id, "");
 }
 
+/// `/v1/{parent}/secrets/{id}?updateMask={mask}`, for `secrets.patch`.
+pub fn updatePath(arena: Allocator, parent: Parent, id: []const u8, mask: []const u8) Allocator.Error![]u8 {
+    return build(arena, struct {
+        fn write(w: *Writer, p: Parent, secret_id: []const u8, update_mask: []const u8) Writer.Error!void {
+            try writeSecret(w, p, secret_id);
+            var params: query.Params = .init(w);
+            try params.add("updateMask", update_mask);
+        }
+    }.write, parent, id, mask);
+}
+
+/// `/v1/{parent}/secrets/{id}?etag={etag}`, for a conditional delete. The
+/// etag goes as read, quotes and all, percent-encoded as production takes
+/// it.
+pub fn deletePath(arena: Allocator, parent: Parent, id: []const u8, etag: []const u8) Allocator.Error![]u8 {
+    return build(arena, struct {
+        fn write(w: *Writer, p: Parent, secret_id: []const u8, tag: []const u8) Writer.Error!void {
+            try writeSecret(w, p, secret_id);
+            var params: query.Params = .init(w);
+            try params.add("etag", tag);
+        }
+    }.write, parent, id, etag);
+}
+
 /// `/v1/{parent}/secrets` with the list query.
 pub fn secretsPath(arena: Allocator, parent: Parent, options: types.ListOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
@@ -174,6 +198,28 @@ const test_util = @import("test_util.zig");
 
 const global: Parent = .{ .project = "extractctl" };
 const regional: Parent = .{ .project = "extractctl", .location = "europe-west3" };
+
+test "paths: update and conditional delete" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "/v1/projects/extractctl/secrets/db-password?updateMask=labels%2Cversion_aliases",
+        try updatePath(a, global, "db-password", "labels,version_aliases"),
+    );
+    try testing.expectEqualStrings(
+        "/v1/projects/extractctl/locations/europe-west3/secrets/db-password?updateMask=ttl",
+        try updatePath(a, regional, "db-password", "ttl"),
+    );
+    try testing.expectEqualStrings(
+        "/v1/projects/extractctl/secrets/db-password?etag=%22165cdb26afa951%22",
+        try deletePath(a, global, "db-password", "\"165cdb26afa951\""),
+    );
+    try testing.expectEqualStrings(
+        "/v1/projects/extractctl/locations/europe-west3/secrets/db-password?etag=%22e%22",
+        try deletePath(a, regional, "db-password", "\"e\""),
+    );
+}
 
 test "paths: global and regional, one per operation" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
