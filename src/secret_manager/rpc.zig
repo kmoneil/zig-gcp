@@ -67,26 +67,63 @@ pub fn isStaleEtag(err: anyerror, diag: *const core.Diagnostics) bool {
     return err == error.FailedPrecondition and std.mem.startsWith(u8, diag.message(), stale_etag);
 }
 
+/// Whether a failed create or update was refused because Secret Manager
+/// cannot publish to a topic it names, in production's words, measured on
+/// 2026-10-02: the agent without the publish permission, a topic whose
+/// storage policy is enforced in transit, or a topic that does not exist.
+pub fn isTopicRefusal(err: anyerror, diag: *const core.Diagnostics) bool {
+    const message = diag.message();
+    return switch (err) {
+        error.FailedPrecondition => std.mem.startsWith(u8, message, "Permission 'pubsub.topics.publish' denied") or
+            std.mem.indexOf(u8, message, "message storage policy requires enforcement in transit") != null,
+        error.NotFound => std.mem.startsWith(u8, message, "Topic ["),
+        else => false,
+    };
+}
+
+/// Which refusals a call maps to errors of their own.
+pub const Mapping = struct {
+    /// The call carries an etag: a stale one is `error.Aborted`.
+    stale_etag: bool = false,
+    /// The call names topics: one Secret Manager cannot publish to is
+    /// `error.TopicNotPublishable`.
+    topics: bool = false,
+};
+
+/// `execute`, mapping the refusals `mapping` names and leaving every
+/// other failure as it was.
+pub fn executeMapped(client: *Client, response: *std.heap.ArenaAllocator, call: Call, mapping: Mapping) Error![]const u8 {
+    var local: core.Diagnostics = .{};
+    const e = engineWith(client, &local);
+    return e.execute(response, call) catch |err| return mapped(err, e.diagnostics.?, mapping);
+}
+
+fn mapped(err: Error, diag: *const core.Diagnostics, mapping: Mapping) Error {
+    if (mapping.stale_etag and isStaleEtag(err, diag)) return error.Aborted;
+    if (mapping.topics and isTopicRefusal(err, diag)) return error.TopicNotPublishable;
+    return err;
+}
+
 /// `execute` for a call sent under an etag: a stale one is `error.Aborted`,
 /// as a stale IAM write is on every resource, and every other failure is
 /// what it was.
 pub fn executeConditional(client: *Client, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
-    var local: core.Diagnostics = .{};
-    const e = engineWith(client, &local);
-    return e.execute(response, call) catch |err| {
-        if (isStaleEtag(err, e.diagnostics.?)) return error.Aborted;
-        return err;
-    };
+    return executeMapped(client, response, call, .{ .stale_etag = true });
 }
 
 /// `executeConditional` for calls whose response body is not needed.
 pub fn executeDiscardConditional(client: *Client, call: Call) Error!void {
     var local: core.Diagnostics = .{};
     const e = engineWith(client, &local);
-    return e.executeDiscard(call) catch |err| {
-        if (isStaleEtag(err, e.diagnostics.?)) return error.Aborted;
-        return err;
-    };
+    return e.executeDiscard(call) catch |err| return mapped(err, e.diagnostics.?, .{ .stale_etag = true });
+}
+
+/// `execute` against Service Usage, which answers for the project's
+/// service agent, rather than Secret Manager's own host.
+pub fn executeServiceUsage(client: *Client, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
+    var e = engine(client);
+    e.base_url = "https://serviceusage.googleapis.com";
+    return e.execute(response, call);
 }
 
 /// The engine, with `local` standing in for the caller's diagnostics when
@@ -159,6 +196,11 @@ pub fn checkConfig(client: *Client, config: types.SecretConfig) Error!void {
     try checkAnnotations(client, config.annotations);
     if (config.expiry) |expiry| try checkExpiry(client, expiry);
     if (config.version_destroy_delay_s) |s| try checkDestroyDelay(client, s);
+    try checkTopics(client, config.topics);
+    if (config.rotation) |r| {
+        try checkRotation(client, r);
+        if (config.topics.len == 0) return refuse(client, "a rotation needs topics, which Secret Manager tells when it is time", .{});
+    }
     // A regional secret sends no replication at all, so there is nothing
     // there to check.
     if (client.location != null) return;
@@ -213,7 +255,44 @@ pub fn checkUpdate(client: *Client, changes: types.SecretUpdate) Error!void {
         .set => |s| try checkDestroyDelay(client, s),
         .keep, .clear => {},
     }
+    switch (changes.topics) {
+        .set => |topics| try checkTopics(client, topics),
+        .keep, .clear => {},
+    }
+    switch (changes.rotation) {
+        .set => |r| {
+            try checkRotation(client, r);
+            const no_topics = switch (changes.topics) {
+                .keep => false,
+                .clear => true,
+                .set => |topics| topics.len == 0,
+            };
+            if (no_topics) return refuse(client, "a rotation needs topics, which Secret Manager tells when it is time", .{});
+        },
+        .keep, .clear => {},
+    }
     if (changes.etag) |etag| try checkEtag(client, etag);
+}
+
+fn checkTopics(client: *Client, topics: []const []const u8) Error!void {
+    if (topics.len > validate.max_topics) return refuse(client, "a secret names at most {d} topics", .{validate.max_topics});
+    for (topics, 1..) |t, n| {
+        if (!validate.isTopicName(t)) return refuse(client, "topic {d}: a topic is named in full, projects/PROJECT/topics/TOPIC", .{n});
+        for (topics[0 .. n - 1], 1..) |earlier, m| {
+            if (std.mem.eql(u8, earlier, t)) return refuse(client, "topics {d} and {d} are the same", .{ m, n });
+        }
+    }
+}
+
+fn checkRotation(client: *Client, rotation: types.Rotation) Error!void {
+    // Whether the time is far enough ahead is the server's to judge.
+    _ = core.timestamp.parse(rotation.next_time) catch
+        return refuse(client, "a rotation's next time is RFC 3339, such as 2027-01-01T00:00:00Z", .{});
+    if (rotation.period_s) |s| if (s < validate.min_rotation_period_s or s > validate.max_rotation_period_s) return refuse(
+        client,
+        "a rotation period is {d} to {d} seconds (1 hour to 100 years)",
+        .{ validate.min_rotation_period_s, validate.max_rotation_period_s },
+    );
 }
 
 /// An etag to send as a condition. Production takes `""` as no etag at

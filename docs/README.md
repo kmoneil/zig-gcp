@@ -42,7 +42,7 @@ Google, not only what Google documents, and where the emulators differ.
 
 | Guide | What's in it |
 | --- | --- |
-| [Secret Manager](secret-manager.md) | Reading a secret's bytes, verified and wiped; versions; checksums; regional secrets; IAM |
+| [Secret Manager](secret-manager.md) | Reading a secret's bytes, verified and wiped; versions; changing a secret under an etag; aliases, expiry and delayed destruction; notifications and rotation; checksums; regional secrets; IAM |
 
 ## 🛠️ Working on zig-gcp
 

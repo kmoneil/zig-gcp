@@ -41,6 +41,10 @@ pub fn access(self: Secret, ref: types.VersionRef) Error!SecretValue {
 /// A global secret names its replication, which is immutable afterwards. A
 /// regional client sends none: the client's location decides, and `config`'s
 /// replication is ignored.
+///
+/// Topics are checked by publishing to each, before anything else: one
+/// Secret Manager's service agent cannot publish to is
+/// `error.TopicNotPublishable`, and nothing is created.
 pub fn create(self: Secret, config: types.SecretConfig) Error!types.Owned(types.SecretInfo) {
     const c = self.client;
     rpc.begin(c);
@@ -54,7 +58,9 @@ pub fn create(self: Secret, config: types.SecretConfig) Error!types.Owned(types.
 
     var result: types.Owned(types.SecretInfo) = try .init(c.gpa);
     errdefer result.deinit();
-    const response = try rpc.execute(c, result.arena, .{ .method = .POST, .path = path, .body = body });
+    const response = try rpc.executeMapped(c, result.arena, .{ .method = .POST, .path = path, .body = body }, .{
+        .topics = config.topics.len > 0,
+    });
     result.value = codec.decodeSecret(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(c, err, "secret");
     return result;
@@ -72,9 +78,12 @@ pub fn create(self: Secret, config: types.SecretConfig) Error!types.Owned(types.
 ///
 /// Refused before sending, as `error.InvalidArgument`: an update that
 /// changes nothing (the server would move the etag and publish an event
-/// for it), and labels, annotations, aliases, an expiry or a delay outside
-/// the rules on their types. An alias naming a version the secret does
-/// not have is the server's `error.InvalidArgument`.
+/// for it), and labels, annotations, aliases, an expiry, a delay, topics or
+/// a rotation outside the rules on their types, a rotation set beside no
+/// topics included. An alias naming a version the secret does not have,
+/// and a rotation left without topics, are the server's
+/// `error.InvalidArgument`; a topic Secret Manager cannot publish to, when
+/// the update names topics, is `error.TopicNotPublishable`.
 pub fn update(self: Secret, changes: types.SecretUpdate) Error!types.Owned(types.SecretInfo) {
     const c = self.client;
     rpc.begin(c);
@@ -89,11 +98,12 @@ pub fn update(self: Secret, changes: types.SecretUpdate) Error!types.Owned(types
 
     var result: types.Owned(types.SecretInfo) = try .init(c.gpa);
     errdefer result.deinit();
-    const call: rpc.Call = .{ .method = .PATCH, .path = path, .body = body };
-    const response = if (changes.etag != null)
-        try rpc.executeConditional(c, result.arena, call)
-    else
-        try rpc.execute(c, result.arena, call);
+    const response = try rpc.executeMapped(c, result.arena, .{ .method = .PATCH, .path = path, .body = body }, .{
+        .stale_etag = changes.etag != null,
+        // Secret Manager checks every topic an update names, by publishing
+        // to it, and only then.
+        .topics = changes.topics == .set,
+    });
     result.value = codec.decodeSecret(result.arena.allocator(), response) catch |err|
         return rpc.decodeFailed(c, err, "secret");
     return result;
@@ -853,4 +863,108 @@ test "update and deleteIf: every allocation failure is OutOfMemory without leaks
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+}
+
+test "golden: topics and rotation, on create and update" {
+    var h: Harness = undefined;
+    try h.init(&.{ created_secret, updated_secret, updated_secret }, .{});
+    defer h.deinit();
+    const secret = h.client.secret("db-password");
+
+    var created = try secret.create(.{
+        .topics = &.{"projects/extractctl/topics/rotations"},
+        .rotation = .{ .next_time = "2027-01-01T00:00:00Z", .period_s = 2_592_000 },
+    });
+    defer created.deinit();
+    try h.expectRequest(
+        0,
+        .POST,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets?secretId=db-password",
+        "{\"replication\":{\"automatic\":{}},\"topics\":[{\"name\":\"projects/extractctl/topics/rotations\"}],\"rotation\":{\"nextRotationTime\":\"2027-01-01T00:00:00Z\",\"rotationPeriod\":\"2592000s\"}}",
+    );
+
+    var moved = try secret.update(.{
+        .topics = .{ .set = &.{ "projects/extractctl/topics/rotations", "projects/other-project/topics/audit" } },
+        .rotation = .{ .set = .{ .next_time = "2027-02-01T00:00:00Z" } },
+    });
+    defer moved.deinit();
+    try h.expectRequest(
+        1,
+        .PATCH,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets/db-password?updateMask=topics%2Crotation",
+        "{\"topics\":[{\"name\":\"projects/extractctl/topics/rotations\"},{\"name\":\"projects/other-project/topics/audit\"}],\"rotation\":{\"nextRotationTime\":\"2027-02-01T00:00:00Z\"}}",
+    );
+
+    var cleared = try secret.update(.{ .rotation = .clear, .topics = .clear });
+    defer cleared.deinit();
+    try h.expectRequest(
+        2,
+        .PATCH,
+        "https://secretmanager.googleapis.com/v1/projects/extractctl/secrets/db-password?updateMask=topics%2Crotation",
+        "{}",
+    );
+}
+
+test "a topic Secret Manager cannot publish to is TopicNotPublishable, wherever topics are named" {
+    const denied: Reply = .{ .respond = .{ .status = 400, .body =
+        \\{"error":{"code":400,"message":"Permission 'pubsub.topics.publish' denied for service-82150720798@gcp-sa-secretmanager.iam.gserviceaccount.com for pubsub topic: projects/extractctl/topics/zigps-t2 or the topic doesn't exist. Grant the 'pubsub.topic.publish' permission (or 'roles/pubsub.publisher') on this topic to service-82150720798@gcp-sa-secretmanager.iam.gserviceaccount.com.","status":"FAILED_PRECONDITION"}}
+    } };
+    const missing: Reply = .{ .respond = .{ .status = 404, .body =
+        \\{"error":{"code":404,"message":"Topic [projects/extractctl/topics/zigps-nosuch] not found.","status":"NOT_FOUND"}}
+    } };
+    const in_transit: Reply = .{ .respond = .{ .status = 400, .body =
+        \\{"error":{"code":400,"message":"The topic's message storage policy requires enforcement in transit, but the Publish request was received by a Pub/Sub server in a non-allowed region. Please either publish via a regional Pub/Sub endpoint corresponding to an allowed region, or update the topic's message storage policy.","status":"FAILED_PRECONDITION"}}
+    } };
+    const secret_missing: Reply = .{ .respond = .{ .status = 404, .body =
+        \\{"error":{"code":404,"message":"Secret [projects/82150720798/secrets/db-password] not found.","status":"NOT_FOUND"}}
+    } };
+    var h: Harness = undefined;
+    try h.init(&.{ denied, missing, in_transit, secret_missing, denied }, .{});
+    defer h.deinit();
+    const secret = h.client.secret("db-password");
+    const topics: []const []const u8 = &.{"projects/extractctl/topics/zigps-t2"};
+
+    try testing.expectError(error.TopicNotPublishable, secret.create(.{ .topics = topics }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "roles/pubsub.publisher") != null);
+    try testing.expectError(error.TopicNotPublishable, secret.update(.{ .topics = .{ .set = topics } }));
+    try testing.expectError(error.TopicNotPublishable, secret.update(.{ .topics = .{ .set = topics }, .etag = "\"e\"" }));
+    // A missing secret is what it says, topics or not.
+    try testing.expectError(error.NotFound, secret.update(.{ .topics = .{ .set = topics } }));
+    // An update that names no topics never meets this refusal; if it
+    // did, it would be what production said.
+    try testing.expectError(error.FailedPrecondition, secret.update(.{ .labels = .clear }));
+    // Never retried: a grant is the caller's to make.
+    try h.expectRequestCount(5);
+}
+
+test "topics and rotation: what never reaches the server" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const secret = h.client.secret("db-password");
+    const eleven: []const []const u8 = &.{
+        "projects/p/topics/t01", "projects/p/topics/t02", "projects/p/topics/t03", "projects/p/topics/t04",
+        "projects/p/topics/t05", "projects/p/topics/t06", "projects/p/topics/t07", "projects/p/topics/t08",
+        "projects/p/topics/t09", "projects/p/topics/t10", "projects/p/topics/t11",
+    };
+    const Case = struct { types.SecretUpdate, []const u8 };
+    for ([_]Case{
+        .{ .{ .topics = .{ .set = eleven } }, "at most 10 topics" },
+        .{ .{ .topics = .{ .set = &.{"rotations"} } }, "named in full" },
+        .{ .{ .topics = .{ .set = &.{"projects/p/topics/goog-x"} } }, "named in full" },
+        .{ .{ .topics = .{ .set = &.{ "projects/p/topics/abc", "projects/p/topics/abc" } } }, "are the same" },
+        .{ .{ .rotation = .{ .set = .{ .next_time = "soon" } }, .topics = .{ .set = &.{"projects/p/topics/abc"} } }, "RFC 3339" },
+        .{ .{ .rotation = .{ .set = .{ .next_time = "2027-01-01T00:00:00Z", .period_s = 3599 } }, .topics = .{ .set = &.{"projects/p/topics/abc"} } }, "1 hour" },
+        .{ .{ .rotation = .{ .set = .{ .next_time = "2027-01-01T00:00:00Z" } }, .topics = .clear }, "needs topics" },
+        .{ .{ .rotation = .{ .set = .{ .next_time = "2027-01-01T00:00:00Z" } }, .topics = .{ .set = &.{} } }, "needs topics" },
+    }) |case| {
+        try testing.expectError(error.InvalidArgument, secret.update(case[0]));
+        if (std.mem.indexOf(u8, h.diag.message(), case[1]) == null) {
+            std.debug.print("diagnostics \"{s}\" lack \"{s}\"\n", .{ h.diag.message(), case[1] });
+            return error.TestUnexpectedDiagnostics;
+        }
+    }
+    try testing.expectError(error.InvalidArgument, secret.create(.{ .rotation = .{ .next_time = "2027-01-01T00:00:00Z" } }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "needs topics") != null);
+    try h.expectRequestCount(0);
 }

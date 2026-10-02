@@ -84,6 +84,30 @@ fn writeSecret(jw: *Stringify, config: types.SecretConfig, regional: bool) Strin
     if (config.annotations.len > 0) try writeAnnotations(jw, config.annotations);
     if (config.expiry) |expiry| try writeExpiry(jw, expiry);
     if (config.version_destroy_delay_s) |s| try writeSeconds(jw, "versionDestroyTtl", s);
+    if (config.topics.len > 0) try writeTopics(jw, config.topics);
+    if (config.rotation) |r| try writeRotation(jw, r);
+    try jw.endObject();
+}
+
+/// Topics travel as objects that name them, `[{"name": ...}]`.
+fn writeTopics(jw: *Stringify, topics: []const []const u8) Stringify.Error!void {
+    try jw.objectField("topics");
+    try jw.beginArray();
+    for (topics) |t| {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(t);
+        try jw.endObject();
+    }
+    try jw.endArray();
+}
+
+fn writeRotation(jw: *Stringify, rotation: types.Rotation) Stringify.Error!void {
+    try jw.objectField("rotation");
+    try jw.beginObject();
+    try jw.objectField("nextRotationTime");
+    try jw.write(rotation.next_time);
+    if (rotation.period_s) |s| try writeSeconds(jw, "rotationPeriod", s);
     try jw.endObject();
 }
 
@@ -169,6 +193,14 @@ fn writeUpdate(jw: *Stringify, changes: types.SecretUpdate) Stringify.Error!void
         .set => |s| try writeSeconds(jw, "versionDestroyTtl", s),
         .keep, .clear => {},
     }
+    switch (changes.topics) {
+        .set => |topics| try writeTopics(jw, topics),
+        .keep, .clear => {},
+    }
+    switch (changes.rotation) {
+        .set => |r| try writeRotation(jw, r),
+        .keep, .clear => {},
+    }
     if (changes.etag) |etag| {
         try jw.objectField("etag");
         try jw.write(etag);
@@ -197,6 +229,8 @@ fn writeMask(w: *Writer, changes: types.SecretUpdate) Writer.Error!void {
             .keep, .clear => "expire_time",
         } },
         .{ changes.version_destroy_delay_s != .keep, "version_destroy_ttl" },
+        .{ changes.topics != .keep, "topics" },
+        .{ changes.rotation != .keep, "rotation" },
     };
     for (paths) |entry| {
         if (!entry[0]) continue;
@@ -306,6 +340,15 @@ const WireSecret = struct {
     versionAliases: ?std.json.ArrayHashMap(std.json.Value) = null,
     expireTime: ?[]const u8 = null,
     versionDestroyTtl: ?[]const u8 = null,
+    topics: ?[]const WireTopic = null,
+    rotation: ?WireRotation = null,
+};
+
+const WireTopic = struct { name: ?[]const u8 = null };
+
+const WireRotation = struct {
+    nextRotationTime: ?[]const u8 = null,
+    rotationPeriod: ?[]const u8 = null,
 };
 
 const WireSecretPage = struct {
@@ -324,7 +367,24 @@ fn secretFromWire(arena: Allocator, wire: WireSecret) DecodeError!types.SecretIn
         .aliases = try aliasesFromWire(arena, wire.versionAliases),
         .expire_time = wire.expireTime orelse "",
         .version_destroy_delay_s = try wholeSeconds(wire.versionDestroyTtl),
+        .topics = try topicsFromWire(arena, wire.topics),
+        .rotation = try rotationFromWire(wire.rotation),
     };
+}
+
+fn topicsFromWire(arena: Allocator, wire: ?[]const WireTopic) Allocator.Error![]const []const u8 {
+    const listed = wire orelse return &.{};
+    const out = try arena.alloc([]const u8, listed.len);
+    for (listed, out) |t, *name| name.* = t.name orelse "";
+    return out;
+}
+
+/// A rotation with no time is none: production sends `rotation` only with
+/// one, and a typed secret's managed rotation status alone is not one.
+fn rotationFromWire(wire: ?WireRotation) DecodeError!?types.Rotation {
+    const r = wire orelse return null;
+    const next = r.nextRotationTime orelse return null;
+    return .{ .next_time = next, .period_s = try wholeSeconds(r.rotationPeriod) };
 }
 
 /// Version numbers arrive as strings, as proto3 JSON writes an int64, or
@@ -381,6 +441,21 @@ fn count(value: ?i64) u32 {
 fn nonEmpty(text: ?[]const u8) ?[]const u8 {
     const t = text orelse return null;
     return if (t.len == 0) null else t;
+}
+
+/// The service agent's address, from the Operation `generateServiceIdentity`
+/// answers, done at once as measured:
+/// `{"done": true, "response": {"email": ..., "uniqueId": ...}}`. One that
+/// is not done, or names no address, is a broken response.
+pub fn decodeServiceIdentity(arena: Allocator, body: []const u8) DecodeError![]const u8 {
+    const wire = try parseWire(struct {
+        done: ?bool = null,
+        response: ?struct { email: ?[]const u8 = null } = null,
+    }, arena, body);
+    if (wire.done != true) return error.InvalidResponse;
+    const email = (wire.response orelse return error.InvalidResponse).email orelse return error.InvalidResponse;
+    if (std.mem.indexOfScalar(u8, email, '@') == null) return error.InvalidResponse;
+    return email;
 }
 
 /// One page of `versions.list`.

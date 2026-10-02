@@ -256,7 +256,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/secret_manager_integration.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "secret_manager", .module = secret_manager }},
+            .imports = &.{
+                .{ .name = "secret_manager", .module = secret_manager },
+                .{ .name = "pubsub", .module = mod },
+            },
         }),
         .filters = test_filters,
     });
@@ -335,9 +338,9 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "quickstart", "iam" }) |name| {
-        // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart and iam
-        // pick their own credentials.
+    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "quickstart", "iam", "secret_rotation" }) |name| {
+        // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam and
+        // secret_rotation pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
@@ -346,6 +349,8 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "iam"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "secret_rotation"))
+            &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else

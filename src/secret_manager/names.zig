@@ -74,6 +74,21 @@ pub fn deletePath(arena: Allocator, parent: Parent, id: []const u8, etag: []cons
     }.write, parent, id, etag);
 }
 
+/// Service Usage's `generateServiceIdentity` for Secret Manager, on
+/// `serviceusage.googleapis.com`.
+pub fn serviceIdentityPath(arena: Allocator, project: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    writeServiceIdentityPath(w, project) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeServiceIdentityPath(w: *Writer, project: []const u8) Writer.Error!void {
+    try w.writeAll("/v1beta1/projects/");
+    try query.writeSegment(w, project);
+    try w.writeAll("/services/secretmanager.googleapis.com:generateServiceIdentity");
+}
+
 /// `/v1/{parent}/secrets` with the list query.
 pub fn secretsPath(arena: Allocator, parent: Parent, options: types.ListOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);

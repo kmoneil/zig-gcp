@@ -56,6 +56,19 @@ pub const Alias = struct {
     version: u64,
 };
 
+/// When Secret Manager tells a secret's topics it is time to rotate it,
+/// with a `SECRET_ROTATE` message. It changes nothing itself: a
+/// subscriber adds the new version. A secret with a rotation needs topics.
+pub const Rotation = struct {
+    /// The first time, RFC 3339: at least 5 minutes and at most 100 years
+    /// from now, by the server's clock.
+    next_time: []const u8,
+    /// Seconds from one rotation to the next: 3,600 to 3,153,600,000 (1
+    /// hour to 100 years). Null: the rotation happens once, and is then
+    /// gone from the secret.
+    period_s: ?u64 = null,
+};
+
 /// When a secret is deleted, with every version, without a trace.
 pub const Expiry = union(enum) {
     /// An RFC 3339 time, such as `2027-01-01T00:00:00Z`: at least 60
@@ -84,6 +97,13 @@ pub const SecretConfig = struct {
     /// How long a destroyed version waits, disabled, before its bytes go:
     /// 86,400 to 86,400,000 seconds (1 to 1,000 days). Null: at once.
     version_destroy_delay_s: ?u64 = null,
+    /// Pub/Sub topics told of every change, `projects/P/topics/T`: at most
+    /// 10. Secret Manager's service agent, which `Client.serviceAgent`
+    /// names, needs `roles/pubsub.publisher` on each first, or the create
+    /// is `error.TopicNotPublishable`.
+    topics: []const []const u8 = &.{},
+    /// Needs topics.
+    rotation: ?Rotation = null,
 };
 
 /// What `Secret.update` changes. Every field left at `.keep` stays as it
@@ -100,6 +120,12 @@ pub const SecretUpdate = struct {
     /// `.clear`: versions destroyed from now on go at once. Versions
     /// already scheduled keep their time.
     version_destroy_delay_s: Change(u64) = .keep,
+    /// `.set` replaces every topic, and Secret Manager checks it can
+    /// publish to each (`error.TopicNotPublishable`); `.clear` removes
+    /// them, which a secret with a rotation cannot do.
+    topics: Change([]const []const u8) = .keep,
+    /// `.set` replaces the rotation, time and period; `.clear` removes it.
+    rotation: Change(Rotation) = .keep,
     /// Change the secret only if its etag is still this one, as read: a
     /// changed secret is `error.Aborted` and nothing changes. Null: no
     /// condition.
@@ -147,6 +173,12 @@ pub const SecretInfo = struct {
     /// Null: destroyed versions go at once. Whole seconds; a fraction
     /// someone else set is dropped.
     version_destroy_delay_s: ?u64 = null,
+    /// Full names, `projects/P/topics/T`, as set.
+    topics: []const []const u8 = &.{},
+    /// Null when the secret has none. `next_time` advances by the period
+    /// each time a rotation fires; a rotation without a period is gone
+    /// once it has fired.
+    rotation: ?Rotation = null,
 
     /// The value of the label named `key`, or null.
     pub fn label(self: SecretInfo, key: []const u8) ?[]const u8 {
@@ -175,6 +207,71 @@ pub const SecretInfo = struct {
     /// The last segment of `name`: the id the secret was created with.
     pub fn id(self: SecretInfo) []const u8 {
         return names.lastSegment(self.name);
+    }
+};
+
+/// What a Secret Manager message on a secret's topic says happened.
+/// Secret Manager adds event types; one this library does not know is
+/// `.unknown`, never refused.
+pub const EventKind = enum {
+    /// Sent to every topic whenever a create or update sets topics, as a
+    /// check that it can publish, even for a create then refused for
+    /// another reason. It names no secret.
+    topic_configured,
+    secret_create,
+    /// Every update, one that changes nothing included.
+    secret_update,
+    secret_delete,
+    /// It is time to rotate the secret: add a version. The secret, as
+    /// sent, already has its next rotation time, or none for a rotation
+    /// that happened once.
+    secret_rotate,
+    version_add,
+    version_enable,
+    version_disable,
+    version_destroy,
+    /// A destroy under a destruction delay: the version is disabled until
+    /// its `scheduled_destroy_time`.
+    version_destroy_scheduled,
+    unknown,
+};
+
+/// Why a secret was deleted.
+pub const DeleteType = enum { requested, expiration, unknown };
+
+/// One message from a secret's topic, decoded by `decodeEvent`.
+pub const SecretEvent = struct {
+    kind: EventKind,
+    /// The `eventType` attribute as sent, such as `SECRET_ROTATE`.
+    event_type: []const u8,
+    /// The secret's full name, with the project number and, for a
+    /// regional secret, `/locations/L`; "" for `.topic_configured`.
+    secret: []const u8,
+    /// The secret's location, or null for a global secret.
+    location: ?[]const u8,
+    /// The version a version event concerns.
+    version: ?u64,
+    /// For `.secret_delete` only.
+    delete_type: ?DeleteType,
+    /// When the change happened, RFC 3339 as sent: Secret Manager writes it
+    /// in Pacific time with an offset and up to six fraction digits, such
+    /// as `2026-10-02T06:03:33.65825-07:00`; "" for `.topic_configured`.
+    time: []const u8,
+    /// The secret as the change left it (as it was, for a delete), for the
+    /// secret events.
+    info: ?SecretInfo,
+    /// The version as the change left it, for the version events.
+    version_info: ?VersionInfo,
+    /// The change's identity, for telling a repeat delivery from a new
+    /// change: event type, name and time. Pub/Sub delivers at least once,
+    /// each repeat under a new message ID, and a global secret's events
+    /// arrive late and out of order, so order them by `time`, not by
+    /// arrival.
+    key: []const u8,
+
+    /// The secret's id, the last segment of `secret`.
+    pub fn secretId(self: SecretEvent) []const u8 {
+        return names.lastSegment(self.secret);
     }
 };
 
