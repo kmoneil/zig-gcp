@@ -2017,7 +2017,7 @@ fn keyConfigProperty(_: void, input: []const u8) !void {
     }
 }
 
-test "fuzz key configurations: what the client sends, the server takes" {
+test "heavy property key configurations: what the client sends, the server takes" {
     try test_util.fuzzBytes({}, keyConfigProperty, .{ .corpus = &.{
         "",
         "\x00\x02\x00\x01\x01\x03\x01",
