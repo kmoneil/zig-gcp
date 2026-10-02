@@ -325,7 +325,10 @@ jobs:
         # changes against FakeSecrets, 21.6 ms a run on a Mac (2K and 20K
         # on a built binary), about 60 on CI at heavy-storage's ratio: it
         # runs in heavy-secret_manager, at 80K for about 80 minutes. Topics
-        # and rotation (10-02, milestone 2) joined it at 20.8 ms a run.
+        # and rotation (10-02, milestone 2) joined it at 20.8 ms a run; a
+        # property of key configurations (milestone 3), about 1 ms a run,
+        # runs there too. The secret_manager job gained an event decoder
+        # property, 0.11 ms a run on a Mac, about 8 minutes at 4500K.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 900K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
