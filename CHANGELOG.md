@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.30.0 (unreleased)
+## 0.30.0 (2026-10-02)
 
 - storage: folders, for buckets created with
   `BucketConfig.hierarchical_namespace`. `Bucket.folder(path)` is a handle:
