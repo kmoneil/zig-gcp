@@ -128,6 +128,24 @@ fn labelTextProblem(text: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The location of a Cloud KMS key named in full,
+/// `projects/P/locations/L/keyRings/R/cryptoKeys/K`, or null for any other
+/// form. Each part is non-empty printable ASCII without `/`.
+pub fn kmsKeyLocation(name: []const u8) ?[]const u8 {
+    var parts = std.mem.splitScalar(u8, name, '/');
+    const expect = [_][]const u8{ "projects", "", "locations", "", "keyRings", "", "cryptoKeys", "" };
+    var location: []const u8 = "";
+    for (expect, 0..) |want, i| {
+        const part = parts.next() orelse return null;
+        if (part.len == 0) return null;
+        for (part) |c| if (c <= ' ' or c >= 0x7f) return null;
+        if (want.len > 0 and !std.mem.eql(u8, part, want)) return null;
+        if (i == 3) location = part;
+    }
+    if (parts.next() != null) return null;
+    return location;
+}
+
 /// Annotation keys: 1 to 64 ASCII letters and digits, with `.`, `_` and
 /// `-` between them, never first or last.
 pub fn isAnnotationKey(key: []const u8) bool {
@@ -235,6 +253,21 @@ test "topic names: in full, with a Pub/Sub id" {
         "//pubsub.googleapis.com/projects/extractctl/topics/rotations",
         "projects/ext ractctl/topics/rotations",
     }) |name| try testing.expect(!isTopicName(name));
+}
+
+test "Cloud KMS key names, and their location" {
+    try testing.expectEqualStrings("global", kmsKeyLocation("projects/extractctl/locations/global/keyRings/r/cryptoKeys/k").?);
+    try testing.expectEqualStrings("us-central1", kmsKeyLocation("projects/p/locations/us-central1/keyRings/zigps-smf/cryptoKeys/zigps-smf-r").?);
+    for ([_][]const u8{
+        "",
+        "projects/p/locations/global/keyRings/r",
+        "projects/p/locations/global/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+        "projects/p/locations//keyRings/r/cryptoKeys/k",
+        "projects/p/location/global/keyRings/r/cryptoKeys/k",
+        "projects/p/locations/global/keyrings/r/cryptoKeys/k",
+        "projects/p/locations/global/keyRings/r/cryptoKeys/k ",
+        "//cloudkms.googleapis.com/projects/p/locations/global/keyRings/r/cryptoKeys/k",
+    }) |name| try testing.expectEqual(null, kmsKeyLocation(name));
 }
 
 test "annotation keys, as production judged them" {

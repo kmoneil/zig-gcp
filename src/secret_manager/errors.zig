@@ -29,6 +29,17 @@ pub const Error = core.rpc.Error || error{
     /// measured; a deleted topic was still taken for a few minutes, from
     /// Pub/Sub's cache. Never retried.
     TopicNotPublishable,
+    /// Cloud KMS refused the key a secret is encrypted with: on a create or
+    /// update naming it, the key does not exist or the Secret Manager
+    /// service agent, which `Client.serviceAgent` names, lacks
+    /// `roles/cloudkms.cryptoKeyEncrypterDecrypter` on it; on `access` and
+    /// `addVersion`, the key version is disabled or scheduled for
+    /// destruction, or the agent lost the role. HTTP 400
+    /// `FAILED_PRECONDITION`, told apart from a disabled secret version by
+    /// production's message, which `Diagnostics` keeps. Measured, each
+    /// change to the key reached Secret Manager within a second. Never
+    /// retried.
+    KeyUnavailable,
     /// `Options.location` is not a Google Cloud location id.
     InvalidLocation,
     /// A success response could not be decoded. Never retried.

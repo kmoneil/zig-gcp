@@ -109,7 +109,7 @@ written policy always carries its bindings, even none, and says version
 
 Guides: [buckets](storage/buckets.md#iam),
 [topics and subscriptions](pubsub/topics-and-subscriptions.md#iam),
-[secrets](secret-manager.md#iam).
+[secrets](secret-manager/README.md#iam).
 
 ## Testing permissions
 

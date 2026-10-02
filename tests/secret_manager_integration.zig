@@ -8,6 +8,13 @@
 //! Set GCP_TEST_LOCATION as well, to a location such as `europe-west3`, and
 //! the regional tests run too.
 //!
+//! Set GCP_TEST_KMS_KEY to a Cloud KMS key named in full, on which the
+//! project's Secret Manager service agent holds
+//! roles/cloudkms.cryptoKeyEncrypterDecrypter, and the key tests run too:
+//! automatic replication for a key in `global`, otherwise a user-managed
+//! replica in the key's location, and a regional secret when that is
+//! GCP_TEST_LOCATION. Keys cost money by the month, so none is assumed.
+//!
 //! Without those, every test skips. Each test creates secrets named
 //! `zigps-<random>-<what>` labelled `zig-gcp-test=1` and deletes them, even
 //! when it fails; the last test sweeps up anything a crashed run left
@@ -93,6 +100,41 @@ const Fixture = struct {
         var created = try f.client.secret(id).create(labelled);
         created.deinit();
         return f.client.secret(id);
+    }
+
+    /// Waits for `access` of `ref` to fail with `want`. A version's state is
+    /// eventually consistent for access: measured on 2026-10-02, a version
+    /// disabled moments before was still served, twice in one run, and
+    /// refused on the next try. Allows a minute.
+    fn expectAccessRefused(f: *Fixture, secret: secret_manager.Secret, ref: secret_manager.VersionRef, want: anyerror) !void {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            if (secret.access(ref)) |served| {
+                var v = served;
+                v.deinit();
+                if (tries == 60) return error.TestStillServed;
+                try testing.io.sleep(.fromSeconds(1), .awake);
+            } else |err| {
+                if (err != want) return f.report(err);
+                return;
+            }
+        }
+    }
+
+    /// Waits for `access` of `ref` to serve `bytes`, as above.
+    fn expectAccessServed(f: *Fixture, secret: secret_manager.Secret, ref: secret_manager.VersionRef, bytes: []const u8) !void {
+        var tries: usize = 0;
+        while (true) : (tries += 1) {
+            if (secret.access(ref)) |served| {
+                var v = served;
+                defer v.deinit();
+                try testing.expectEqualStrings(bytes, v.bytes());
+                return;
+            } else |err| {
+                if (err != error.FailedPrecondition or tries == 60) return f.report(err);
+                try testing.io.sleep(.fromSeconds(1), .awake);
+            }
+        }
     }
 
     /// Prints the server's own words when a call fails unexpectedly.
@@ -223,15 +265,13 @@ test "disable, access, enable: a version can be taken out of service" {
     defer off.deinit();
     try testing.expectEqual(.disabled, off.value.state);
     // Production answers FAILED_PRECONDITION, with HTTP 400.
-    try testing.expectError(error.FailedPrecondition, secret.access(.{ .number = 1 }));
+    try f.expectAccessRefused(secret, .{ .number = 1 }, error.FailedPrecondition);
     try testing.expectEqual(400, f.diag.http_status);
 
     var on = version.enable() catch |err| return f.report(err);
     defer on.deinit();
     try testing.expectEqual(.enabled, on.value.state);
-    var value = secret.access(.{ .number = 1 }) catch |err| return f.report(err);
-    defer value.deinit();
-    try testing.expectEqualStrings("s3cr3t", value.bytes());
+    try f.expectAccessServed(secret, .{ .number = 1 }, "s3cr3t");
 
     // Both are idempotent: production answers 200 and the same state, so a
     // lost answer costs nothing to ask again.
@@ -336,7 +376,7 @@ test "user-managed replication: two locations, one usable secret" {
     defer f.deinit();
 
     const secret = f.create("replicated", .{
-        .replication = .{ .user_managed = &.{ "europe-west1", "us-east1" } },
+        .replication = .{ .user_managed = &.{ .{ .location = "europe-west1" }, .{ .location = "us-east1" } } },
     }) catch |err| return f.report(err);
     var added = secret.addVersion("s3cr3t") catch |err| return f.report(err);
     added.deinit();
@@ -625,14 +665,12 @@ test "delayed destruction: scheduled, refused a second time, cancelled" {
     try testing.expectEqualStrings("", scheduled.value.destroy_time);
     try testing.expectError(error.FailedPrecondition, v.destroy());
     try testing.expect(std.mem.indexOf(u8, f.diag.message(), "already scheduled") != null);
-    try testing.expectError(error.FailedPrecondition, secret.access(.{ .number = 1 }));
+    try f.expectAccessRefused(secret, .{ .number = 1 }, error.FailedPrecondition);
     var back = v.enable() catch |err| return f.report(err);
     defer back.deinit();
     try testing.expectEqual(.enabled, back.value.state);
     try testing.expectEqualStrings("", back.value.scheduled_destroy_time);
-    var value = secret.access(.{ .number = 1 }) catch |err| return f.report(err);
-    defer value.deinit();
-    try testing.expectEqualStrings("v1", value.bytes());
+    try f.expectAccessServed(secret, .{ .number = 1 }, "v1");
 }
 
 test "serviceAgent: the project's Secret Manager service agent" {
@@ -784,6 +822,60 @@ test "rotation: set beside a topic, read back, cleared" {
     defer cleared.deinit();
     try testing.expectEqual(null, cleared.value.rotation);
     try testing.expectEqual(0, cleared.value.topics.len);
+}
+
+/// A secret under `key` stores, reads and records its key version; one
+/// cleared of its key wraps new versions in Google's keys.
+fn keyCycle(f: *Fixture, config: secret_manager.SecretConfig, key: []const u8, what: []const u8) !void {
+    const secret = try f.create(what, config);
+    var info = secret.get() catch |err| return f.report(err);
+    defer info.deinit();
+    if (config.kms_key != null) {
+        try testing.expectEqualStrings(key, info.value.kms_key.?);
+    } else {
+        try testing.expectEqualStrings(key, info.value.replicas[0].kms_key.?);
+    }
+    var added = secret.addVersion("wrapped") catch |err| return f.report(err);
+    defer added.deinit();
+    try testing.expectEqual(1, added.value.kms_key_versions.len);
+    try testing.expect(std.mem.startsWith(u8, added.value.kms_key_versions[0].name, key));
+    var value = secret.access(.{ .number = 1 }) catch |err| return f.report(err);
+    defer value.deinit();
+    try testing.expectEqualStrings("wrapped", value.bytes());
+
+    var cleared = (if (config.kms_key != null)
+        secret.update(.{ .kms_key = .clear })
+    else
+        secret.update(.{ .replica_keys = &.{.{ .location = config.replication.user_managed[0].location }} })) catch |err| return f.report(err);
+    defer cleared.deinit();
+    var plain = secret.addVersion("plain") catch |err| return f.report(err);
+    defer plain.deinit();
+    try testing.expectEqual(0, plain.value.kms_key_versions.len);
+    // The first version keeps the key version that wrapped it.
+    var first = secret.version(.{ .number = 1 }).get() catch |err| return f.report(err);
+    defer first.deinit();
+    try testing.expectEqual(1, first.value.kms_key_versions.len);
+}
+
+test "keys: a secret under GCP_TEST_KMS_KEY, global and regional" {
+    var f: Fixture = undefined;
+    if (!try f.init(false)) return error.SkipZigTest;
+    defer f.deinit();
+    const key = f.env.get("GCP_TEST_KMS_KEY") orelse return error.SkipZigTest;
+    var parts = std.mem.splitScalar(u8, key, '/');
+    for (0..3) |_| _ = parts.next();
+    const location = parts.next() orelse return error.TestBadKmsKey;
+    if (std.mem.eql(u8, location, "global")) {
+        try keyCycle(&f, .{ .kms_key = key }, key, "key-auto");
+    } else {
+        try keyCycle(&f, .{ .replication = .{ .user_managed = &.{.{ .location = location, .kms_key = key }} } }, key, "key-um");
+        if (f.env.get("GCP_TEST_LOCATION")) |regional_location| if (std.mem.eql(u8, regional_location, location)) {
+            var r: Fixture = undefined;
+            if (!try r.init(true)) return;
+            defer r.deinit();
+            try keyCycle(&r, .{ .kms_key = key }, key, "key-reg");
+        };
+    }
 }
 
 test "sweep: delete anything a crashed run left behind" {
