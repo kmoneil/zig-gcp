@@ -397,7 +397,9 @@ test "golden: serviceAgent asks Service Usage, and reads the done operation" {
         \\{"done":true,"name":"operations/finished.DONE_OPERATION","response":{"@type":"type.googleapis.com/google.api.serviceusage.v1beta1.ServiceIdentity","email":"service-82150720798@gcp-sa-secretmanager.iam.gserviceaccount.com","uniqueId":"101786303149630632912"}}
         } },
         .{ .respond = .{ .body = "{\"name\":\"operations/acf.p2-1\",\"done\":false}" } },
+        .{ .respond = .{ .body = "{\"done\":false,\"response\":{\"email\":\"service-1@gcp-sa-secretmanager.iam.gserviceaccount.com\"}}" } },
         .{ .respond = .{ .body = "{\"done\":true,\"response\":{}}" } },
+        .{ .respond = .{ .body = "{\"done\":true,\"response\":{\"email\":\"not-an-address\"}}" } },
     }, .{ .location = "europe-west3" });
     defer h.deinit();
 
@@ -411,9 +413,9 @@ test "golden: serviceAgent asks Service Usage, and reads the done operation" {
         "{}",
     );
     try std.testing.expectEqualStrings("service-82150720798@gcp-sa-secretmanager.iam.gserviceaccount.com", agent.value);
-    // An operation still running, or one that names no address, is no answer.
-    try std.testing.expectError(error.InvalidResponse, h.client.serviceAgent());
-    try std.testing.expectError(error.InvalidResponse, h.client.serviceAgent());
+    // An operation still running, even one that says more than it should,
+    // or one that names no address, is no answer.
+    for (0..4) |_| try std.testing.expectError(error.InvalidResponse, h.client.serviceAgent());
 }
 
 test "serviceAgent: every allocation failure is OutOfMemory without leaks" {
