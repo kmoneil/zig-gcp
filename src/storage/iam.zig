@@ -456,7 +456,7 @@ fn iamAllocations(gpa: std.mem.Allocator) !void {
 }
 
 test "bucket IAM: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, iamAllocations, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, iamAllocations, .{});
 }
 
 fn iamModelProperty(_: void, bytes: []const u8) !void {
@@ -515,5 +515,5 @@ fn iamModelProperty(_: void, bytes: []const u8) !void {
 }
 
 test "heavy property iam on buckets: grants and revokes land as asked, a stale write is Aborted, and the legacy owners stay" {
-    try test_util.fuzzBytes({}, iamModelProperty, .{ .corpus = &.{ "", "\x01" ** 64, "\x00\x01\x02\x03\x04" ** 20 } });
+    try test_util.fuzzBytes({}, iamModelProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 64), test_util.repeat("\x00\x01\x02\x03\x04", 20) } });
 }

@@ -32,9 +32,9 @@ pub const Implementation = enum {
 /// names them, such as `x86_64_v2`; a baseline build takes the tables.
 pub const implementation: Implementation = if (has_instructions) .hardware else .software;
 
-const has_instructions = switch (builtin.cpu.arch) {
-    .aarch64 => std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc),
-    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .crc32),
+const has_instructions = switch (builtin.target.cpu.arch) {
+    .aarch64 => std.Target.aarch64.featureSetHas(builtin.target.cpu.features, .crc),
+    .x86_64 => std.Target.x86.featureSetHas(builtin.target.cpu.features, .crc32),
     else => false,
 };
 
@@ -229,7 +229,7 @@ fn hardware(register: u32, bytes: []const u8) u32 {
 
 /// Eight bytes, little-endian in `value`, into the register.
 inline fn word(register: u32, value: u64) u32 {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .aarch64 => asm ("crc32cx %[out:w], %[crc:w], %[value:x]"
             : [out] "=r" (-> u32),
             : [crc] "r" (register),
@@ -308,7 +308,7 @@ test "hashing in pieces matches hashing at once" {
 /// std's CRC-32/ISCSI: one table, a byte at a time, and none of the code
 /// above. The oracle at lengths the bit-at-a-time `reference` is too slow
 /// for.
-const Oracle = std.hash.crc.Crc32Iscsi;
+const Oracle = std.hash.crc.@"CRC-32/ISCSI";
 
 fn expectBothPaths(data: []const u8) !void {
     errdefer std.debug.print("{d} bytes at address {x}\n", .{ data.len, @intFromPtr(data.ptr) });
@@ -341,9 +341,9 @@ test "a checksum at comptime, as std's could be" {
 }
 
 test "the build's CPU picks the path" {
-    const expected: Implementation = switch (builtin.cpu.arch) {
-        .aarch64 => if (std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc)) .hardware else .software,
-        .x86_64 => if (std.Target.x86.featureSetHas(builtin.cpu.features, .crc32)) .hardware else .software,
+    const expected: Implementation = switch (builtin.target.cpu.arch) {
+        .aarch64 => if (std.Target.aarch64.featureSetHas(builtin.target.cpu.features, .crc)) .hardware else .software,
+        .x86_64 => if (std.Target.x86.featureSetHas(builtin.target.cpu.features, .crc32)) .hardware else .software,
         else => .software,
     };
     try testing.expectEqual(expected, implementation);

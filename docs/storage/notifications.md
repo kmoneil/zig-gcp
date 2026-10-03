@@ -20,7 +20,7 @@ flowchart LR
 // publisher role on the topic.
 var agent = try gcs.serviceAgent();
 defer agent.deinit();
-const member = try std.fmt.allocPrint(arena, "serviceAccount:{s}", .{agent.value});
+const member = try arena.print("serviceAccount:{s}", .{agent.value});
 var policy = try ps.topic("uploads").addIamBinding("roles/pubsub.publisher", member);
 policy.deinit();
 

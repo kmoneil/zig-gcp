@@ -609,7 +609,7 @@ test "check: what a changed copy refuses, before anything is sent" {
         .{ .options = .{ .storage_class = "" }, .says = "storage_class" },
         .{ .options = .{ .storage_class = "nearline" }, .says = "storage_class" },
         .{ .options = .{ .storage_class = "NEAR LINE" }, .says = "storage_class" },
-        .{ .options = .{ .storage_class = "A" ** 65 }, .says = "storage_class" },
+        .{ .options = .{ .storage_class = test_util.repeat("A", 65) }, .says = "storage_class" },
         .{ .options = .{ .edit = .{ .change = &.{.{ .key = "", .value = "v" }} } }, .says = "no key" },
         .{ .options = .{ .edit = .{ .change = &.{
             .{ .key = "k", .value = "1" },
@@ -625,7 +625,7 @@ test "check: what a changed copy refuses, before anything is sent" {
     try h.expectRequestCount(0);
     // The longest real class, and a made-up one the server will judge.
     try check(null, .{ .storage_class = "DURABLE_REDUCED_AVAILABILITY" });
-    try check(null, .{ .storage_class = "A" ** max_storage_class_len });
+    try check(null, .{ .storage_class = test_util.repeat("A", max_storage_class_len) });
 }
 
 fn copyWithChanges(gpa: Allocator) !void {
@@ -655,7 +655,7 @@ fn copyWithChanges(gpa: Allocator) !void {
 }
 
 test "copyTo with changes: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, copyWithChanges, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, copyWithChanges, .{});
 }
 
 // Properties. Each states a rule of the module comment independently of

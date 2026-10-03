@@ -552,7 +552,7 @@ const unavailable: Reply = .{ .respond = .{ .status = 503, .body = "Service Unav
 
 /// A credentials file around `source`, optionally impersonating.
 fn credJson(arena: Allocator, source: []const u8, impersonated: bool) ![]const u8 {
-    return std.fmt.allocPrint(arena,
+    return arena.print(
         \\{{"type": "external_account", "audience": "{s}",
         \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
         \\ "token_url": "https://sts.googleapis.com/v1/token",
@@ -592,7 +592,7 @@ const Harness = struct {
         const a = h.arena.allocator();
         const source = options.source orelse source: {
             try h.tmp.dir.writeFile(testing.io, .{ .sub_path = "subject", .data = options.subject });
-            break :source try std.fmt.allocPrint(a, "{{\"file\": \".zig-cache/tmp/{s}/subject\"}}", .{&h.tmp.sub_path});
+            break :source try a.print("{{\"file\": \".zig-cache/tmp/{s}/subject\"}}", .{&h.tmp.sub_path});
         };
         h.account = try .initFromJson(testing.allocator, testing.io, try credJson(a, source, options.impersonate), .{
             .diagnostics = &h.diag,
@@ -777,11 +777,11 @@ test "ExternalAccount: init refuses what cannot work, and says why" {
     }));
 
     // Endpoints from the file that would carry secrets in the clear.
-    const bad_sts = try std.fmt.allocPrint(a, "{{\"type\":\"external_account\",\"audience\":\"{s}\",\"subject_token_type\":\"t\",\"token_url\":\"http://elsewhere.example/token\",\"credential_source\":{{\"file\":\"/t\"}}}}", .{test_audience});
+    const bad_sts = try a.print("{{\"type\":\"external_account\",\"audience\":\"{s}\",\"subject_token_type\":\"t\",\"token_url\":\"http://elsewhere.example/token\",\"credential_source\":{{\"file\":\"/t\"}}}}", .{test_audience});
     try testing.expectError(error.InvalidCredentialsFile, ExternalAccount.initFromJson(testing.allocator, io, bad_sts, .{ .diagnostics = &diag }));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "token_url") != null);
 
-    const bad_lifetime = try std.fmt.allocPrint(a, "{{\"type\":\"external_account\",\"audience\":\"{s}\",\"subject_token_type\":\"t\",\"credential_source\":{{\"file\":\"/t\"}},\"service_account_impersonation\":{{\"token_lifetime_seconds\":100}}}}", .{test_audience});
+    const bad_lifetime = try a.print("{{\"type\":\"external_account\",\"audience\":\"{s}\",\"subject_token_type\":\"t\",\"credential_source\":{{\"file\":\"/t\"}},\"service_account_impersonation\":{{\"token_lifetime_seconds\":100}}}}", .{test_audience});
     try testing.expectError(error.InvalidCredentialsFile, ExternalAccount.initFromJson(testing.allocator, io, bad_lifetime, .{ .diagnostics = &diag }));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "token_lifetime_seconds") != null);
 
@@ -832,7 +832,7 @@ test "ExternalAccount: every block it frees is wiped first" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "subject", .data = "wipe-subject" });
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const with_headers = try std.fmt.allocPrint(arena.allocator(),
+    const with_headers = try arena.allocator().print(
         \\{{"url": "http://127.0.0.1:1/t", "headers": {{"Metadata": "True"}}}}
     , .{});
     var fake: test_util.FakeTransport = .init(testing.allocator, &.{
@@ -856,7 +856,7 @@ test "ExternalAccount: every allocation failure is OutOfMemory without leaks" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "subject", .data = "alloc-subject" });
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const source = try std.fmt.allocPrint(arena.allocator(), "{{\"file\": \".zig-cache/tmp/{s}/subject\"}}", .{&tmp.sub_path});
+    const source = try arena.allocator().print("{{\"file\": \".zig-cache/tmp/{s}/subject\"}}", .{&tmp.sub_path});
     const json = try credJson(arena.allocator(), source, false);
     const Run = struct {
         fn get(gpa: Allocator, cred: []const u8) !void {
@@ -869,7 +869,7 @@ test "ExternalAccount: every allocation failure is OutOfMemory without leaks" {
             _ = try account.provider().getToken(testing.io, scratch.allocator(), test_scopes);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{json});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{json});
 }
 
 test "ExternalAccount: against an STS on loopback" {
@@ -886,7 +886,7 @@ test "ExternalAccount: against an STS on loopback" {
     try tmp.dir.writeFile(io, .{ .sub_path = "subject", .data = "loopback-subject\n" });
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const source = try std.fmt.allocPrint(arena.allocator(), "{{\"file\": \".zig-cache/tmp/{s}/subject\"}}", .{&tmp.sub_path});
+    const source = try arena.allocator().print("{{\"file\": \".zig-cache/tmp/{s}/subject\"}}", .{&tmp.sub_path});
     var url_buf: [64]u8 = undefined;
     var account: ExternalAccount = try .initFromJson(testing.allocator, io, try credJson(arena.allocator(), source, false), .{
         .token_url = server.url(&url_buf, "/v1/token"),
@@ -907,7 +907,8 @@ fn anyStsReplyProperty(_: void, input: []const u8) !void {
     const status = g.pick(u16, &.{ 200, 200, 400, 403, 429, 500, 503, 302, 0 });
     const reply: Reply = .{ .respond = .{ .status = status, .body = g.rest() } };
     var h: Harness = undefined;
-    try h.init(&(.{reply} ** 2), .{});
+    const replies: [2]Reply = @splat(reply);
+    try h.init(&replies, .{});
     defer h.deinit();
     const token = h.get() catch return;
     try testing.expect(TokenProvider.isValidToken(token));

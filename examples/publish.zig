@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     const messages = try arena.alloc(pubsub.Message, count);
     for (messages, 0..) |*m, i| {
         m.* = .{
-            .data = try std.fmt.allocPrint(arena, "message {d} of {d}", .{ i + 1, count }),
+            .data = try arena.print("message {d} of {d}", .{ i + 1, count }),
             .attributes = &.{.{ .key = "origin", .value = "zig-pubsub example" }},
         };
     }

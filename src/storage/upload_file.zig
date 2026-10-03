@@ -952,7 +952,7 @@ fn uploadFileWithCheckpoint(gpa: Allocator) !void {
 }
 
 test "uploadFile with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, uploadFileWithCheckpoint, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, uploadFileWithCheckpoint, .{});
 }
 
 /// Draws each session request's fate from fuzz bytes: mostly nothing,
@@ -1333,7 +1333,7 @@ fn forgeState(saved: *MemoryCheckpoint, edit: anytype) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var state = (try checkpoint.parse(arena.allocator(), saved.stored.?)).upload_file;
-    inline for (std.meta.fields(@TypeOf(edit))) |field| @field(state, field.name) = @field(edit, field.name);
+    inline for (@typeInfo(@TypeOf(edit)).@"struct".field_names) |name| @field(state, name) = @field(edit, name);
     const forged = try checkpoint.encodeAlloc(testing.allocator, .{ .upload_file = state });
     testing.allocator.free(saved.stored.?);
     saved.stored = forged;
@@ -1427,7 +1427,7 @@ test "compressed uploadFile: a session holding other bytes is refused at the fin
         var saved: MemoryCheckpoint = .{ .gpa = testing.allocator };
         defer saved.deinit();
         try dieAfterTwoChunks(&fake, &token, file, &saved, 6);
-        const small = "a small file\n" ** 1000;
+        const small = test_util.repeat("a small file\n", 1000);
         var tmp2 = testing.tmpDir(.{});
         defer tmp2.cleanup();
         const small_file = try sourceOn(&tmp2, small);
@@ -1470,7 +1470,7 @@ fn compressedUploadWithCheckpoint(gpa: Allocator) !void {
 }
 
 test "compressed uploadFile with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, compressedUploadWithCheckpoint, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, compressedUploadWithCheckpoint, .{});
 }
 
 /// `resumeUnderFaults` for a compressed upload: whatever the faults cut,
@@ -1596,7 +1596,7 @@ test "compressed uploadFile: a file shorter than it measured is caught, and noth
     var diag: Diagnostics = .{};
     var client = try clientOn(&fake, &token, &diag, 3);
     defer client.deinit();
-    const data = "a line that repeats\n" ** 5000;
+    const data = test_util.repeat("a line that repeats\n", 5000);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try sourceOn(&tmp, data);

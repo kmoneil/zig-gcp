@@ -482,7 +482,7 @@ test "addVersion: every allocation failure is OutOfMemory without leaks" {
             added.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
 
 const created_secret: Reply = .{ .respond = .{ .body =
@@ -637,7 +637,7 @@ test "secret administration: every allocation failure is OutOfMemory without lea
             try secret.delete();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
 
 /// Production's refusal of a write under a stale etag, word for word.
@@ -771,13 +771,13 @@ test "update: what never reaches the server" {
         for (&aliases, 0..) |*a, i| a.* = .{ .name = std.fmt.comptimePrint("a{d}", .{i}), .version = 1 };
         break :blk aliases;
     };
-    const big = "x" ** (validate.max_annotation_bytes);
+    const big = test_util.repeat("x", validate.max_annotation_bytes);
     const cases = [_]Case{
         .{ .{}, "at least one change" },
         .{ .{ .etag = "\"e\"" }, "at least one change" },
         .{ .{ .labels = .{ .set = &.{.{ .key = "Team", .value = "v" }} } }, "lowercase letter" },
         .{ .{ .labels = .{ .set = &.{.{ .key = "team", .value = "A" }} } }, "lowercase letters" },
-        .{ .{ .labels = .{ .set = &.{.{ .key = "a" ** 64, .value = "v" }} } }, "63 characters" },
+        .{ .{ .labels = .{ .set = &.{.{ .key = test_util.repeat("a", 64), .value = "v" }} } }, "63 characters" },
         .{ .{ .labels = .{ .set = &.{ .{ .key = "a", .value = "1" }, .{ .key = "a", .value = "2" } } } }, "same key" },
         .{ .{ .labels = .{ .set = &many_labels } }, "at most 64 labels" },
         .{ .{ .annotations = .{ .set = &.{.{ .key = "example.com/owner", .value = "v" }} } }, "annotation 1" },
@@ -808,8 +808,8 @@ test "update: what never reaches the server" {
 
     // The edges themselves go out: Latest and new are names production takes.
     var edges = try secret.update(.{
-        .aliases = .{ .set = &.{ .{ .name = "Latest", .version = 1 }, .{ .name = "new", .version = 1 }, .{ .name = "a" ** 63, .version = 1 } } },
-        .annotations = .{ .set = &.{.{ .key = "a" ** 64, .value = "x" ** (validate.max_annotation_bytes - 64) }} },
+        .aliases = .{ .set = &.{ .{ .name = "Latest", .version = 1 }, .{ .name = "new", .version = 1 }, .{ .name = test_util.repeat("a", 63), .version = 1 } } },
+        .annotations = .{ .set = &.{.{ .key = test_util.repeat("a", 64), .value = test_util.repeat("x", validate.max_annotation_bytes - 64) }} },
         .expiry = .{ .set = .{ .after_s = 60 } },
     });
     edges.deinit();
@@ -872,7 +872,7 @@ test "update and deleteIf: every allocation failure is OutOfMemory without leaks
             try secret.deleteIf("\"e\"");
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
 
 test "golden: topics and rotation, on create and update" {

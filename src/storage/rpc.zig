@@ -154,7 +154,7 @@ fn billedPath(client: *Client, path: []const u8) Allocator.Error!?[]u8 {
 fn hintBilling(client: *Client, err: anyerror) void {
     if (err != error.InvalidArgument or client.billing_project != null) return;
     const d = client.diagnostics orelse return;
-    if (std.ascii.indexOfIgnoreCase(d.message(), "requester pays") == null) return;
+    if (std.ascii.findIgnoreCase(d.message(), "requester pays") == null) return;
     var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
     const status_text = d.status();
     @memcpy(status_buf[0..status_text.len], status_text);
@@ -172,9 +172,9 @@ fn hintKeys(client: *Client, err: anyerror) void {
     const d = client.diagnostics orelse return;
     const message = d.message();
     const keyless = err == error.InvalidArgument and client.encryption_key == null and
-        (std.ascii.indexOfIgnoreCase(message, "is encrypted by a customer-supplied") != null or
-            std.ascii.indexOfIgnoreCase(message, "is encrypted with a customer encryption key") != null);
-    const ungranted = err == error.PermissionDenied and std.ascii.indexOfIgnoreCase(message, "Cloud KMS key") != null;
+        (std.ascii.findIgnoreCase(message, "is encrypted by a customer-supplied") != null or
+            std.ascii.findIgnoreCase(message, "is encrypted with a customer encryption key") != null);
+    const ungranted = err == error.PermissionDenied and std.ascii.findIgnoreCase(message, "Cloud KMS key") != null;
     const message_hint = if (keyless)
         "the object is encrypted with a customer-supplied key, and this request carried none: Object.withEncryptionKey gives it"
     else if (ungranted)

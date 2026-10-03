@@ -128,7 +128,7 @@ What else is safe to repeat depends on the call, and each module says:
   etag, and a concurrent change is `error.Aborted`: see
   [IAM on every resource](iam.md#errors-and-retries).
 
-`std.http.Client` has no per-request timeout in 0.16, so the library
+`std.http.Client` has no per-request timeout (Zig 0.17), so the library
 adds one: every request is raced against a timer, and one that outlives
 `Client.Options.request_timeout_ms` is `error.TimedOut` and is retried
 like any other transient failure. The default is 3 minutes for Pub/Sub,

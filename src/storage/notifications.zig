@@ -118,7 +118,7 @@ fn refuse(diag: ?*core.Diagnostics, comptime format: []const u8, args: anytype) 
 /// The body of a create: the topic in its documented form, the payload
 /// format always (Cloud Storage requires it), and nothing empty.
 pub fn encode(arena: Allocator, config: types.NotificationConfig) Allocator.Error![]u8 {
-    const topic = try std.fmt.allocPrint(arena, "//pubsub.googleapis.com/projects/{s}/topics/{s}", .{ config.topic.project, config.topic.topic });
+    const topic = try arena.print("//pubsub.googleapis.com/projects/{s}/topics/{s}", .{ config.topic.project, config.topic.topic });
     var out: std.Io.Writer.Allocating = .init(arena);
     var jw: Stringify = .{ .writer = &out.writer };
     write(&jw, config, topic) catch return error.OutOfMemory;
@@ -443,8 +443,8 @@ test "encode: the topic in its documented form, the format always, and nothing e
 
 test "check: each refusal alone, and what production took" {
     const Case = struct { config: types.NotificationConfig, says: []const u8 };
-    const k257 = "k" ** 257;
-    const v1025 = "v" ** 1025;
+    const k257 = test_util.repeat("k", 257);
+    const v1025 = test_util.repeat("v", 1025);
     const six = [_]types.Attribute{ .{ .key = "a", .value = "" }, .{ .key = "b", .value = "" }, .{ .key = "c", .value = "" }, .{ .key = "d", .value = "" }, .{ .key = "e", .value = "" }, .{ .key = "f", .value = "" } };
     const cases = [_]Case{
         .{ .config = .{ .topic = .{ .project = "", .topic = "zigps-t1" } }, .says = "project" },
@@ -461,8 +461,8 @@ test "check: each refusal alone, and what production took" {
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = k257, .value = "v" }} }, .says = "257 bytes" },
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "k", .value = v1025 }} }, .says = "1025 bytes" },
         // Characters to the eye, bytes to Cloud Storage, as measured.
-        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "é" ** 129, .value = "v" }} }, .says = "258 bytes" },
-        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "k", .value = "é" ** 513 }} }, .says = "1026 bytes" },
+        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = test_util.repeat("é", 129), .value = "v" }} }, .says = "258 bytes" },
+        .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "k", .value = test_util.repeat("é", 513) }} }, .says = "1026 bytes" },
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "goog-x", .value = "1" }} }, .says = "begins with goog" },
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "GOOGy", .value = "1" }} }, .says = "begins with goog" },
         .{ .config = .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "eventType", .value = "x" }} }, .says = "named like an attribute every message carries" },
@@ -479,8 +479,8 @@ test "check: each refusal alone, and what production took" {
         }
     }
     // Each taken by production as asked, at the limits.
-    const k256 = "k" ** 256;
-    const v1024 = "v" ** 1024;
+    const k256 = test_util.repeat("k", 256);
+    const v1024 = test_util.repeat("v", 1024);
     const five = six[0..5];
     for ([_]types.NotificationConfig{
         minimal,
@@ -488,7 +488,7 @@ test "check: each refusal alone, and what production took" {
         .{ .topic = minimal.topic, .custom_attributes = five },
         .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = k256, .value = v1024 }} },
         .{ .topic = minimal.topic, .custom_attributes = &.{ .{ .key = "xgoog", .value = "" }, .{ .key = "ключ", .value = "значение" } } },
-        .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = "é" ** 128, .value = "é" ** 512 }} },
+        .{ .topic = minimal.topic, .custom_attributes = &.{.{ .key = test_util.repeat("é", 128), .value = test_util.repeat("é", 512) }} },
         .{ .topic = minimal.topic, .events = &.{ .initialize, .archive, .metadata_update } },
         .{ .topic = minimal.topic, .object_name_prefix = "" },
     }) |config| try check(null, config);
@@ -840,7 +840,7 @@ fn everyCall(gpa: Allocator) !void {
 }
 
 test "notifications: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, everyCall, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, everyCall, .{});
 }
 
 /// A configuration drawn from `bytes`, near the bounds production holds it
@@ -849,7 +849,7 @@ test "notifications: every allocation failure is OutOfMemory, and nothing leaks"
 /// empty, repeated or unknown.
 fn drawConfig(g: *test_util.ByteGen, arena: Allocator) !types.NotificationConfig {
     const project = g.pick([]const u8, &.{ "extractctl", "82150720798", "example.com:p", "", "a/b", "p q" });
-    const topic = g.pick([]const u8, &.{ "zigps-t1", "t", "goog-t", "1abc", "a" ** 255, "a" ** 256, "ab/c", "t%ópico" });
+    const topic = g.pick([]const u8, &.{ "zigps-t1", "t", "goog-t", "1abc", test_util.repeat("a", 255), test_util.repeat("a", 256), "ab/c", "t%ópico" });
     const payload = g.pick(types.PayloadFormat, &.{ .json, .none, .unknown });
     const events: ?[]const types.EventType = if (g.boolean()) null else events: {
         const out = try arena.alloc(types.EventType, g.intRange(usize, 0, 6));
@@ -863,8 +863,8 @@ fn drawConfig(g: *test_util.ByteGen, arena: Allocator) !types.NotificationConfig
             1 => g.pick([]const u8, &builtin_attributes),
             2 => g.pick([]const u8, &.{ "team", "goog-x", "GoOg", "xgoog" }),
             3 => try arena.alloc(u8, g.intRange(usize, 254, 258)),
-            4 => try std.fmt.allocPrint(arena, "{s}", .{g.utf8(try arena.alloc(u8, 600), 600)}),
-            else => try std.fmt.allocPrint(arena, "k{d}", .{g.int(u8)}),
+            4 => try arena.print("{s}", .{g.utf8(try arena.alloc(u8, 600), 600)}),
+            else => try arena.print("k{d}", .{g.int(u8)}),
         };
         if (key.len > 0 and key[0] == 0xaa) @memset(@constCast(key), 'k');
         const value: []const u8 = switch (g.intRange(u8, 0, 2)) {
@@ -896,7 +896,7 @@ fn takenAsAsked(config: types.NotificationConfig) bool {
     // An empty or unknown list is dropped, a repeat kept once.
     if (config.events) |events| {
         if (events.len == 0) return false;
-        var seen = std.EnumSet(types.EventType).initEmpty();
+        var seen: std.EnumSet(types.EventType) = .empty;
         for (events) |e| {
             if (e == .unknown or seen.contains(e)) return false;
             seen.insert(e);
@@ -938,5 +938,5 @@ fn checksProperty(_: void, bytes: []const u8) !void {
 }
 
 test "fuzz notification checks: taken exactly when production takes the configuration as asked" {
-    try test_util.fuzzBytes({}, checksProperty, .{ .corpus = &.{ "", "\x00" ** 64, "\x01\x02\x03\x04" ** 32, "\xff" ** 128 } });
+    try test_util.fuzzBytes({}, checksProperty, .{ .corpus = &.{ "", test_util.repeat("\x00", 64), test_util.repeat("\x01\x02\x03\x04", 32), test_util.repeat("\xff", 128) } });
 }

@@ -554,7 +554,7 @@ test "findDefault: a workload identity federation file works from the environmen
     // The subject token, where the file's credential source points.
     var subject_buf: [160]u8 = undefined;
     _ = try config.write(&subject_buf, "subject", "external-subject-token");
-    const external_json = try std.fmt.allocPrint(arena.allocator(),
+    const external_json = try arena.allocator().print(
         \\{{"type": "external_account",
         \\ "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/x",
         \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
@@ -624,7 +624,7 @@ test "Credentials.signer: a key file signs here, impersonation and the metadata 
     var subject_buf: [160]u8 = undefined;
     _ = try config.write(&subject_buf, "subject", "external-subject-token");
     var external_buf: [160]u8 = undefined;
-    const external_path = try config.write(&external_buf, "external.json", try std.fmt.allocPrint(a,
+    const external_path = try config.write(&external_buf, "external.json", try a.print(
         \\{{"type": "external_account",
         \\ "audience": "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/x",
         \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
@@ -715,7 +715,7 @@ test "findDefault: a gcloud path that cannot even be checked is an error" {
     // platform refuses a different path: Windows reports one that is
     // merely too long as absent, which it is, but refuses one it cannot
     // encode, and posix is the other way round.
-    const unusable_dir = if (builtin.os.tag == .windows) "bad\xffname" else "x" ** 5000;
+    const unusable_dir = if (builtin.target.os.tag == .windows) "bad\xffname" else test_util.repeat("x", 5000);
     var fake: test_util.FakeTransport = .init(testing.allocator, &.{ metadata_listing, metadata_token });
     defer fake.deinit();
     var diag: Diagnostics = .{};
@@ -954,14 +954,14 @@ test "findDefault: every allocation failure is OutOfMemory without leaks" {
     defer with_file.deinit();
     var path_buf: [160]u8 = undefined;
     _ = try with_file.write(&path_buf, Lookup.adc_file_name, gcloud_json);
-    try testing.checkAllAllocationFailures(testing.allocator, Run.fromFile, .{with_file.dir});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromFile, .{with_file.dir});
     var named_buf: [160]u8 = undefined;
     const named = try std.fmt.bufPrint(&named_buf, "{s}/{s}", .{ with_file.dir, Lookup.adc_file_name });
-    try testing.checkAllAllocationFailures(testing.allocator, Run.fromNamedFile, .{named});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromNamedFile, .{named});
 
     var empty: TmpConfig = undefined;
     try empty.init();
     defer empty.deinit();
-    try testing.checkAllAllocationFailures(testing.allocator, Run.fromMetadata, .{empty.dir});
-    try testing.checkAllAllocationFailures(testing.allocator, Run.nothing, .{empty.dir});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromMetadata, .{empty.dir});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.nothing, .{empty.dir});
 }

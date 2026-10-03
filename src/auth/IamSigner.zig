@@ -112,7 +112,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) InitError!IamSigner {
     errdefer freeAll(gpa, delegates);
     const url = try iam_credentials.signBlobUrl(gpa, options.iam_endpoint, options.service_account);
     errdefer gpa.free(url);
-    const refused = try std.fmt.allocPrint(gpa, "signing was refused: the credentials need roles/iam.serviceAccountTokenCreator on {s}, and the IAM Service Account Credentials API must be enabled", .{options.service_account});
+    const refused = try gpa.print("signing was refused: the credentials need roles/iam.serviceAccountTokenCreator on {s}, and the IAM Service Account Credentials API must be enabled", .{options.service_account});
     errdefer gpa.free(refused);
     const user_agent = try gpa.dupe(u8, options.user_agent);
     errdefer gpa.free(user_agent);
@@ -287,7 +287,7 @@ test "IamSigner: one signBlob call, with the caller's token and the bytes in bas
     try testing.expectEqualStrings("ya29.CALLER", sent.bearer.?);
     try testing.expectEqual(.json, sent.content_type);
     var payload: [std.base64.standard.Encoder.calcSize(test_message.len)]u8 = undefined;
-    const want = try std.fmt.allocPrint(h.arena.allocator(), "{{\"payload\":\"{s}\"}}", .{std.base64.standard.Encoder.encode(&payload, test_message)});
+    const want = try h.arena.allocator().print("{{\"payload\":\"{s}\"}}", .{std.base64.standard.Encoder.encode(&payload, test_message)});
     try testing.expectEqualStrings(want, sent.body.?);
     // The token is asked for the scope IAM Credentials takes.
     try testing.expectEqualStrings(iam_credentials.scope, h.token.firstScope());
@@ -368,8 +368,8 @@ test "IamSigner: a 403 names the role; other refusals keep the server's words" {
 }
 
 test "IamSigner: an answer without a usable signature is SigningFailed" {
-    const short = "{\"signedBlob\":\"" ++ "AAAA" ** 10 ++ "\"}";
-    const long = "{\"signedBlob\":\"" ++ "AAAA" ** 180 ++ "\"}";
+    const short = "{\"signedBlob\":\"" ++ test_util.repeat("AAAA", 10) ++ "\"}";
+    const long = "{\"signedBlob\":\"" ++ test_util.repeat("AAAA", 180) ++ "\"}";
     for ([_][]const u8{ "<html>", "{}", "{\"signedBlob\":null}", "{\"signedBlob\":\"!!!!\"}", short, long }) |body| {
         var h: Harness = undefined;
         try h.init(&.{.{ .respond = .{ .body = body } }}, &.{});
@@ -471,5 +471,5 @@ fn signWithFailingAllocations(gpa: Allocator) !void {
 }
 
 test "IamSigner: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, signWithFailingAllocations, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, signWithFailingAllocations, .{});
 }

@@ -33,12 +33,12 @@ pub fn main(init: std.process.Init) !void {
         }
     };
     const candidates = [_]Candidate{
-        .{ .name = "std Crc32Iscsi", .run = std.hash.crc.Crc32Iscsi.hash },
+        .{ .name = "std CRC-32/ISCSI", .run = std.hash.crc.@"CRC-32/ISCSI".hash },
         .{ .name = "core.crc32c.hashSoftware", .run = core.crc32c.hashSoftware },
         .{ .name = "core.crc32c.hash", .run = core.crc32c.hash },
         .{ .name = "Hasher, 64 KiB updates", .run = Stream.run },
     };
-    std.debug.print("{t} ({s}), core.crc32c.implementation = .{t}\n", .{ builtin.cpu.arch, builtin.cpu.model.name, core.crc32c.implementation });
+    std.debug.print("{t} ({s}), core.crc32c.implementation = .{t}\n", .{ builtin.target.cpu.arch, builtin.target.cpu.model.name, core.crc32c.implementation });
     var want: ?u32 = null;
     for (candidates) |candidate| {
         var best: u64 = std.math.maxInt(u64);

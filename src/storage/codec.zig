@@ -607,8 +607,8 @@ pub fn eventTypeName(event: types.EventType) ?[]const u8 {
 /// A type this library does not know is `.unknown`, never an error: Cloud
 /// Storage added `OBJECT_INITIALIZE` long after the other four.
 pub fn eventTypeOf(name: []const u8) types.EventType {
-    inline for (@typeInfo(types.EventType).@"enum".fields) |field| {
-        const event: types.EventType = @enumFromInt(field.value);
+    inline for (@typeInfo(types.EventType).@"enum".field_names) |field_name| {
+        const event = @field(types.EventType, field_name);
         if (eventTypeName(event)) |known| if (std.mem.eql(u8, name, known)) return event;
     }
     return .unknown;
@@ -952,12 +952,12 @@ fn timeOf(arena: Allocator, value: ?std.json.Value) Allocator.Error!?[]const u8 
             if (year_day.year > 9999) return null;
             const month_day = year_day.calculateMonthDay();
             const day = epoch.getDaySeconds();
-            const date = try std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
+            const date = try arena.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}", .{
                 year_day.year,         month_day.month.numeric(), @as(u8, month_day.day_index) + 1,
                 day.getHoursIntoDay(), day.getMinutesIntoHour(),  day.getSecondsIntoMinute(),
             });
-            if (nanos == 0) return try std.fmt.allocPrint(arena, "{s}Z", .{date});
-            return try std.fmt.allocPrint(arena, "{s}.{d:0>9}Z", .{ date, @as(u64, @intCast(nanos)) });
+            if (nanos == 0) return try arena.print("{s}Z", .{date});
+            return try arena.print("{s}.{d:0>9}Z", .{ date, @as(u64, @intCast(nanos)) });
         },
         else => return null,
     }

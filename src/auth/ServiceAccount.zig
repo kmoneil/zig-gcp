@@ -799,7 +799,7 @@ test "ServiceAccount: every allocation failure while signing is OutOfMemory" {
     var h: Harness = undefined;
     try h.init(&.{});
     defer h.deinit();
-    try testing.checkAllAllocationFailures(testing.allocator, signOnce, .{ h.account.signer(), h.clock.io() });
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, signOnce, .{ h.account.signer(), h.clock.io() });
 }
 
 test "ServiceAccount: secrets reach neither the log nor Diagnostics" {
@@ -856,7 +856,7 @@ test "ServiceAccount: every allocation failure is OutOfMemory without leaks" {
             _ = try account.provider().getToken(clock.io(), arena.allocator(), test_scopes);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{token_ok});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{token_ok});
 }
 
 test "ServiceAccount: initFromFile reads the file, and reports a missing one" {
@@ -910,7 +910,8 @@ fn anyReplyProperty(_: void, input: []const u8) !void {
     const status = g.pick(u16, &.{ 200, 200, 400, 401, 403, 429, 500, 503, 302, 0 });
     const reply: Reply = .{ .respond = .{ .status = status, .body = g.rest() } };
     var h: Harness = undefined;
-    try h.init(&(.{reply} ** 3));
+    const replies: [3]Reply = @splat(reply);
+    try h.init(&replies);
     defer h.deinit();
     // Whatever the token endpoint says, a usable token or an error, and no leak.
     const token = h.get() catch return;

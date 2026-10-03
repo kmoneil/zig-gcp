@@ -1194,6 +1194,50 @@ pub const ByteGen = struct {
     }
 };
 
+/// `std.testing.allocator`, except that no block grows in place: the
+/// backing allocator for `std.testing.checkAllAllocationFailures`, which
+/// needs the same allocations on every run of the code it sweeps. Zig
+/// 0.17's testing allocator, `std.heap.SafeAllocator`, grows a block in
+/// place only while nothing was handed out after it, and that depends on
+/// earlier runs: a grow that moved its block in one run (an allocation
+/// more) stayed put in the next, and the sweep failed with
+/// `NondeterministicMemoryUsage`. Here every grow allocates anew.
+pub const no_grow_allocator: Allocator = .{ .ptr = undefined, .vtable = &.{
+    .alloc = NoGrow.alloc,
+    .resize = NoGrow.resize,
+    .remap = NoGrow.remap,
+    .free = NoGrow.free,
+} };
+
+const NoGrow = struct {
+    fn alloc(_: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
+        return std.testing.allocator.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(_: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
+        if (new_len > memory.len) return false;
+        return std.testing.allocator.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(_: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        if (new_len > memory.len) return null;
+        return std.testing.allocator.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(_: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
+        std.testing.allocator.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+/// `s` written `n` times over, as a comptime constant that `++` accepts.
+/// It stands in for `s ** n`, which Zig 0.17 removed from the language.
+pub inline fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    return comptime repeated: {
+        const copies: [n][s.len]u8 = @splat(s[0..s.len].*);
+        break :repeated @ptrCast(&copies);
+    };
+}
+
 /// The longest input a property sees under the coverage-guided fuzzer.
 pub const max_fuzz_input = 4096;
 
@@ -1280,6 +1324,43 @@ test "FakeClock random is deterministic or pinned" {
     a.random_byte = 0xff;
     a.io().random(&x);
     try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(0xff)), &x);
+}
+
+test "no_grow_allocator refuses every grow and allows the rest" {
+    const a = no_grow_allocator;
+    const block = try a.alloc(u8, 64);
+    try std.testing.expect(!a.resize(block, 65));
+    try std.testing.expect(a.remap(block, 4096) == null);
+    // An ArrayList still grows, by moving.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(a);
+    for (0..10_000) |i| try list.append(a, @truncate(i));
+    try std.testing.expectEqual(10_000, list.items.len);
+    a.free(block);
+}
+
+fn growMany(gpa: Allocator) !void {
+    var list: std.ArrayList(u64) = .empty;
+    defer list.deinit(gpa);
+    for (0..5_000) |i| try list.append(gpa, i);
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    // An allocating writer reports a failed allocation as WriteFailed.
+    for (0..2_000) |i| text.writer.print("{d},", .{i}) catch return error.OutOfMemory;
+}
+
+test "no_grow_allocator: a sweep of code that grows its blocks sees the same allocations every run" {
+    for (0..3) |_| try std.testing.checkAllAllocationFailures(no_grow_allocator, growMany, .{});
+}
+
+test "repeat writes the text n times, at comptime" {
+    try std.testing.expectEqualStrings("abababab", repeat("ab", 4));
+    try std.testing.expectEqualStrings("x", repeat("x", 1));
+    try std.testing.expectEqualStrings("", repeat("ab", 0));
+    try std.testing.expectEqualStrings("", repeat("", 5));
+    // Several bytes to a character stay whole, and `++` takes the result.
+    try std.testing.expectEqualStrings("<日日日>", "<" ++ repeat("日", 3) ++ ">");
+    comptime std.debug.assert(repeat("ab", 4).len == 8);
 }
 
 test "ByteGen is total and in range" {

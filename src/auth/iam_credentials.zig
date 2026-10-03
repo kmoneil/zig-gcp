@@ -519,7 +519,7 @@ test "fuzz principalFromUrl: only a plain account name ever comes out" {
     } });
 }
 
-const signed_body = "{\"keyId\":\"k1\",\"signedBlob\":\"" ++ "Wlpa" ** 85 ++ "Wg==" ++ "\"}";
+const signed_body = "{\"keyId\":\"k1\",\"signedBlob\":\"" ++ test_util.repeat("Wlpa", 85) ++ "Wg==" ++ "\"}";
 
 fn signOnce(fake: *test_util.FakeTransport, arena: Allocator, diag: *core.Diagnostics) SignOutcome {
     return signBlob(fake.transport(), arena, .{
@@ -607,7 +607,7 @@ test "fuzz signBlob answers: a plausible signature or SigningFailed, never a cra
         signed_body,
         "{}",
         "{\"signedBlob\":\"AAAA\"}",
-        "{\"signedBlob\":\"" ++ "AAAA" ** 128 ++ "\"}",
+        "{\"signedBlob\":\"" ++ test_util.repeat("AAAA", 128) ++ "\"}",
         "{\"signedBlob\":null,\"keyId\":7}",
         "",
     } });

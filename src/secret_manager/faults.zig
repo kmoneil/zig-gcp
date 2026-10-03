@@ -108,10 +108,9 @@ const FaultyTransport = struct {
                     .wrong_checksum => ",\"dataCrc32c\":\"1\"",
                     .no_checksum => "",
                     .checksum_not_a_number => ",\"dataCrc32c\":\"not-a-number\"",
-                    else => try std.fmt.allocPrint(arena, ",\"dataCrc32c\":\"{d}\"", .{core.crc32c.hash(self.payload)}),
+                    else => try arena.print(",\"dataCrc32c\":\"{d}\"", .{core.crc32c.hash(self.payload)}),
                 };
-                break :b .{ .status = 200, .body = try std.fmt.allocPrint(
-                    arena,
+                break :b .{ .status = 200, .body = try arena.print(
                     "{{\"name\":\"projects/1/secrets/db/versions/1\",\"payload\":{{\"data\":\"{s}\"{s}}}}}",
                     .{ data, checksum },
                 ) };
@@ -135,7 +134,7 @@ const FaultyTransport = struct {
 
 /// The payload the properties move around. Long enough to span more than one
 /// allocation, and recognizable in a memory dump.
-const payload = "S3CR3T-payload-" ** 20;
+const payload = test_util.repeat("S3CR3T-payload-", 20);
 
 const Outcome = struct {
     /// Null when the call failed.

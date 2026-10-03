@@ -720,7 +720,7 @@ test "the fake: a token is kept with its request's resource, as production keeps
     for ([_][]const u8{ "x", "y" }) |name| {
         var arena: std.heap.ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
-        const url = try std.fmt.allocPrint(arena.allocator(), "https://storage.googleapis.com/storage/v1/b/b/o/{s}", .{name});
+        const url = try arena.allocator().print("https://storage.googleapis.com/storage/v1/b/b/o/{s}", .{name});
         const res = try t.send(.{ .method = .DELETE, .url = url, .headers = same }, arena.allocator());
         try testing.expectEqual(204, res.status);
     }

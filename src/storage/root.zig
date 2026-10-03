@@ -174,7 +174,7 @@ test "every public declaration of types.zig is public here too" {
     // RetentionPolicy and ObjectRetention were public in types.zig and
     // missing here before 0.26.0 was tagged, so no program could name
     // them; the module's own tests, which import types.zig, never knew.
-    inline for (@typeInfo(@import("types.zig")).@"struct".decls) |decl| {
-        if (!@hasDecl(@This(), decl.name)) @compileError("not exported: types." ++ decl.name);
+    inline for (@typeInfo(@import("types.zig")).@"struct".decl_names) |name| {
+        if (!@hasDecl(@This(), name)) @compileError("not exported: types." ++ name);
     }
 }

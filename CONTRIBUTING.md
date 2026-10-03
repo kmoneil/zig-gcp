@@ -5,7 +5,7 @@ small fix, open an issue first so the approach can be agreed on.
 
 ## Setup
 
-You need Zig 0.16.0. [docs/development.md](docs/development.md) lists
+You need Zig 0.17.0. [docs/development.md](docs/development.md) lists
 every build step; these are the ones to know:
 
 ```

@@ -563,7 +563,7 @@ test "parallel downloads: ranges into memory and into a file, and a gzip-stored 
 
     // Stored gzip-compressed: fetched as stored in one stream, checked
     // against the stored checksum, and decompressed here.
-    const text = "parallel downloads fetch a gzip-stored object whole\n" ** 20;
+    const text = core.testing.repeat("parallel downloads fetch a gzip-stored object whole\n", 20);
     const gzipped = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\x48\x2c\x4a\xcc\xc9\x49\xcd\x51\x48\xc9\x2f\xcf\xcb\xc9\x4f\x4c\x29\x56\x48\x4b\x2d\x49\xce\x50\x48\x54\x48\xaf\xca\x2c\xd0\x2d\x2e\xc9\x2f\x4a\x4d\x51\xc8\x4f\xca\x4a\x4d\x2e\x51\x28\xcf\xc8\xcf\x49\xe5\x2a\x18\xd5\x33\xaa\x67\x54\xcf\xb0\xd4\x03\x00\xf0\x9e\x3c\x07\x10\x04\x00\x00";
     var stored = try f.bucket().object("page.txt").upload(gzipped, .{ .content_type = "text/plain", .content_encoding = "gzip" });
     stored.deinit();

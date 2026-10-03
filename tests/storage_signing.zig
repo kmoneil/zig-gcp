@@ -247,7 +247,7 @@ test "Google's V4 signing vectors, byte for byte, signatures included" {
         const signature_hex = url.value[std.mem.lastIndexOf(u8, url.value, marker).? + marker.len ..];
         var signature: [256]u8 = undefined;
         try testing.expectEqual(signature.len, (try std.fmt.hexToBytes(&signature, signature_hex)).len);
-        try rsa.PKCS1v1_5Signature.verify(256, signature, recording.message.items, public_key, Sha256);
+        try rsa.PKCS1v1_5Signature.verify(256, &signature, recording.message.items, public_key, Sha256);
     }
     try testing.expectEqual(0, fake.requests.items.len);
 }
@@ -520,7 +520,7 @@ test "Google's V4 POST policy vectors, byte for byte, signatures included" {
         var signature: [256]u8 = undefined;
         const signature_hex = policy.value.field("x-goog-signature").?;
         try testing.expectEqual(signature.len, (try std.fmt.hexToBytes(&signature, signature_hex)).len);
-        try rsa.PKCS1v1_5Signature.verify(256, signature, recording.message.items, public_key, Sha256);
+        try rsa.PKCS1v1_5Signature.verify(256, &signature, recording.message.items, public_key, Sha256);
     }
     try testing.expectEqual(0, fake.requests.items.len);
 }

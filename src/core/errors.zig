@@ -430,7 +430,7 @@ test "Diagnostics.set copies and truncates" {
 test "Diagnostics.set never splits a UTF-8 sequence" {
     var d: Diagnostics = .{};
     // 170 three-byte characters are 510 bytes; the 171st straddles the end.
-    const text = "€" ** 171;
+    const text = test_util.repeat("€", 171);
     d.set(400, "", text);
     try testing.expect(std.unicode.utf8ValidateSlice(d.message()));
     try testing.expectEqual(510, d.message().len);
@@ -622,7 +622,7 @@ fn decodeErrorInfosWith(gpa: Allocator, body: []const u8) !void {
 }
 
 test "decodeErrorInfos: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, decodeErrorInfosWith, .{
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodeErrorInfosWith, .{
         \\{"error":{"code":400,"status":"INVALID_ARGUMENT","details":[
         \\{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"R\u00e9","domain":"d",
         \\"metadata":{"a\"1":"PERMANENT_FAILURE_INVALID_ACK_ID","b":"TRANSIENT_FAILURE_ACK_ID","c":5}},
@@ -703,7 +703,7 @@ fn errorInfoRoundTrip(_: void, input: []const u8) !void {
                     var key_buf: [32]u8 = undefined;
                     var value_buf: [48]u8 = undefined;
                     // The digit keeps every key distinct.
-                    const key = try std.fmt.allocPrint(a, "{d}{s}", .{ k, g.utf8(&key_buf, key_buf.len) });
+                    const key = try a.print("{d}{s}", .{ k, g.utf8(&key_buf, key_buf.len) });
                     try jw.objectField(key);
                     if (g.intRange(u8, 0, 3) == 0) {
                         try jw.write(null);

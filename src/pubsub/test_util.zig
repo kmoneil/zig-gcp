@@ -19,6 +19,8 @@ pub const ByteGen = core.testing.ByteGen;
 pub const FuzzOptions = core.testing.FuzzOptions;
 pub const fuzzBytes = core.testing.fuzzBytes;
 pub const max_fuzz_input = core.testing.max_fuzz_input;
+pub const repeat = core.testing.repeat;
+pub const no_grow_allocator = core.testing.no_grow_allocator;
 
 /// A real `Client` wired to a `FakeTransport` and a `FakeClock`. Initialize
 /// it in place with `init`: the client points into the harness.

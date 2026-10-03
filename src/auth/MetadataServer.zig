@@ -315,7 +315,7 @@ fn sign(ptr: *anyopaque, io: std.Io, arena: Allocator, message: []const u8) core
         .retry = self.retry,
         .timeout_ms = self.request_timeout_ms,
         .diagnostics = self.diagnostics,
-        .refused = try std.fmt.allocPrint(arena, "signing was refused: {s} needs roles/iam.serviceAccountTokenCreator on itself, the IAM Service Account Credentials API must be enabled, and on Compute Engine the VM's access scopes must include cloud-platform", .{account}),
+        .refused = try arena.print("signing was refused: {s} needs roles/iam.serviceAccountTokenCreator on itself, the IAM Service Account Credentials API must be enabled, and on Compute Engine the VM's access scopes must include cloud-platform", .{account}),
     });
 }
 
@@ -737,7 +737,7 @@ test "MetadataServer: projectId reads the project id, and refuses what is not on
 
 const email_ok: Reply = .{ .respond = .{ .body = "worker@my-project.iam.gserviceaccount.com\n", .headers = flavor } };
 /// 256 bytes of 0x5a in base64: what IAM answers for a 2048-bit key.
-const signature_base64 = "Wlpa" ** 85 ++ "Wg==";
+const signature_base64 = test_util.repeat("Wlpa", 85) ++ "Wg==";
 const signed: Reply = .{ .respond = .{ .body = "{\"keyId\":\"k1\",\"signedBlob\":\"" ++ signature_base64 ++ "\"}" } };
 
 test "MetadataServer: email reads the attached account, and refuses what is not one" {
@@ -956,14 +956,14 @@ test "MetadataServer: every allocation failure is OutOfMemory without leaks" {
             metadata.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.token, .{token_ok});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.token, .{token_ok});
     // Escapes make std.json allocate; without them it points into the body.
-    try testing.checkAllAllocationFailures(testing.allocator, Run.token, .{Reply{ .respond = .{
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.token, .{Reply{ .respond = .{
         .body = "{\"access_token\":\"ya29.\\u0053ECRET\",\"expires_in\":3599}",
         .headers = flavor,
     } }});
-    try testing.checkAllAllocationFailures(testing.allocator, Run.project, .{});
-    try testing.checkAllAllocationFailures(testing.allocator, Run.withOwnTransport, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.project, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.withOwnTransport, .{});
 }
 
 test "MetadataServer: against a metadata server on loopback" {
@@ -1019,7 +1019,7 @@ test "MetadataServer: probe gives up on a server that never answers" {
     // Windows sometimes tears the idle connection down before the timeout
     // (STATUS_LOCAL_DISCONNECT). The probe still gave up promptly, and
     // "no" is still the answer, but the timeout was not what ended it.
-    if (builtin.os.tag == .windows and elapsed_ms < 150) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows and elapsed_ms < 150) return error.SkipZigTest;
     // It waited for the timeout, and not much longer.
     try testing.expect(elapsed_ms >= 150);
     try testing.expect(elapsed_ms < 5_000);
@@ -1038,7 +1038,8 @@ fn anyAnswerProperty(_: void, input: []const u8) !void {
     const headers: []const core.transport.Header = if (g.boolean()) flavor else &.{};
     const reply: Reply = .{ .respond = .{ .status = status, .body = g.rest(), .headers = headers } };
     var h: Harness = undefined;
-    try h.init(&(.{reply} ** 3));
+    const replies: [3]Reply = @splat(reply);
+    try h.init(&replies);
     defer h.deinit();
     // Whatever answers on the metadata address: a usable token or an error.
     const token = h.get() catch return;

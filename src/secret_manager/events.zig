@@ -173,9 +173,9 @@ const Attributes = struct {
     deleteType: ?[]const u8 = null,
 
     fn take(self: *Attributes, name: []const u8, value: []const u8) void {
-        inline for (@typeInfo(Attributes).@"struct".fields) |field| {
-            if (std.mem.eql(u8, name, field.name)) {
-                if (@field(self, field.name) == null) @field(self, field.name) = value;
+        inline for (@typeInfo(Attributes).@"struct".field_names) |field_name| {
+            if (std.mem.eql(u8, name, field_name)) {
+                if (@field(self, field_name) == null) @field(self, field_name) = value;
                 return;
             }
         }
@@ -218,8 +218,8 @@ fn versionOf(secret: []const u8, name: []const u8) ?u64 {
 /// `TYPE NAME[/versions/N] TIME`: no type, name or time holds a space, and
 /// one change to one resource has one time.
 fn key(a: Allocator, event_type: []const u8, secret: []const u8, version: ?u64, time: []const u8) Allocator.Error![]const u8 {
-    if (version) |v| return std.fmt.allocPrint(a, "{s} {s}/versions/{d} {s}", .{ event_type, secret, v, time });
-    return std.fmt.allocPrint(a, "{s} {s} {s}", .{ event_type, secret, time });
+    if (version) |v| return a.print("{s} {s}/versions/{d} {s}", .{ event_type, secret, v, time });
+    return a.print("{s} {s} {s}", .{ event_type, secret, time });
 }
 
 fn refuse(diag: ?*core.Diagnostics, comptime format: []const u8, args: anytype) error{NotASecretEvent} {
@@ -442,7 +442,7 @@ test "decode: the event outlives the message, and every allocation failure is cl
             }
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
 
 fn decodeProperty(_: void, input: []const u8) !void {

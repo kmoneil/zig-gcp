@@ -177,7 +177,7 @@ pub const FakeBuckets = struct {
     /// Records a started rename and returns its index in `renames`.
     pub fn startRenameOp(self: *FakeBuckets, bucket: []const u8, source: []const u8, destination: []const u8, pending: u32) Allocator.Error!usize {
         const a = self.arena.allocator();
-        const id = try std.fmt.allocPrint(a, "CiRmYWtlcmVuYW1l{d}QAQ", .{self.next_operation});
+        const id = try a.print("CiRmYWtlcmVuYW1l{d}QAQ", .{self.next_operation});
         self.next_operation += 1;
         try self.renames.append(a, .{
             .bucket = try a.dupe(u8, bucket),
@@ -314,7 +314,7 @@ pub const FakeBuckets = struct {
         try next.put(a, "kind", .{ .string = "storage#bucket" });
         try next.put(a, "name", .{ .string = owned_name });
         try next.put(a, "projectNumber", .{ .string = "82150720798" });
-        try next.put(a, "generation", .{ .string = try std.fmt.allocPrint(a, "{d}", .{self.next_generation}) });
+        try next.put(a, "generation", .{ .string = try a.print("{d}", .{self.next_generation}) });
         try next.put(a, "metageneration", .{ .string = "1" });
         try next.put(a, "location", .{ .string = try std.ascii.allocUpperString(a, location) });
         try next.put(a, "storageClass", .{ .string = class });
@@ -398,7 +398,7 @@ pub const FakeBuckets = struct {
             };
         }
         stored.metageneration += 1;
-        try next.put(a, "metageneration", .{ .string = try std.fmt.allocPrint(a, "{d}", .{stored.metageneration}) });
+        try next.put(a, "metageneration", .{ .string = try a.print("{d}", .{stored.metageneration}) });
         try next.put(a, "updated", .{ .string = "2026-09-29T14:07:47.529Z" });
         stored.resource = next;
         return .{ .status = 200, .body = try render(arena, next) };
@@ -422,7 +422,7 @@ pub const FakeBuckets = struct {
         try locked.put(a, "isLocked", .{ .bool = true });
         try next.put(a, "retentionPolicy", .{ .object = locked });
         stored.metageneration += 1;
-        try next.put(a, "metageneration", .{ .string = try std.fmt.allocPrint(a, "{d}", .{stored.metageneration}) });
+        try next.put(a, "metageneration", .{ .string = try a.print("{d}", .{stored.metageneration}) });
         stored.resource = next;
         return .{ .status = 200, .body = try render(arena, next) };
     }
@@ -600,9 +600,9 @@ pub const FakeBuckets = struct {
         };
         if (policy.etag) |etag| if (etag.len > 0) {
             var raw: [16]u8 = undefined;
-            const size = std.base64.standard.Decoder.calcSizeForSlice(etag) catch return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for ByteString: {s}", .{etag}));
+            const size = std.base64.standard.Decoder.calcSizeForSlice(etag) catch return answer(arena, 400, "invalid", try arena.print("Invalid value for ByteString: {s}", .{etag}));
             if (size > raw.len) return answer(arena, 400, "invalid", "Invalid etag - must use etag from GetPolicy response.");
-            std.base64.standard.Decoder.decode(raw[0..size], etag) catch return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for ByteString: {s}", .{etag}));
+            std.base64.standard.Decoder.decode(raw[0..size], etag) catch return answer(arena, 400, "invalid", try arena.print("Invalid value for ByteString: {s}", .{etag}));
             const meta = metagenerationOfEtag(raw[0..size]) orelse return answer(arena, 400, "invalid", "Invalid etag - must use etag from GetPolicy response.");
             if (meta > stored.metageneration) return answer(arena, 400, "invalid", "Invalid etag - must use etag from GetPolicy response.");
             if (meta != stored.metageneration) return answer(arena, 412, "conditionNotMet", "At least one of the pre-conditions you specified did not hold.");
@@ -612,7 +612,7 @@ pub const FakeBuckets = struct {
         for (policy.bindings) |b| {
             if (core.iam.roleProblem(b.role) != null) return answer(arena, 400, "invalid", "The role name must be in the form \"roles/{role}\", \"organizations/{organization_id}/roles/{role}\", or \"projects/{project_id}/roles/{role}\".");
             if (std.mem.startsWith(u8, b.role, "roles/") and !std.mem.startsWith(u8, b.role, "roles/storage.")) {
-                return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Role {s} is not supported for this resource.", .{b.role}));
+                return answer(arena, 400, "invalid", try arena.print("Role {s} is not supported for this resource.", .{b.role}));
             }
             for (b.members) |m| {
                 if (std.mem.eql(u8, m, "allUsers") or std.mem.eql(u8, m, "allAuthenticatedUsers")) {
@@ -623,16 +623,16 @@ pub const FakeBuckets = struct {
                 for ([_][]const u8{ "projectOwner:", "projectEditor:", "projectViewer:" }) |prefix| {
                     if (!std.mem.startsWith(u8, m, prefix)) continue;
                     const project = m[prefix.len..];
-                    if (!std.mem.eql(u8, project, stored.project)) return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Project {s} does not exist.", .{project}));
+                    if (!std.mem.eql(u8, project, stored.project)) return answer(arena, 400, "invalid", try arena.print("Project {s} does not exist.", .{project}));
                 }
                 if (core.iam.memberProblem(m, .{ .project_values = true, .deleted = true }) != null) {
-                    return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "The member {s} is of an unknown type. Please set a valid type prefix for the member.", .{m}));
+                    return answer(arena, 400, "invalid", try arena.print("The member {s} is of an unknown type. Please set a valid type prefix for the member.", .{m}));
                 }
             }
         }
         if (policy.hasConditions()) {
             if (!uniform) return answer(arena, 412, "conditionNotMet", "To set IAM conditions in this bucket, enable uniform bucket-level access. This ensures that all object access is controlled uniformly at the bucket-level without individual, object-level permissions. Learn more at https://cloud.google.com/storage/docs/uniform-bucket-level-access");
-            if (policy.version < 3) return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Specified policy version ({d}) must be at least 3 based on the policy's contents. For more information, please refer to https://cloud.google.com/iam/help/allow-policies/versions.", .{policy.version}));
+            if (policy.version < 3) return answer(arena, 400, "invalid", try arena.print("Specified policy version ({d}) must be at least 3 based on the policy's contents. For more information, please refer to https://cloud.google.com/iam/help/allow-policies/versions.", .{policy.version}));
         }
         stored.bindings = try storedBindings(self.arena.allocator(), policy.bindings);
         try self.bump(stored);
@@ -644,7 +644,7 @@ pub const FakeBuckets = struct {
         const a = self.arena.allocator();
         stored.metageneration += 1;
         var next = try cloneObject(a, stored.resource);
-        try next.put(a, "metageneration", .{ .string = try std.fmt.allocPrint(a, "{d}", .{stored.metageneration}) });
+        try next.put(a, "metageneration", .{ .string = try a.print("{d}", .{stored.metageneration}) });
         stored.resource = next;
     }
 
@@ -669,8 +669,7 @@ pub const FakeBuckets = struct {
             return self.invalid(arena, "Invalid Google Cloud Pub/Sub topic. It should look like '//pubsub.googleapis.com/projects/*/topics/*.'");
         if (self.topics.get(topic)) |state| switch (state) {
             .missing => return self.invalidFmt(arena, "Cloud Pub/Sub topic '{s}' not found, or user '{s}' does not have permission to it.", .{ topic, service_agent }),
-            .ungranted => return answer(arena, 403, "forbidden", try std.fmt.allocPrint(
-                arena,
+            .ungranted => return answer(arena, 403, "forbidden", try arena.print(
                 "The service account '{s}' does not have permission to publish messages to to the Cloud Pub/Sub topic '{s}', or that topic does not exist.",
                 .{ service_agent, topic },
             )),
@@ -713,10 +712,10 @@ pub const FakeBuckets = struct {
             if (overlapping >= max_overlapping) return self.invalid(arena, "Too many overlapping notifications. The maximum is 10.");
         }
 
-        const id = try std.fmt.allocPrint(a, "{d}", .{stored.metageneration});
+        const id = try a.print("{d}", .{stored.metageneration});
         var next: ObjectMap = .empty;
         try next.put(a, "kind", .{ .string = "storage#notification" });
-        try next.put(a, "selfLink", .{ .string = try std.fmt.allocPrint(a, "https://www.googleapis.com/storage/v1/b/{s}/notificationConfigs/{s}", .{ bucket, id }) });
+        try next.put(a, "selfLink", .{ .string = try a.print("https://www.googleapis.com/storage/v1/b/{s}/notificationConfigs/{s}", .{ bucket, id }) });
         try next.put(a, "id", .{ .string = id });
         try next.put(a, "topic", .{ .string = try a.dupe(u8, topic) });
         if (!every) {
@@ -919,7 +918,7 @@ pub const FakeBuckets = struct {
                 if (n < 0 or n > 5 << 40) {
                     return self.failFmt("Lifecycle {s} condition cannot exceed GCS maximum object size limit: 5 TiB, but was {d}.", .{ key, n });
                 }
-                try out.put(a, try a.dupe(u8, key), .{ .string = try std.fmt.allocPrint(a, "{d}", .{n}) });
+                try out.put(a, try a.dupe(u8, key), .{ .string = try a.print("{d}", .{n}) });
             } else if (std.mem.eql(u8, key, "matchesPattern")) {
                 return self.fail("MatchesPattern is not available for this project 82150720798");
             } else return self.failFmt("this fake does not take the condition \"{s}\"", .{key});
@@ -954,7 +953,7 @@ pub const FakeBuckets = struct {
             return self.fail("Soft delete policy must have a retention duration between 7 days and 90 days.");
         }
         var policy: ObjectMap = .empty;
-        try policy.put(a, "retentionDurationSeconds", .{ .string = try std.fmt.allocPrint(a, "{d}", .{seconds}) });
+        try policy.put(a, "retentionDurationSeconds", .{ .string = try a.print("{d}", .{seconds}) });
         if (seconds != 0) try policy.put(a, "effectiveTime", .{ .string = "2026-09-29T14:08:48.987Z" });
         try next.put(a, "softDeletePolicy", .{ .object = policy });
     }
@@ -966,7 +965,7 @@ pub const FakeBuckets = struct {
         const name = next.get("name").?.string;
         const fields = switch (value) {
             .null => {
-                if (locked) return self.forbid("retentionPolicyNotMet", try std.fmt.allocPrint(a, "Bucket '{s}' has a locked Retention Policy which cannot be removed.", .{name}));
+                if (locked) return self.forbid("retentionPolicyNotMet", try a.print("Bucket '{s}' has a locked Retention Policy which cannot be removed.", .{name}));
                 _ = next.orderedRemove("retentionPolicy");
                 return;
             },
@@ -986,11 +985,11 @@ pub const FakeBuckets = struct {
         }
         if (locked) {
             const current = std.fmt.parseInt(i64, old.?.object.get("retentionPeriod").?.string, 10) catch unreachable;
-            if (period < current) return self.forbid("forbidden", try std.fmt.allocPrint(a, "Cannot reduce retention duration of a locked Retention Policy for bucket '{s}'.", .{name}));
+            if (period < current) return self.forbid("forbidden", try a.print("Cannot reduce retention duration of a locked Retention Policy for bucket '{s}'.", .{name}));
         }
         const effective = if (old) |p| p.object.get("effectiveTime").? else Value{ .string = "2026-09-30T21:57:51.487Z" };
         var policy: ObjectMap = .empty;
-        try policy.put(a, "retentionPeriod", .{ .string = try std.fmt.allocPrint(a, "{d}", .{period}) });
+        try policy.put(a, "retentionPeriod", .{ .string = try a.print("{d}", .{period}) });
         try policy.put(a, "effectiveTime", effective);
         if (locked) try policy.put(a, "isLocked", .{ .bool = true });
         try next.put(a, "retentionPolicy", .{ .object = policy });
@@ -1094,7 +1093,7 @@ pub const FakeBuckets = struct {
     }
 
     fn failFmt(self: *FakeBuckets, comptime format: []const u8, args: anytype) ApplyError {
-        return self.fail(try std.fmt.allocPrint(self.arena.allocator(), format, args));
+        return self.fail(try self.arena.allocator().print(format, args));
     }
 
     /// The latest refusal's answer.
@@ -1119,7 +1118,7 @@ pub const FakeBuckets = struct {
     }
 
     fn invalidFmt(self: *FakeBuckets, arena: Allocator, comptime format: []const u8, args: anytype) Allocator.Error!Reply {
-        return self.invalid(arena, try std.fmt.allocPrint(arena, format, args));
+        return self.invalid(arena, try arena.print(format, args));
     }
 };
 
@@ -1196,10 +1195,10 @@ fn publicAccessPrevented(resource: ObjectMap) bool {
 /// access, the object roles too.
 fn legacyBindings(arena: Allocator, stored: *const FakeBuckets.Stored) Allocator.Error![]const core.iam.Binding {
     const owners = try arena.dupe([]const u8, &.{
-        try std.fmt.allocPrint(arena, "projectEditor:{s}", .{stored.project}),
-        try std.fmt.allocPrint(arena, "projectOwner:{s}", .{stored.project}),
+        try arena.print("projectEditor:{s}", .{stored.project}),
+        try arena.print("projectOwner:{s}", .{stored.project}),
     });
-    const viewers = try arena.dupe([]const u8, &.{try std.fmt.allocPrint(arena, "projectViewer:{s}", .{stored.project})});
+    const viewers = try arena.dupe([]const u8, &.{try arena.print("projectViewer:{s}", .{stored.project})});
     if (uniformAccess(stored.resource)) return arena.dupe(core.iam.Binding, &.{
         .{ .role = "roles/storage.legacyBucketOwner", .members = owners },
         .{ .role = "roles/storage.legacyBucketReader", .members = viewers },
@@ -1310,7 +1309,7 @@ fn testPermissions(arena: Allocator, permissions: []const []const u8) Allocator.
     for (permissions) |p| {
         if (std.mem.eql(u8, p, "storage.buckets.list") or std.mem.eql(u8, p, "storage.buckets.create")) return answer(arena, 400, "invalid", "Invalid argument.");
         if (!std.mem.startsWith(u8, p, "storage.") or std.mem.indexOfScalar(u8, p, '*') != null) {
-            return answer(arena, 400, "invalid", try std.fmt.allocPrint(arena, "{s} is not a valid Google Cloud Storage permission.", .{p}));
+            return answer(arena, 400, "invalid", try arena.print("{s} is not a valid Google Cloud Storage permission.", .{p}));
         }
     }
     const body = try std.json.Stringify.valueAlloc(arena, .{ .kind = "storage#testIamPermissionsResponse", .permissions = permissions }, .{});
@@ -1327,7 +1326,7 @@ fn normalTopic(arena: Allocator, topic: []const u8) Allocator.Error!?[]const u8 
     const word = parts.next() orelse return null;
     const id = parts.next() orelse return null;
     if (parts.next() != null or project.len == 0 or id.len == 0 or !std.mem.eql(u8, word, "topics")) return null;
-    return try std.fmt.allocPrint(arena, "//pubsub.googleapis.com/projects/{s}/topics/{s}", .{ project, id });
+    return try arena.print("//pubsub.googleapis.com/projects/{s}/topics/{s}", .{ project, id });
 }
 
 /// What Cloud Storage's limits call characters: bytes, as measured.
@@ -1519,8 +1518,8 @@ test "the fake refuses what Cloud Storage refused on 2026-09-29, and leaves the 
         "{\"softDeletePolicy\":{\"retentionDurationSeconds\":\"604799\"}}",
         "{\"softDeletePolicy\":{\"retentionDurationSeconds\":\"7776001\"}}",
         "{\"labels\":{\"Env\":\"x\"}}",
-        "{\"labels\":{\"k\":\"" ++ "v" ** 64 ++ "\"}}",
-        "{\"labels\":{\"k\":\"" ++ "日" ** 43 ++ "\"}}",
+        "{\"labels\":{\"k\":\"" ++ core.testing.repeat("v", 64) ++ "\"}}",
+        "{\"labels\":{\"k\":\"" ++ core.testing.repeat("日", 43) ++ "\"}}",
         "{\"labels\":{\"1k\":\"v\"}}",
         "{\"labels\":{\"k\":1}}",
         // Removing a key that could never exist.
@@ -1540,7 +1539,7 @@ test "the fake refuses what Cloud Storage refused on 2026-09-29, and leaves the 
         "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"numNewerVersions\":2147483648}}]}}",
         "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"sizeBelowBytes\":\"5497558138881\"}}]}}",
         "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"matchesSuffix\":[\"\"]}}]}}",
-        "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"matchesPrefix\":[\"" ++ "p" ** 1025 ++ "\"]}}]}}",
+        "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"matchesPrefix\":[\"" ++ core.testing.repeat("p", 1025) ++ "\"]}}]}}",
         "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"matchesStorageClass\":[\"BOGUS\"]}}]}}",
         "{\"lifecycle\":{\"rule\":[{\"action\":{\"type\":\"Delete\"},\"condition\":{\"matchesPattern\":\"tmp/.*\"}}]}}",
         many_prefixes.items,

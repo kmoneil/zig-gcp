@@ -85,7 +85,7 @@ pub fn update(client: *Client, bucket: []const u8, changes: types.BucketUpdate) 
 pub fn lock(client: *Client, bucket: []const u8, metageneration: u64) Error!types.Owned(types.BucketInfo) {
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
-    const path = try std.fmt.allocPrint(scratch.allocator(), "{s}/lockRetentionPolicy?ifMetagenerationMatch={d}", .{
+    const path = try scratch.allocator().print("{s}/lockRetentionPolicy?ifMetagenerationMatch={d}", .{
         try names.bucketPath(scratch.allocator(), bucket),
         metageneration,
     });
@@ -398,7 +398,7 @@ pub fn isDate(text: []const u8) bool {
     const month: u16 = digitsValue(text[5..7]);
     const day: u16 = digitsValue(text[8..10]);
     if (month < 1 or month > 12 or day < 1) return false;
-    return day <= std.time.epoch.getDaysInMonth(year, @enumFromInt(month));
+    return day <= std.time.epoch.getDaysInMonth(year, @fromBackingInt(@intCast(month)));
 }
 
 fn digitsValue(digits: []const u8) u16 {
@@ -1175,13 +1175,13 @@ test "labels: the rules at their boundaries, as Cloud Storage enforced them" {
         &.{.{ .key = "a", .value = "" }},
         &.{.{ .key = "team", .value = "zig-gcp_1" }},
         &.{.{ .key = "k", .value = "-x" }},
-        &.{.{ .key = "k" ++ "x" ** 62, .value = "v" ** 63 }},
+        &.{.{ .key = "k" ++ test_util.repeat("x", 62), .value = test_util.repeat("v", 63) }},
         // Letters beyond ASCII go to the server to judge.
         &.{.{ .key = "clé", .value = "été" }},
         &.{.{ .key = "日k", .value = "語" }},
         // 63 characters of two bytes, 126 bytes: both limits hold.
-        &.{.{ .key = "k", .value = "é" ** 63 }},
-        &.{.{ .key = "k", .value = "日" ** 42 }},
+        &.{.{ .key = "k", .value = test_util.repeat("é", 63) }},
+        &.{.{ .key = "k", .value = test_util.repeat("日", 42) }},
     };
     for (ok) |labels| try checkConfig(&d, .{ .labels = labels });
     const refused = [_]struct { []const types.Label, []const u8 }{
@@ -1193,11 +1193,11 @@ test "labels: the rules at their boundaries, as Cloud Storage enforced them" {
         .{ &.{.{ .key = "-team", .value = "v" }}, "starts with a lowercase letter" },
         .{ &.{.{ .key = "a.b", .value = "v" }}, "byte 0x2e" },
         .{ &.{.{ .key = "k", .value = "a b" }}, "byte 0x20" },
-        .{ &.{.{ .key = "k" ++ "x" ** 63, .value = "v" }}, "64 characters" },
-        .{ &.{.{ .key = "k", .value = "v" ** 64 }}, "64 characters" },
+        .{ &.{.{ .key = "k" ++ test_util.repeat("x", 63), .value = "v" }}, "64 characters" },
+        .{ &.{.{ .key = "k", .value = test_util.repeat("v", 64) }}, "64 characters" },
         // 43 characters of three bytes: within 63 characters, over 128 bytes.
-        .{ &.{.{ .key = "k", .value = "日" ** 43 }}, "129 bytes" },
-        .{ &.{.{ .key = "日" ** 43, .value = "v" }}, "129 bytes" },
+        .{ &.{.{ .key = "k", .value = test_util.repeat("日", 43) }}, "129 bytes" },
+        .{ &.{.{ .key = test_util.repeat("日", 43), .value = "v" }}, "129 bytes" },
         .{ &.{.{ .key = "k", .value = "\xc0" }}, "not valid UTF-8" },
         .{ &.{ .{ .key = "k", .value = "1" }, .{ .key = "k", .value = "2" } }, "repeats" },
     };
@@ -1394,12 +1394,12 @@ test "lifecycle: numbers, sizes, dates, prefixes and classes at their limits" {
     }
     try checkUpdate(&d, .{ .lifecycle = &oneRule(.delete, .{ .created_before = "2024-02-29" }) });
 
-    const long = "p" ** limits.max_lifecycle_affix_bytes;
+    const long = test_util.repeat("p", limits.max_lifecycle_affix_bytes);
     try checkUpdate(&d, .{ .lifecycle = &oneRule(.delete, .{ .matches_prefix = &.{long}, .matches_suffix = &.{long} }) });
     try expectRefused(checkUpdate(&d, .{ .lifecycle = &oneRule(.delete, .{ .matches_prefix = &.{long ++ "p"} }) }), &d, "matches_prefix 0 is empty or over 1024 bytes");
     try expectRefused(checkUpdate(&d, .{ .lifecycle = &oneRule(.delete, .{ .matches_suffix = &.{ "a", "" } }) }), &d, "matches_suffix 1 is empty");
     // 1,024 bytes, not characters: 600 two-byte letters are too many.
-    try expectRefused(checkUpdate(&d, .{ .lifecycle = &oneRule(.delete, .{ .matches_prefix = &.{"é" ** 600} }) }), &d, "over 1024 bytes");
+    try expectRefused(checkUpdate(&d, .{ .lifecycle = &oneRule(.delete, .{ .matches_prefix = &.{test_util.repeat("é", 600)} }) }), &d, "over 1024 bytes");
     try expectRefused(checkUpdate(&d, .{ .lifecycle = &oneRule(.delete, .{ .matches_storage_class = &.{""} }) }), &d, "matches_storage_class 0 is empty");
 }
 
@@ -1516,7 +1516,7 @@ fn updateEverything(gpa: Allocator) !void {
 }
 
 test "update: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, updateEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, updateEverything, .{});
 }
 
 fn createEverything(gpa: Allocator) !void {
@@ -1543,7 +1543,7 @@ fn createEverything(gpa: Allocator) !void {
 }
 
 test "create with settings: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, createEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, createEverything, .{});
 }
 
 // Properties. Each states a rule again, independently of the code above,
@@ -1593,7 +1593,7 @@ fn labelsProperty(_: void, bytes: []const u8) !void {
     for (labels, 0..) |*label, i| {
         // Distinct keys when the draw is about the count.
         label.* = if (count > 3)
-            .{ .key = try std.fmt.allocPrint(arena, "k{d}", .{i}), .value = "" }
+            .{ .key = try arena.print("k{d}", .{i}), .value = "" }
         else
             .{ .key = try drawLabelText(arena, &g), .value = try drawLabelText(arena, &g) };
     }
@@ -1666,10 +1666,10 @@ fn drawRule(arena: Allocator, g: *test_util.ByteGen) !types.LifecycleRule {
 }
 
 fn drawAffixes(arena: Allocator, g: *test_util.ByteGen) ![]const []const u8 {
-    const long = "p" ** limits.max_lifecycle_affix_bytes;
+    const long = test_util.repeat("p", limits.max_lifecycle_affix_bytes);
     const count: usize = g.pick(usize, &.{ 0, 1, 2, 500, 501 });
     const out = try arena.alloc([]const u8, count);
-    for (out) |*text| text.* = g.pick([]const u8, &.{ "logs/", ".tmp", "", long, long ++ "p", "é" ** 512, "é" ** 513 });
+    for (out) |*text| text.* = g.pick([]const u8, &.{ "logs/", ".tmp", "", long, long ++ "p", test_util.repeat("é", 512), test_util.repeat("é", 513) });
     return out;
 }
 
@@ -1737,7 +1737,7 @@ fn lifecycleCheckProperty(_: void, bytes: []const u8) !void {
 test "fuzz lifecycle rules: the check accepts exactly what Cloud Storage takes" {
     try test_util.fuzzBytes({}, lifecycleCheckProperty, .{ .corpus = &.{
         "",
-        "\x00" ** 8 ++ "\x01",
+        test_util.repeat("\x00", 8) ++ "\x01",
     } });
 }
 
@@ -1759,7 +1759,7 @@ fn drawUpdate(arena: Allocator, g: *test_util.ByteGen) !types.BucketUpdate {
         else => edit: {
             const changes = try arena.alloc(types.LabelChange, g.intRange(usize, 0, 3));
             for (changes, 0..) |*change, i| change.* = .{
-                .key = try std.fmt.allocPrint(arena, "k{d}", .{i}),
+                .key = try arena.print("k{d}", .{i}),
                 .value = if (g.boolean()) null else g.pick([]const u8, &.{ "", "v", "été" }),
             };
             break :edit .{ .change = changes };
@@ -1875,7 +1875,7 @@ fn updateBodyProperty(_: void, bytes: []const u8) !void {
 }
 
 test "fuzz bucket updates: the patch body says what the update said, and no more" {
-    try test_util.fuzzBytes({}, updateBodyProperty, .{ .corpus = &.{ "", "\x01" ** 64, "\xff" ** 64 } });
+    try test_util.fuzzBytes({}, updateBodyProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 64), test_util.repeat("\xff", 64) } });
 }
 
 fn configRoundTripProperty(_: void, bytes: []const u8) !void {
@@ -1930,7 +1930,7 @@ fn configRoundTripProperty(_: void, bytes: []const u8) !void {
 }
 
 test "fuzz bucket configs: a config goes out and comes back as it was" {
-    try test_util.fuzzBytes({}, configRoundTripProperty, .{ .corpus = &.{ "", "\x01" ** 64, "\xff" ** 64 } });
+    try test_util.fuzzBytes({}, configRoundTripProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 64), test_util.repeat("\xff", 64) } });
 }
 
 // Against `FakeMultipart`'s buckets, which hold Cloud Storage's rules as
@@ -2187,7 +2187,7 @@ fn modelProperty(_: void, bytes: []const u8) !void {
     // A bucket from drawn settings, sometimes one label short of full.
     const first = try drawUpdate(arena, &g);
     var labels: std.ArrayList(types.Label) = .empty;
-    if (g.intRange(u8, 0, 3) == 0) for (0..63) |i| try labels.append(arena, .{ .key = try std.fmt.allocPrint(arena, "l{d}", .{i}), .value = "" });
+    if (g.intRange(u8, 0, 3) == 0) for (0..63) |i| try labels.append(arena, .{ .key = try arena.print("l{d}", .{i}), .value = "" });
     const config: types.BucketConfig = .{
         .versioning = first.versioning orelse false,
         .soft_delete_retention_s = first.soft_delete_retention_s,
@@ -2261,5 +2261,5 @@ fn modelProperty(_: void, bytes: []const u8) !void {
 }
 
 test "heavy property bucket updates against production's rules: every change lands once, as a model says" {
-    try test_util.fuzzBytes({}, modelProperty, .{ .corpus = &.{ "", "\x01" ** 96, "\x00\x01\x02\x03" ** 32 } });
+    try test_util.fuzzBytes({}, modelProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 96), test_util.repeat("\x00\x01\x02\x03", 32) } });
 }

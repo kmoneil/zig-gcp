@@ -47,14 +47,18 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
-    // Fuzzing on Zig 0.16.0 needs two things the defaults lack: a test runner
-    // that compiles in fuzz mode (see tools/test_runner.zig), and the LLVM
-    // backend. The self-hosted x86_64 backend, the Debug default there,
-    // emits no coverage instrumentation, so the fuzzer would run blind.
+    // Every test build runs under std's test runner with one fix, which
+    // keeps std.debug from swallowing a task's cancel (see the top of
+    // tools/test_runner.zig).
+    const test_runner: std.Build.Step.Compile.TestRunner = .{ .path = b.path("tools/test_runner.zig"), .mode = .server };
+
+    // Fuzzing needs the LLVM backend. The self-hosted x86_64 backend, the
+    // Debug default there, emits no coverage instrumentation, so the fuzzer
+    // would run blind.
     const fuzz_runner = b.option(
         bool,
         "fuzz-runner",
-        "Build the unit tests for `zig build test --fuzz`: patched runner, LLVM backend",
+        "Build the unit tests for `zig build test --fuzz`: LLVM backend",
     ) orelse false;
 
     // Unit, property and fuzz-corpus tests, one run per module. No network: a
@@ -87,7 +91,7 @@ pub fn build(b: *std.Build) void {
             .name = entry[0],
             .root_module = entry[1],
             .filters = test_filters,
-            .test_runner = if (fuzz_runner) .{ .path = b.path("tools/test_runner.zig"), .mode = .server } else null,
+            .test_runner = test_runner,
             .use_llvm = if (fuzz_runner) true else null,
         });
         test_step.dependOn(&b.addRunArtifact(unit_tests).step);
@@ -110,7 +114,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
-        .test_runner = if (fuzz_runner) .{ .path = b.path("tools/test_runner.zig"), .mode = .server } else null,
+        .test_runner = test_runner,
         .use_llvm = if (fuzz_runner) true else null,
     });
     if (only_module == null or std.mem.eql(u8, only_module.?, "storage")) {
@@ -132,7 +136,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
-        .test_runner = if (fuzz_runner) .{ .path = b.path("tools/test_runner.zig"), .mode = .server } else null,
+        .test_runner = test_runner,
         .use_llvm = if (fuzz_runner) true else null,
     });
     if (only_module == null or std.mem.eql(u8, only_module.?, "pubsub")) {
@@ -145,18 +149,20 @@ pub fn build(b: *std.Build) void {
     // cobertura.xml in kcov-merged/.
     const coverage_step = b.step("coverage", "Measure the unit tests' line coverage with kcov");
     const merge = b.addSystemCommand(&.{ "kcov", "--merge" });
-    const merged = merge.addOutputDirectoryArg("coverage");
+    const merged = merge.addOutputDirectoryArg2("coverage", .{});
     for (unit_modules) |entry| {
         const coverage_tests = b.addTest(.{
             .name = entry[0],
             .root_module = entry[1],
             .filters = test_filters,
+            .test_runner = test_runner,
             // kcov maps addresses to lines through DWARF, which LLVM emits in full.
             .use_llvm = true,
         });
-        const kcov = b.addSystemCommand(&.{ "kcov", b.fmt("--include-path={s}", .{b.pathFromRoot("src")}) });
-        merge.addDirectoryArg(kcov.addOutputDirectoryArg(entry[0]));
-        kcov.addArtifactArg(coverage_tests);
+        const kcov = b.addSystemCommand(&.{"kcov"});
+        kcov.addDirectoryArg2(b.path("src"), .{ .prefix = "--include-path=", .make_absolute = true });
+        merge.addDirectoryArg2(kcov.addOutputDirectoryArg2(entry[0], .{}), .{});
+        kcov.addArtifactArg2(coverage_tests, .{});
         // The tests' progress output is captured: the build shows it only
         // when they fail, which kcov reports by exiting as they did.
         _ = kcov.captureStdErr(.{});
@@ -178,6 +184,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "pubsub", .module = mod }},
         }),
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_integration = streamed(b, integration_tests);
     const integration_step = b.step(
@@ -200,6 +207,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_storage_integration = streamed(b, storage_integration_tests);
     integration_step.dependOn(&run_storage_integration.step);
@@ -218,6 +226,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_notifications_integration = streamed(b, notifications_integration_tests);
     integration_step.dependOn(&run_notifications_integration.step);
@@ -236,6 +245,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_auth_integration = streamed(b, auth_integration_tests);
     integration_step.dependOn(&run_auth_integration.step);
@@ -262,6 +272,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     gcp_step.dependOn(&streamed(b, gcp_tests).step);
     test_step.dependOn(&gcp_tests.step);
@@ -279,6 +290,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     gcp_step.dependOn(&streamed(b, storage_gcp_tests).step);
     test_step.dependOn(&storage_gcp_tests.step);
@@ -296,6 +308,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     gcp_step.dependOn(&streamed(b, notifications_gcp_tests).step);
     test_step.dependOn(&notifications_gcp_tests.step);
@@ -315,6 +328,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     gcp_step.dependOn(&streamed(b, signed_url_gcp_tests).step);
     test_step.dependOn(&signed_url_gcp_tests.step);
@@ -334,6 +348,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
@@ -365,7 +380,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const run = b.addRunArtifact(exe);
-        if (b.args) |args| run.addArgs(args);
+        run.addPassthruArgs();
         const step = b.step("example-" ++ name, "Run examples/" ++ name ++ ".zig");
         step.dependOn(&run.step);
         // Compile the examples with the unit tests so they never rot.
@@ -379,11 +394,11 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/bench_crc32c.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .imports = &.{.{ .name = "core", .module = b.createModule(.{
                 .root_source_file = b.path("src/core/root.zig"),
                 .target = target,
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
             }) }},
         }),
     });
@@ -391,7 +406,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&bench_crc32c.step);
 
     const fmt = b.addFmt(.{
-        .paths = &.{ "build.zig", "build.zig.zon", "src", "tests", "examples", "tools" },
+        .paths = b.pathList(&.{ "build.zig", "build.zig.zon", "src", "tests", "examples", "tools" }),
         .check = true,
     });
     b.step("fmt", "Check formatting (zig fmt --check)").dependOn(&fmt.step);
@@ -406,7 +421,7 @@ pub fn build(b: *std.Build) void {
 /// step always runs, since its result depends on a server, never the cache.
 fn streamed(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Run {
     const run = std.Build.Step.Run.create(b, b.fmt("run {s}", .{tests.name}));
-    run.addArtifactArg(tests);
+    run.addArtifactArg2(tests, .{});
     run.stdio = .inherit;
     return run;
 }

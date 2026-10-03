@@ -99,8 +99,8 @@ test "baseUrl: rejects what cannot be a base URL" {
         "host:8085\x00",
         // Regressions: these once passed and then tripped assertions in std's
         // resolver on the first call.
-        "a" ** 64 ++ ":8085",
-        ("abcdefgh." ** 29) ++ "x:8085",
+        test_util.repeat("a", 64) ++ ":8085",
+        test_util.repeat("abcdefgh.", 29) ++ "x:8085",
         "%61%61%61:8085",
         "[::1:8085",
         "[not-ipv6]:8085",
@@ -122,14 +122,21 @@ fn baseUrlProperty(_: void, input: []const u8) !void {
         return;
     };
     defer testing.allocator.free(url);
-    // A result is printable, parses back with a host std can resolve, and
-    // is its own normal form.
+    // A result is printable, parses back with a host the transport can
+    // reach, and is its own normal form. The transport connects to an IPv6
+    // literal itself; any other host goes to std's HTTP client, which
+    // takes only what `HostName.fromUri` accepts.
     for (url) |c| try testing.expect(c > ' ' and c < 0x7f);
     try testing.expect(!std.mem.endsWith(u8, url, "/"));
     const uri = try std.Uri.parse(url);
     try testing.expect(std.mem.eql(u8, uri.scheme, "http") or std.mem.eql(u8, uri.scheme, "https"));
-    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
-    _ = try uri.getHost(&host_buf);
+    const host = switch (uri.host orelse return error.TestUnexpectedResult) {
+        .raw, .percent_encoded => |h| h,
+    };
+    if (!(host.len >= 3 and host[0] == '[' and host[host.len - 1] == ']')) {
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        _ = try std.Io.net.HostName.fromUri(uri, &host_buf);
+    }
     const again = try baseUrl(testing.allocator, url, scheme);
     defer testing.allocator.free(again);
     try testing.expectEqualStrings(url, again);

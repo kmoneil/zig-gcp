@@ -86,7 +86,7 @@ const Fixture = struct {
 
     /// A unique id: the prefix plus `suffix`.
     fn id(f: *Fixture, suffix: []const u8) []const u8 {
-        return std.fmt.allocPrint(f.arena.allocator(), "{s}-{s}", .{ &f.prefix, suffix }) catch @panic("OOM");
+        return f.arena.allocator().print("{s}-{s}", .{ &f.prefix, suffix }) catch @panic("OOM");
     }
 
     // Resources are registered for cleanup before the create call: a call
@@ -122,7 +122,7 @@ const Fixture = struct {
     /// topics or subscriptions, through the library's `addIamBinding`. The
     /// grant goes when the test deletes the resource.
     fn grantServiceAgent(f: *Fixture, project_number: []const u8, kind: enum { topic, subscription }, id_: []const u8, role: []const u8) !void {
-        const member = try std.fmt.allocPrint(f.arena.allocator(), "serviceAccount:service-{s}@gcp-sa-pubsub.iam.gserviceaccount.com", .{project_number});
+        const member = try f.arena.allocator().print("serviceAccount:service-{s}@gcp-sa-pubsub.iam.gserviceaccount.com", .{project_number});
         var policy = switch (kind) {
             .topic => f.client.topic(id_).addIamBinding(role, member),
             .subscription => f.client.subscription(id_).addIamBinding(role, member),
@@ -358,7 +358,10 @@ test "compressed publish: every byte value and a long text arrive exactly as sen
     const sub = try f.createSubscription("gzip-sub", .{ .topic_id = topic.id });
     var all: [256]u8 = undefined;
     for (&all, 0..) |*b, i| b.* = @intCast(i);
-    const text = "a line of text that compresses well\n" ** 1000;
+    const text: []const u8 = comptime text: {
+        const lines: [1000][36]u8 = @splat("a line of text that compresses well\n".*);
+        break :text @ptrCast(&lines);
+    };
     const messages = [_]pubsub.Message{
         .{ .data = &all, .attributes = &.{.{ .key = "kind", .value = "bytes" }} },
         .{ .data = text, .attributes = &.{.{ .key = "kind", .value = "text" }} },
@@ -1099,8 +1102,8 @@ test "IAM: the emulator answers every call Unimplemented; production grants once
     // The member is Pub/Sub's service agent, named by the project's number.
     const number = f.env.get("PUBSUB_TEST_PROJECT_NUMBER") orelse return error.SkipZigTest;
     const a = f.arena.allocator();
-    const agent = try std.fmt.allocPrint(a, "serviceAccount:service-{s}@gcp-sa-pubsub.iam.gserviceaccount.com", .{number});
-    const shouting = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{try std.ascii.allocUpperString(a, agent["serviceAccount:".len..])});
+    const agent = try a.print("serviceAccount:service-{s}@gcp-sa-pubsub.iam.gserviceaccount.com", .{number});
+    const shouting = try a.print("serviceAccount:{s}", .{try std.ascii.allocUpperString(a, agent["serviceAccount:".len..])});
     const role = "roles/pubsub.viewer";
 
     var fresh = sub.iamPolicy() catch |err| return f.fail(err);

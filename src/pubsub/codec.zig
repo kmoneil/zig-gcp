@@ -1210,7 +1210,7 @@ fn pullRoundTrip(_: void, input: []const u8) !void {
         var key_buf: [16]u8 = undefined;
         w.* = .{
             .ack_id = try a.dupe(u8, g.utf8(&ack_buf, 40)),
-            .message_id = try std.fmt.allocPrint(a, "{d}", .{g.int(u64)}),
+            .message_id = try a.print("{d}", .{g.int(u64)}),
             .data = p.data,
             .attributes = p.attributes,
             .publish_time = "2026-09-18T23:12:18.388Z",
@@ -1246,7 +1246,7 @@ test "fuzz pull decoding: server-shaped responses decode exactly" {
 test "decodePull: every allocation failure is OutOfMemory without leaks" {
     // 12 KiB of data, so decoding it needs an allocation of its own rather
     // than space left over in the arena.
-    const body = "{\"receivedMessages\":[{\"ackId\":\"a1\",\"message\":{\"data\":\"" ++ ("QUFB" ** 4096) ++
+    const body = "{\"receivedMessages\":[{\"ackId\":\"a1\",\"message\":{\"data\":\"" ++ test_util.repeat("QUFB", 4096) ++
         "\",\"attributes\":{\"k\":\"v\"},\"messageId\":\"1\",\"publishTime\":\"2026-09-19T00:00:00Z\"},\"deliveryAttempt\":1}]}";
     const Run = struct {
         fn decode(gpa: Allocator, text: []const u8) !void {
@@ -1256,7 +1256,7 @@ test "decodePull: every allocation failure is OutOfMemory without leaks" {
             try testing.expectEqual(3 * 4096, result.messages[0].data.len);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.decode, .{@as([]const u8, body)});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.decode, .{@as([]const u8, body)});
 }
 
 fn stringLenProperty(_: void, input: []const u8) !void {
@@ -1595,7 +1595,7 @@ fn genSubscriptionConfig(g: *ByteGen, arena: Allocator) !types.SubscriptionConfi
     };
     const labels = try arena.alloc(types.Label, g.intRange(u8, 0, 4));
     for (labels, 0..) |*l, i| l.* = .{
-        .key = try std.fmt.allocPrint(arena, "k{d}{s}", .{ i, g.pick([]const u8, &.{ "", "_x", "-y", "z9" }) }),
+        .key = try arena.print("k{d}{s}", .{ i, g.pick([]const u8, &.{ "", "_x", "-y", "z9" }) }),
         .value = g.pick([]const u8, &.{ "", "v", "prod", "a-b_c" }),
     };
     config.labels = labels;

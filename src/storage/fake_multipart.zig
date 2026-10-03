@@ -800,7 +800,7 @@ pub const FakeMultipart = struct {
         else if (std.mem.eql(u8, mode.string, "Unlocked"))
             false
         else
-            return .{ .refused = try jsonRefusal(arena, 400, "invalid", try std.fmt.allocPrint(arena, "Invalid value for: {s} is not a valid value", .{mode.string})) };
+            return .{ .refused = try jsonRefusal(arena, 400, "invalid", try arena.print("Invalid value for: {s} is not a valid value", .{mode.string})) };
         const at = core.timestamp.parse(until.string) catch return .{ .refused = try jsonRefusal(
             arena,
             400,
@@ -861,19 +861,19 @@ pub const FakeMultipart = struct {
             null;
         if (hold) |kind| {
             self.counts.kept_refusals += 1;
-            const details = try std.fmt.allocPrint(arena, "Object '{s}/{s}' is under active {s} hold and cannot be deleted, overwritten or archived until hold is removed.", .{ bucket, o.name, kind });
+            const details = try arena.print("Object '{s}/{s}' is under active {s} hold and cannot be deleted, overwritten or archived until hold is removed.", .{ bucket, o.name, kind });
             return switch (api) {
                 .json => try jsonRefusal(arena, 403, "forbidden", details),
-                .xml => .{ .status = 403, .body = try std.fmt.allocPrint(arena, "<?xml version='1.0' encoding='UTF-8'?><Error><Code>ObjectUnderActiveHold</Code><Message>Object overwrite or deletion is not allowed due to active hold on the object.</Message><Details>{s}</Details></Error>", .{details}) },
+                .xml => .{ .status = 403, .body = try arena.print("<?xml version='1.0' encoding='UTF-8'?><Error><Code>ObjectUnderActiveHold</Code><Message>Object overwrite or deletion is not allowed due to active hold on the object.</Message><Details>{s}</Details></Error>", .{details}) },
             };
         }
         const until = self.retainedUntil(bucket, o) orelse return null;
         if (self.now() >= until) return null;
         self.counts.kept_refusals += 1;
-        const details = try std.fmt.allocPrint(arena, "Object '{s}/{s}' is subject to bucket's retention policy or object retention and cannot be deleted or overwritten until {s}", .{ bucket, o.name, try rfc3339(arena, until) });
+        const details = try arena.print("Object '{s}/{s}' is subject to bucket's retention policy or object retention and cannot be deleted or overwritten until {s}", .{ bucket, o.name, try rfc3339(arena, until) });
         return switch (api) {
             .json => try jsonRefusal(arena, 403, "retentionPolicyNotMet", details),
-            .xml => .{ .status = 403, .body = try std.fmt.allocPrint(arena, "<?xml version='1.0' encoding='UTF-8'?><Error><Code>RetentionPolicyNotMet</Code><Message>Object overwrite or deletion is not allowed due to retention policy.</Message><Details>{s}</Details></Error>", .{details}) },
+            .xml => .{ .status = 403, .body = try arena.print("<?xml version='1.0' encoding='UTF-8'?><Error><Code>RetentionPolicyNotMet</Code><Message>Object overwrite or deletion is not allowed due to retention policy.</Message><Details>{s}</Details></Error>", .{details}) },
         };
     }
 
@@ -1013,7 +1013,7 @@ pub const FakeMultipart = struct {
             if (std.mem.eql(u8, o.name, target.name) and o.generation == generation) break i;
         } else return .{
             .status = 404,
-            .body = try std.fmt.allocPrint(arena, "{{\"error\":{{\"code\":404,\"message\":\"No such object: {s}/{s}\",\"errors\":[{{\"reason\":\"notFound\"}}]}}}}", .{ target.bucket, target.name }),
+            .body = try arena.print("{{\"error\":{{\"code\":404,\"message\":\"No such object: {s}/{s}\",\"errors\":[{{\"reason\":\"notFound\"}}]}}}}", .{ target.bucket, target.name }),
         };
         const live = self.liveIndex(target.name);
         const holds = if (live) |i| target.conditions.check(&self.objects.items[i]) == .hold else target.conditions.checkAbsent();
@@ -1092,9 +1092,9 @@ pub const FakeMultipart = struct {
     fn media(o: *const Stored, headers: []const Header, accept_gzip: bool, fault: Fault, arena: Allocator) Allocator.Error!Reply {
         const hash = core.crc32c.toBase64(core.crc32c.hash(o.bytes));
         var reply_headers: std.ArrayList(Header) = .empty;
-        try reply_headers.append(arena, .{ .name = "x-goog-generation", .value = try std.fmt.allocPrint(arena, "{d}", .{o.generation}) });
-        try reply_headers.append(arena, .{ .name = "x-goog-hash", .value = try std.fmt.allocPrint(arena, "crc32c={s}", .{&hash}) });
-        try reply_headers.append(arena, .{ .name = "x-goog-stored-content-length", .value = try std.fmt.allocPrint(arena, "{d}", .{o.bytes.len}) });
+        try reply_headers.append(arena, .{ .name = "x-goog-generation", .value = try arena.print("{d}", .{o.generation}) });
+        try reply_headers.append(arena, .{ .name = "x-goog-hash", .value = try arena.print("crc32c={s}", .{&hash}) });
+        try reply_headers.append(arena, .{ .name = "x-goog-stored-content-length", .value = try arena.print("{d}", .{o.bytes.len}) });
         if (o.served) |served| {
             try reply_headers.append(arena, .{ .name = "x-goog-stored-content-encoding", .value = "gzip" });
             if (!accept_gzip) return .{ .status = 200, .headers = reply_headers.items, .body = served, .cut = fault == .cut };
@@ -1106,7 +1106,7 @@ pub const FakeMultipart = struct {
         var partial = false;
         if (requestedRange(headers)) |range| {
             if (range.start >= size) {
-                try reply_headers.append(arena, .{ .name = "Content-Range", .value = try std.fmt.allocPrint(arena, "bytes */{d}", .{size}) });
+                try reply_headers.append(arena, .{ .name = "Content-Range", .value = try arena.print("bytes */{d}", .{size}) });
                 return .{ .status = 416, .headers = reply_headers.items, .body = "<Error><Code>InvalidRange</Code></Error>" };
             }
             start = @intCast(range.start);
@@ -1130,7 +1130,7 @@ pub const FakeMultipart = struct {
         }
         if (partial) try reply_headers.append(arena, .{
             .name = "Content-Range",
-            .value = try std.fmt.allocPrint(arena, "bytes {d}-{d}/{d}", .{ start, end - 1, size }),
+            .value = try arena.print("bytes {d}-{d}/{d}", .{ start, end - 1, size }),
         });
         return .{ .status = if (partial) 206 else 200, .headers = reply_headers.items, .body = body, .cut = fault == .cut };
     }
@@ -1155,8 +1155,8 @@ pub const FakeMultipart = struct {
                 };
                 // The reply first: once the upload is stored, nothing
                 // may fail and free what it owns.
-                const id_text = try std.fmt.allocPrint(arena, "VXBs+{d}=", .{self.next_upload});
-                const reply_body = try std.fmt.allocPrint(arena, "<?xml version='1.0' encoding='UTF-8'?>\n" ++
+                const id_text = try arena.print("VXBs+{d}=", .{self.next_upload});
+                const reply_body = try arena.print("<?xml version='1.0' encoding='UTF-8'?>\n" ++
                     "<InitiateMultipartUploadResult xmlns='http://s3.amazonaws.com/doc/2006-03-01/'>" ++
                     "<Bucket>{s}</Bucket><Key>{s}</Key><UploadId>{s}</UploadId></InitiateMultipartUploadResult>", .{ target.bucket, target.name, id_text });
                 const id = try self.gpa.dupe(u8, id_text);
@@ -1193,10 +1193,10 @@ pub const FakeMultipart = struct {
                 if (fault == .corrupt and bytes.len > 0) bytes[bytes.len / 2] ^= 0x01;
                 const crc = core.crc32c.hash(bytes);
                 const hash = core.crc32c.toBase64(crc);
-                const etag_text = try std.fmt.allocPrint(arena, "\"{x:0>8}{d}\"", .{ crc, bytes.len });
+                const etag_text = try arena.print("\"{x:0>8}{d}\"", .{ crc, bytes.len });
                 const reply_headers = try replyHeaders(arena, &.{
                     .{ .name = "ETag", .value = etag_text },
-                    .{ .name = "x-goog-hash", .value = try std.fmt.allocPrint(arena, "crc32c={s}", .{&hash}) },
+                    .{ .name = "x-goog-hash", .value = try arena.print("crc32c={s}", .{&hash}) },
                 });
                 const etag = try self.gpa.dupe(u8, etag_text);
                 errdefer self.gpa.free(etag);
@@ -1297,8 +1297,8 @@ pub const FakeMultipart = struct {
         // upload under a key of either kind finishes with no checksum.
         const keyed = u.key_sha256 != null or u.kms_key_name != null;
         const all_headers = [_]Header{
-            .{ .name = "x-goog-generation", .value = try std.fmt.allocPrint(arena, "{d}", .{generation}) },
-            .{ .name = "x-goog-hash", .value = try std.fmt.allocPrint(arena, "crc32c={s}", .{&hash}) },
+            .{ .name = "x-goog-generation", .value = try arena.print("{d}", .{generation}) },
+            .{ .name = "x-goog-hash", .value = try arena.print("crc32c={s}", .{&hash}) },
         };
         const reply_headers = try replyHeaders(arena, all_headers[0..if (keyed) 1 else 2]);
         try self.objects.ensureUnusedCapacity(self.gpa, 1);
@@ -1382,12 +1382,12 @@ pub const FakeMultipart = struct {
         else
             null;
         const metadata_crc: ?u32 = if (meta.crc32c) |text| core.crc32c.fromBase64(text) catch null else null;
-        const id_text = try std.fmt.allocPrint(arena, "sess-{d}", .{self.next_session});
+        const id_text = try arena.print("sess-{d}", .{self.next_session});
         // As Google's, the session URL carries the project its start billed.
         const location = if (target.user_project) |project|
-            try std.fmt.allocPrint(arena, "{s}/upload/session/{s}?userProject={s}", .{ target.origin, id_text, project })
+            try arena.print("{s}/upload/session/{s}?userProject={s}", .{ target.origin, id_text, project })
         else
-            try std.fmt.allocPrint(arena, "{s}/upload/session/{s}", .{ target.origin, id_text });
+            try arena.print("{s}/upload/session/{s}", .{ target.origin, id_text });
         const id = try self.gpa.dupe(u8, id_text);
         errdefer self.gpa.free(id);
         const name = try self.gpa.dupe(u8, meta.name);
@@ -1872,8 +1872,7 @@ pub const FakeMultipart = struct {
         };
         for (policy.bindings) |binding| {
             if (!std.mem.startsWith(u8, binding.role, "roles/storage.")) {
-                return .{ .status = 400, .body = try std.fmt.allocPrint(
-                    arena,
+                return .{ .status = 400, .body = try arena.print(
                     "{{\"error\":{{\"code\":400,\"errors\":[{{\"domain\":\"global\",\"message\":\"Role {s} is not supported for this resource.\",\"reason\":\"invalid\"}}],\"message\":\"Role {s} is not supported for this resource.\"}}}}",
                     .{ binding.role, binding.role },
                 ) };
@@ -2122,7 +2121,7 @@ fn sessionProgress(arena: Allocator, held: usize) Allocator.Error!FakeMultipart.
     if (held == 0) return .{ .status = 308 };
     return .{ .status = 308, .headers = try arena.dupe(Header, &.{.{
         .name = "Range",
-        .value = try std.fmt.allocPrint(arena, "bytes=0-{d}", .{held - 1}),
+        .value = try arena.print("bytes=0-{d}", .{held - 1}),
     }}) };
 }
 
@@ -2262,8 +2261,7 @@ fn keyRefusal(kind: FakeMultipart.Kind, target: Target, url: []const u8, headers
     else
         null;
     const w = what orelse return null;
-    return .{ .status = 400, .body = try std.fmt.allocPrint(
-        arena,
+    return .{ .status = 400, .body = try arena.print(
         "{{\"error\":{{\"code\":400,\"message\":\"this fake refuses what this library must never send: {s} on a {t}\"}}}}",
         .{ w, kind },
     ) };
@@ -2282,8 +2280,7 @@ fn tokenRefusal(kind: FakeMultipart.Kind, method: Method, headers: []const Heade
         else => false,
     };
     if (takes_token) return null;
-    return .{ .status = 400, .body = try std.fmt.allocPrint(
-        arena,
+    return .{ .status = 400, .body = try arena.print(
         "{{\"error\":{{\"code\":400,\"message\":\"this fake refuses what this library must never send: an idempotency token on a {t} {t}\"}}}}",
         .{ method, kind },
     ) };
@@ -2297,12 +2294,12 @@ fn tokenRefusal(kind: FakeMultipart.Kind, method: Method, headers: []const Heade
 fn keptKey(arena: Allocator, kind: FakeMultipart.Kind, target: Target, headers: []const Header, content_type: ?[]const u8, body: []const u8) Allocator.Error!?[]const u8 {
     const token = headerValue(headers, "X-Goog-Gcs-Idempotency-Token") orelse return null;
     const resource: []const u8 = switch (kind) {
-        .delete, .patch => try std.fmt.allocPrint(arena, "{s}/{s}#{?d}", .{ target.json.bucket, target.json.name, target.json.generation }),
-        .move => try std.fmt.allocPrint(arena, "{s}/{s}>{s}", .{ target.move.bucket, target.move.source, target.move.destination }),
-        .insert => try std.fmt.allocPrint(arena, "{s}/{s}", .{ target.insert.bucket, try insertedName(arena, content_type, body) orelse return null }),
+        .delete, .patch => try arena.print("{s}/{s}#{?d}", .{ target.json.bucket, target.json.name, target.json.generation }),
+        .move => try arena.print("{s}/{s}>{s}", .{ target.move.bucket, target.move.source, target.move.destination }),
+        .insert => try arena.print("{s}/{s}", .{ target.insert.bucket, try insertedName(arena, content_type, body) orelse return null }),
         else => return null,
     };
-    return try std.fmt.allocPrint(arena, "{s} {t} {s}", .{ token, kind, resource });
+    return try arena.print("{s} {t} {s}", .{ token, kind, resource });
 }
 
 /// The name a one-request upload names in its metadata, or null for a
@@ -2375,7 +2372,7 @@ fn writeManagedFolderJson(
     try jw.objectField("kind");
     try jw.write("storage#managedFolder");
     try jw.objectField("metageneration");
-    try jw.write(try std.fmt.allocPrint(arena, "{d}", .{state.metageneration}));
+    try jw.write(try arena.print("{d}", .{state.metageneration}));
     try jw.objectField("name");
     try jw.write(folder);
     try jw.objectField("selfLink");
@@ -2481,8 +2478,7 @@ const folder_condition_failed: FakeMultipart.Reply = .{ .status = 412, .body =
 
 /// A folder 409, in production's shape: the message says which conflict.
 fn folderConflict(arena: Allocator, message: []const u8) Allocator.Error!FakeMultipart.Reply {
-    return .{ .status = 409, .body = try std.fmt.allocPrint(
-        arena,
+    return .{ .status = 409, .body = try arena.print(
         "{{\"error\":{{\"code\":409,\"errors\":[{{\"domain\":\"global\",\"message\":\"{s}\",\"reason\":\"conflict\"}}],\"message\":\"{s}\"}}}}",
         .{ message, message },
     ) };
@@ -2519,7 +2515,7 @@ fn writeFolder(
     try jw.objectField("kind");
     try jw.write("storage#folder");
     try jw.objectField("metageneration");
-    try jw.write(try std.fmt.allocPrint(arena, "{d}", .{state.metageneration}));
+    try jw.write(try arena.print("{d}", .{state.metageneration}));
     try jw.objectField("name");
     try jw.write(folder);
     try jw.objectField("selfLink");
@@ -2596,14 +2592,14 @@ fn objectJson(
     jw.write(.{
         .name = name,
         .bucket = bucket,
-        .size = try std.fmt.allocPrint(arena, "{d}", .{o.bytes.len}),
-        .generation = try std.fmt.allocPrint(arena, "{d}", .{generation}),
-        .metageneration = try std.fmt.allocPrint(arena, "{d}", .{o.metageneration}),
+        .size = try arena.print("{d}", .{o.bytes.len}),
+        .generation = try arena.print("{d}", .{generation}),
+        .metageneration = try arena.print("{d}", .{o.metageneration}),
         .contentType = o.content_type,
         .contentEncoding = @as(?[]const u8, if (o.served != null) "gzip" else null),
         .crc32c = @as(?[]const u8, if (hashes) &crc else null),
         .storageClass = "STANDARD",
-        .kmsKeyName = @as(?[]const u8, if (o.kms_key_name) |k| try std.fmt.allocPrint(arena, "{s}/cryptoKeyVersions/1", .{k}) else null),
+        .kmsKeyName = @as(?[]const u8, if (o.kms_key_name) |k| try arena.print("{s}/cryptoKeyVersions/1", .{k}) else null),
         .customerEncryption = if (o.key_sha256) |digest| @as(?struct { encryptionAlgorithm: []const u8, keySha256: []const u8 }, .{
             .encryptionAlgorithm = "AES256",
             .keySha256 = std.base64.standard.Encoder.encode(&sha_text, &digest),
@@ -2642,7 +2638,7 @@ fn rfc3339(arena: Allocator, ns: i96) Allocator.Error![]const u8 {
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     const secs = epoch.getDaySeconds();
-    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+    return arena.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
         year_day.year,
         month_day.month.numeric(),
         month_day.day_index + 1,
@@ -2716,9 +2712,9 @@ fn splitMultipart(arena: Allocator, content_type: []const u8, body: []const u8) 
     const marker = "boundary=";
     const at = std.mem.indexOf(u8, content_type, marker) orelse return error.Malformed;
     const boundary = content_type[at + marker.len ..];
-    const opening = try std.fmt.allocPrint(arena, "--{s}\r\n", .{boundary});
-    const middle = try std.fmt.allocPrint(arena, "\r\n--{s}\r\n", .{boundary});
-    const closing = try std.fmt.allocPrint(arena, "\r\n--{s}--\r\n", .{boundary});
+    const opening = try arena.print("--{s}\r\n", .{boundary});
+    const middle = try arena.print("\r\n--{s}\r\n", .{boundary});
+    const closing = try arena.print("\r\n--{s}--\r\n", .{boundary});
     if (!std.mem.startsWith(u8, body, opening) or !std.mem.endsWith(u8, body, closing)) return error.Malformed;
     const inner = body[opening.len .. body.len - closing.len];
     const meta_start = (std.mem.indexOf(u8, inner, "\r\n\r\n") orelse return error.Malformed) + 4;
@@ -3339,7 +3335,7 @@ pub const MultipartServer = struct {
         const body = try arena.alloc(u8, content_length);
         try r.readSliceAll(body);
 
-        const full_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}{s}", .{ s.port, target });
+        const full_url = try arena.print("http://127.0.0.1:{d}{s}", .{ s.port, target });
         // A client that offers gzip takes a gzip object's stored bytes.
         const accept_gzip = for (headers.items) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "accept-encoding")) break std.mem.indexOf(u8, h.value, "gzip") != null;

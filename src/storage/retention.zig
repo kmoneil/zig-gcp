@@ -329,7 +329,7 @@ test "a policy keeps every object its period, old and new, then lets it go" {
     // Every write that would take it away is refused, a metadata update is
     // not.
     try testing.expectError(error.ObjectRetained, f.object("new").upload("over it", .{}));
-    try testing.expectError(error.ObjectRetained, f.object("new").upload("over it, resumably, more than a kilobyte" ** 30, .{}));
+    try testing.expectError(error.ObjectRetained, f.object("new").upload(test_util.repeat("over it, resumably, more than a kilobyte", 30), .{}));
     var patched = try f.object("new").updateMetadata(.{ .temporary_hold = false });
     patched.deinit();
     // A condition is checked first.

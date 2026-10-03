@@ -313,7 +313,7 @@ Five calls read and change it:
 ```zig
 var service_agent = try gcs.serviceAgent();
 defer service_agent.deinit();
-const member = try std.fmt.allocPrint(arena, "serviceAccount:{s}", .{service_agent.value});
+const member = try arena.print("serviceAccount:{s}", .{service_agent.value});
 var policy = try gcs.bucket("my-bucket").addIamBinding("roles/storage.objectViewer", member);
 defer policy.deinit();
 ```

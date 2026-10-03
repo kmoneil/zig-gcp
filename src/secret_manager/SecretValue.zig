@@ -185,5 +185,5 @@ test "every allocation failure is OutOfMemory without leaks" {
             value.data = .init(try value.allocator().dupe(u8, "s3cr3t"));
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(core.testing.no_grow_allocator, Run.run, .{});
 }

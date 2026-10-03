@@ -103,7 +103,7 @@ pub fn main(init: std.process.Init) !void {
             info.deinit();
             try out.print("created topic {s}\n", .{topic_id});
         } else |err| if (err != error.AlreadyExists) return fail(err, &ps_diag);
-        const watch_id = try std.fmt.allocPrint(arena, "{s}-watch", .{topic_id});
+        const watch_id = try arena.print("{s}-watch", .{topic_id});
         if (ps.subscription(watch_id).create(.{ .topic_id = topic_id })) |created| {
             var info = created;
             info.deinit();
@@ -112,13 +112,13 @@ pub fn main(init: std.process.Init) !void {
 
         var agent = secrets.serviceAgent() catch |err| return fail(err, &sm_diag);
         defer agent.deinit();
-        const member = try std.fmt.allocPrint(arena, "serviceAccount:{s}", .{agent.value});
+        const member = try arena.print("serviceAccount:{s}", .{agent.value});
         var policy = ps.topic(topic_id).addIamBinding("roles/pubsub.publisher", member) catch |err| return fail(err, &ps_diag);
         policy.deinit();
         try out.print("{s} may publish to {s}\n", .{ agent.value, topic_id });
         try out.flush();
 
-        const topic_name = try std.fmt.allocPrint(arena, "projects/{s}/topics/{s}", .{ project, topic_id });
+        const topic_name = try arena.print("projects/{s}/topics/{s}", .{ project, topic_id });
         const topics: []const []const u8 = &.{topic_name};
         const rotation: secret_manager.Rotation = .{
             .next_time = try timeFromNow(init.io, arena, first_s),
@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
         try out.print("{s} no longer rotates or publishes\n", .{secret_id});
         var ps = pubsub.Client.init(init.gpa, init.io, .{ .project_id = project, .token_provider = creds.provider(), .diagnostics = &ps_diag }) catch |err| return fail(err, &ps_diag);
         defer ps.deinit();
-        const watch_id = try std.fmt.allocPrint(arena, "{s}-watch", .{topic_id});
+        const watch_id = try arena.print("{s}-watch", .{topic_id});
         ps.subscription(watch_id).delete() catch |err| if (err != error.NotFound) return fail(err, &ps_diag);
         ps.topic(topic_id).delete() catch |err| if (err != error.NotFound) return fail(err, &ps_diag);
         try out.print("deleted {s} and {s}\n", .{ watch_id, topic_id });
@@ -278,7 +278,7 @@ fn timeFromNow(io: std.Io, arena: std.mem.Allocator, seconds: u64) ![]const u8 {
     const day = es.getEpochDay().calculateYearDay();
     const md = day.calculateMonthDay();
     const ds = es.getDaySeconds();
-    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    return arena.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         day.year,             md.month.numeric(),      md.day_index + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     });

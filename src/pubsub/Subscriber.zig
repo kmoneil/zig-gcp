@@ -77,7 +77,7 @@ janitor_diag: Diagnostics,
 mutex: std.Io.Mutex,
 /// Signaled when a message resolves, when `stop` is called, and when a
 /// fatal error is recorded.
-cond: core.Condition,
+cond: std.Io.Condition,
 queue: std.Io.Queue(*Tracked),
 queue_buffer: []*Tracked,
 /// Scratch for the janitor's lease snapshot, sized `max_outstanding`.
@@ -368,10 +368,11 @@ pub fn run(self: *Subscriber, handler: Handler) Error!void {
     defer if (janitor_running) discard(janitor_task.cancel(io));
     var workers: std.Io.Group = .init;
     defer workers.cancel(io);
-    // Runs before the cancel above, on every way out. A worker parked in
-    // the queue's own wait can miss a cancel: std's queue, like its
-    // Condition, takes a message handed over as the cancel lands and drops
-    // the cancel. A closed queue sends every worker home anyway.
+    // Runs before the cancel above, on every way out. Before Zig 0.17, a
+    // worker parked in the queue's own wait could miss a cancel: std's
+    // queue, like its Condition, took a message handed over as the cancel
+    // landed and dropped the cancel. A closed queue sends every worker home
+    // whatever std does.
     defer self.queue.close(io);
     for (0..self.concurrency) |_| workers.concurrent(io, workerLoop, .{ self, handler }) catch {
         var d: Diagnostics = .{};
@@ -1029,7 +1030,7 @@ const FakePubSub = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     /// Wakes pulls blocked on an empty backlog.
-    cond: core.Condition = .init,
+    cond: std.Io.Condition = .init,
     pending: std.ArrayList(Msg) = .empty,
     /// Delivered and not yet acknowledged, by ack id.
     leased: std.StringHashMapUnmanaged(Msg) = .empty,
@@ -1131,7 +1132,7 @@ const FakePubSub = struct {
         defer f.mutex.unlock(f.io);
         const copy = try f.gpa.dupe(u8, data);
         errdefer f.gpa.free(copy);
-        const ack_id = try std.fmt.allocPrint(f.gpa, "ack-{d}", .{f.next_id});
+        const ack_id = try f.gpa.print("ack-{d}", .{f.next_id});
         f.next_id += 1;
         try f.pending.append(f.gpa, .{ .data = copy, .ack_id = ack_id });
         f.cond.broadcast(f.io);
@@ -1190,8 +1191,7 @@ const FakePubSub = struct {
                 .status = 403,
                 .body = "{\"error\":{\"code\":403,\"message\":\"User not authorized to perform this action.\",\"status\":\"PERMISSION_DENIED\"}}",
             };
-            const body = try std.fmt.allocPrint(
-                arena,
+            const body = try arena.print(
                 "{{\"name\":\"s\",\"topic\":\"t\",\"ackDeadlineSeconds\":{d},\"enableExactlyOnceDelivery\":{}}}",
                 .{ f.ack_deadline_s, f.exactly_once },
             );
@@ -1211,8 +1211,7 @@ const FakePubSub = struct {
 
     fn failure(f: *FakePubSub, arena: Allocator) TransportError!Response {
         const status: []const u8 = if (f.fail_status == 404) "NOT_FOUND" else "UNAVAILABLE";
-        const body = try std.fmt.allocPrint(
-            arena,
+        const body = try arena.print(
             "{{\"error\":{{\"code\":{d},\"message\":\"scripted failure\",\"status\":\"{s}\"}}}}",
             .{ f.fail_status, status },
         );
@@ -1393,7 +1392,7 @@ const FakePubSub = struct {
     fn lapse(f: *FakePubSub, id: []const u8) !void {
         const entry = f.leased.fetchRemove(id) orelse return;
         f.gpa.free(entry.value.ack_id);
-        const fresh = try std.fmt.allocPrint(f.gpa, "ack-{d}", .{f.next_id});
+        const fresh = try f.gpa.print("ack-{d}", .{f.next_id});
         f.next_id += 1;
         try f.pending.append(f.gpa, .{ .data = entry.value.data, .ack_id = fresh });
         f.cond.broadcast(f.io);
@@ -2212,10 +2211,11 @@ fn cancelBusyRounds(rounds: usize, done: *std.atomic.Value(bool)) anyerror!void 
 
 test "Subscriber: canceling run while handlers resolve messages never hangs" {
     // Regression. run() waits on a condition that every resolved message
-    // broadcasts. std's Condition in Zig 0.16.0 drops a cancel that lands
-    // while another waiter's signal is pending, and then run() never
-    // returned: its next wait could not be canceled. core.Condition keeps
-    // the cancel. Rather than hang the suite, this gives up after 60 s.
+    // broadcasts. std's Condition in Zig 0.16.0 dropped a cancel that
+    // landed while another waiter's signal was pending, and then run()
+    // never returned: its next wait could not be canceled. Zig 0.17's
+    // keeps the cancel. Rather than hang the suite, this gives up after
+    // 60 s.
     const io = testing.io;
     var done: std.atomic.Value(bool) = .init(false);
     var rounds = try io.concurrent(cancelBusyRounds, .{ 150, &done });
@@ -2269,7 +2269,7 @@ test "Subscriber: init failures under memory pressure are OutOfMemory without le
             subscriber.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.initDeinit, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.initDeinit, .{});
 }
 
 fn chaosProperty(_: void, input: []const u8) !void {
@@ -2495,7 +2495,7 @@ test "acks put back keep room for every message in flight" {
     defer gpa.free(held);
     const zero: std.Io.Timestamp = .{ .nanoseconds = 0 };
     for (held, 0..) |*entry, i| entry.* = .{
-        .ack_id = try std.fmt.allocPrint(gpa, "held-{d}", .{i}),
+        .ack_id = try gpa.print("held-{d}", .{i}),
         .resolved_at = zero,
         .not_before = zero,
     };

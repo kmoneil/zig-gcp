@@ -114,9 +114,9 @@ const Builtins = struct {
 
     /// Keeps `value` if `name` is one of Cloud Storage's attributes.
     fn take(self: *Builtins, name: []const u8, value: []const u8) bool {
-        inline for (@typeInfo(Builtins).@"struct".fields) |field| {
-            if (std.mem.eql(u8, name, field.name)) {
-                if (@field(self, field.name) == null) @field(self, field.name) = value;
+        inline for (@typeInfo(Builtins).@"struct".field_names) |field_name| {
+            if (std.mem.eql(u8, name, field_name)) {
+                if (@field(self, field_name) == null) @field(self, field_name) = value;
                 return true;
             }
         }
@@ -126,7 +126,7 @@ const Builtins = struct {
 
 comptime {
     // The attributes a configuration may not name are the ones read here.
-    std.debug.assert(@typeInfo(Builtins).@"struct".fields.len == notifications.builtin_attributes.len);
+    std.debug.assert(@typeInfo(Builtins).@"struct".field_names.len == notifications.builtin_attributes.len);
     for (notifications.builtin_attributes) |name| std.debug.assert(@hasField(Builtins, name));
 }
 
@@ -170,10 +170,10 @@ fn key(
     object: []const u8,
 ) Allocator.Error![]const u8 {
     if (kind == .metadata_update) {
-        if (info) |i| return std.fmt.allocPrint(a, "{s} {d} m{d} {s}/{s}", .{ event_type, generation, i.metageneration, bucket, object });
-        return std.fmt.allocPrint(a, "{s} {d} t{s} {s}/{s}", .{ event_type, generation, time, bucket, object });
+        if (info) |i| return a.print("{s} {d} m{d} {s}/{s}", .{ event_type, generation, i.metageneration, bucket, object });
+        return a.print("{s} {d} t{s} {s}/{s}", .{ event_type, generation, time, bucket, object });
     }
-    return std.fmt.allocPrint(a, "{s} {d} - {s}/{s}", .{ event_type, generation, bucket, object });
+    return a.print("{s} {d} - {s}/{s}", .{ event_type, generation, bucket, object });
 }
 
 fn refuse(diag: ?*core.Diagnostics, comptime format: []const u8, args: anytype) error{NotAnObjectEvent} {
@@ -558,7 +558,7 @@ fn decodeEverything(gpa: Allocator) !void {
 }
 
 test "decode: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, decodeEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, decodeEverything, .{});
 }
 
 /// Attributes drawn from `bytes`: Cloud Storage's names, sometimes twice or
@@ -618,5 +618,5 @@ fn eventProperty(_: void, bytes: []const u8) !void {
 }
 
 test "fuzz object events: any message decodes as sent, or is refused" {
-    try test_util.fuzzBytes({}, eventProperty, .{ .corpus = &.{ "", "\x00" ** 32, "\x03" ** 48, "\x05\x07" ** 40 } });
+    try test_util.fuzzBytes({}, eventProperty, .{ .corpus = &.{ "", test_util.repeat("\x00", 32), test_util.repeat("\x03", 48), test_util.repeat("\x05\x07", 40) } });
 }

@@ -452,7 +452,7 @@ test "Cache: every allocation failure is OutOfMemory without leaks" {
             _ = try cache.getToken(clock.io(), arena.allocator(), source.source());
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(core.testing.no_grow_allocator, Run.run, .{});
 }
 
 test "Cache: callers that arrive during a fetch wait for it and share its token" {
@@ -532,7 +532,7 @@ const CountingSource = struct {
         return switch (self.outcome) {
             .fail => |err| err,
             .token => |expires_in| .{
-                .token = try std.fmt.allocPrint(arena, "ya29.t{d}", .{self.fetches}),
+                .token = try arena.print("ya29.t{d}", .{self.fetches}),
                 .expires_in = expires_in,
             },
         };

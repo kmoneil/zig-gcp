@@ -1096,7 +1096,7 @@ fn keyProperty(_: void, input: []const u8) !void {
 }
 
 test "heavy property keys: every call under the right key, another or none, is what the model says, and no key goes where none belongs" {
-    try test_util.fuzzBytes({}, keyProperty, .{ .corpus = &.{ "", "\x01" ** 64, "\x00\x01\x02\x03\x04\x05\x06\x07" ** 8, "\x02\x05\x01\x03\x04" ** 16 } });
+    try test_util.fuzzBytes({}, keyProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 64), test_util.repeat("\x00\x01\x02\x03\x04\x05\x06\x07", 8), test_util.repeat("\x02\x05\x01\x03\x04", 16) } });
 }
 
 fn keyedEverything(gpa: Allocator) !void {
@@ -1131,7 +1131,7 @@ fn keyedEverything(gpa: Allocator) !void {
 }
 
 test "keys: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, keyedEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, keyedEverything, .{});
 }
 
 test "keys: a resumable upload names its key at the start, and its chunks carry none" {
@@ -1215,7 +1215,7 @@ fn fromBase64Property(_: void, bytes: []const u8) !void {
 }
 
 test "fuzz encryption keys: fromBase64 takes exactly the base64 of 32 bytes, and gives them back" {
-    try test_util.fuzzBytes({}, fromBase64Property, .{ .corpus = &.{ "", "\x01" ** 40, "\x00" ** 34 } });
+    try test_util.fuzzBytes({}, fromBase64Property, .{ .corpus = &.{ "", test_util.repeat("\x01", 40), test_util.repeat("\x00", 34) } });
 }
 
 fn kmsNameProperty(_: void, bytes: []const u8) !void {
@@ -1270,7 +1270,7 @@ fn kmsNameProperty(_: void, bytes: []const u8) !void {
 }
 
 test "fuzz kms key names: a key's name, or a version's, goes out as the key's, and nothing else goes out" {
-    try test_util.fuzzBytes({}, kmsNameProperty, .{ .corpus = &.{ "", "\x01" ** 64, "\x00\x00\x00\x00\x00\x00\x00\x03" ** 8 } });
+    try test_util.fuzzBytes({}, kmsNameProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 64), test_util.repeat("\x00\x00\x00\x00\x00\x00\x00\x03", 8) } });
 }
 
 test "against the fake: an XML upload's parts and finish are held to the key it began with, as production holds them" {

@@ -3,11 +3,12 @@
 //!
 //! Zig 0.16's `std.compress.flate.Compress` was audited for storage's
 //! compressing uploads (v0.23.0): correct and deterministic, with traps
-//! this stays clear of. Its state must not move once in use, so it lives on
-//! the heap; its output buffer must be longer than 8 bytes; a mid-stream
-//! flush changes the bytes, so it is never flushed; and it is only fed
-//! through `writeAll`. The result is decompressed again with core's own
-//! decompressor and must give back exactly the input, and the gzip
+//! this stays clear of. Zig 0.17's is the same code, but for its stored-only
+//! and Huffman-only variants, which this does not use. Its state must not
+//! move once in use, so it lives on the heap; its output buffer must be
+//! longer than 8 bytes; a mid-stream flush changes the bytes, so it is never
+//! flushed; and it is only fed through `writeAll`. The result is
+//! decompressed again and must give back exactly the input, and the gzip
 //! trailer's CRC-32 and length must agree with it, since std's
 //! decompressor checks neither.
 
@@ -134,7 +135,7 @@ test "levelOptions: each level is std's of the same number" {
 }
 
 test "compress: the same data at the same level gives the same bytes" {
-    const data = "the same publish body, compressed twice" ** 50;
+    const data = test_util.repeat("the same publish body, compressed twice", 50);
     const a = try compress(testing.allocator, data, 6);
     defer testing.allocator.free(a);
     const b = try compress(testing.allocator, data, 6);
@@ -143,7 +144,7 @@ test "compress: the same data at the same level gives the same bytes" {
 }
 
 test "check: refuses a header, trailer or content that does not match" {
-    const data = "check me" ** 100;
+    const data = test_util.repeat("check me", 100);
     const made = try compress(testing.allocator, data, 6);
     defer testing.allocator.free(made);
     try check(testing.allocator, made, data);
@@ -166,12 +167,12 @@ test "check: refuses a header, trailer or content that does not match" {
 }
 
 fn compressWith(gpa: Allocator) !void {
-    const made = try compress(gpa, "a body to compress, " ** 30, 6);
+    const made = try compress(gpa, test_util.repeat("a body to compress, ", 30), 6);
     gpa.free(made);
 }
 
 test "compress: every allocation failure is OutOfMemory without leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, compressWith, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, compressWith, .{});
 }
 
 fn roundTripProperty(_: void, input: []const u8) !void {
@@ -221,9 +222,9 @@ test "fuzz gzip check: a changed byte is refused, unless the body still gives ba
         .corpus = &.{
             // 54 bytes of a run, 23 compressed: the header's flags, a byte of
             // the compressed data, the trailer's last byte.
-            "\x05\x01\x00\x03" ++ "a" ** 54,
-            "\x05\x80\x00\x0c" ++ "a" ** 54,
-            "\x05\xff\x00\x16" ++ "a" ** 54,
+            "\x05\x01\x00\x03" ++ test_util.repeat("a", 54),
+            "\x05\x80\x00\x0c" ++ test_util.repeat("a", 54),
+            "\x05\xff\x00\x16" ++ test_util.repeat("a", 54),
             // 64 random bytes, which go in a stored block: padding after its
             // header, which no decompressor reads, and its length.
             "\x00\x7f\x00\x0a" ++ random_64,

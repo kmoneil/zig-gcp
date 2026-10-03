@@ -701,7 +701,7 @@ test "gzip upload: small data goes in one request, compressed, labelled, and giv
     var s: Setup = undefined;
     try s.init(.{});
     defer s.deinit();
-    const plain = "a line of text that repeats\n" ** 300;
+    const plain = test_util.repeat("a line of text that repeats\n", 300);
     var info = try s.object("notes.txt").upload(plain, .{ .content_type = "text/plain", .gzip = .{} });
     defer info.deinit();
     try s.expectStored("notes.txt", plain, "text/plain", info.value);
@@ -1012,7 +1012,7 @@ fn uploadBoth(gpa: Allocator, plain: []const u8) !void {
 test "gzip upload: every allocation failure is OutOfMemory, and nothing leaks" {
     const plain = try randomBytes(testing.allocator, 300 * 1024, 12);
     defer testing.allocator.free(plain);
-    try testing.checkAllAllocationFailures(testing.allocator, uploadBoth, .{plain});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, uploadBoth, .{plain});
 }
 
 /// Data drawn from the fuzz input: text that compresses, noise that does

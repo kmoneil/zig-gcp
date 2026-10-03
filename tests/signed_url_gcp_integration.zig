@@ -118,7 +118,7 @@ const Fixture = struct {
 
     /// A handle on `what` under the test's prefix.
     fn object(f: *Fixture, what: []const u8) !storage.Object {
-        const name = try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}", .{ &f.prefix, what });
+        const name = try f.arena.allocator().print("{s}{s}", .{ &f.prefix, what });
         return f.bucket().object(name);
     }
 
@@ -218,7 +218,7 @@ fn useUrl(arena: Allocator, method: std.http.Method, url: []const u8, headers: [
     var copied: std.ArrayList(std.http.Header) = .empty;
     var it = response.head.iterateHeaders();
     while (it.next()) |h| try copied.append(arena, .{ .name = try arena.dupe(u8, h.name), .value = try arena.dupe(u8, h.value) });
-    const status: u16 = @intFromEnum(response.head.status);
+    const status: u16 = @backingInt(response.head.status);
     var transfer: [64]u8 = undefined;
     const got = try response.reader(&transfer).allocRemaining(arena, .limited(16 * 1024 * 1024));
     return .{ .status = status, .headers = copied.items, .body = got };
@@ -433,7 +433,7 @@ test "signed URLs, real bucket: Google computes the same canonical request, for 
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
         // Every character a URL treats specially, UTF-8, a space and a plus.
-        const name = try std.fmt.allocPrint(a, "{s} awk ward/+%\xc3\xa9~!*'();:@&=$,[]#?.txt", .{s.name});
+        const name = try a.print("{s} awk ward/+%\xc3\xa9~!*'();:@&=$,[]#?.txt", .{s.name});
         const obj = try f.put(name, hello);
         var recording: Recording = .{ .inner = s.signer };
         const headers: []const std.http.Header = &.{.{ .name = "x-goog-meta-note", .value = "runs \t of   spaces" }};
@@ -501,7 +501,7 @@ test "signed URLs, real bucket: virtual-hosted style over https" {
     for (f.signers(&buffer)) |s| {
         const obj = try f.put(s.name, hello);
         const url = try f.sign(obj, s.signer, .{ .expires_in_s = 300, .style = .virtual_hosted });
-        try testing.expect(std.mem.startsWith(u8, url, try std.fmt.allocPrint(a, "https://{s}.storage.googleapis.com/", .{f.bucket_name})));
+        try testing.expect(std.mem.startsWith(u8, url, try a.print("https://{s}.storage.googleapis.com/", .{f.bucket_name})));
         const got = try useUrl(a, .GET, url, &.{}, null);
         try expectStatus(200, got, s.name);
         try testing.expectEqualStrings(hello, got.body);
@@ -521,7 +521,7 @@ test "signed URLs, real bucket: create-only and size-capped uploads" {
         try expectStatus(412, try useUrl(a, .PUT, once, &.{create_only}, "second"), s.name);
 
         const capped: std.http.Header = .{ .name = "x-goog-content-length-range", .value = "0,10" };
-        const small = try f.sign(try f.object(try std.fmt.allocPrint(a, "{s}-capped", .{s.name})), s.signer, .{ .method = .PUT, .expires_in_s = 300, .headers = &.{capped} });
+        const small = try f.sign(try f.object(try a.print("{s}-capped", .{s.name})), s.signer, .{ .method = .PUT, .expires_in_s = 300, .headers = &.{capped} });
         try expectStatus(200, try useUrl(a, .PUT, small, &.{capped}, "ten bytes!"), s.name);
         const big = try useUrl(a, .PUT, small, &.{capped}, "eleven byte");
         try expectStatus(400, big, s.name);
@@ -604,7 +604,7 @@ test "signed URLs, real bucket: IAM's signature verifies against the account's p
 
     // Google publishes every service account's public certificates.
     const account = try iam.email(testing.io, a);
-    const certs = try useUrl(a, .GET, try std.fmt.allocPrint(a, "https://www.googleapis.com/service_accounts/v1/metadata/x509/{s}", .{account}), &.{}, null);
+    const certs = try useUrl(a, .GET, try a.print("https://www.googleapis.com/service_accounts/v1/metadata/x509/{s}", .{account}), &.{}, null);
     try expectStatus(200, certs, "certificates");
     const parsed = try std.json.parseFromSliceLeaky(std.json.ArrayHashMap([]const u8), a, certs.body, .{});
     var verified = false;
@@ -620,7 +620,7 @@ test "signed URLs, real bucket: IAM's signature verifies against the account's p
         const cert = try (std.crypto.Certificate{ .buffer = der, .index = 0 }).parse();
         const key = try std.crypto.Certificate.rsa.PublicKey.parseDer(cert.pubKey());
         const public_key = try std.crypto.Certificate.rsa.PublicKey.fromBytes(key.exponent, key.modulus);
-        std.crypto.Certificate.rsa.PKCS1v1_5Signature.verify(256, signature, recording.message(), public_key, Sha256) catch continue;
+        std.crypto.Certificate.rsa.PKCS1v1_5Signature.verify(256, &signature, recording.message(), public_key, Sha256) catch continue;
         verified = true;
     }
     try testing.expect(verified);
@@ -700,7 +700,7 @@ test "POST policy, real bucket: a form stores the object, and the policy pins it
     const a = f.arena.allocator();
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
-        const obj = try f.object(try std.fmt.allocPrint(a, "{s}-form.txt", .{s.name}));
+        const obj = try f.object(try a.print("{s}-form.txt", .{s.name}));
         var policy = obj.postPolicy(s.signer, .{
             .expires_in_s = 600,
             .fields = &.{.{ .name = "content-type", .value = "text/plain" }},
@@ -750,7 +750,7 @@ test "POST policy, real bucket: success_action_status and success_action_redirec
     const a = f.arena.allocator();
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
-        const created = try f.object(try std.fmt.allocPrint(a, "{s}-201.txt", .{s.name}));
+        const created = try f.object(try a.print("{s}-201.txt", .{s.name}));
         var with_status = created.postPolicy(s.signer, .{
             .expires_in_s = 600,
             .fields = &.{.{ .name = "success_action_status", .value = "201" }},
@@ -764,7 +764,7 @@ test "POST policy, real bucket: success_action_status and success_action_redirec
         try testing.expect(xmlElement(answer.body, "Location") != null);
         try testing.expect(xmlElement(answer.body, "ETag") != null);
 
-        const sent = try f.object(try std.fmt.allocPrint(a, "{s}-303.txt", .{s.name}));
+        const sent = try f.object(try a.print("{s}-303.txt", .{s.name}));
         const back = "https://example.com/thanks";
         var with_redirect = sent.postPolicy(s.signer, .{
             .expires_in_s = 600,
@@ -788,7 +788,7 @@ test "POST policy, real bucket: a prefix key lets the browser name the object" {
     const a = f.arena.allocator();
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
-        const prefix = try std.fmt.allocPrint(a, "{s}uploads-{s}/", .{ &f.prefix, s.name });
+        const prefix = try a.print("{s}uploads-{s}/", .{ &f.prefix, s.name });
         var policy = f.bucket().postPolicy(s.signer, .{
             .expires_in_s = 600,
             .key = .{ .starts_with = prefix },
@@ -796,14 +796,14 @@ test "POST policy, real bucket: a prefix key lets the browser name the object" {
         defer policy.deinit();
         // The form's key field is the prefix plus Google's ${filename}.
         try testing.expectEqualStrings(
-            try std.fmt.allocPrint(a, "{s}${{filename}}", .{prefix}),
+            try a.print("{s}${{filename}}", .{prefix}),
             policy.value.field("key").?,
         );
 
         const stored = try postForm(a, policy.value, "report.pdf", hello);
         try expectStatus(204, stored, s.name);
         // Cloud Storage put the browser's file name where ${filename} was.
-        const landed = f.bucket().object(try std.fmt.allocPrint(a, "{s}report.pdf", .{prefix}));
+        const landed = f.bucket().object(try a.print("{s}report.pdf", .{prefix}));
         var info = landed.get(.{}) catch |err| return f.report(err);
         defer info.deinit();
         try testing.expectEqual(hello.len, info.value.size);
@@ -811,7 +811,7 @@ test "POST policy, real bucket: a prefix key lets the browser name the object" {
         // A name outside the prefix is refused, which is the point of it.
         const outside = try postForm(a, .{
             .url = policy.value.url,
-            .fields = try withField(a, policy.value.fields, "key", try std.fmt.allocPrint(a, "{s}elsewhere.txt", .{&f.prefix})),
+            .fields = try withField(a, policy.value.fields, "key", try a.print("{s}elsewhere.txt", .{&f.prefix})),
         }, "elsewhere.txt", hello);
         try expectStatus(400, outside, s.name);
         try testing.expectEqualStrings("InvalidPolicyDocument", outside.code());
@@ -828,7 +828,7 @@ test "POST policy, real bucket: content-length-range caps the body at both ends"
     const a = f.arena.allocator();
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
-        const obj = try f.object(try std.fmt.allocPrint(a, "{s}-sized.txt", .{s.name}));
+        const obj = try f.object(try a.print("{s}-sized.txt", .{s.name}));
         var policy = obj.postPolicy(s.signer, .{
             .expires_in_s = 600,
             .conditions = &.{.{ .content_length_range = .{ .min = hello.len, .max = hello.len } }},
@@ -857,7 +857,7 @@ test "POST policy, real bucket: an expired policy and a tampered signature are r
     const a = f.arena.allocator();
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
-        const obj = try f.object(try std.fmt.allocPrint(a, "{s}-refused.txt", .{s.name}));
+        const obj = try f.object(try a.print("{s}-refused.txt", .{s.name}));
         var brief = obj.postPolicy(s.signer, .{ .expires_in_s = 1 }) catch |err| return f.report(err);
         defer brief.deinit();
         try testing.io.sleep(.fromSeconds(3), .awake);
@@ -984,9 +984,9 @@ test "requester pays, real bucket: a signed URL bills the project it names, and 
     var vhost = try plain.object("form-query.txt").postPolicy(iam.signer(), .{ .expires_in_s = 600, .style = .virtual_hosted });
     defer vhost.deinit();
     for ([_][]const u8{
-        try std.fmt.allocPrint(a, "{s}?userProject={s}", .{ bare.value.url, project }),
-        try std.fmt.allocPrint(a, "{s}?userProject={s}", .{ bare.value.url[0 .. bare.value.url.len - 1], project }),
-        try std.fmt.allocPrint(a, "{s}?userProject={s}", .{ vhost.value.url, project }),
+        try a.print("{s}?userProject={s}", .{ bare.value.url, project }),
+        try a.print("{s}?userProject={s}", .{ bare.value.url[0 .. bare.value.url.len - 1], project }),
+        try a.print("{s}?userProject={s}", .{ vhost.value.url, project }),
     }, [_][]const storage.PostField{ bare.value.fields, bare.value.fields, vhost.value.fields }) |url_with, fields| {
         const answer = try postForm(a, .{ .url = url_with, .fields = fields }, "x.txt", hello);
         try expectStatus(400, answer, url_with);

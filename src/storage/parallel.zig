@@ -1629,7 +1629,7 @@ test "check: what a parallel upload refuses, before anything is sent" {
         .{ .options = .{ .metadata = &.{.{ .key = "k", .value = "caf\xc3\xa9" }} }, .says = "printable ASCII" },
         .{ .options = .{ .metadata = &.{.{ .key = "k", .value = "trailing " }} }, .says = "printable ASCII" },
         .{ .options = .{ .metadata = &.{ .{ .key = "k", .value = "1" }, .{ .key = "k", .value = "2" } } }, .says = "twice" },
-        .{ .options = .{ .metadata = &.{.{ .key = "k", .value = "v" ** (8 * 1024) }} }, .says = "8192" },
+        .{ .options = .{ .metadata = &.{.{ .key = "k", .value = test_util.repeat("v", 8 * 1024) }} }, .says = "8192" },
         .{ .name = "a/../b", .options = .{}, .says = "segment" },
         .{ .name = "./x", .options = .{}, .says = "segment" },
     };
@@ -1696,7 +1696,7 @@ fn parallelEverything(gpa: Allocator) !void {
 }
 
 test "uploadParallel: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, parallelEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, parallelEverything, .{});
 }
 
 /// Draws each request's fate from fuzz bytes, under the fake's lock:
@@ -3278,7 +3278,7 @@ fn uploadWithCheckpoint(gpa: Allocator) !void {
 }
 
 test "uploadParallel with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, uploadWithCheckpoint, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, uploadWithCheckpoint, .{});
 }
 
 /// Lets every request through, recording each part number sent, so a
