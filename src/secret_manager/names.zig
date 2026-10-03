@@ -24,7 +24,7 @@ pub const Parent = struct {
 /// it from naming another host.
 pub fn host(arena: Allocator, location: ?[]const u8) Allocator.Error![]u8 {
     const loc = location orelse return arena.dupe(u8, "secretmanager.googleapis.com");
-    return std.fmt.allocPrint(arena, "secretmanager.{s}.rep.googleapis.com", .{loc});
+    return arena.print("secretmanager.{s}.rep.googleapis.com", .{loc});
 }
 
 /// `/v1/{parent}/secrets/{id}{suffix}`. `suffix` is a literal method such as
@@ -155,9 +155,9 @@ fn writeVersionsPath(w: *Writer, parent: Parent, id: []const u8, options: types.
 /// The unencoded resource name of a secret, as it appears inside a body.
 pub fn secretName(arena: Allocator, parent: Parent, id: []const u8) Allocator.Error![]u8 {
     if (parent.location) |loc| {
-        return std.fmt.allocPrint(arena, "projects/{s}/locations/{s}/secrets/{s}", .{ parent.project, loc, id });
+        return arena.print("projects/{s}/locations/{s}/secrets/{s}", .{ parent.project, loc, id });
     }
-    return std.fmt.allocPrint(arena, "projects/{s}/secrets/{s}", .{ parent.project, id });
+    return arena.print("projects/{s}/secrets/{s}", .{ parent.project, id });
 }
 
 /// The trailing number of a version's resource name, or null when it ends in

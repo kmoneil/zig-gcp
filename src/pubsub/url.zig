@@ -79,7 +79,7 @@ pub fn resourceName(
     collection: Collection,
     id: []const u8,
 ) Allocator.Error![]u8 {
-    return std.fmt.allocPrint(arena, "projects/{s}/{t}/{s}", .{ project, collection, id });
+    return arena.print("projects/{s}/{t}/{s}", .{ project, collection, id });
 }
 
 const testing = std.testing;

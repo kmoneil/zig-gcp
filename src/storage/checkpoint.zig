@@ -443,7 +443,7 @@ fn checkWritten(written: []const u8, parts: u32) error{CheckpointFailed}!void {
 
 /// Renders `bits`, one per range, into `out`, which is `digitsFor(parts)`
 /// long.
-pub fn hexFromBits(bits: *const std.DynamicBitSetUnmanaged, parts: u32, out: []u8) void {
+pub fn hexFromBits(bits: *const std.bit_set.Dynamic, parts: u32, out: []u8) void {
     std.debug.assert(out.len == digitsFor(parts));
     for (out, 0..) |*c, j| {
         var value: u4 = 0;
@@ -458,9 +458,9 @@ pub fn hexFromBits(bits: *const std.DynamicBitSetUnmanaged, parts: u32, out: []u
 
 /// The bit set behind a state's `written`, which `parse` already held to
 /// its rules.
-pub fn bitsFromHex(gpa: Allocator, written: []const u8, parts: u32) Allocator.Error!std.DynamicBitSetUnmanaged {
+pub fn bitsFromHex(gpa: Allocator, written: []const u8, parts: u32) Allocator.Error!std.bit_set.Dynamic {
     std.debug.assert(written.len == digitsFor(parts));
-    var bits: std.DynamicBitSetUnmanaged = try .initEmpty(gpa, parts);
+    var bits: std.bit_set.Dynamic = try .initEmpty(gpa, parts);
     errdefer bits.deinit(gpa);
     for (written, 0..) |c, j| {
         const value = hexValue(c).?;
@@ -523,7 +523,7 @@ test "state: encode and parse round-trip, escapes and edges included" {
             .size = mp.max_object_size,
             .generation = 1,
             .part_size = 549_755_814,
-            .written = "f" ** 2_500,
+            .written = core.testing.repeat("f", 2_500),
         } },
     };
     for (states) |state| {
@@ -757,7 +757,7 @@ test "upload states: the billing project, written last, older states without it,
 
     // A project that is not one never reaches a header.
     for ([_][]const u8{ "", "a b", "p\\r\\nX: 1", "p/q" }) |bad| {
-        const forged = try std.fmt.allocPrint(arena, "{{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5000," ++
+        const forged = try arena.print("{{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5000," ++
             "\"mtime\":1,\"upload_id\":\"u\",\"part_size\":1024,\"billing_project\":\"{s}\"}}", .{bad});
         errdefer std.debug.print("forged: {s}\n", .{forged});
         try testing.expectError(error.CheckpointFailed, parse(arena, forged));
@@ -795,7 +795,7 @@ test "upload state: everything that is not a canonical upload state is Checkpoin
 
 test "bitmap: bits to hex and back, at every width mod 4" {
     for ([_]u32{ 1, 2, 3, 4, 5, 7, 8, 9, 100 }) |parts| {
-        var bits: std.DynamicBitSetUnmanaged = try .initEmpty(testing.allocator, parts);
+        var bits: std.bit_set.Dynamic = try .initEmpty(testing.allocator, parts);
         defer bits.deinit(testing.allocator);
         // Every third range, and always the last.
         var i: u32 = 0;
@@ -813,7 +813,7 @@ test "bitmap: bits to hex and back, at every width mod 4" {
 
     // The digit order is little-endian in ranges: range 0 is the low bit
     // of the first digit.
-    var bits: std.DynamicBitSetUnmanaged = try .initEmpty(testing.allocator, 6);
+    var bits: std.bit_set.Dynamic = try .initEmpty(testing.allocator, 6);
     defer bits.deinit(testing.allocator);
     bits.set(0);
     bits.set(5);

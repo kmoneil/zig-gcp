@@ -172,7 +172,7 @@ test "a real STS refusal: Google's token exchange rejects a fabricated subject t
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "subject", .data = "not-a-real-oidc-token" });
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const json = try std.fmt.allocPrint(arena.allocator(),
+    const json = try arena.allocator().print(
         \\{{"type": "external_account",
         \\ "audience": "//iam.googleapis.com/projects/000000/locations/global/workloadIdentityPools/no-such-pool/providers/none",
         \\ "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
@@ -256,7 +256,7 @@ test "a real impersonation: IAM trades the source's token for one that is the se
     // the login's that asked for it.
     var http: pubsub.transport.HttpTransport = .init(testing.allocator, testing.io, "zig-gcp-auth-integration/0.1");
     defer http.deinit();
-    const body = try std.fmt.allocPrint(arena.allocator(), "access_token={s}", .{token});
+    const body = try arena.allocator().print("access_token={s}", .{token});
     const res = try http.transport().send(.{
         .method = .POST,
         .url = "https://oauth2.googleapis.com/tokeninfo",

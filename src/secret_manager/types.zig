@@ -168,13 +168,13 @@ pub const SecretUpdate = struct {
 
     /// Whether the update changes anything at all.
     pub fn isEmpty(self: SecretUpdate) bool {
-        inline for (@typeInfo(SecretUpdate).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, "etag")) continue;
-            if (comptime std.mem.eql(u8, field.name, "replica_keys")) {
+        inline for (@typeInfo(SecretUpdate).@"struct".field_names) |name| {
+            if (comptime std.mem.eql(u8, name, "etag")) continue;
+            if (comptime std.mem.eql(u8, name, "replica_keys")) {
                 if (self.replica_keys != null) return false;
                 continue;
             }
-            if (@field(self, field.name) != .keep) return false;
+            if (@field(self, name) != .keep) return false;
         }
         return true;
     }

@@ -467,7 +467,7 @@ test "log hygiene: page tokens stay out of the log" {
 
 test "the response arena is reset between attempts" {
     var h: Harness = undefined;
-    const big_error: Reply = .{ .respond = .{ .status = 503, .body = "x" ** 4096 } };
+    const big_error: Reply = .{ .respond = .{ .status = 503, .body = test_util.repeat("x", 4096) } };
     try h.init(&.{ big_error, big_error, big_error, topic_ok }, .{});
     defer h.deinit();
     var info = try h.client.topic("orders").get();
@@ -484,7 +484,8 @@ fn anyResponseProperty(_: void, input: []const u8) !void {
     // Whatever the server says, every call returns a value or an error, and
     // leaks nothing.
     var h: Harness = undefined;
-    try h.init(&(.{reply} ** 3), .{ .retry = .{ .max_attempts = 1 } });
+    const replies: [3]Reply = @splat(reply);
+    try h.init(&replies, .{ .retry = .{ .max_attempts = 1 } });
     defer h.deinit();
     const c = &h.client;
     if (c.topic("orders").get()) |r| {
@@ -636,7 +637,7 @@ test "credentials: every allocation failure on the token path is OutOfMemory wit
             info.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{});
 }
 
 const unauthenticated: Reply = .{ .respond = .{
@@ -687,7 +688,7 @@ test "quota: the emulator never gets the project either" {
 }
 
 test "quota: a project id that is not one is refused before anything is sent" {
-    for ([_][]const u8{ "bad project", "billing\r\nX-Injected: 1", "x" ** 101, "" }) |bad| {
+    for ([_][]const u8{ "bad project", "billing\r\nX-Injected: 1", test_util.repeat("x", 101), "" }) |bad| {
         var provider: FakeTokenProvider = .{ .quota_project = bad };
         var h: Harness = undefined;
         try h.init(&.{topic_ok}, .{ .token = "ya29.token" });

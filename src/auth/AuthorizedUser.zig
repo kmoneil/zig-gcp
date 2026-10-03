@@ -430,7 +430,7 @@ test "AuthorizedUser: invalid_grant without a usable description still says how 
         "{\"error\":\"invalid_grant\"}",
         "{\"error\":\"invalid_grant\",\"error_description\":\"\"}",
         // Too long to fit in front of the fix.
-        "{\"error\":\"invalid_grant\",\"error_description\":\"" ++ "x" ** 400 ++ "\"}",
+        "{\"error\":\"invalid_grant\",\"error_description\":\"" ++ test_util.repeat("x", 400) ++ "\"}",
     }) |body| {
         var h: Harness = undefined;
         try h.init(&.{.{ .respond = .{ .status = 400, .body = body } }});
@@ -617,12 +617,12 @@ test "AuthorizedUser: every allocation failure is OutOfMemory without leaks" {
             user.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{token_ok});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{token_ok});
     // Escapes make std.json allocate; without them it points into the body.
-    try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{Reply{ .respond = .{
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{Reply{ .respond = .{
         .body = "{\"access_token\":\"ya29.\\u0053ECRET-at\",\"expires_in\":3599}",
     } }});
-    try testing.checkAllAllocationFailures(testing.allocator, Run.refused, .{Reply{ .respond = .{
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.refused, .{Reply{ .respond = .{
         .status = 400,
         .body = "{\"error\":\"invalid_grant\",\"error_description\":\"Token has been \\\"revoked\\\".\"}",
     } }});
@@ -632,7 +632,7 @@ test "AuthorizedUser: every allocation failure is OutOfMemory without leaks" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "adc.json", .data = file_json });
     var buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/adc.json", .{&tmp.sub_path});
-    try testing.checkAllAllocationFailures(testing.allocator, Run.fromFile, .{path});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.fromFile, .{path});
 }
 
 test "AuthorizedUser: initFromFile reads the file, and reports a missing or oversized one" {
@@ -693,7 +693,8 @@ fn anyReplyProperty(_: void, input: []const u8) !void {
     const status = g.pick(u16, &.{ 200, 200, 400, 401, 403, 429, 500, 503, 302, 0 });
     const reply: Reply = .{ .respond = .{ .status = status, .body = g.rest() } };
     var h: Harness = undefined;
-    try h.init(&(.{reply} ** 3));
+    const replies: [3]Reply = @splat(reply);
+    try h.init(&replies);
     defer h.deinit();
     // Whatever the token endpoint says, a usable token or an error, and no leak.
     const token = h.get() catch return;

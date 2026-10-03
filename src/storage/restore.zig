@@ -571,7 +571,7 @@ fn restoreEverything(gpa: Allocator) !void {
 }
 
 test "restores: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, restoreEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, restoreEverything, .{});
 }
 
 fn bulkBodyProperty(_: void, bytes: []const u8) !void {
@@ -623,7 +623,7 @@ fn bulkBodyProperty(_: void, bytes: []const u8) !void {
 }
 
 test "fuzz bulk restore: the body says what the options said, and no more" {
-    try test_util.fuzzBytes({}, bulkBodyProperty, .{ .corpus = &.{ "", "\x03" ** 40 } });
+    try test_util.fuzzBytes({}, bulkBodyProperty, .{ .corpus = &.{ "", test_util.repeat("\x03", 40) } });
 }
 
 // Against `FakeMultipart` with soft delete on, which restores as Cloud

@@ -446,7 +446,7 @@ fn roundTripProperty(_: void, bytes: []const u8) !void {
 }
 
 test "fuzz iam policies: a member added is granted, and the written policy reads back the same" {
-    try test_util.fuzzBytes({}, roundTripProperty, .{ .corpus = &.{ "", "\x01" ** 64, "\x07\x02\x09" ** 30 } });
+    try test_util.fuzzBytes({}, roundTripProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 64), test_util.repeat("\x07\x02\x09", 30) } });
 }
 
 test "sameMember: the prefix exactly, the address of the four address forms in any case, the rest exactly" {
@@ -750,7 +750,7 @@ fn updateAllocations(gpa: Allocator) !void {
 }
 
 test "update: every allocation failure is OutOfMemory, and nothing leaks" {
-    try std.testing.checkAllAllocationFailures(testing.allocator, updateAllocations, .{});
+    try std.testing.checkAllAllocationFailures(test_util.no_grow_allocator, updateAllocations, .{});
 }
 
 fn updateProperty(_: void, bytes: []const u8) !void {
@@ -804,5 +804,5 @@ fn updateProperty(_: void, bytes: []const u8) !void {
 }
 
 test "fuzz iam update: a finished grant or revoke holds, attempts stay bounded, and no binding is left empty or doubled" {
-    try test_util.fuzzBytes({}, updateProperty, .{ .corpus = &.{ "", "\x01" ** 40, "\x05\x00\x01\x03\x01\x00" ** 12, "\x02\xff\x00\x04\x01\x01\x02\x00" ** 10 } });
+    try test_util.fuzzBytes({}, updateProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 40), test_util.repeat("\x05\x00\x01\x03\x01\x00", 12), test_util.repeat("\x02\xff\x00\x04\x01\x01\x02\x00", 10) } });
 }

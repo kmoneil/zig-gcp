@@ -102,7 +102,7 @@ pub fn main(init: std.process.Init) !void {
             info.deinit();
             try out.print("created topic {s}\n", .{topic_id});
         } else |err| if (err != error.AlreadyExists) return failPubsub(err, &ps_diag);
-        const watch_id = try std.fmt.allocPrint(arena, "{s}-watch", .{topic_id});
+        const watch_id = try arena.print("{s}-watch", .{topic_id});
         if (ps.subscription(watch_id).create(.{ .topic_id = topic_id })) |created| {
             var info = created;
             info.deinit();
@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
         if (!emulated) {
             var agent = gcs.serviceAgent() catch |err| return failGcs(err, &gcs_diag);
             defer agent.deinit();
-            const member = try std.fmt.allocPrint(arena, "serviceAccount:{s}", .{agent.value});
+            const member = try arena.print("serviceAccount:{s}", .{agent.value});
             var policy = ps.topic(topic_id).addIamBinding("roles/pubsub.publisher", member) catch |err| return failPubsub(err, &ps_diag);
             policy.deinit();
             try out.print("{s} may publish to {s}\n", .{ agent.value, topic_id });

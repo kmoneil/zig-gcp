@@ -48,7 +48,7 @@ pub const Platform = enum {
     posix,
     windows,
 
-    pub const host: Platform = if (builtin.os.tag == .windows) .windows else .posix;
+    pub const host: Platform = if (builtin.target.os.tag == .windows) .windows else .posix;
 
     fn sep(p: Platform) u8 {
         return switch (p) {
@@ -247,7 +247,7 @@ test "Lookup: every allocation failure while reading the environment is OutOfMem
             _ = try fromEnv(&map, arena.allocator());
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
 
 fn varsProperty(_: void, input: []const u8) !void {

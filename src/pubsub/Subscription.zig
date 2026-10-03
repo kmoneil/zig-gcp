@@ -885,7 +885,7 @@ test "ackWithResults: every allocation failure is OutOfMemory without leaks" {
             try testing.expectEqual(replies.len, fake.requests.items.len);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{@as([]const Reply, &script)});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{@as([]const Reply, &script)});
 }
 
 /// Drawn answers to an ack call, and a model of what the loop must do with
@@ -960,7 +960,7 @@ fn ackOutcomesProperty(_: void, input: []const u8) !void {
                     .unauthenticated => .{ 401, "UNAUTHENTICATED" },
                     else => unreachable,
                 };
-                const body = try std.fmt.allocPrint(a, "{{\"error\":{{\"code\":{d},\"status\":\"{s}\"}}}}", .{ status, api });
+                const body = try a.print("{{\"error\":{{\"code\":{d},\"status\":\"{s}\"}}}}", .{ status, api });
                 break :r .{ .respond = .{ .status = status, .body = body } };
             },
         };
@@ -1107,7 +1107,7 @@ test "golden: create with settings, and update" {
     // would refuse, a filter over its limit.
     try testing.expectError(error.InvalidArgument, work.update(.{}));
     try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .labels = &.{.{ .key = "Bad", .value = "" }} }));
-    try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .filter = "x" ** 257 }));
+    try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .filter = test_util.repeat("x", 257) }));
     try testing.expectError(error.InvalidResourceId, h.client.subscription("s").update(.{ .ack_deadline_seconds = 10 }));
     try h.expectRequestCount(2);
 }
@@ -1152,5 +1152,5 @@ test "create and update with settings: every allocation failure is OutOfMemory w
             try testing.expectEqual(replies.len, fake.requests.items.len);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{@as([]const Reply, &script)});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{@as([]const Reply, &script)});
 }

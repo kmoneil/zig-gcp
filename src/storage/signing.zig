@@ -1114,7 +1114,7 @@ fn signEverything(gpa: Allocator) !void {
 }
 
 test "signedUrl: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, signEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, signEverything, .{});
 }
 
 // Properties. Each states a rule of the module comment independently of
@@ -1300,7 +1300,7 @@ fn modelCanonicalRequest(arena: Allocator, d: *const Drawn) ![]const u8 {
     const endpoint_authority = d.base_url[scheme_end + 3 ..];
     const authority = switch (d.options.style) {
         .path => endpoint_authority,
-        .virtual_hosted => try std.fmt.allocPrint(arena, "{s}.{s}", .{ d.bucket, endpoint_authority }),
+        .virtual_hosted => try arena.print("{s}.{s}", .{ d.bucket, endpoint_authority }),
         .bucket_bound => |bound| bound.host,
     };
     // The host without its port: an IPv6 literal keeps its brackets.
@@ -1310,10 +1310,10 @@ fn modelCanonicalRequest(arena: Allocator, d: *const Drawn) ![]const u8 {
     const object_path = if (d.object) |o| try Encode.run(arena, o, true) else "";
     const path = switch (d.options.style) {
         .path => if (d.object == null)
-            try std.fmt.allocPrint(arena, "/{s}", .{try Encode.run(arena, d.bucket, true)})
+            try arena.print("/{s}", .{try Encode.run(arena, d.bucket, true)})
         else
-            try std.fmt.allocPrint(arena, "/{s}/{s}", .{ try Encode.run(arena, d.bucket, true), object_path }),
-        else => try std.fmt.allocPrint(arena, "/{s}", .{object_path}),
+            try arena.print("/{s}/{s}", .{ try Encode.run(arena, d.bucket, true), object_path }),
+        else => try arena.print("/{s}", .{object_path}),
     };
 
     const Line = struct { name: []const u8, value: []const u8 };
@@ -1344,8 +1344,8 @@ fn modelCanonicalRequest(arena: Allocator, d: *const Drawn) ![]const u8 {
     const date = d.signed_at[0..8];
     const Param = struct { name: []const u8, value: []const u8 };
     var params: std.ArrayList(Param) = .empty;
-    const credential_value = try std.fmt.allocPrint(arena, "{s}/{s}/auto/storage/goog4_request", .{ d.email, date });
-    const expires = try std.fmt.allocPrint(arena, "{d}", .{d.options.expires_in_s});
+    const credential_value = try arena.print("{s}/{s}/auto/storage/goog4_request", .{ d.email, date });
+    const expires = try arena.print("{d}", .{d.options.expires_in_s});
     for ([_][2][]const u8{
         .{ "X-Goog-Algorithm", "GOOG4-RSA-SHA256" },
         .{ "X-Goog-Credential", credential_value },
@@ -1420,7 +1420,7 @@ fn modelProperty(_: void, input: []const u8) !void {
     _ = lines.next();
     const path_line = lines.next().?;
     const query_line = lines.next().?;
-    try testing.expect(std.mem.endsWith(u8, prepared.unsigned_url, try std.fmt.allocPrint(a, "{s}?{s}", .{ path_line, query_line })));
+    try testing.expect(std.mem.endsWith(u8, prepared.unsigned_url, try a.print("{s}?{s}", .{ path_line, query_line })));
 }
 
 // Building whole requests costs about a third of a millisecond a run under
@@ -1514,8 +1514,8 @@ fn urlProperty(_: void, input: []const u8) !void {
     // `parse` leaves components encoded; decode the path once, here.
     const decoded_path = std.Uri.percentDecodeInPlace(try a.dupe(u8, uri.path.percent_encoded));
     const want_path = switch (d.options.style) {
-        .path => if (d.object) |o| try std.fmt.allocPrint(a, "/{s}/{s}", .{ d.bucket, o }) else try std.fmt.allocPrint(a, "/{s}", .{d.bucket}),
-        else => try std.fmt.allocPrint(a, "/{s}", .{d.object orelse ""}),
+        .path => if (d.object) |o| try a.print("/{s}/{s}", .{ d.bucket, o }) else try a.print("/{s}", .{d.bucket}),
+        else => try a.print("/{s}", .{d.object orelse ""}),
     };
     try testing.expectEqualStrings(want_path, decoded_path);
     // The query: the caller's parameters and the five, then the signature.
@@ -1532,11 +1532,11 @@ fn urlProperty(_: void, input: []const u8) !void {
     for (d.options.query) |q| {
         // First in the query when it sorts before every X-Goog- name.
         const name = try encodeQuery(a, q.name);
-        const after = try std.fmt.allocPrint(a, "&{s}=", .{name});
-        const first = try std.fmt.allocPrint(a, "?{s}=", .{name});
+        const after = try a.print("&{s}=", .{name});
+        const first = try a.print("?{s}=", .{name});
         try testing.expect(std.mem.indexOf(u8, url.value, after) != null or std.mem.indexOf(u8, url.value, first) != null);
     }
-    const expires = try std.fmt.allocPrint(a, "X-Goog-Expires={d}&", .{d.options.expires_in_s});
+    const expires = try a.print("X-Goog-Expires={d}&", .{d.options.expires_in_s});
     try testing.expect(std.mem.indexOf(u8, query, expires) != null);
 }
 

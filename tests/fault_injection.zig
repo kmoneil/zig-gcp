@@ -449,7 +449,7 @@ const Fixture = struct {
 
     /// A unique id: the prefix plus `suffix`.
     fn id(f: *Fixture, suffix: []const u8) []const u8 {
-        return std.fmt.allocPrint(f.arena.allocator(), "{s}-{s}", .{ &f.prefix, suffix }) catch @panic("OOM");
+        return f.arena.allocator().print("{s}-{s}", .{ &f.prefix, suffix }) catch @panic("OOM");
     }
 
     /// Creates a topic directly, bypassing the proxy, registered for cleanup.
@@ -670,13 +670,13 @@ test "publish: a compressed publish answered 503 is resent byte for byte, and st
 
     // The server stored the first attempt, and the proxy answered for it
     // with a 503 of its own: the retry sends the same compressed bytes.
-    const data = "a compressed publish, sent twice. " ** 20;
+    const data = core.testing.repeat("a compressed publish, sent twice. ", 20);
     var sent = f.proxied.topic(topic.id).publish(&.{.{ .data = data }}, .{ .compression = .{} }) catch |err| return f.fail(err);
     defer sent.deinit();
     try testing.expectEqual(2, f.proxy.forwarded);
     try testing.expectEqual(2, f.proxy.recorded.items.len);
     for (f.proxy.recorded.items) |request| {
-        try testing.expect(std.ascii.indexOfIgnoreCase(request, "\r\ncontent-encoding: gzip\r\n") != null);
+        try testing.expect(std.ascii.findIgnoreCase(request, "\r\ncontent-encoding: gzip\r\n") != null);
     }
     try testing.expectEqualSlices(u8, f.proxy.recordedBody(0), f.proxy.recordedBody(1));
     try testing.expect(f.proxy.recordedBody(0).len < data.len);

@@ -96,7 +96,7 @@ caller_diag: ?*Diagnostics,
 // `timer_event`, which synchronizes itself.
 mutex: std.Io.Mutex,
 /// Broadcast when a batch comes due, when one resolves, and on `stop`.
-cond: core.Condition,
+cond: std.Io.Condition,
 /// Set when a batch opens, so the timer looks again.
 timer_event: std.Io.Event,
 unkeyed: KeyState,
@@ -1091,7 +1091,7 @@ const FakeTopic = struct {
     gpa: Allocator,
     io: std.Io,
     mutex: std.Io.Mutex = .init,
-    cond: core.Condition = .init,
+    cond: std.Io.Condition = .init,
     /// Every publish request, in the order it arrived.
     requests: std.ArrayList(Seen) = .empty,
     /// How to answer the next requests, in order. Once it runs out, every
@@ -1314,8 +1314,7 @@ const FakeTopic = struct {
     }
 
     fn errorResponse(arena: Allocator, code: u16, status: []const u8) TransportError!Response {
-        return .{ .status = code, .body = try std.fmt.allocPrint(
-            arena,
+        return .{ .status = code, .body = try arena.print(
             "{{\"error\":{{\"code\":{d},\"message\":\"scripted\",\"status\":\"{s}\"}}}}",
             .{ code, status },
         ) };
@@ -1610,7 +1609,8 @@ test "deadlines: transient failures are retried until the deadline, then the las
     try s.init(.{ .publish_timeout_ms = 5_000 });
     defer s.deinit();
     const unavailable: FakeTopic.Answer = .{ .status = .{ 503, "UNAVAILABLE" } };
-    s.fake.script = &(.{unavailable} ** 64);
+    const script: [64]FakeTopic.Answer = @splat(unavailable);
+    s.fake.script = &script;
     const receipt = try s.publishText("doomed");
     defer receipt.release();
     s.advance(10);
@@ -1977,7 +1977,7 @@ test "compression: running out of memory while compressing fails the batch, whic
     var refuse: core.testing.RefuseOver = .{ .child = testing.allocator, .limit = 128 * 1024 };
     var publisher: Publisher = try .init(refuse.allocator(), clock.io(), testOptions(fake.transport(), .{ .compression = .{} }));
     defer publisher.deinit();
-    const receipt = try publisher.publish(.{ .data = "a message big enough to compress " ** 10 }, .{});
+    const receipt = try publisher.publish(.{ .data = test_util.repeat("a message big enough to compress ", 10) }, .{});
     defer receipt.release();
     publisher.stop();
     try publisher.sendDue();
@@ -1996,7 +1996,7 @@ test "init and deinit: every allocation failure is OutOfMemory without leaks" {
             publisher.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.initDeinit, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.initDeinit, .{});
 }
 
 test "publish, send and resolve: every allocation failure is OutOfMemory without leaks" {
@@ -2030,9 +2030,9 @@ test "publish, send and resolve: every allocation failure is OutOfMemory without
             for (fake.requests.items) |seen| try testing.expectEqual(compression != null, seen.gzipped);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.wholePath, .{null});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.wholePath, .{null});
     // Every body compressed, however short.
-    try testing.checkAllAllocationFailures(testing.allocator, Run.wholePath, .{@as(?types.Compression, .{ .min_bytes = 0 })});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.wholePath, .{@as(?types.Compression, .{ .min_bytes = 0 })});
 }
 
 test "keys: a key needs enable_message_ordering, an empty key is none, and a bad key is refused" {
@@ -2249,7 +2249,7 @@ test "keys: every allocation failure on a keyed path is OutOfMemory without leak
             publisher.resumePublish("k1");
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.keyedPath, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.keyedPath, .{});
 }
 
 /// A publisher running for real, with its own tasks, against the fake.
@@ -2691,8 +2691,8 @@ test "cancel: canceling a wait leaves the message in flight" {
 }
 
 /// Rounds of stopping or canceling a publisher with work in flight: the
-/// shape of the hang that core.Condition fixed, where stop's broadcast
-/// raced run's cancel of its idle senders.
+/// shape of the hang std's Condition caused before Zig 0.17, where stop's
+/// broadcast raced run's cancel of its idle senders.
 fn stopOrCancelRounds(rounds: usize) !void {
     for (0..rounds) |round| {
         var l: Live = undefined;

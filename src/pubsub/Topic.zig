@@ -379,7 +379,7 @@ test "every allocation failure is reported as OutOfMemory without leaks" {
             sent.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.publish, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.publish, .{});
 }
 
 test "golden: create a topic with settings, and update it" {
@@ -427,7 +427,8 @@ fn gunzip(body: []const u8) ![]u8 {
 
 test "publish: compression gzips a body of min_bytes or more, marked Content-Encoding: gzip" {
     var h: Harness = undefined;
-    try h.init(&(.{FakeReply{ .respond = .{ .body = "{\"messageIds\":[\"1\",\"2\",\"3\",\"4\",\"5\"]}" } }} ** 5), .{});
+    const replies: [5]FakeReply = @splat(.{ .respond = .{ .body = "{\"messageIds\":[\"1\",\"2\",\"3\",\"4\",\"5\"]}" } });
+    try h.init(&replies, .{});
     defer h.deinit();
     const orders = h.client.topic("orders");
     const messages: []const types.Message = &.{
@@ -491,7 +492,7 @@ test "publish: a compressed body that fails its check goes uncompressed, with a 
     var h: Harness = undefined;
     try h.init(&.{.{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } }}, .{});
     defer h.deinit();
-    const messages: []const types.Message = &.{.{ .data = "x" ** 300 }};
+    const messages: []const types.Message = &.{.{ .data = test_util.repeat("x", 300) }};
     const plain = try plainBody(messages);
     defer testing.allocator.free(plain);
     core.gzip.test_corrupt_trailer = true;
@@ -518,11 +519,11 @@ test "publish: running out of memory while compressing fails the publish, rather
     });
     defer client.deinit();
     const orders = client.topic("orders");
-    try testing.expectError(error.OutOfMemory, orders.publish(&.{.{ .data = "compress me " ** 40 }}, .{ .compression = .{} }));
+    try testing.expectError(error.OutOfMemory, orders.publish(&.{.{ .data = test_util.repeat("compress me ", 40) }}, .{ .compression = .{} }));
     try testing.expect(refuse.refused > 0);
     try testing.expectEqual(0, fake.requests.items.len);
     // Uncompressed, the same publish needs no such block.
-    var sent = try orders.publish(&.{.{ .data = "compress me " ** 40 }}, .{});
+    var sent = try orders.publish(&.{.{ .data = test_util.repeat("compress me ", 40) }}, .{});
     sent.deinit();
 }
 
@@ -534,7 +535,7 @@ test "publish: a compressed publish is retried with the same bytes and the same 
         .{ .respond = .{ .body = "{\"messageIds\":[\"1\"]}" } },
     }, .{});
     defer h.deinit();
-    var sent = try h.client.topic("orders").publish(&.{.{ .data = "retried " ** 50 }}, .{ .compression = .{} });
+    var sent = try h.client.topic("orders").publish(&.{.{ .data = test_util.repeat("retried ", 50) }}, .{ .compression = .{} });
     sent.deinit();
     try h.expectRequestCount(3);
     const first = try h.fake.request(0);
@@ -560,12 +561,12 @@ test "publish: every allocation failure with compression is OutOfMemory without 
                 .transport = fake.transport(),
             });
             defer client.deinit();
-            var sent = try client.topic("orders").publish(&.{.{ .data = "compress me " ** 40 }}, .{ .compression = .{} });
+            var sent = try client.topic("orders").publish(&.{.{ .data = test_util.repeat("compress me ", 40) }}, .{ .compression = .{} });
             sent.deinit();
             try testing.expectEqualStrings("gzip", (try fake.request(1)).header("content-encoding").?);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.publish, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.publish, .{});
 }
 
 const agent = "serviceAccount:service-82150720798@gs-project-accounts.iam.gserviceaccount.com";

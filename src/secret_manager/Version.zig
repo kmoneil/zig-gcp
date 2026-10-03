@@ -508,7 +508,7 @@ test "access: every allocation failure is OutOfMemory without leaks" {
             again.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
 
 const destroyed_version: Reply = .{ .respond = .{ .body =
@@ -619,14 +619,14 @@ test "version administration: every allocation failure is OutOfMemory without le
             gone.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
 
 test "access: a payload too big for the arena's spare room is OutOfMemory" {
     // Small payloads are decoded inside the chunk the response body already
     // sits in, so an allocation-failure sweep never reaches the decode
     // itself. A payload larger than that chunk does.
-    const big = "0123456789abcdef" ** 3072; // 48 KiB
+    const big = test_util.repeat("0123456789abcdef", 3072); // 48 KiB
     const Run = struct {
         fn run(gpa: std.mem.Allocator, body: []const u8) !void {
             var fake: test_util.FakeTransport = .init(testing.allocator, &.{.{ .respond = .{ .body = body } }});
@@ -649,13 +649,12 @@ test "access: a payload too big for the arena's spare room is OutOfMemory" {
     const encoded = try testing.allocator.alloc(u8, core.base64.encodedLen(big.len));
     defer testing.allocator.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, big);
-    const body = try std.fmt.allocPrint(
-        testing.allocator,
+    const body = try testing.allocator.print(
         "{{\"name\":\"v/1\",\"payload\":{{\"data\":\"{s}\",\"dataCrc32c\":\"{d}\"}}}}",
         .{ encoded, core.crc32c.hash(big) },
     );
     defer testing.allocator.free(body);
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{body});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{body});
 }
 
 test "golden: enableIf, disableIf and destroyIf send the etag as read" {
@@ -751,5 +750,5 @@ test "conditional version changes: every allocation failure is OutOfMemory witho
             b.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }

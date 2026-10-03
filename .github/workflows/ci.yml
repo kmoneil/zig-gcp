@@ -31,7 +31,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Format
         run: zig build fmt
@@ -202,7 +202,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Unit, property and fuzz-corpus tests
         env:
@@ -223,7 +223,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Unit, property and fuzz-corpus tests
         run: zig build test --summary all
@@ -249,7 +249,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       - name: Measure coverage
         run: zig build coverage
@@ -357,7 +357,7 @@ jobs:
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
 
       # Each run starts from the corpus the earlier runs built up.
       - name: Restore the fuzz corpus

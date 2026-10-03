@@ -355,7 +355,7 @@ fn download(
     // One a later run can carry on stays, with the state that says which
     // ranges it holds.
     const cwd = std.Io.Dir.cwd();
-    const part = try std.fmt.allocPrint(arena, "{s}.part", .{path});
+    const part = try arena.print("{s}.part", .{path});
     var finished = false;
     defer if (!finished and !(state != null and stateKept(io, state.?))) cwd.deleteFile(io, part) catch {};
     var saved: storage.CheckpointFile = .init(io, cwd, state orelse "");

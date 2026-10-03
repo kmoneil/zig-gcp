@@ -329,7 +329,7 @@ fn sign(ptr: *anyopaque, io: std.Io, arena: Allocator, message: []const u8) core
         .retry = self.retry,
         .timeout_ms = self.request_timeout_ms,
         .diagnostics = self.diagnostics,
-        .refused = try std.fmt.allocPrint(arena, "signing was refused: the source credentials need roles/iam.serviceAccountTokenCreator on {s}", .{self.target}),
+        .refused = try arena.print("signing was refused: the source credentials need roles/iam.serviceAccountTokenCreator on {s}", .{self.target}),
     });
 }
 
@@ -511,7 +511,7 @@ const Harness = struct {
 };
 
 /// 256 bytes of 0x5a in base64: what IAM answers for a 2048-bit key.
-const signature_base64 = "Wlpa" ** 85 ++ "Wg==";
+const signature_base64 = test_util.repeat("Wlpa", 85) ++ "Wg==";
 const signed: Reply = .{ .respond = .{ .body = "{\"keyId\":\"k1\",\"signedBlob\":\"" ++ signature_base64 ++ "\"}" } };
 const test_sign_url = "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/" ++ test_target ++ ":signBlob";
 
@@ -784,7 +784,7 @@ test "ImpersonatedServiceAccount: every allocation failure is OutOfMemory withou
             _ = try account.provider().getToken(testing.io, scratch.allocator(), test_scopes);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.get, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{});
 }
 
 fn anyIamReplyProperty(_: void, input: []const u8) !void {

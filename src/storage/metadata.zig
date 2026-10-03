@@ -49,8 +49,7 @@ pub fn update(
         options.generation,
         options.preconditions,
     );
-    const path = if (options.override_unlocked_retention) try std.fmt.allocPrint(
-        scratch.allocator(),
+    const path = if (options.override_unlocked_retention) try scratch.allocator().print(
         "{s}{c}overrideUnlockedRetention=true",
         .{ object_path, @as(u8, if (std.mem.indexOfScalar(u8, object_path, '?') == null) '?' else '&') },
     ) else object_path;
@@ -459,7 +458,7 @@ fn patchEverything(gpa: Allocator) !void {
 }
 
 test "updateMetadata: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, patchEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, patchEverything, .{});
 }
 
 // Properties. Each states a rule of the module comment independently of

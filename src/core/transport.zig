@@ -383,7 +383,7 @@ pub const HttpTransport = struct {
         }
         if (req.content_type) |ct| if (!isValidHeaderValue(ct)) return error.InvalidRequestHeader;
         const authorization: ?[]const u8 = if (req.bearer) |token|
-            try std.fmt.allocPrint(arena, "Bearer {s}", .{token})
+            try arena.print("Bearer {s}", .{token})
         else
             null;
 
@@ -442,7 +442,7 @@ pub const HttpTransport = struct {
             return mapError(err, connection);
         };
         const head = response.head;
-        const status: u16 = @intFromEnum(head.status);
+        const status: u16 = @backingInt(head.status);
         // The head lives in the connection's read buffer, which reading the
         // body overwrites, so copy the headers out first.
         const headers = try collectHeaders(head, arena);
@@ -490,9 +490,9 @@ pub const HttpTransport = struct {
             dechunker = .init(request.reader.in, &transfer_buffer, max_chunk);
             break :t &dechunker.interface;
         } else request.reader.bodyReader(&transfer_buffer, head.transfer_encoding, head.content_length);
-        // core's copy of std's decompressor, where std.http would use std's,
-        // which panics on a body that ends partway, as a dropped
-        // connection's can.
+        // Decompressed here, from the transport's own dechunker, rather than
+        // by std.http's reader, which would decode the chunks with std's
+        // decoder (see `Dechunker`).
         var inflate: flate.Decompress = undefined;
         const reader: *std.Io.Reader = switch (encoding) {
             .identity => transfer,
@@ -540,9 +540,8 @@ pub const HttpTransport = struct {
                 return error.WriteFailed;
             };
         } else {
-            // The limit is exclusive: `allocRemaining` fails when it is reached.
-            const limit: std.Io.Limit = .limited(self.max_response_bytes +| 1);
-            body = reader.allocRemaining(arena, limit) catch |err| {
+            // `allocRemaining` takes up to the limit and fails past it.
+            body = reader.allocRemaining(arena, .limited(self.max_response_bytes)) catch |err| {
                 connection.closing = true;
                 return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
@@ -846,12 +845,13 @@ fn mapError(err: anyerror, connection: ?*http.Client.Connection) Error {
 
         error.UnsupportedUriScheme, error.UriMissingHost => error.InvalidEndpoint,
 
-        // std 0.16 on Windows returns Unexpected for socket statuses it does
-        // not map, among them a refused connection (STATUS_CONNECTION_REFUSED)
-        // and a peer that hangs up (STATUS_LOCAL_DISCONNECT). Which one it
-        // was is lost by now; both are worth retrying, so call it a dropped
-        // connection. Elsewhere std maps every socket error it expects.
-        error.Unexpected => if (builtin.os.tag == .windows) error.ConnectionResetByPeer else error.NetworkFailure,
+        // std on Windows returns Unexpected for socket statuses it does not
+        // map, among them a peer that hangs up (STATUS_LOCAL_DISCONNECT);
+        // Zig 0.16 also left a refused connection unmapped. Which status it
+        // was is lost by now, and a hang-up is worth retrying, so call it a
+        // dropped connection. Elsewhere std maps every socket error it
+        // expects.
+        error.Unexpected => if (builtin.target.os.tag == .windows) error.ConnectionResetByPeer else error.NetworkFailure,
 
         error.HttpHeadersOversize,
         error.HttpHeadersInvalid,
@@ -999,13 +999,13 @@ test "HttpTransport: a server that accepts and then says nothing is TimedOut" {
     // timeout under test, so bow out. The outcome says which it was; the
     // time cannot, since a Windows timer can fire a hair before this clock
     // says it is due, and a real timeout then measures 149 ms.
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         if (outcome) |_| {} else |err| if (err == error.ConnectionResetByPeer) return error.SkipZigTest;
     }
     try testing.expectError(error.TimedOut, outcome);
     // It waited for the timeout, and not much longer. Windows gets a timer
     // tick of slack.
-    const slack_ms: i64 = if (builtin.os.tag == .windows) 16 else 0;
+    const slack_ms: i64 = if (builtin.target.os.tag == .windows) 16 else 0;
     try testing.expect(elapsed_ms >= 150 - slack_ms);
     try testing.expect(elapsed_ms < 5_000);
 }
@@ -1516,7 +1516,7 @@ test "HttpTransport: chunked framing cut after a whole gzip stream is a dropped 
 test "HttpTransport: a chunk-size line longer than the read buffer is a protocol error" {
     const io = testing.io;
     var server: ScriptedServer = try .start(io, &.{
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;" ++ ("x" ** 16384) ++ "\r\nhello\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;" ++ test_util.repeat("x", 16384) ++ "\r\nhello\r\n0\r\n\r\n",
     });
     defer server.deinit(io);
     var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
@@ -1550,10 +1550,10 @@ test "HttpTransport: a failed TLS handshake forgets the TLS clock" {
     ht.client.now = std.Io.Clock.real.now(io);
     var buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&buf, "https://127.0.0.1:{d}/v1/x", .{server.port});
-    // The server hangs up mid-handshake: a failure worth retrying. std 0.16
-    // on Windows reports that as a socket error rather than a TLS failure
+    // The server hangs up mid-handshake: a failure worth retrying. std on
+    // Windows reports that as a socket error rather than a TLS failure
     // (see mapError), and only a TLS failure forgets the clock.
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         try testing.expectError(error.ConnectionResetByPeer, ht.transport().send(.{ .method = .GET, .url = url }, arena.allocator()));
         return;
     }
@@ -1634,7 +1634,7 @@ test "Dechunker: framing errors" {
         } else |err| try testing.expectEqual(c[1], err);
     }
     // Endless trailers are cut off.
-    const trailers = "0\r\n" ++ ("X-Trailer: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\r\n" ** 400) ++ "\r\n";
+    const trailers = "0\r\n" ++ test_util.repeat("X-Trailer: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\r\n", 400) ++ "\r\n";
     try testing.expectError(error.HttpProtocolError, dechunk(gpa, trailers, 1024));
 }
 
@@ -1678,7 +1678,7 @@ test "fuzz Dechunker: encoded data decodes exactly; every prefix is a dropped co
     try test_util.fuzzBytes({}, dechunkRoundTrip, .{ .corpus = &.{
         "\x00\x05hello\x00\x03\x01",
         "",
-        "\x00\x40" ++ "0123456789abcdef" ** 4 ++ "\x07\x01\x00\x01",
+        "\x00\x40" ++ test_util.repeat("0123456789abcdef", 4) ++ "\x07\x01\x00\x01",
     } });
 }
 
@@ -1765,17 +1765,16 @@ test "HttpTransport maps a refused connection" {
     defer arena.deinit();
     var buf: [64]u8 = undefined;
     const url = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}/v1/x", .{port});
-    // std 0.16 on Windows cannot tell a refused connection from a dropped
-    // one (see mapError). Either way the call is retried.
-    const expected: Error = if (builtin.os.tag == .windows) error.ConnectionResetByPeer else error.ConnectionRefused;
-    try testing.expectError(expected, ht.transport().send(.{ .method = .GET, .url = url }, arena.allocator()));
+    // Zig 0.16 on Windows reported this as error.Unexpected, which mapError
+    // calls a dropped connection; Zig 0.17 maps it everywhere.
+    try testing.expectError(error.ConnectionRefused, ht.transport().send(.{ .method = .GET, .url = url }, arena.allocator()));
 }
 
 test "mapError: an unmapped socket status on Windows is a dropped connection" {
     // Regression: CI on Windows showed a refused connection and a hang-up
     // arriving as error.Unexpected, which was a permanent NetworkFailure, so
     // neither was retried.
-    const expected: Error = if (builtin.os.tag == .windows) error.ConnectionResetByPeer else error.NetworkFailure;
+    const expected: Error = if (builtin.target.os.tag == .windows) error.ConnectionResetByPeer else error.NetworkFailure;
     try testing.expectEqual(expected, mapError(error.Unexpected, null));
 }
 
@@ -2070,8 +2069,8 @@ test "sendStream delivers a gzip body as sent when asked, and a plain one as it 
 
 test "a gzip body that ends partway is refused, never a panic: whole framing is a bad body, cut framing a drop" {
     const io = testing.io;
-    // Nineteen bytes of gzip that end partway through a code, which std's
-    // own decompressor panics on (nightly run 36230092734).
+    // Nineteen bytes of gzip that end partway through a code, which Zig
+    // 0.16's decompressor panicked on (nightly run 36230092734).
     const cut_gzip = "\x1f\x8b\x08\x00\x00\x00\x00\xb5\x33\x8e\x2d\x00\x02\x29\xbd\xfb\x54\x0f\xcc";
     var server: ScriptedServer = try .start(io, &.{
         // All the body the length promised: the body itself is bad.
@@ -2270,7 +2269,7 @@ test "sendStream: a server that says nothing is TimedOut" {
         .timeout_ms = 150,
     }, arena.allocator());
     // Windows may tear the idle connection down first; see the send test.
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         if (outcome) |_| {} else |err| if (err == error.ConnectionResetByPeer) return error.SkipZigTest;
     }
     try testing.expectError(error.TimedOut, outcome);

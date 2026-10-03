@@ -36,8 +36,8 @@ const testing = std.testing;
 test "Pub/Sub ids: the documented rules at their boundaries" {
     try testing.expect(isPubSubId("abc"));
     try testing.expect(!isPubSubId("ab"));
-    try testing.expect(isPubSubId("a" ** 255));
-    try testing.expect(!isPubSubId("a" ** 256));
+    try testing.expect(isPubSubId(test_util.repeat("a", 255)));
+    try testing.expect(!isPubSubId(test_util.repeat("a", 256)));
     try testing.expect(isPubSubId("a.b~c_d-e+f%41"));
     try testing.expect(isPubSubId("gooXfoo"));
     try testing.expect(isPubSubId("xgoog"));
@@ -63,7 +63,7 @@ test "project ids" {
     try testing.expect(!isProjectId("a/b"));
     try testing.expect(!isProjectId("a b"));
     try testing.expect(!isProjectId("a\"b"));
-    try testing.expect(!isProjectId("x" ** 101));
+    try testing.expect(!isProjectId(test_util.repeat("x", 101)));
 }
 
 fn projectIdProperty(_: void, input: []const u8) !void {
@@ -85,7 +85,7 @@ test "fuzz project ids: accepts exactly what is safe in a path and a body" {
         "example.com:my-project",
         "",
         "a/b",
-        "x" ** 101,
+        test_util.repeat("x", 101),
         "pro\xc3\xa9ject",
     } });
 }

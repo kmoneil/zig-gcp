@@ -53,7 +53,7 @@ Google, not only what Google documents, and where the emulators differ.
 | Guide | What's in it |
 | --- | --- |
 | [Development](development.md) | Build steps, fuzzing, coverage, CI, and every integration suite with what it needs |
-| [Zig 0.16 workarounds](zig-std-workarounds.md) | Standard library issues this library works around, each with its regression test |
+| [Zig 0.17 workarounds](zig-std-workarounds.md) | Standard library issues this library works around, each with its regression test |
 | [Contributing](../CONTRIBUTING.md) | How changes are proposed, tested and merged |
 | [Security](../SECURITY.md) | The threat model, and the test that holds each claim |
 | [Changelog](../CHANGELOG.md) | Every release, and what each one breaks |

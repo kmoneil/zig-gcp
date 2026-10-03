@@ -137,7 +137,7 @@ fn startHeaders(arena: Allocator, meta: Start, key: *const encryption.KeyHeaders
     };
     for (fixed) |field| if (field[1]) |value| try headers.append(arena, .{ .name = field[0], .value = value });
     for (meta.metadata) |entry| try headers.append(arena, .{
-        .name = try std.fmt.allocPrint(arena, "x-goog-meta-{s}", .{entry.key}),
+        .name = try arena.print("x-goog-meta-{s}", .{entry.key}),
         .value = entry.value,
     });
     return headers.items;
@@ -679,7 +679,7 @@ fn everyRequest(gpa: Allocator) !void {
 }
 
 test "multipart requests: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, everyRequest, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, everyRequest, .{});
 }
 
 const list_page_one =

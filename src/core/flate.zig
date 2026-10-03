@@ -1,13 +1,16 @@
-//! gzip, zlib and raw deflate decompression: `std.compress.flate.Decompress`
-//! from Zig 0.16.0, fixed for input that ends partway, which std's panics
-//! on in a safe build and reads past in `ReleaseFast`. See `Decompress.zig`
-//! for what changed. The transport decompresses response bodies with it,
-//! and `storage` the objects it stores gzip-compressed.
+//! gzip, zlib and raw deflate decompression: `std.compress.flate.Decompress`.
+//! The transport decompresses response bodies with it, and `storage` the
+//! objects it stores gzip-compressed.
+//!
+//! Until Zig 0.17 this was a copy of std's decompressor with a fix: on
+//! input that ends partway through a code, std's panicked in a safe build
+//! and read past the input in `ReleaseFast`. Zig 0.17 fixed it the same
+//! way, and the tests below hold std to it.
 
 const std = @import("std");
 const test_util = @import("testing.zig");
 
-pub const Decompress = @import("flate/Decompress.zig");
+pub const Decompress = std.compress.flate.Decompress;
 pub const Container = std.compress.flate.Container;
 /// What `Decompress.init` needs as its buffer.
 pub const max_window_len = std.compress.flate.max_window_len;
@@ -36,9 +39,10 @@ fn gzipAlloc(data: []const u8) ![]u8 {
     return out.toOwnedSlice();
 }
 
-test "the nightly's input, 19 bytes of gzip that end partway, is EndOfStream, where std panics" {
-    // std.compress.flate.Decompress on these bytes: "panic: integer
-    // overflow" in peekBitsEnding (nightly run 36230092734, 2026-09-26).
+test "the nightly's input, 19 bytes of gzip that end partway, is EndOfStream" {
+    // Zig 0.16's std.compress.flate.Decompress on these bytes: "panic:
+    // integer overflow" in peekBitsEnding (nightly run 36230092734,
+    // 2026-09-26).
     const input = "\x1f\x8b\x08\x00\x00\x00\x00\xb5\x33\x8e\x2d\x00\x02\x29\xbd\xfb\x54\x0f\xcc";
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -94,8 +98,4 @@ test "fuzz flate: any bytes, as gzip, zlib or raw deflate, decompress or are ref
             "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xcb\x48\xcd\xc9\xc9\x57\x28",
         },
     });
-}
-
-test {
-    _ = Decompress;
 }

@@ -590,7 +590,7 @@ fn billingProperty(_: void, bytes: []const u8) !void {
 }
 
 test "heavy property billing: billed calls go through, unbilled ones are refused with the hint, and nothing else is ever sent" {
-    try test_util.fuzzBytes({}, billingProperty, .{ .corpus = &.{ "", "\x01" ** 32, "\x00\x01\x02\x03\x04\x05\x06\x07" ** 4 } });
+    try test_util.fuzzBytes({}, billingProperty, .{ .corpus = &.{ "", test_util.repeat("\x01", 32), test_util.repeat("\x00\x01\x02\x03\x04\x05\x06\x07", 4) } });
 }
 
 fn billedEverything(gpa: Allocator) !void {
@@ -615,5 +615,5 @@ fn billedEverything(gpa: Allocator) !void {
 }
 
 test "billing: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, billedEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, billedEverything, .{});
 }

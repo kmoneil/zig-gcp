@@ -18,7 +18,7 @@ to one grants it to any:
 // The project's Cloud Storage service agent may read one secret.
 var service_agent = try gcs.serviceAgent();
 defer service_agent.deinit();
-const member = try std.fmt.allocPrint(arena, "serviceAccount:{s}", .{service_agent.value});
+const member = try arena.print("serviceAccount:{s}", .{service_agent.value});
 var policy = try secrets.secret("db-password").addIamBinding("roles/secretmanager.secretAccessor", member);
 defer policy.deinit();
 ```

@@ -182,7 +182,7 @@ const Fixture = struct {
 
     /// A handle on `what` under the test's prefix.
     fn object(f: *Fixture, what: []const u8) !storage.Object {
-        const name = try std.fmt.allocPrint(f.arena.allocator(), "{s}{s}", .{ &f.prefix, what });
+        const name = try f.arena.allocator().print("{s}{s}", .{ &f.prefix, what });
         return f.bucket().object(name);
     }
 
@@ -947,8 +947,8 @@ const RewriteCapper = struct {
         if (req.method != .POST or std.mem.indexOf(u8, req.url, "/rewriteTo/") == null) return self.inner.send(req, arena);
         var capped = req;
         const separator: u8 = if (std.mem.indexOfScalar(u8, req.url, '?') == null) '?' else '&';
-        capped.url = try std.fmt.allocPrint(arena, "{s}{c}maxBytesRewrittenPerCall={d}", .{ req.url, separator, self.max_bytes_per_call });
-        capped.body = try std.fmt.allocPrint(arena, "{{\"storageClass\":\"{s}\"}}", .{self.storage_class});
+        capped.url = try arena.print("{s}{c}maxBytesRewrittenPerCall={d}", .{ req.url, separator, self.max_bytes_per_call });
+        capped.body = try arena.print("{{\"storageClass\":\"{s}\"}}", .{self.storage_class});
         return self.inner.send(capped, arena);
     }
 
@@ -1133,7 +1133,7 @@ test "11. compose: three parts join, the composite has no md5, and its crc32c ve
     const parts = [_][]const u8{ "alpha\n", "beta\n", "gamma\n" };
     var sources: [3]storage.ComposeSource = undefined;
     for (parts, &sources, 0..) |data, *source, i| {
-        const name = try std.fmt.allocPrint(f.arena.allocator(), "part-{d}", .{i});
+        const name = try f.arena.allocator().print("part-{d}", .{i});
         const part = try f.object(name);
         var info = part.upload(data, .{ .content_type = "text/plain" }) catch |err| return f.report(err);
         defer info.deinit();
@@ -1177,7 +1177,7 @@ test "12. compose: deleting the sources leaves the composite and removes the par
     defer f.deinit();
     var sources: [2]storage.ComposeSource = undefined;
     for (&sources, 0..) |*source, i| {
-        const name = try std.fmt.allocPrint(f.arena.allocator(), "temp-{d}", .{i});
+        const name = try f.arena.allocator().print("temp-{d}", .{i});
         const part = try f.object(name);
         var info = part.upload("chunk\n", .{ .content_type = "text/plain" }) catch |err| return f.report(err);
         info.deinit();
@@ -1208,7 +1208,7 @@ test "13. compose: 32 sources work, and 33 is this library's limit, not a reques
     // to the one generation and named through a distinct copy.
     var sources: [33]storage.ComposeSource = undefined;
     for (&sources, 0..) |*source, i| {
-        const name = try std.fmt.allocPrint(f.arena.allocator(), "unit-{d}.txt", .{i});
+        const name = try f.arena.allocator().print("unit-{d}.txt", .{i});
         const copy = try f.object(name);
         var copied = one.copyTo(copy, .{}) catch |err| return f.report(err);
         copied.deinit();
@@ -1263,7 +1263,7 @@ test "sweep: delete anything a crashed run left under zig-gcp-test/ or zig-gcp-t
     // purpose, and a run that dies before it abandons them keeps them.
     var aborted: usize = 0;
     for ([_][]const u8{ "zig-gcp-test/", "zig-gcp-tmp/" }) |prefix| {
-        const path = try std.fmt.allocPrint(f.arena.allocator(), "/{s}?uploads&prefix={s}", .{ f.bucket_name, prefix });
+        const path = try f.arena.allocator().print("/{s}?uploads&prefix={s}", .{ f.bucket_name, prefix });
         const res = try raw(&f, .GET, path, &.{}, null, null);
         try expectStatus(200, res);
         var rest = res.body;
@@ -1299,7 +1299,7 @@ fn raw(
     body: ?[]const u8,
 ) !core.transport.StreamResponse {
     const arena = f.arena.allocator();
-    const url = try std.fmt.allocPrint(arena, "https://storage.googleapis.com{s}", .{path});
+    const url = try arena.print("https://storage.googleapis.com{s}", .{path});
     const segments = [_][]const u8{body orelse ""};
     return f.faults.transport().sendStream(.{
         .method = method,
@@ -1313,7 +1313,7 @@ fn raw(
 
 /// `/storage/v1/b/{bucket}/o/{name}`, the name one strict segment.
 fn jsonPath(f: *Fixture, name: []const u8, suffix: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(f.arena.allocator(), "/storage/v1/b/{s}/o/{s}{s}", .{ f.bucket_name, try segment(f, name), suffix });
+    return f.arena.allocator().print("/storage/v1/b/{s}/o/{s}{s}", .{ f.bucket_name, try segment(f, name), suffix });
 }
 
 /// A name as one strict segment of a JSON API path.
@@ -1325,13 +1325,13 @@ fn segment(f: *Fixture, name: []const u8) ![]const u8 {
 
 /// The rewrite call a copy makes, raw, with `resource` as its body.
 fn rewriteRaw(f: *Fixture, source: []const u8, dest: []const u8, resource: []const u8) !core.transport.StreamResponse {
-    const path = try std.fmt.allocPrint(f.arena.allocator(), "{s}/rewriteTo/b/{s}/o/{s}", .{ try jsonPath(f, source, ""), f.bucket_name, try segment(f, dest) });
+    const path = try f.arena.allocator().print("{s}/rewriteTo/b/{s}/o/{s}", .{ try jsonPath(f, source, ""), f.bucket_name, try segment(f, dest) });
     return raw(f, .POST, path, &.{}, "application/json", resource);
 }
 
 /// `/{bucket}/{name}{query}`: the suite's names need no escaping.
 fn xmlPath(f: *Fixture, name: []const u8, query: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(f.arena.allocator(), "/{s}/{s}{s}", .{ f.bucket_name, name, query });
+    return f.arena.allocator().print("/{s}/{s}{s}", .{ f.bucket_name, name, query });
 }
 
 fn expectStatus(expected: u16, res: core.transport.StreamResponse) !void {
@@ -1361,7 +1361,7 @@ fn rawField(f: *Fixture, name: []const u8, field: []const u8) !?[]const u8 {
 
 /// Multipart uploads still open for names under the test's prefix.
 fn openUploads(f: *Fixture) !usize {
-    const path = try std.fmt.allocPrint(f.arena.allocator(), "/{s}?uploads&prefix={s}", .{ f.bucket_name, &f.prefix });
+    const path = try f.arena.allocator().print("/{s}?uploads&prefix={s}", .{ f.bucket_name, &f.prefix });
     const res = try raw(f, .GET, path, &.{}, null, null);
     try expectStatus(200, res);
     return std.mem.count(u8, res.body, "<Upload>");
@@ -1645,7 +1645,7 @@ test "18. parallel: what the XML API answers, asked raw" {
     var id_query: std.Io.Writer.Allocating = .init(a);
     try id_query.writer.writeAll("?uploadId=");
     try core.query.writeValue(&id_query.writer, id);
-    const body = try std.fmt.allocPrint(a, "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>", .{etag});
+    const body = try a.print("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>", .{etag});
     const finished = try raw(&f, .POST, try xmlPath(&f, name, id_query.written()), &.{}, "application/xml", body);
     try expectStatus(200, finished);
     std.debug.print("a finish answers x-goog-generation {?s}, x-goog-hash {?s}, ETag {?s}\n", .{
@@ -1689,7 +1689,7 @@ test "18. parallel: what the XML API answers, asked raw" {
     var q3: std.Io.Writer.Allocating = .init(a);
     try q3.writer.writeAll("?uploadId=");
     try core.query.writeValue(&q3.writer, empty_id);
-    const empty_finish = try raw(&f, .POST, try xmlPath(&f, empty_name, q3.written()), &.{}, "application/xml", try std.fmt.allocPrint(a, "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>", .{empty_part.header("ETag").?}));
+    const empty_finish = try raw(&f, .POST, try xmlPath(&f, empty_name, q3.written()), &.{}, "application/xml", try a.print("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>", .{empty_part.header("ETag").?}));
     std.debug.print("a multipart upload of one empty part finishes with HTTP {d}\n", .{empty_finish.status});
     if (empty_finish.status != 200) _ = try raw(&f, .DELETE, try xmlPath(&f, empty_name, q3.written()), &.{}, null, null);
 
@@ -1705,7 +1705,7 @@ test "18. parallel: what the XML API answers, asked raw" {
     var q5: std.Io.Writer.Allocating = .init(a);
     try q5.writer.writeAll("?uploadId=");
     try core.query.writeValue(&q5.writer, cond_id);
-    const cond_finish = try raw(&f, .POST, try xmlPath(&f, name, q5.written()), &.{.{ .name = "x-goog-if-generation-match", .value = "0" }}, "application/xml", try std.fmt.allocPrint(a, "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>", .{cond_part.header("ETag").?}));
+    const cond_finish = try raw(&f, .POST, try xmlPath(&f, name, q5.written()), &.{.{ .name = "x-goog-if-generation-match", .value = "0" }}, "application/xml", try a.print("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>", .{cond_part.header("ETag").?}));
     std.debug.print("a finish with x-goog-if-generation-match: 0 over an existing object answers HTTP {d}\n", .{cond_finish.status});
     if (cond_finish.status != 200) _ = try raw(&f, .DELETE, try xmlPath(&f, name, q5.written()), &.{}, null, null);
 
@@ -1742,8 +1742,7 @@ test "18. parallel: what the XML API answers, asked raw" {
     var q8: std.Io.Writer.Allocating = .init(a);
     try q8.writer.writeAll("?uploadId=");
     try core.query.writeValue(&q8.writer, small_id);
-    const small_finish = try raw(&f, .POST, try xmlPath(&f, small_name, q8.written()), &.{}, "application/xml", try std.fmt.allocPrint(
-        a,
+    const small_finish = try raw(&f, .POST, try xmlPath(&f, small_name, q8.written()), &.{}, "application/xml", try a.print(
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{s}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{s}</ETag></Part></CompleteMultipartUpload>",
         .{ etags[0], etags[1] },
     ));
@@ -1859,7 +1858,7 @@ test "21. parallel: 1 GiB from a file, one connection against eight, timed" {
     // parts, timed.
     var ms: [2]i64 = undefined;
     for ([_]u16{ 1, 8 }, 0..) |concurrency, i| {
-        const obj = client.bucket(f.bucket_name).object(try std.fmt.allocPrint(f.arena.allocator(), "{s}gib-{d}.bin", .{ &f.prefix, concurrency }));
+        const obj = client.bucket(f.bucket_name).object(try f.arena.allocator().print("{s}gib-{d}.bin", .{ &f.prefix, concurrency }));
         const started = std.Io.Clock.awake.now(testing.io);
         var info = obj.uploadParallel(.{ .file = file }, .{
             .part_size = 10 * 1024 * 1024,
@@ -1886,8 +1885,8 @@ test "22. move: whether objects.move works in a bucket without hierarchical name
     up.deinit();
     const dest_name = (try f.object("move-dest.txt")).name;
     // 16. For the follow-up that would make parallel uploads create-only.
-    const path = try std.fmt.allocPrint(f.arena.allocator(), "{s}/moveTo/o/{s}", .{ try jsonPath(&f, src.name, ""), try segment(&f, dest_name) });
-    const moved = try raw(&f, .POST, try std.fmt.allocPrint(f.arena.allocator(), "{s}?ifGenerationMatch=0", .{path}), &.{}, "application/json", "");
+    const path = try f.arena.allocator().print("{s}/moveTo/o/{s}", .{ try jsonPath(&f, src.name, ""), try segment(&f, dest_name) });
+    const moved = try raw(&f, .POST, try f.arena.allocator().print("{s}?ifGenerationMatch=0", .{path}), &.{}, "application/json", "");
     std.debug.print("objects.move in a flat bucket: HTTP {d} {s}\n", .{ moved.status, moved.body[0..@min(moved.body.len, 300)] });
     if (moved.status == 200) {
         try testing.expect(!(try src.exists()));
@@ -1910,7 +1909,7 @@ fn tempObjects(f: *Fixture) !usize {
 
 /// Multipart uploads still open under `zig-gcp-tmp/`.
 fn openTempUploads(f: *Fixture) !usize {
-    const path = try std.fmt.allocPrint(f.arena.allocator(), "/{s}?uploads&prefix=zig-gcp-tmp/", .{f.bucket_name});
+    const path = try f.arena.allocator().print("/{s}?uploads&prefix=zig-gcp-tmp/", .{f.bucket_name});
     const res = try raw(f, .GET, path, &.{}, null, null);
     try expectStatus(200, res);
     return std.mem.count(u8, res.body, "<Upload>");
@@ -1998,7 +1997,7 @@ test "24. parallel download: what a range of a private object carries, and range
 
     // 2. A range short of the whole object, and one that is all of it.
     const media = try jsonPath(&f, obj.name, "?alt=media");
-    const whole = try std.fmt.allocPrint(f.arena.allocator(), "bytes=0-{d}", .{size - 1});
+    const whole = try f.arena.allocator().print("bytes=0-{d}", .{size - 1});
     for ([_][]const u8{ "bytes=0-1048575", whole }) |range| {
         const res = try raw(&f, .GET, media, &.{.{ .name = "Range", .value = range }}, null, null);
         try expectStatus(206, res);
@@ -2687,7 +2686,7 @@ test "34. sessions: a cancelled session answers 499 to everything after, and a r
     const cancel = try toSession(&f, .DELETE, session, null);
     std.debug.print("a cancel: HTTP {d}\n", .{cancel.status});
     try testing.expectEqual(499, cancel.status);
-    const range = try std.fmt.allocPrint(f.arena.allocator(), "bytes */{d}", .{size});
+    const range = try f.arena.allocator().print("bytes */{d}", .{size});
     const query = try toSession(&f, .PUT, session, range);
     const again = try toSession(&f, .DELETE, session, null);
     std.debug.print("then a status query: HTTP {d}; a second cancel: HTTP {d}\n", .{ query.status, again.status });
@@ -2746,7 +2745,7 @@ test "35. sessions: a parallel upload of 12 parts dies after 7, ListParts pages 
     var marker: []const u8 = "";
     var pages: usize = 0;
     while (pages < 10) {
-        const rest = if (marker.len == 0) "&max-parts=5" else try std.fmt.allocPrint(f.arena.allocator(), "&max-parts=5&part-number-marker={s}", .{marker});
+        const rest = if (marker.len == 0) "&max-parts=5" else try f.arena.allocator().print("&max-parts=5&part-number-marker={s}", .{marker});
         const res = try raw(&f, .GET, try xmlPath(&f, target.name, try uploadIdQuery(&f, upload_id, rest)), &.{}, null, null);
         try expectStatus(200, res);
         pages += 1;
@@ -2875,7 +2874,7 @@ test "37. sessions: abandonTransfer cancels a session and aborts a multipart upl
     const session = try savedField(&f, tmp.dir, "session.upload", "session");
     f.client.abandonTransfer(session_store.checkpoint()) catch |err| return f.report(err);
     try testing.expect(!try hasState(tmp.dir, "session.upload"));
-    const range = try std.fmt.allocPrint(f.arena.allocator(), "bytes */{d}", .{size});
+    const range = try f.arena.allocator().print("bytes */{d}", .{size});
     const query = try toSession(&f, .PUT, session, range);
     std.debug.print("a status query on an abandoned session: HTTP {d}\n", .{query.status});
     try testing.expectEqual(499, query.status);
@@ -2943,7 +2942,7 @@ fn textBytes(n: usize, seed: u64) ![]u8 {
 /// handling. Lives in the fixture's arena.
 fn rawMedia(f: *Fixture, name: []const u8, accept: core.transport.StreamRequest.AcceptEncoding, range: ?[]const u8) !core.transport.StreamResponse {
     const arena = f.arena.allocator();
-    const url = try std.fmt.allocPrint(arena, "https://storage.googleapis.com{s}", .{try jsonPath(f, name, "?alt=media")});
+    const url = try arena.print("https://storage.googleapis.com{s}", .{try jsonPath(f, name, "?alt=media")});
     const headers = [_]Header{.{ .name = "Range", .value = range orelse "" }};
     return f.http.transport().sendStream(.{
         .method = .GET,
@@ -3180,7 +3179,7 @@ test "45. gzip uploads: each call stores std's gzip of the data, labelled, and a
     defer f.deinit();
     const text = try textBytes(12 * 1024 * 1024, 45);
     defer testing.allocator.free(text);
-    const small = "a short line of text, compressed and sent in one request\n" ** 20;
+    const small = core.testing.repeat("a short line of text, compressed and sent in one request\n", 20);
     const want = try gzipAlloc(text, .default);
     defer testing.allocator.free(want);
     const small_want = try gzipAlloc(small, .default);
@@ -3382,7 +3381,7 @@ test "48. gzip uploads, for later: what a request body sent with Content-Encodin
 
     // 5a. A media upload whose body is sent compressed.
     const media = try f.object("in-transit-media.txt");
-    const media_path = try std.fmt.allocPrint(arena, "/upload/storage/v1/b/{s}/o?uploadType=media&name={s}", .{ f.bucket_name, try segment(&f, media.name) });
+    const media_path = try arena.print("/upload/storage/v1/b/{s}/o?uploadType=media&name={s}", .{ f.bucket_name, try segment(&f, media.name) });
     const a = try raw(&f, .POST, media_path, &gzip_header, "text/plain", packed_text);
     std.debug.print("media, body compressed in transit: HTTP {d}\n", .{a.status});
     try printStored(&f, media, "  media");
@@ -3391,10 +3390,10 @@ test "48. gzip uploads, for later: what a request body sent with Content-Encodin
     // compressed, as gcloud's -j does, with the data's checksum.
     const multipart = try f.object("in-transit-multipart.txt");
     const crc = core.crc32c.toBase64(core.crc32c.hash(text));
-    const body = try std.fmt.allocPrint(arena, "--BB\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{{\"name\":\"{s}\",\"contentType\":\"text/plain\",\"crc32c\":\"{s}\"}}\r\n--BB\r\nContent-Type: text/plain\r\n\r\n{s}\r\n--BB--\r\n", .{ multipart.name, &crc, text });
+    const body = try arena.print("--BB\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{{\"name\":\"{s}\",\"contentType\":\"text/plain\",\"crc32c\":\"{s}\"}}\r\n--BB\r\nContent-Type: text/plain\r\n\r\n{s}\r\n--BB--\r\n", .{ multipart.name, &crc, text });
     const packed_body = try gzipAlloc(body, .default);
     defer testing.allocator.free(packed_body);
-    const multipart_path = try std.fmt.allocPrint(arena, "/upload/storage/v1/b/{s}/o?uploadType=multipart", .{f.bucket_name});
+    const multipart_path = try arena.print("/upload/storage/v1/b/{s}/o?uploadType=multipart", .{f.bucket_name});
     const b = try raw(&f, .POST, multipart_path, &gzip_header, "multipart/related; boundary=BB", packed_body);
     std.debug.print("multipart, whole body compressed in transit: HTTP {d}\n", .{b.status});
     try printStored(&f, multipart, "  multipart");
@@ -3402,12 +3401,12 @@ test "48. gzip uploads, for later: what a request body sent with Content-Encodin
     // 5c. A resumable session whose one chunk is sent compressed, its
     // Content-Range counting the data's bytes, as gcloud's -j counts them.
     const session_obj = try f.object("in-transit-resumable.txt");
-    const start_path = try std.fmt.allocPrint(arena, "/upload/storage/v1/b/{s}/o?uploadType=resumable", .{f.bucket_name});
-    const meta = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"contentType\":\"text/plain\"}}", .{session_obj.name});
+    const start_path = try arena.print("/upload/storage/v1/b/{s}/o?uploadType=resumable", .{f.bucket_name});
+    const meta = try arena.print("{{\"name\":\"{s}\",\"contentType\":\"text/plain\"}}", .{session_obj.name});
     const opened = try raw(&f, .POST, start_path, &.{}, "application/json; charset=UTF-8", meta);
     try expectStatus(200, opened);
     const session = opened.header("Location").?;
-    const range = try std.fmt.allocPrint(arena, "bytes 0-{d}/{d}", .{ text.len - 1, text.len });
+    const range = try arena.print("bytes 0-{d}/{d}", .{ text.len - 1, text.len });
     const headers = [_]Header{ .{ .name = "Content-Encoding", .value = "gzip" }, .{ .name = "Content-Range", .value = range } };
     const segments = [_][]const u8{packed_text};
     const c = try f.faults.transport().sendStream(.{
@@ -3671,7 +3670,7 @@ test "50. bucket settings: what Cloud Storage refuses, the library refuses first
     // Refused here, and nothing sent: the metageneration stands still.
     const refused = [_]storage.BucketUpdate{
         .{ .labels = .{ .change = &.{.{ .key = "Env", .value = "x" }} } },
-        .{ .labels = .{ .change = &.{.{ .key = "k", .value = "日" ** 43 }} } },
+        .{ .labels = .{ .change = &.{.{ .key = "k", .value = core.testing.repeat("日", 43) }} } },
         .{ .soft_delete_retention_s = 604_799 },
         .{ .soft_delete_retention_s = 7_776_001 },
         .{ .lifecycle = &.{.{ .action = .delete, .condition = .{} }} },
@@ -4095,7 +4094,7 @@ test "55. keys: every path under a customer-supplied key, a rotation by copy, an
     }) catch |err| return f.report(err);
     try testing.expectEqual(core.crc32c.hash(parted), (try some(u32, moved.value.crc32c)));
     moved.deinit();
-    const text = "compressible " ** 400;
+    const text = core.testing.repeat("compressible ", 400);
     var zipped = b.object("zipped").withEncryptionKey(&a).upload(text, .{ .gzip = .{} }) catch |err| return f.report(err);
     zipped.deinit();
 
@@ -4441,15 +4440,15 @@ test "60. IAM: a bucket's policy read, granted once in any case, tested, revoked
     const a = arena_state.allocator();
     var service_agent = f.client.serviceAgent() catch |err| return f.report(err);
     defer service_agent.deinit();
-    const member = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{service_agent.value});
-    const shouting = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{try std.ascii.allocUpperString(a, service_agent.value)});
+    const member = try a.print("serviceAccount:{s}", .{service_agent.value});
+    const shouting = try a.print("serviceAccount:{s}", .{try std.ascii.allocUpperString(a, service_agent.value)});
     const role = "roles/storage.objectViewer";
 
     // A new bucket's legacy bindings, at its first metageneration.
     var fresh = b.iamPolicy() catch |err| return f.report(err);
     defer fresh.deinit();
     try testing.expectEqualStrings("CAE=", fresh.value.etag.?);
-    try testing.expect(fresh.value.grants("roles/storage.legacyBucketOwner", try std.fmt.allocPrint(a, "projectOwner:{s}", .{f.project})));
+    try testing.expect(fresh.value.grants("roles/storage.legacyBucketOwner", try a.print("projectOwner:{s}", .{f.project})));
     try testing.expectEqual(4, fresh.value.bindings.len);
 
     var granted = b.addIamBinding(role, member) catch |err| return f.report(err);
@@ -4524,7 +4523,7 @@ test "61. IAM: without uniform access, two legacy bindings and a condition refus
     var conditional = fresh.value;
     conditional.bindings = try std.mem.concat(arena_state.allocator(), storage.iam.Binding, &.{ fresh.value.bindings, &.{.{
         .role = "roles/storage.objectViewer",
-        .members = &.{try std.fmt.allocPrint(arena_state.allocator(), "projectViewer:{s}", .{f.project})},
+        .members = &.{try arena_state.allocator().print("projectViewer:{s}", .{f.project})},
         .condition = "{\"title\":\"t\",\"expression\":\"true\"}",
     }} });
     try testing.expectError(error.FailedPrecondition, b.setIamPolicy(conditional));
@@ -4736,7 +4735,7 @@ test "64. managed folders: created, listed, deleted as measured, and a policy of
     try testing.expectEqual(0, fresh.value.bindings.len);
     var service_agent = f.client.serviceAgent() catch |err| return f.report(err);
     defer service_agent.deinit();
-    const member = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{service_agent.value});
+    const member = try a.print("serviceAccount:{s}", .{service_agent.value});
     var granted = mf.addIamBinding("roles/storage.objectViewer", member) catch |err| return f.report(err);
     defer granted.deinit();
     try testing.expect(granted.value.grants("roles/storage.objectViewer", member));

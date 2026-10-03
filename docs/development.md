@@ -34,16 +34,17 @@ against Google, so none of them can rot between runs.
 ## Fuzzing
 
 Every fuzz property also runs in `zig build test`: on its seed corpus and
-on a few hundred pseudo-random inputs. Zig 0.16.0's own test runner does
-not compile in fuzz mode, and its default x86_64 backend emits no
-coverage instrumentation. `-Dfuzz-runner` fixes both: it swaps in
-`tools/test_runner.zig`, a copy with a one-line fix, and builds the tests
-with LLVM. The fuzzer keeps its corpus in `.zig-cache/f`, so only one
-fuzzing run per checkout at a time; `-Dtest-filter=fuzz` skips the unit
-tests that are not fuzz targets. When it finds a failing input, it saves
-it to `.zig-cache/f/crash`: a 4-byte little-endian length, then the
-input. Add the input to that property's corpus, so the fix stays
-covered.
+on a few hundred pseudo-random inputs. Zig's default x86_64 backend emits
+no coverage instrumentation, so `-Dfuzz-runner` builds the tests with
+LLVM. Every test build, fuzzing or not, runs under `tools/test_runner.zig`,
+Zig 0.17's test runner with one fix (see
+[Zig 0.17 workarounds](zig-std-workarounds.md)). The fuzzer keeps its
+corpus in `.zig-cache/f`, so only one fuzzing run per checkout at a time;
+`-Dtest-filter=fuzz` skips the unit tests that are not fuzz targets. When
+it finds a failing input, it saves it to `.zig-cache/f/crash`: a 4-byte
+little-endian length, then the input. `zig build` still exits 0 then, so
+look for that file, or for "input saved to" in the output, as CI does.
+Add the input to that property's corpus, so the fix stays covered.
 
 ## Coverage
 

@@ -23,17 +23,24 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//! Zig 0.16.0's test runner (lib/compiler/test_runner.zig), with two fixes to
-//! its fuzz path:
-//! - It passes an error return trace to `std.debug.writeStackTrace`, which
-//!   does not compile, so `zig build test --fuzz` fails for every project.
-//!   The fix calls `writeErrorReturnTrace`.
-//! - It never initializes `std.testing.io` or `std.testing.environ`, which
-//!   the normal path sets up for every test, so a fuzz test that uses them
-//!   reads an uninitialized `Io.Threaded` and segfaults at its first
-//!   allocation. Each fuzz run now gets its own, as every test does.
-//! Used only with `zig build test -Dfuzz-runner --fuzz`. Delete this file
-//! once the Zig release in use ships both fixes.
+//! Zig 0.17.0's test runner (lib/compiler/test_runner.zig), with one change:
+//! `std_options_debug_io` below, which makes `std.debug`'s futex waits
+//! uncancelable.
+//!
+//! `std.testing.allocator` is a `std.heap.SafeAllocator`, which records a
+//! stack trace for every allocation. On macOS, capturing one locks the
+//! debug info's mutex with a cancelable `Io.Mutex.lock`, and when that lock
+//! is contended its futex wait takes the calling task's pending cancel and
+//! returns `error.Canceled`, which the unwinder swallows. Cancels arrive
+//! once, so the task's next wait can no longer be canceled, and whoever
+//! cancels it waits forever: pubsub's Subscriber tests hung that way, a
+//! different test each run. std's own `std.debug.print` and `lockStderr`
+//! already block cancelation around their waits; this does the same for
+//! every wait `std.debug` makes, whatever the platform.
+//!
+//! Every test build uses this runner (see build.zig). Compare it with the
+//! upstream file on each Zig upgrade, and delete it once std's unwinder
+//! never takes a cancel.
 //! Default test runner for unit tests.
 const builtin = @import("builtin");
 
@@ -58,10 +65,32 @@ var stdin_reader: Io.File.Reader = undefined;
 var stdout_writer: Io.File.Writer = undefined;
 const runner_threaded_io: Io = Io.Threaded.global_single_threaded.io();
 
+/// `std.debug`'s Io: the default, `Io.Threaded.global_single_threaded`,
+/// except that a futex wait never takes the calling task's cancel. See the
+/// top of this file.
+pub const std_options_debug_io: Io = .{
+    .userdata = Io.Threaded.global_single_threaded,
+    .vtable = &debug_io_vtable,
+};
+
+const debug_io_vtable: Io.VTable = v: {
+    var v = Io.Threaded.global_single_threaded.io().vtable.*;
+    v.futexWait = debugFutexWait;
+    break :v v;
+};
+
+fn debugFutexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
+    const inner = Io.Threaded.global_single_threaded.io().vtable;
+    const prev = inner.swapCancelProtection(userdata, .blocked);
+    defer _ = inner.swapCancelProtection(userdata, prev);
+    return inner.futexWait(userdata, ptr, expected, timeout);
+}
+
 /// Keep in sync with logic in `std.Build.addRunArtifact` which decides whether
 /// the test runner will communicate with the build runner via `std.zig.Server`.
 const need_simple = switch (builtin.zig_backend) {
     .stage2_aarch64,
+    .stage2_loongarch,
     .stage2_powerpc,
     .stage2_riscv64,
     => true,
@@ -114,11 +143,11 @@ fn mainServer(init: std.process.Init.Minimal) !void {
     @disableInstrumentation();
     stdin_reader = .initStreaming(.stdin(), runner_threaded_io, &stdin_buffer);
     stdout_writer = .initStreaming(.stdout(), runner_threaded_io, &stdout_buffer);
-    var server = try std.zig.Server.init(.{
+    var server: std.zig.Server = .{
         .in = &stdin_reader.interface,
         .out = &stdout_writer.interface,
-        .zig_version = builtin.zig_version_string,
-    });
+    };
+    try server.serveStringMessage(.zig_version, builtin.zig_version_string);
 
     while (true) {
         const hdr = try server.receiveMessage();
@@ -127,24 +156,23 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 return std.process.exit(0);
             },
             .query_test_metadata => {
-                testing.allocator_instance = .{};
-                defer if (testing.allocator_instance.deinit() == .leak) {
-                    @panic("internal test runner memory leak");
-                };
+                var sa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+                defer if (sa.deinit() != 0) @panic("internal test runner memory leak");
+                const gpa = sa.allocator();
 
                 var string_bytes: std.ArrayList(u8) = .empty;
-                defer string_bytes.deinit(testing.allocator);
-                try string_bytes.append(testing.allocator, 0); // Reserve 0 for null.
+                defer string_bytes.deinit(gpa);
+                try string_bytes.append(gpa, 0); // Reserve 0 for null.
 
                 const test_fns = builtin.test_functions;
-                const names = try testing.allocator.alloc(u32, test_fns.len);
-                defer testing.allocator.free(names);
-                const expected_panic_msgs = try testing.allocator.alloc(u32, test_fns.len);
-                defer testing.allocator.free(expected_panic_msgs);
+                const names = try gpa.alloc(u32, test_fns.len);
+                defer gpa.free(names);
+                const expected_panic_msgs = try gpa.alloc(u32, test_fns.len);
+                defer gpa.free(expected_panic_msgs);
 
                 for (test_fns, names, expected_panic_msgs) |test_fn, *name, *expected_panic_msg| {
                     name.* = @intCast(string_bytes.items.len);
-                    try string_bytes.ensureUnusedCapacity(testing.allocator, test_fn.name.len + 1);
+                    try string_bytes.ensureUnusedCapacity(gpa, test_fn.name.len + 1);
                     string_bytes.appendSliceAssumeCapacity(test_fn.name);
                     string_bytes.appendAssumeCapacity(0);
                     expected_panic_msg.* = 0;
@@ -159,7 +187,10 @@ fn mainServer(init: std.process.Init.Minimal) !void {
 
             .run_test => {
                 testing.environ = init.environ;
-                testing.allocator_instance = .{};
+                testing.allocator_instance = .init(std.heap.page_allocator, .{
+                    .canary = 0xc3a701ba,
+                    .check_write_after_free = true,
+                });
                 testing.io_instance = .init(testing.allocator, .{
                     .argv0 = .init(init.args),
                     .environ = init.environ,
@@ -186,8 +217,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                     },
                 };
                 testing.io_instance.deinit();
-                const leak_count = testing.allocator_instance.detectLeaks();
-                testing.allocator_instance.deinitWithoutLeakChecks();
+                const leak_count = testing.allocator_instance.deinit();
                 try server.serveTestResults(.{
                     .index = index,
                     .flags = .{
@@ -209,8 +239,8 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                 // since they are not present.
                 if (!builtin.fuzz) unreachable;
 
-                var gpa_instance: std.heap.DebugAllocator(.{}) = .init;
-                defer if (gpa_instance.deinit() == .leak) {
+                var gpa_instance: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+                defer if (gpa_instance.deinit() != 0) {
                     @panic("internal test runner memory leak");
                 };
                 const gpa = gpa_instance.allocator();
@@ -219,9 +249,8 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                     .environ = init.environ,
                 });
                 defer io_instance.deinit();
-                const io = io_instance.io();
 
-                const mode: fuzz_abi.LimitKind = @enumFromInt(try server.receiveBody_u8());
+                const mode: fuzz_abi.LimitKind = @fromBackingInt(@intCast(try server.receiveBody_u8()));
                 const amount_or_instance = try server.receiveBody_u64();
                 const main_instance = mode == .iterations or amount_or_instance == 0;
 
@@ -242,14 +271,9 @@ fn mainServer(init: std.process.Init.Minimal) !void {
                     .indexes = test_indexes,
                     .server = &server,
                     .gpa = gpa,
-                    .io = io,
+                    .threaded_io = &io_instance,
                     .input_poller = undefined,
-                    .test_io_options = .{
-                        .argv0 = .init(init.args),
-                        .environ = init.environ,
-                    },
                 };
-                testing.environ = init.environ;
 
                 {
                     var large_name_buf: std.ArrayList(u8) = .empty;
@@ -288,7 +312,7 @@ fn mainServer(init: std.process.Init.Minimal) !void {
             },
 
             else => {
-                std.debug.print("unsupported message: {x}\n", .{@intFromEnum(hdr.tag)});
+                std.debug.print("unsupported message: {x}\n", .{@backingInt(hdr.tag)});
                 std.process.exit(1);
             },
         }
@@ -312,14 +336,17 @@ fn mainTerminal(init: std.process.Init.Minimal) void {
 
     var leaks: usize = 0;
     for (test_fn_list, 0..) |test_fn, i| {
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{
+            .canary = 0xc3a701ba,
+            .check_write_after_free = true,
+        });
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
         });
         defer {
             testing.io_instance.deinit();
-            if (testing.allocator_instance.deinit() == .leak) leaks += 1;
+            if (testing.allocator_instance.deinit() != 0) leaks += 1;
         }
         testing.log_level = .warn;
         testing.environ = init.environ;
@@ -387,10 +414,10 @@ pub fn log(
     args: anytype,
 ) void {
     @disableInstrumentation();
-    if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
+    if (@backingInt(message_level) <= @backingInt(std.log.Level.err)) {
         log_err_count +|= 1;
     }
-    if (@intFromEnum(message_level) <= @intFromEnum(testing.log_level)) {
+    if (@backingInt(message_level) <= @backingInt(testing.log_level)) {
         std.debug.print(
             "[" ++ @tagName(scope) ++ "] (" ++ @tagName(message_level) ++ "): " ++ format ++ "\n",
             args,
@@ -413,6 +440,7 @@ pub fn mainSimple() anyerror!void {
         else => false,
     };
 
+    testing.allocator_instance = .init(std.heap.page_allocator, .{});
     testing.io_instance = .init(testing.allocator, .{});
 
     var passed: u64 = 0;
@@ -457,10 +485,8 @@ var fuzz_runner: if (builtin.fuzz) struct {
     indexes: []u32,
     server: *std.zig.Server,
     gpa: std.mem.Allocator,
-    io: Io,
+    threaded_io: *Io.Threaded,
     input_poller: Io.Future(Io.Cancelable!void),
-    /// What `std.testing.io` is built with for each run, as `run_test` does.
-    test_io_options: Io.Threaded.InitOptions,
 
     comptime {
         assert(builtin.fuzz); // `fuzz_runner` was analyzed in non-fuzzing compilation
@@ -473,15 +499,18 @@ var fuzz_runner: if (builtin.fuzz) struct {
             error.WriteFailed => panic("failed to write to stdout: {t}", .{stdout_writer.err.?}),
         };
 
-        testing.allocator_instance = .{};
-        defer if (testing.allocator_instance.deinit() == .leak) std.process.exit(1);
-        // Every input of this run happens inside this call. The Io lives on
-        // the runner's allocator, not `testing.allocator`, whose state the
-        // fuzz loop replaces for each input: an Io that outlives an input
-        // must not have its allocator swapped under it.
-        testing.io_instance = .init(fuzz_runner.gpa, fuzz_runner.test_io_options);
-        defer testing.io_instance.deinit();
+        testing.allocator_instance = .init(std.heap.page_allocator, .{
+            .canary = 0xc3a701ba,
+            .check_write_after_free = true,
+        });
+        defer if (testing.allocator_instance.deinit() != 0) std.process.exit(1);
         is_fuzz_test = false;
+
+        testing.io_instance = .init(testing.allocator, .{
+            .argv0 = fuzz_runner.threaded_io.argv0,
+            .environ = fuzz_runner.threaded_io.environ.process_environ,
+        });
+        defer testing.io_instance.deinit();
 
         builtin.test_functions[fuzz_runner.indexes[i]].func() catch |err| switch (err) {
             error.SkipZigTest => return,
@@ -513,7 +542,8 @@ var fuzz_runner: if (builtin.fuzz) struct {
 
     export fn runner_start_input_poller() void {
         @disableInstrumentation();
-        const future = fuzz_runner.io.concurrent(inputPoller, .{}) catch |e| switch (e) {
+        const io = fuzz_runner.threaded_io.io();
+        const future = io.concurrent(inputPoller, .{}) catch |e| switch (e) {
             error.ConcurrencyUnavailable => @panic("failed to spawn concurrent fuzz input poller"),
         };
         fuzz_runner.input_poller = future;
@@ -521,23 +551,26 @@ var fuzz_runner: if (builtin.fuzz) struct {
 
     export fn runner_stop_input_poller() void {
         @disableInstrumentation();
-        assert(fuzz_runner.input_poller.cancel(fuzz_runner.io) == error.Canceled);
+        const io = fuzz_runner.threaded_io.io();
+        assert(fuzz_runner.input_poller.cancel(io) == error.Canceled);
     }
 
     export fn runner_futex_wait(ptr: *const u32, expected: u32) bool {
         @disableInstrumentation();
-        return fuzz_runner.io.futexWait(u32, ptr, expected) == error.Canceled;
+        const io = fuzz_runner.threaded_io.io();
+        return io.futexWait(u32, ptr, expected) == error.Canceled;
     }
 
     export fn runner_futex_wake(ptr: *const u32, waiters: u32) void {
         @disableInstrumentation();
-        fuzz_runner.io.futexWake(u32, ptr, waiters);
+        const io = fuzz_runner.threaded_io.io();
+        io.futexWake(u32, ptr, waiters);
     }
 
     fn inputPoller() Io.Cancelable!void {
         @disableInstrumentation();
         switch (inputPollerInner()) {
-            error.Canceled => return error.Canceled,
+            error.Canceled => |e| return e,
             error.ReadFailed => {
                 if (stdin_reader.err.? == error.Canceled) return error.Canceled;
                 panic("failed to read from stdin: {t}", .{stdin_reader.err.?});
@@ -554,7 +587,7 @@ var fuzz_runner: if (builtin.fuzz) struct {
         while (true) {
             const hdr = try server.receiveMessage();
             if (hdr.tag != .new_fuzz_input) {
-                panic("unexpected message: {x}\n", .{@intFromEnum(hdr.tag)});
+                panic("unexpected message: {x}\n", .{@backingInt(hdr.tag)});
             }
             const test_i = try server.receiveBody_u32();
             const input_len = hdr.bytes_len - 4;
@@ -603,8 +636,11 @@ pub fn fuzz(
 
         fn test_one() callconv(.c) bool {
             @disableInstrumentation();
-            testing.allocator_instance = .{};
-            defer if (testing.allocator_instance.deinit() == .leak) std.process.exit(1);
+            testing.allocator_instance = .init(std.heap.page_allocator, .{
+                .canary = 0xcacce5e0,
+                .check_write_after_free = true,
+            });
+            defer if (testing.allocator_instance.deinit() != 0) std.process.exit(1);
             log_err_count = 0;
             testOne(ctx, @constCast(&testing.Smith{ .in = null })) catch |err| switch (err) {
                 error.SkipZigTest => return true,
@@ -631,7 +667,6 @@ pub fn fuzz(
     if (builtin.fuzz) {
         // Preserve the calling test's allocator state
         const prev_allocator_state = testing.allocator_instance;
-        testing.allocator_instance = .{};
         defer testing.allocator_instance = prev_allocator_state;
 
         global.ctx = context;

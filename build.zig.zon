@@ -4,7 +4,7 @@
     // Tied to .name: `zig build` generated it when the package became gcp.
     // Never change it; forks regenerate it.
     .fingerprint = 0xac0c4def50e03e1b,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "README.md", "CHANGELOG.md" },
 }

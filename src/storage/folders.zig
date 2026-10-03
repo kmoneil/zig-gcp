@@ -639,7 +639,7 @@ test "refused before sending: the paths production takes that nothing can addres
     try testing.expectError(error.InvalidFolderName, b.folder("../").delete(.{}));
     try testing.expectError(error.InvalidFolderName, b.folder("a/./b/").create(.{}));
     try testing.expectError(error.InvalidFolderName, b.folder("a//b/").get());
-    try testing.expectError(error.InvalidFolderName, b.folder("s" ** 512 ++ "/").create(.{}));
+    try testing.expectError(error.InvalidFolderName, b.folder(test_util.repeat("s", 512) ++ "/").create(.{}));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "512 bytes") != null);
     try testing.expectError(error.InvalidArgument, b.listFolders(.{ .prefix = "a" }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "ends with '/'") != null);
@@ -957,7 +957,7 @@ fn drawPath(g: *test_util.ByteGen, arena: Allocator) ![]const u8 {
     const w = &out.writer;
     const depth = g.intRange(usize, 1, 52);
     for (0..depth) |_| {
-        const segment = g.pick([]const u8, &.{ "a", "b0", "caf\xc3\xa9", "...", ".", "..", "", "s" ** 300, "x\ry", "\xff" });
+        const segment = g.pick([]const u8, &.{ "a", "b0", "caf\xc3\xa9", "...", ".", "..", "", test_util.repeat("s", 300), "x\ry", "\xff" });
         w.writeAll(segment) catch return error.OutOfMemory;
         w.writeByte('/') catch return error.OutOfMemory;
     }
@@ -1017,7 +1017,7 @@ fn pathsProperty(_: void, bytes: []const u8) !void {
 // about 2.2 ms on a Mac, so it runs in the nightly heavy-storage job, not
 // the storage one.
 test "heavy property folder paths: whatever the checks accept round-trips through production's rules" {
-    try test_util.fuzzBytes({}, pathsProperty, .{ .corpus = &.{ "", "\x00" ** 32, "\x07\x01\x02\x03" ** 16, "\xff" ** 64 } });
+    try test_util.fuzzBytes({}, pathsProperty, .{ .corpus = &.{ "", test_util.repeat("\x00", 32), test_util.repeat("\x07\x01\x02\x03", 16), test_util.repeat("\xff", 64) } });
 }
 
 fn everyCall(gpa: Allocator) !void {
@@ -1057,5 +1057,5 @@ fn everyCall(gpa: Allocator) !void {
 }
 
 test "folders: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, everyCall, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, everyCall, .{});
 }

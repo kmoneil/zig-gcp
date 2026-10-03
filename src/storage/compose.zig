@@ -443,7 +443,7 @@ fn composeEverything(gpa: Allocator) !void {
 }
 
 test "composeFrom: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, composeEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, composeEverything, .{});
 }
 
 // Properties. Each states a rule of the module comment independently of

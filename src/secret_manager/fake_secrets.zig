@@ -208,10 +208,10 @@ pub const FakeSecrets = struct {
             return fail(arena, 501, "UNIMPLEMENTED", "fake: listing secrets is not modelled");
         }
         const id = target.secret_id.?;
-        const key = try std.fmt.allocPrint(arena, "{s}|{s}", .{ target.location orelse "", id });
+        const key = try arena.print("{s}|{s}", .{ target.location orelse "", id });
         const s = self.secrets.get(key) orelse {
             const name = try self.secretName(arena, target.location, id);
-            return fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "Secret [{s}] not found.", .{name}));
+            return fail(arena, 404, "NOT_FOUND", try arena.print("Secret [{s}] not found.", .{name}));
         };
         if (target.versions) {
             return self.version(s, target, method, body, arena);
@@ -230,10 +230,10 @@ pub const FakeSecrets = struct {
 
     fn create(self: *FakeSecrets, target: Target, body: []const u8, arena: Allocator) Allocator.Error!Reply {
         const id = target.query_secret_id orelse return fail(arena, 400, "INVALID_ARGUMENT", "Secret ID must be provided.");
-        const key = try std.fmt.allocPrint(arena, "{s}|{s}", .{ target.location orelse "", id });
+        const key = try arena.print("{s}|{s}", .{ target.location orelse "", id });
         const name = try self.secretName(arena, target.location, id);
         if (self.secrets.contains(key)) {
-            return fail(arena, 409, "ALREADY_EXISTS", try std.fmt.allocPrint(arena, "Secret [{s}] already exists.", .{name}));
+            return fail(arena, 409, "ALREADY_EXISTS", try arena.print("Secret [{s}] already exists.", .{name}));
         }
         const fields = switch (try parseBody(arena, body)) {
             .ok => |f| f,
@@ -334,7 +334,7 @@ pub const FakeSecrets = struct {
                     arena,
                     400,
                     "INVALID_ARGUMENT",
-                    try std.fmt.allocPrint(arena, "Field '{s}' is immutable and cannot be updated.", .{field}),
+                    try arena.print("Field '{s}' is immutable and cannot be updated.", .{field}),
                 ),
                 .replication => {
                     const current = s.replication orelse return fail(arena, 400, "INVALID_ARGUMENT", "Field mask paths starting with \"replication\" are not supported in updates of regional secret.");
@@ -413,14 +413,13 @@ pub const FakeSecrets = struct {
         var records: std.ArrayListUnmanaged(KeyVersionRec) = .empty;
         for (try self.keysOf(arena, s)) |entry| {
             if (self.key_states.get(entry.key)) |state| return switch (state) {
-                .missing, .ungranted => permissionDenied(arena, try std.fmt.allocPrint(arena, "{s}/cryptoKeyVersions/1", .{entry.key})),
-                .disabled => fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(
-                    arena,
+                .missing, .ungranted => permissionDenied(arena, try arena.print("{s}/cryptoKeyVersions/1", .{entry.key})),
+                .disabled => fail(arena, 400, "FAILED_PRECONDITION", try arena.print(
                     "Failed precondition on Cloud KMS resource []. KMS error message: [{s}/cryptoKeyVersions/1 is not enabled, current state is: DISABLED.]",
                     .{entry.key},
                 )),
             };
-            try records.append(arena, .{ .location = entry.location, .name = try std.fmt.allocPrint(arena, "{s}/cryptoKeyVersions/1", .{entry.key}) });
+            try records.append(arena, .{ .location = entry.location, .name = try arena.print("{s}/cryptoKeyVersions/1", .{entry.key}) });
         }
         const a = self.store.allocator();
         const kept = try a.alloc(KeyVersionRec, records.items.len);
@@ -436,7 +435,7 @@ pub const FakeSecrets = struct {
             var n = s.versions.items.len;
             while (n > 0) : (n -= 1) try parts.append(arena, try self.versionJson(arena, s, n));
             const joined = try std.mem.join(arena, ",", parts.items);
-            return .{ .status = 200, .body = try std.fmt.allocPrint(arena, "{{\"versions\":[{s}],\"totalSize\":{d}}}", .{ joined, s.versions.items.len }) };
+            return .{ .status = 200, .body = try arena.print("{{\"versions\":[{s}],\"totalSize\":{d}}}", .{ joined, s.versions.items.len }) };
         };
         const as_number = std.fmt.parseInt(u64, ref, 10) catch null;
         if (target.verb) |verb| {
@@ -449,8 +448,7 @@ pub const FakeSecrets = struct {
                     const state = self.key_states.get(key) orelse continue;
                     return switch (state) {
                         .missing, .ungranted => permissionDenied(arena, kv.name),
-                        .disabled => fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(
-                            arena,
+                        .disabled => fail(arena, 400, "FAILED_PRECONDITION", try arena.print(
                             "Failed precondition on Cloud KMS resource [{s}]. KMS error message: [{s} is not enabled, current state is: DISABLED.]",
                             .{ kv.name, kv.name },
                         )),
@@ -460,15 +458,15 @@ pub const FakeSecrets = struct {
                     arena,
                     400,
                     "FAILED_PRECONDITION",
-                    try std.fmt.allocPrint(arena, "Secret Version [{s}/versions/{d}] is in {t} state.", .{ s.name, n, v.state }),
+                    try arena.print("Secret Version [{s}/versions/{d}] is in {t} state.", .{ s.name, n, v.state }),
                 );
                 var out: std.Io.Writer.Allocating = .init(arena);
                 var jw: Stringify = .{ .writer = &out.writer };
                 jw.write(.{
-                    .name = try std.fmt.allocPrint(arena, "{s}/versions/{d}", .{ s.name, n }),
+                    .name = try arena.print("{s}/versions/{d}", .{ s.name, n }),
                     .payload = .{
                         .data = try encodeBase64(arena, v.data),
-                        .dataCrc32c = try std.fmt.allocPrint(arena, "{d}", .{core.crc32c.hash(v.data)}),
+                        .dataCrc32c = try arena.print("{d}", .{core.crc32c.hash(v.data)}),
                     },
                 }) catch return error.OutOfMemory;
                 return .{ .status = 200, .body = try out.toOwnedSlice() };
@@ -478,13 +476,13 @@ pub const FakeSecrets = struct {
                 arena,
                 400,
                 "INVALID_ARGUMENT",
-                try std.fmt.allocPrint(arena, "The provided Secret Version ID [{s}/versions/{s}] does not match the expected format [projects/*/secrets/*/versions*]", .{ s.name, ref }),
+                try arena.print("The provided Secret Version ID [{s}/versions/{s}] does not match the expected format [projects/*/secrets/*/versions*]", .{ s.name, ref }),
             );
             if (n == 0 or n > s.versions.items.len) return fail(
                 arena,
                 404,
                 "NOT_FOUND",
-                try std.fmt.allocPrint(arena, "Secret Version [{s}/versions/{d}] not found.", .{ s.name, n }),
+                try arena.print("Secret Version [{s}/versions/{d}] not found.", .{ s.name, n }),
             );
             const v = &s.versions.items[n - 1];
             const parsed = std.json.parseFromSliceLeaky(struct { etag: []const u8 = "" }, arena, if (body.len == 0) "{}" else body, .{ .ignore_unknown_fields = true }) catch return invalidArgument(arena);
@@ -525,7 +523,7 @@ pub const FakeSecrets = struct {
                 arena,
                 404,
                 "NOT_FOUND",
-                try std.fmt.allocPrint(arena, "Secret Version [{s}/versions/{d}] not found.", .{ s.name, n }),
+                try arena.print("Secret Version [{s}/versions/{d}] not found.", .{ s.name, n }),
             ) };
             return .{ .ok = n };
         } else |_| {}
@@ -534,7 +532,7 @@ pub const FakeSecrets = struct {
                 arena,
                 404,
                 "NOT_FOUND",
-                try std.fmt.allocPrint(arena, "Secret Version [{s}/versions/latest] not found.", .{s.name}),
+                try arena.print("Secret Version [{s}/versions/latest] not found.", .{s.name}),
             ) };
             return .{ .ok = s.versions.items.len };
         }
@@ -542,7 +540,7 @@ pub const FakeSecrets = struct {
             arena,
             404,
             "NOT_FOUND",
-            try std.fmt.allocPrint(arena, "Secret [{s}] has no alias [{s}]", .{ s.name, ref }),
+            try arena.print("Secret [{s}] has no alias [{s}]", .{ s.name, ref }),
         ) };
         return .{ .ok = n };
     }
@@ -607,19 +605,17 @@ pub const FakeSecrets = struct {
         if (draft.period_sent) |p| {
             if (p < 3600) return try fail(arena, 400, "INVALID_ARGUMENT", "Rotation period cannot be shorter than [1h].");
         }
-        if (draft.labels.count() > 64) return try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-            arena,
+        if (draft.labels.count() > 64) return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
             "Invalid field \"labels\"; at most 64 entries allowed but found {d}",
             .{draft.labels.count()},
         ));
         for (draft.labels.keys(), draft.labels.values()) |k, v| {
-            if (labelProblem(k, true)) |p| return try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid field \"labels\"; key \"{s}\" {s}", .{ k, p }));
-            if (labelProblem(v, false)) |p| return try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Invalid field \"labels.{s}\"; value \"{s}\" {s}", .{ k, v, p }));
+            if (labelProblem(k, true)) |p| return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Invalid field \"labels\"; key \"{s}\" {s}", .{ k, p }));
+            if (labelProblem(v, false)) |p| return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print("Invalid field \"labels.{s}\"; value \"{s}\" {s}", .{ k, v, p }));
         }
         var total: usize = 0;
         for (draft.annotations.keys(), draft.annotations.values()) |k, v| {
-            if (!annotationKey(k)) return try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-                arena,
+            if (!annotationKey(k)) return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
                 "[{s}] must follow pattern [a-z0-9A-Z]+([_\\.\\-]*[a-z0-9A-Z]+)*), be less than 64 characters, and must have a UTF encoding of less than 128 bytes",
                 .{k},
             ));
@@ -628,8 +624,7 @@ pub const FakeSecrets = struct {
         if (total > 16 * 1024) return try fail(arena, 400, "INVALID_ARGUMENT", "Annotation map must not exceed 16kib.");
         if (draft.aliases.count() > 50) return try fail(arena, 400, "INVALID_ARGUMENT", "No more than 50 aliases can be assgined to any given secret");
         for (draft.aliases.keys(), draft.aliases.values()) |k, v| {
-            if (!aliasName(k)) return try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-                arena,
+            if (!aliasName(k)) return try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
                 "[{s}] must follow pattern [a-zA-Z][a-Aa-Z0-9_-]+, be less than 64 characters and cannot be \"latest\" or \"NEW\"",
                 .{k},
             ));
@@ -846,16 +841,14 @@ pub const FakeSecrets = struct {
             };
         }
         for (out) |name| {
-            if (!fullTopicName(name)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-                arena,
+            if (!fullTopicName(name)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
                 "Failed to Publish to topic [{s}], got an error from Pub/Sub.",
                 .{name},
             )) };
             const state = self.topic_states.get(name) orelse continue;
             return .{ .refused = switch (state) {
-                .missing => try fail(arena, 404, "NOT_FOUND", try std.fmt.allocPrint(arena, "Topic [{s}] not found.", .{name})),
-                .unpublishable => try fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(
-                    arena,
+                .missing => try fail(arena, 404, "NOT_FOUND", try arena.print("Topic [{s}] not found.", .{name})),
+                .unpublishable => try fail(arena, 400, "FAILED_PRECONDITION", try arena.print(
                     "Permission 'pubsub.topics.publish' denied for service-{s}@gcp-sa-secretmanager.iam.gserviceaccount.com for pubsub topic: {s} or the topic doesn't exist. Grant the 'pubsub.topic.publish' permission (or 'roles/pubsub.publisher') on this topic to service-{s}@gcp-sa-secretmanager.iam.gserviceaccount.com.",
                     .{ self.project_number, name, self.project_number },
                 )),
@@ -873,8 +866,7 @@ pub const FakeSecrets = struct {
         if (value != .object) return .{ .refused = try invalidArgument(arena) };
         if (value.object.get("automatic")) |automatic| {
             const key = try cmekName(arena, automatic, "kmsKeyName") orelse return .{ .ok = .{ .automatic = null } };
-            if (!std.mem.eql(u8, keyLocation(key), "global")) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-                arena,
+            if (!std.mem.eql(u8, keyLocation(key), "global")) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
                 "Automatic replication policy can only be configured with Cloud KMS keys in location [global]. Requested: [{s}]",
                 .{key},
             )) };
@@ -895,16 +887,14 @@ pub const FakeSecrets = struct {
             replica.* = .{ .location = loc.string, .key = key };
             if (key) |k| {
                 keyed += 1;
-                if (!std.mem.eql(u8, keyLocation(k), loc.string)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-                    arena,
+                if (!std.mem.eql(u8, keyLocation(k), loc.string)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
                     "User-managed replica in location [{s}] can only be configured with Cloud KMS keys in location [{s}]. Requested: [{s}]",
                     .{ loc.string, loc.string, k },
                 )) };
             }
         }
         if (keyed != 0 and keyed != out.len) {
-            for (out) |r| if (r.key == null) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-                arena,
+            for (out) |r| if (r.key == null) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
                 "If a customer_managed_encryption is provided, it must be provided for all replicas. Missing configuration for [{s}].",
                 .{r.location},
             )) };
@@ -920,8 +910,7 @@ pub const FakeSecrets = struct {
         if (name != .string) return .{ .refused = try invalidArgument(arena) };
         if (name.string.len == 0) return .{ .ok = null };
         const key = name.string;
-        if (!std.mem.eql(u8, keyLocation(key), location)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-            arena,
+        if (!std.mem.eql(u8, keyLocation(key), location)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
             "Secret in location [{s}] can only be configured with Cloud KMS keys in location [{s}]. Requested: [{s}]",
             .{ location, location, key },
         )) };
@@ -971,12 +960,12 @@ pub const FakeSecrets = struct {
 
     fn etagMatches(self: *FakeSecrets, arena: Allocator, current: u64, sent: []const u8) Allocator.Error!bool {
         _ = self;
-        return std.mem.eql(u8, sent, try std.fmt.allocPrint(arena, "\"{x}\"", .{current}));
+        return std.mem.eql(u8, sent, try arena.print("\"{x}\"", .{current}));
     }
 
     fn secretName(self: *FakeSecrets, arena: Allocator, location: ?[]const u8, id: []const u8) Allocator.Error![]const u8 {
-        if (location) |loc| return std.fmt.allocPrint(arena, "projects/{s}/locations/{s}/secrets/{s}", .{ self.project_number, loc, id });
-        return std.fmt.allocPrint(arena, "projects/{s}/secrets/{s}", .{ self.project_number, id });
+        if (location) |loc| return arena.print("projects/{s}/locations/{s}/secrets/{s}", .{ self.project_number, loc, id });
+        return arena.print("projects/{s}/secrets/{s}", .{ self.project_number, id });
     }
 };
 
@@ -1012,7 +1001,7 @@ fn parseUrl(arena: Allocator, url: []const u8) !Target {
     var next = parts.next() orelse return error.NoRoute;
     if (std.mem.eql(u8, next, "locations")) {
         t.location = parts.next() orelse return error.NoRoute;
-        const want = try std.fmt.allocPrint(arena, "secretmanager.{s}.rep.googleapis.com", .{t.location.?});
+        const want = try arena.print("secretmanager.{s}.rep.googleapis.com", .{t.location.?});
         if (!std.mem.eql(u8, host, want)) return error.NoRoute;
         next = parts.next() orelse return error.NoRoute;
     } else if (!std.mem.eql(u8, host, "secretmanager.googleapis.com")) return error.NoRoute;
@@ -1111,8 +1100,7 @@ fn parseBody(arena: Allocator, body: []const u8) Allocator.Error!Parsed {
         } else if (eqlAny(k, &.{ "name", "createTime", "create_time", "tags", "secretType", "secret_type", "policyMember", "policy_member" })) {
             // Ignored on patch, or immutable: the mask decides.
         } else {
-            return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-                arena,
+            return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
                 "Invalid JSON payload received. Unknown name \"{s}\" at 'secret': Cannot find field.",
                 .{k},
             )) };
@@ -1192,8 +1180,7 @@ fn readRotation(arena: Allocator, value: std.json.Value, draft: *FakeSecrets.Dra
 const MapResult = union(enum) { ok: FakeSecrets.Map, refused: FakeSecrets.Reply };
 
 fn readMap(arena: Allocator, value: std.json.Value, field: []const u8) Allocator.Error!MapResult {
-    if (value != .object) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
-        arena,
+    if (value != .object) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try arena.print(
         "Invalid value at 'secret' (Map), Cannot bind a list to map for field '{s}'.",
         .{field},
     )) };
@@ -1327,8 +1314,7 @@ fn stale(arena: Allocator) Allocator.Error!FakeSecrets.Reply {
 }
 
 fn permissionDenied(arena: Allocator, resource: []const u8) Allocator.Error!FakeSecrets.Reply {
-    return fail(arena, 400, "FAILED_PRECONDITION", try std.fmt.allocPrint(
-        arena,
+    return fail(arena, 400, "FAILED_PRECONDITION", try arena.print(
         "Permission denied on Cloud KMS resource [{s}] (or it does not exist). Please grant cloudkms.cryptoKeyVersions.useToDecrypt and cloudkms.cryptoKeyVersions.useToEncrypt permissions (roles/cloudkms.cryptoKeyEncrypterDecrypter) to the Secret Manager service identity. See https://cloud.google.com/secret-manager/docs/cmek for more information.",
         .{resource},
     ));

@@ -153,7 +153,7 @@ fn transfer(
         logging.debug("parallel download of {s}: {d} bytes in {d} ranges of {d}", .{ object, size, plan.parts, plan.part_size });
         const crcs = try client.gpa.alloc(u32, plan.parts);
         defer client.gpa.free(crcs);
-        var written: std.DynamicBitSetUnmanaged = if (saved) |s|
+        var written: std.bit_set.Dynamic = if (saved) |s|
             try checkpoint.bitsFromHex(client.gpa, s.written, plan.parts)
         else
             try .initEmpty(client.gpa, plan.parts);
@@ -291,7 +291,7 @@ fn rereadWritten(
     client: *Client,
     file: std.Io.File,
     plan: mp.Plan,
-    written: *const std.DynamicBitSetUnmanaged,
+    written: *const std.bit_set.Dynamic,
     crcs: []u32,
 ) Error!void {
     const buf = try client.gpa.alloc(u8, file_buffer_len);
@@ -392,7 +392,7 @@ const Run = struct {
     checkpoint: ?checkpoint.Checkpoint,
     /// Which ranges the destination holds: the resumed ones up front, and
     /// each fetched range as its save records it.
-    written: *std.DynamicBitSetUnmanaged,
+    written: *std.bit_set.Dynamic,
     /// Scratch for the state's hex form, `digitsFor(parts)` long.
     hex: []u8,
     mutex: std.Io.Mutex = .init,
@@ -760,8 +760,8 @@ fn expectDiag(diag: *const Diagnostics, says: []const u8) !void {
 
 /// The metadata a JSON read answers for `data`, as Cloud Storage words it.
 fn metadataJson(arena: Allocator, size: u64, generation: u64, crc: ?u32, extra: []const u8) ![]const u8 {
-    const hash: []const u8 = if (crc) |c| try std.fmt.allocPrint(arena, ",\"crc32c\":\"{s}\"", .{&core.crc32c.toBase64(c)}) else "";
-    return std.fmt.allocPrint(arena, "{{\"name\":\"dir/o\",\"bucket\":\"b\",\"size\":\"{d}\",\"generation\":\"{d}\"{s}{s}}}", .{ size, generation, hash, extra });
+    const hash: []const u8 = if (crc) |c| try arena.print(",\"crc32c\":\"{s}\"", .{&core.crc32c.toBase64(c)}) else "";
+    return arena.print("{{\"name\":\"dir/o\",\"bucket\":\"b\",\"size\":\"{d}\",\"generation\":\"{d}\"{s}{s}}}", .{ size, generation, hash, extra });
 }
 
 test "downloadParallel: the metadata, then every range pinned to its generation, at its offset" {
@@ -1176,7 +1176,7 @@ test "downloadParallel: a worker whose request meets Canceled stops the download
 }
 
 test "downloadParallel: a file opened for appending is caught by its length" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     var s: Setup = undefined;
     try s.init(testing.io, .{});
     defer s.deinit();
@@ -1193,7 +1193,7 @@ test "downloadParallel: a file opened for appending is caught by its length" {
     const outcome = s.object("o").downloadParallel(.{ .file = file }, .{ .part_size = 4096, .concurrency = 2 });
     if (outcome) |_| {
         // A system that honors the offset: the bytes are where they belong.
-        try testing.expect(builtin.os.tag != .linux);
+        try testing.expect(builtin.target.os.tag != .linux);
         const got = try readBack(&tmp);
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(u8, &data, got);
@@ -1245,7 +1245,7 @@ test "downloadParallel: a file that refuses a write fails with its error, and a 
 }
 
 test "downloadParallel: a pipe is refused when it is sized, before any range" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var s: Setup = undefined;
     try s.init(testing.io, .{});
     defer s.deinit();
@@ -1264,7 +1264,7 @@ test "downloadParallel: a gzip-stored object on the fake, into memory and into a
     var s: Setup = undefined;
     try s.init(testing.io, .{});
     defer s.deinit();
-    const decompressed = "hello, " ** 300;
+    const decompressed = test_util.repeat("hello, ", 300);
     try s.fake.putGzipped("page.html", decompressed);
     var out: [decompressed.len + 10]u8 = undefined;
     const result = try s.object("page.html").downloadParallel(.{ .buffer = &out }, .{ .part_size = 1024 });
@@ -1278,7 +1278,7 @@ test "downloadParallel: a gzip-stored object on the fake, into memory and into a
     // the decompressed bytes.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try junkFile(&tmp, "x" ** 5000);
+    const file = try junkFile(&tmp, test_util.repeat("x", 5000));
     defer file.close(testing.io);
     const into_file = try s.object("page.html").downloadParallel(.{ .file = file }, .{ .part_size = 1024 });
     try testing.expectEqual(decompressed.len, into_file.bytes_written);
@@ -1976,7 +1976,7 @@ fn downloadEverything(gpa: Allocator) !void {
 }
 
 test "downloadParallel: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, downloadEverything, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, downloadEverything, .{});
 }
 
 /// Draws each request's fate from fuzz bytes, under the fake's lock: mostly
@@ -2462,7 +2462,7 @@ fn downloadWithCheckpoint(gpa: Allocator) !void {
 }
 
 test "downloadParallel with a checkpoint: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, downloadWithCheckpoint, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, downloadWithCheckpoint, .{});
 }
 
 test "Run: ranges are handed out once each, never a held one, and none after a failure; the first failure is kept" {
@@ -2470,7 +2470,7 @@ test "Run: ranges are handed out once each, never a held one, and none after a f
     try s.init(testing.io, .{});
     defer s.deinit();
     var crcs: [5]u32 = undefined;
-    var written: std.DynamicBitSetUnmanaged = try .initEmpty(testing.allocator, 5);
+    var written: std.bit_set.Dynamic = try .initEmpty(testing.allocator, 5);
     defer written.deinit(testing.allocator);
     var hex: [2]u8 = undefined;
     var run: Run = .{

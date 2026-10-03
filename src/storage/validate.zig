@@ -162,10 +162,10 @@ test "object names: the documented rules, nothing more" {
     try testing.expect(isObjectName("caf\xc3\xa9"));
     try testing.expect(isObjectName("..."));
     try testing.expect(isObjectName("./relative"));
-    try testing.expect(isObjectName("a" ** max_object_name_len));
+    try testing.expect(isObjectName(test_util.repeat("a", max_object_name_len)));
 
     try testing.expect(!isObjectName(""));
-    try testing.expect(!isObjectName("a" ** (max_object_name_len + 1)));
+    try testing.expect(!isObjectName(test_util.repeat("a", max_object_name_len + 1)));
     try testing.expect(!isObjectName("."));
     try testing.expect(!isObjectName(".."));
     try testing.expect(!isObjectName("line\nbreak"));
@@ -230,8 +230,8 @@ test "folder paths: the measured limits, and the names the server takes that no 
     try testing.expect(folderPathProblem("a/b/c/") == null);
     try testing.expect(folderPathProblem("caf\xc3\xa9/") == null);
     try testing.expect(folderPathProblem("...a/") == null);
-    try testing.expect(folderPathProblem("s" ** 511 ++ "/") == null);
-    const deep50 = "d/" ** 50;
+    try testing.expect(folderPathProblem(test_util.repeat("s", 511) ++ "/") == null);
+    const deep50 = test_util.repeat("d/", 50);
     try testing.expect(folderPathProblem(deep50) == null);
 
     try testing.expect(folderPathProblem("") != null);
@@ -242,7 +242,7 @@ test "folder paths: the measured limits, and the names the server takes that no 
     try testing.expect(folderPathProblem("a/../") != null);
     try testing.expect(folderPathProblem("/a/") != null);
     try testing.expect(folderPathProblem("a//b/") != null);
-    try testing.expect(folderPathProblem("s" ** 512 ++ "/") != null);
+    try testing.expect(folderPathProblem(test_util.repeat("s", 512) ++ "/") != null);
     try testing.expect(folderPathProblem(deep50 ++ "x/") != null);
     try testing.expect(folderPathProblem("a\rb/") != null);
     try testing.expect(folderPathProblem("a\nb/") != null);
@@ -252,13 +252,13 @@ test "folder paths: the measured limits, and the names the server takes that no 
 test "managed folder paths: the measured limits, and the shared dot-segment stance" {
     try testing.expect(managedFolderPathProblem("m1/") == null);
     try testing.expect(managedFolderPathProblem("teams/data/") == null);
-    try testing.expect(managedFolderPathProblem("m" ** 1023 ++ "/") == null);
-    const deep15 = "d/" ** 15;
+    try testing.expect(managedFolderPathProblem(test_util.repeat("m", 1023) ++ "/") == null);
+    const deep15 = test_util.repeat("d/", 15);
     try testing.expect(managedFolderPathProblem(deep15) == null);
     try testing.expect(managedFolderPathProblem("not-acme/.well-known/acme-challenge/") == null);
 
     try testing.expect(managedFolderPathProblem("") != null);
-    try testing.expect(managedFolderPathProblem("m" ** 1024 ++ "/") != null);
+    try testing.expect(managedFolderPathProblem(test_util.repeat("m", 1024) ++ "/") != null);
     try testing.expect(managedFolderPathProblem(deep15 ++ "x/") != null);
     try testing.expect(managedFolderPathProblem("a\rb/") != null);
     try testing.expect(managedFolderPathProblem("a\nb/") != null);

@@ -372,11 +372,9 @@ pub fn finish(
     // that start no member are ignored, as `gzip -d` ignores them.
     var decompress_error: ?anyerror = null;
     while (true) {
-        // core's copy of std's decompressor: std's panics on stored bytes
-        // that end partway through a code.
         var inflate: core.flate.Decompress = .init(&pull.interface, .gzip, window);
         // std reads each member's trailer, its CRC-32 and length, and checks
-        // neither (Zig 0.16.0), so they are checked here, as `gzip -d` does:
+        // neither (Zig 0.17.0), so they are checked here, as `gzip -d` does:
         // with verification off, they are all that stands between a flipped
         // byte and the caller.
         var member_count: core.CountingWriter = .init(&hashing.writer);
@@ -525,7 +523,7 @@ test "gzip: an object stored gzip-compressed comes as stored, is verified, and i
     var s: Setup = undefined;
     try s.init(.{});
     defer s.deinit();
-    const plain = "a line of text that repeats\n" ** 200;
+    const plain = test_util.repeat("a line of text that repeats\n", 200);
     try s.fake.putGzipped("page.txt", plain);
     const stored = s.fake.object("page.txt").?.bytes;
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -581,7 +579,7 @@ test "gzip: a transport that shows the head only once the call returns still get
         .retry = .{ .max_attempts = 4, .initial_backoff_ms = 1, .max_backoff_ms = 2 },
     });
     defer client.deinit();
-    const small = "a small page of text\n" ** 100;
+    const small = test_util.repeat("a small page of text\n", 100);
     const big = try randomBytes(testing.allocator, 700 * 1024, 5);
     defer testing.allocator.free(big);
     try s.fake.putGzipped("small.txt", small);
@@ -611,7 +609,7 @@ test "gzip: decompress = false writes the stored bytes, verified" {
     var s: Setup = undefined;
     try s.init(.{});
     defer s.deinit();
-    try s.fake.putGzipped("page.txt", "kept compressed\n" ** 100);
+    try s.fake.putGzipped("page.txt", test_util.repeat("kept compressed\n", 100));
     const stored = s.fake.object("page.txt").?.bytes;
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -670,7 +668,7 @@ test "gzip: cut connections resume at a stored offset, and the decompressor neve
 }
 
 test "gzip: a stored byte flipped on the way is caught, with checking on or off" {
-    const plain = "the object's text, compressed\n" ** 50;
+    const plain = test_util.repeat("the object's text, compressed\n", 50);
     // On, the stored bytes miss the stored checksum; off, gzip's own
     // checksum of what it decompressed misses, and the bytes do not pass.
     for ([_]struct { verify: bool, want: Error }{
@@ -689,12 +687,12 @@ test "gzip: a stored byte flipped on the way is caught, with checking on or off"
     }
 }
 
-test "gzip: stored bytes that end partway through a code are DecompressionFailed, where std's decompressor panicked" {
+test "gzip: stored bytes that end partway through a code are DecompressionFailed, where Zig 0.16's decompressor panicked" {
     var s: Setup = undefined;
     try s.init(.{});
     defer s.deinit();
-    // Found by the nightly fuzzing on 2026-09-26: std's decompressor tossed
-    // a code past the end of these bytes, then underflowed.
+    // Found by the nightly fuzzing on 2026-09-26: Zig 0.16's decompressor
+    // tossed a code past the end of these bytes, then underflowed.
     try s.fake.putGzip("cut.gz", "\x1f\x8b\x08\x00\x00\x00\x00\xb5\x33\x8e\x2d\x00\x02\x29\xbd\xfb\x54\x0f\xcc", "unused");
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -753,7 +751,7 @@ test "gzip: a range decompresses nothing, so it is refused; decompress = false s
     var s: Setup = undefined;
     try s.init(.{});
     defer s.deinit();
-    try s.fake.putGzipped("page.txt", "ranged text\n" ** 100);
+    try s.fake.putGzipped("page.txt", test_util.repeat("ranged text\n", 100));
     const stored = s.fake.object("page.txt").?.bytes;
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -871,7 +869,7 @@ test "gzip: every allocation failure is OutOfMemory, and nothing leaks" {
     defer testing.allocator.free(plain);
     const stored = try test_util.gzipAlloc(testing.allocator, plain, .fastest);
     defer testing.allocator.free(stored);
-    try testing.checkAllAllocationFailures(testing.allocator, downloadGzip, .{ stored, plain });
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, downloadGzip, .{ stored, plain });
 }
 
 /// Any bytes, compressible or not, gzipped at any level, served under drawn
@@ -961,7 +959,7 @@ test "heavy property gzip download: any stored bytes decompress or fail with Dec
             // Two members.
             "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x4b\xcb\x2c\x2a\x2e\x51\x00\x00\xfc\x7a\xf1\x1c\x06\x00\x00\x00\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\x4e\x4d\xce\xcf\x4b\xe1\x02\x00\x7e\xc0\x0f\x06\x07\x00\x00\x00",
             // The 2026-09-26 nightly: gzip that ends partway through a
-            // code, which std's decompressor panicked on.
+            // code, which Zig 0.16's decompressor panicked on.
             "\x1f\x8b\x08\x00\x00\x00\x00\xb5\x33\x8e\x2d\x00\x02\x29\xbd\xfb\x54\x0f\xcc",
         },
     });

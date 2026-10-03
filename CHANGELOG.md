@@ -4,6 +4,37 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.31.0 (unreleased)
+
+- **Breaking:** Zig 0.17.0 is required, as `minimum_zig_version` says;
+  the package no longer builds with 0.16. Zig 0.17 removed array
+  multiplication and changed `@typeInfo`, `std.Io.net.HostName` and
+  several std names this code used. No public API changed for it but
+  `core.Condition`, below.
+- core: **Breaking:** `core.Condition` is gone; use `std.Io.Condition`.
+  It was std's with one fix, for a canceled wait that took another
+  waiter's pending signal and dropped the cancel, after which the task
+  could never be canceled. Zig 0.17's has the same fix, and pubsub's
+  Subscriber and Publisher wait on it now.
+- core: `core.flate.Decompress` is `std.compress.flate.Decompress` again,
+  under the same names. The copy fixed a panic on input that ends partway
+  through a code, which Zig 0.17 fixes the same way; the tests that held
+  the copy to it hold std to it now.
+- core: `core.testing.repeat(s, n)` stands in for `s ** n`, and
+  `core.testing.no_grow_allocator` is `std.testing.allocator` except that
+  no block grows in place, as `std.testing.checkAllAllocationFailures`
+  needs on Zig 0.17: its `SafeAllocator` grows a block in place or not
+  depending on earlier runs, which the sweep reports as
+  `NondeterministicMemoryUsage`.
+- Every test build runs under `tools/test_runner.zig`, Zig 0.17's test
+  runner with `std.debug`'s waits made uncancelable. On macOS, the stack
+  trace `SafeAllocator` records for each allocation can take a task's
+  pending cancel and drop it, and the Subscriber tests hung on that. A
+  program on macOS whose allocator records stack traces can lose a cancel
+  the same way; `docs/zig-std-workarounds.md` says how to prevent it.
+- auth, pubsub, secret_manager and storage: unchanged but for the Zig
+  version.
+
 ## 0.30.0 (2026-10-02)
 
 - storage: folders, for buckets created with

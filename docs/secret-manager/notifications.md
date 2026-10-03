@@ -15,7 +15,7 @@ and answers its address at once:
 ```zig
 var agent = try secrets.serviceAgent();
 defer agent.deinit();
-const member = try std.fmt.allocPrint(arena, "serviceAccount:{s}", .{agent.value});
+const member = try arena.print("serviceAccount:{s}", .{agent.value});
 var policy = try ps.topic("rotations").addIamBinding("roles/pubsub.publisher", member);
 policy.deinit();
 

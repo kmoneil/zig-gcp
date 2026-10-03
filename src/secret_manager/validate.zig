@@ -185,10 +185,10 @@ test "secret ids" {
     try testing.expect(isSecretId("db-password"));
     try testing.expect(isSecretId("DB_PASSWORD_2"));
     try testing.expect(isSecretId("a"));
-    try testing.expect(isSecretId("x" ** 255));
+    try testing.expect(isSecretId(test_util.repeat("x", 255)));
     // Production refuses each of these.
     try testing.expect(!isSecretId(""));
-    try testing.expect(!isSecretId("x" ** 256));
+    try testing.expect(!isSecretId(test_util.repeat("x", 256)));
     try testing.expect(!isSecretId("with.dot"));
     try testing.expect(!isSecretId("with space"));
     try testing.expect(!isSecretId("with/slash"));
@@ -202,7 +202,7 @@ test "aliases are ids that are neither a number nor latest" {
     try testing.expect(isAlias("prod-2"));
     try testing.expect(isAlias("v2"));
     try testing.expect(isAlias("a-b_C9"));
-    try testing.expect(isAlias("a" ** 63));
+    try testing.expect(isAlias(test_util.repeat("a", 63)));
     // Production takes these, refusing only the two exact words.
     try testing.expect(isAlias("Latest"));
     try testing.expect(isAlias("LATEST"));
@@ -211,7 +211,7 @@ test "aliases are ids that are neither a number nor latest" {
     // And refuses each of these.
     try testing.expect(!isAlias("latest"));
     try testing.expect(!isAlias("NEW"));
-    try testing.expect(!isAlias("a" ** 64));
+    try testing.expect(!isAlias(test_util.repeat("a", 64)));
     try testing.expect(!isAlias("1a"));
     try testing.expect(!isAlias("_a"));
     try testing.expect(!isAlias("-a"));
@@ -224,17 +224,17 @@ test "aliases are ids that are neither a number nor latest" {
 
 test "label keys and values, as production judged them" {
     // Taken by production on 2026-10-02.
-    for ([_][]const u8{ "a", "a" ** 63, "\xc3\xa9", "\xe3\x82\xa2" ** 42, "team", "k-1_x" }) |key| {
+    for ([_][]const u8{ "a", test_util.repeat("a", 63), "\xc3\xa9", test_util.repeat("\xe3\x82\xa2", 42), "team", "k-1_x" }) |key| {
         try testing.expectEqual(null, labelKeyProblem(key));
     }
-    for ([_][]const u8{ "", "v", "a" ** 63, "1abc", "_x", "-x" }) |value| {
+    for ([_][]const u8{ "", "v", test_util.repeat("a", 63), "1abc", "_x", "-x" }) |value| {
         try testing.expectEqual(null, labelValueProblem(value));
     }
     // Refused by production.
-    for ([_][]const u8{ "", "a" ** 64, "Abc", "1abc", "_abc", "a.b", "\xe3\x82\xa2" ** 43, "a b", "caf\xff" }) |key| {
+    for ([_][]const u8{ "", test_util.repeat("a", 64), "Abc", "1abc", "_abc", "a.b", test_util.repeat("\xe3\x82\xa2", 43), "a b", "caf\xff" }) |key| {
         try testing.expect(labelKeyProblem(key) != null);
     }
-    for ([_][]const u8{ "a" ** 64, "ABC", "a.b", "x/y" }) |value| {
+    for ([_][]const u8{ test_util.repeat("a", 64), "ABC", "a.b", "x/y" }) |value| {
         try testing.expect(labelValueProblem(value) != null);
     }
 }
@@ -271,10 +271,10 @@ test "Cloud KMS key names, and their location" {
 }
 
 test "annotation keys, as production judged them" {
-    for ([_][]const u8{ "a", "a" ** 63, "a" ** 64, "Owner", "a.b-c_d", "k1" }) |key| {
+    for ([_][]const u8{ "a", test_util.repeat("a", 63), test_util.repeat("a", 64), "Owner", "a.b-c_d", "k1" }) |key| {
         try testing.expect(isAnnotationKey(key));
     }
-    for ([_][]const u8{ "", "a" ** 65, "-a", "a.", "example.com/owner", "\xc3\xa9", "a b", "_a" }) |key| {
+    for ([_][]const u8{ "", test_util.repeat("a", 65), "-a", "a.", "example.com/owner", "\xc3\xa9", "a b", "_a" }) |key| {
         try testing.expect(!isAnnotationKey(key));
     }
 }
@@ -291,7 +291,7 @@ test "locations are host-name safe" {
     try testing.expect(!isLocation("-west3"));
     try testing.expect(!isLocation("west3-"));
     try testing.expect(!isLocation("3west"));
-    try testing.expect(!isLocation("a" ** 64));
+    try testing.expect(!isLocation(test_util.repeat("a", 64)));
     // The reason for the rule: neither of these may reach a host name.
     try testing.expect(!isLocation("evil.example.com"));
     try testing.expect(!isLocation("x\r\nHost: evil"));
@@ -334,7 +334,7 @@ test "fuzz ids, aliases and locations: exactly the safe ones are accepted" {
         "3",
         "europe-west3",
         "",
-        "x" ** 256,
+        test_util.repeat("x", 256),
         "with.dot",
         "x\r\nHost: evil",
         "caf\xc3\xa9",

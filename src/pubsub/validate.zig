@@ -408,8 +408,8 @@ test "publish limits: each at its boundary and one past it" {
     const long_key: [max_ordering_key_bytes + 1]u8 = @splat('o');
     try publish(&.{.{ .data = "x" }}, long_key[0..max_ordering_key_bytes], null);
     try expectRejected(&.{.{ .data = "x" }}, &long_key, "the ordering key has 1025 bytes");
-    try publish(&.{.{ .data = "x" }}, "é" ** 512, null);
-    try expectRejected(&.{.{ .data = "x" }}, "é" ** 513, "the ordering key has 1026 bytes");
+    try publish(&.{.{ .data = "x" }}, test_util.repeat("é", 512), null);
+    try expectRejected(&.{.{ .data = "x" }}, test_util.repeat("é", 513), "the ordering key has 1026 bytes");
 }
 
 test "publish rules: empty messages, duplicate keys, UTF-8" {
@@ -508,7 +508,7 @@ test "labels: the rules at their boundaries" {
         &.{},
         &.{.{ .key = "a", .value = "" }},
         &.{.{ .key = "team", .value = "zig-gcp_1" }},
-        &.{.{ .key = "k" ++ "x" ** 62, .value = "v" ** 63 }},
+        &.{.{ .key = "k" ++ test_util.repeat("x", 62), .value = test_util.repeat("v", 63) }},
         // International characters go to the server to judge.
         &.{.{ .key = "équipe", .value = "zürich" }},
         &.{.{ .key = "日本", .value = "東京" }},
@@ -521,8 +521,8 @@ test "labels: the rules at their boundaries" {
         .{ &.{.{ .key = "1team", .value = "v" }}, "starts with a lowercase letter" },
         .{ &.{.{ .key = "_team", .value = "v" }}, "starts with a lowercase letter" },
         .{ &.{.{ .key = "a b", .value = "v" }}, "byte 0x20" },
-        .{ &.{.{ .key = "k" ++ "x" ** 63, .value = "v" }}, "64 characters" },
-        .{ &.{.{ .key = "k", .value = "v" ** 64 }}, "64 characters" },
+        .{ &.{.{ .key = "k" ++ test_util.repeat("x", 63), .value = "v" }}, "64 characters" },
+        .{ &.{.{ .key = "k", .value = test_util.repeat("v", 64) }}, "64 characters" },
         .{ &.{.{ .key = "k", .value = "\xc0" }}, "not valid UTF-8" },
         .{ &.{ .{ .key = "k", .value = "1" }, .{ .key = "k", .value = "2" } }, "repeats" },
     };
@@ -543,9 +543,9 @@ test "subscription settings: each rule at its boundary" {
     try subscriptionConfig(base, &d);
 
     var c = base;
-    c.filter = "x" ** max_filter_bytes;
+    c.filter = test_util.repeat("x", max_filter_bytes);
     try subscriptionConfig(c, &d);
-    c.filter = "x" ** (max_filter_bytes + 1);
+    c.filter = test_util.repeat("x", max_filter_bytes + 1);
     try testing.expectError(error.InvalidArgument, subscriptionConfig(c, &d));
 
     for ([_]u8{ 5, 100 }) |n| try deadLetterPolicy(.{ .topic = "dead", .max_delivery_attempts = n }, &d);

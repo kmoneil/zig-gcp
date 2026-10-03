@@ -88,7 +88,7 @@ const Fixture = struct {
 
     /// A unique id for this run, such as `zigps-1a2b3c4d-access`.
     fn name(f: *Fixture, what: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(f.arena.allocator(), "{s}-{s}", .{ f.prefix, what });
+        return f.arena.allocator().print("{s}-{s}", .{ f.prefix, what });
     }
 
     /// Creates a labelled secret and registers it for cleanup.
@@ -162,7 +162,7 @@ test "a secret's life: create, get, list by label, delete, gone" {
     try testing.expect(got.value.create_time.len > 0);
 
     // The filter grammar the sweep depends on.
-    const filter = try std.fmt.allocPrint(f.arena.allocator(), "name:{s}", .{secret.id});
+    const filter = try f.arena.allocator().print("name:{s}", .{secret.id});
     var listed = f.client.listSecrets(.{ .filter = filter }) catch |err| return f.report(err);
     defer listed.deinit();
     try testing.expectEqual(1, listed.value.secrets.len);
@@ -424,8 +424,8 @@ fn iamCycle(f: *Fixture, secret: secret_manager.Secret) !void {
     var parts = std.mem.splitScalar(u8, info.value.name, '/');
     _ = parts.next();
     const number = parts.next().?;
-    const member = try std.fmt.allocPrint(a, "serviceAccount:service-{s}@gs-project-accounts.iam.gserviceaccount.com", .{number});
-    const shouting = try std.fmt.allocPrint(a, "serviceAccount:{s}", .{try std.ascii.allocUpperString(a, member["serviceAccount:".len..])});
+    const member = try a.print("serviceAccount:service-{s}@gs-project-accounts.iam.gserviceaccount.com", .{number});
+    const shouting = try a.print("serviceAccount:{s}", .{try std.ascii.allocUpperString(a, member["serviceAccount:".len..])});
     const role = "roles/secretmanager.secretAccessor";
 
     var fresh = secret.iamPolicy() catch |err| return f.report(err);
@@ -508,7 +508,7 @@ fn updateCycle(f: *Fixture) !void {
     }
     var set = secret.update(.{
         .labels = .{ .set = &.{ test_label, .{ .key = "team", .value = "payments" } } },
-        .annotations = .{ .set = &.{ .{ .key = "Owner", .value = "Ann <ann@example.com>" }, .{ .key = "a" ** 64, .value = "line\nbreak" } } },
+        .annotations = .{ .set = &.{ .{ .key = "Owner", .value = "Ann <ann@example.com>" }, .{ .key = &@as([64]u8, @splat('a')), .value = "line\nbreak" } } },
         .aliases = .{ .set = &.{ .{ .name = "prod", .version = 2 }, .{ .name = "Prod", .version = 1 }, .{ .name = "Latest", .version = 1 } } },
         .expiry = .{ .set = .{ .after_s = 86_400 } },
         .version_destroy_delay_s = .{ .set = 86_400 },
@@ -516,7 +516,7 @@ fn updateCycle(f: *Fixture) !void {
     defer set.deinit();
     try testing.expectEqualStrings("payments", set.value.label("team").?);
     try testing.expectEqualStrings("Ann <ann@example.com>", set.value.annotation("Owner").?);
-    try testing.expectEqualStrings("line\nbreak", set.value.annotation("a" ** 64).?);
+    try testing.expectEqualStrings("line\nbreak", set.value.annotation(&@as([64]u8, @splat('a'))).?);
     try testing.expectEqual(2, set.value.alias("prod").?);
     try testing.expectEqual(1, set.value.alias("Prod").?);
     try testing.expect(set.value.expire_time.len > 0);
@@ -696,7 +696,7 @@ const Topic = struct {
         t.diag = .{};
         t.id = try f.name("topic");
         t.sub_id = try f.name("watch");
-        t.name = try std.fmt.allocPrint(f.arena.allocator(), "projects/{s}/topics/{s}", .{ project, t.id });
+        t.name = try f.arena.allocator().print("projects/{s}/topics/{s}", .{ project, t.id });
         t.ps = try .init(testing.allocator, testing.io, .{ .project_id = project, .token_provider = f.token.provider(), .diagnostics = &t.diag });
         errdefer t.ps.deinit();
         var topic = try t.ps.topic(t.id).create(.{});
@@ -715,7 +715,7 @@ const Topic = struct {
     fn grant(t: *Topic, f: *Fixture) !void {
         var agent = f.client.serviceAgent() catch |err| return f.report(err);
         defer agent.deinit();
-        const member = try std.fmt.allocPrint(f.arena.allocator(), "serviceAccount:{s}", .{agent.value});
+        const member = try f.arena.allocator().print("serviceAccount:{s}", .{agent.value});
         var policy = try t.ps.topic(t.id).addIamBinding("roles/pubsub.publisher", member);
         policy.deinit();
     }
@@ -885,8 +885,7 @@ test "sweep: delete anything a crashed run left behind" {
 
     // Only this project's test secrets, by the label every one of them
     // carries. A secret that is not ours is never touched.
-    const filter = try std.fmt.allocPrint(
-        f.arena.allocator(),
+    const filter = try f.arena.allocator().print(
         "labels.{s}={s}",
         .{ test_label.key, test_label.value },
     );

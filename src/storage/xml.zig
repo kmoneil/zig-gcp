@@ -342,7 +342,7 @@ test "text: entities, character references, CDATA and comments" {
 test "refused: everything that is not a plain, well-formed document" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const deep = "<a>" ** (max_depth + 1) ++ "</a>" ** (max_depth + 1);
+    const deep = test_util.repeat("<a>", max_depth + 1) ++ test_util.repeat("</a>", max_depth + 1);
     for ([_][]const u8{
         "",
         "   ",
@@ -389,7 +389,7 @@ test "refused: everything that is not a plain, well-formed document" {
         try testing.expectError(error.InvalidResponse, parse(arena.allocator(), bad));
     }
     // Exactly the limit is fine.
-    const ok = "<a>" ** max_depth ++ "</a>" ** max_depth;
+    const ok = test_util.repeat("<a>", max_depth) ++ test_util.repeat("</a>", max_depth);
     _ = try parse(arena.allocator(), ok);
 }
 

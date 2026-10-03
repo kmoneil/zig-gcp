@@ -923,7 +923,7 @@ test "executeDiscard sends the call and keeps nothing" {
 /// Runs a retry through an arena over a wiping allocator on a fixed buffer,
 /// and reports whether the failed attempt's body is still readable after.
 fn failedBodySurvives(wipe: bool) !bool {
-    const marker = "S3CR3T" ** 40;
+    const marker = test_util.repeat("S3CR3T", 40);
     var h: Harness = undefined;
     h.init(&.{
         .{ .respond = .{ .status = 503, .body = "{\"error\":{\"status\":\"UNAVAILABLE\",\"message\":\"" ++ marker ++ "\"}}" } },

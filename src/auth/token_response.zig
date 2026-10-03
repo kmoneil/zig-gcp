@@ -140,8 +140,8 @@ test "token_response: running out of memory is OutOfMemory, never a verdict on t
             try testing.expectEqualStrings("it's gone", e.description);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.token, .{});
-    try testing.checkAllAllocationFailures(testing.allocator, Run.oauthError, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.token, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.oauthError, .{});
 }
 
 fn arbitraryProperty(_: void, input: []const u8) !void {

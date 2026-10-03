@@ -330,7 +330,7 @@ test "init: every allocation failure is OutOfMemory without leaks" {
             client.deinit();
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Run.run, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }
 
 test "golden: listSecrets pages, filters and stops" {
@@ -437,5 +437,5 @@ test "serviceAgent: every allocation failure is OutOfMemory without leaks" {
             agent.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
+    try std.testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
 }

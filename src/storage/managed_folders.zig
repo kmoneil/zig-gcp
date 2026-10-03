@@ -237,8 +237,8 @@ test "refused before sending: the rules Cloud Storage holds managed folders to, 
     defer h.deinit();
     const b = h.client.bucket("zigps-mf");
     try testing.expectError(error.InvalidFolderName, b.managedFolder("").create());
-    try testing.expectError(error.InvalidFolderName, b.managedFolder("m" ** 1024 ++ "/").create());
-    try testing.expectError(error.InvalidFolderName, b.managedFolder("d/" ** 16).create());
+    try testing.expectError(error.InvalidFolderName, b.managedFolder(test_util.repeat("m", 1024) ++ "/").create());
+    try testing.expectError(error.InvalidFolderName, b.managedFolder(test_util.repeat("d/", 16)).create());
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "15 levels") != null);
     try testing.expectError(error.InvalidFolderName, b.managedFolder("a\rb/").create());
     try testing.expectError(error.InvalidFolderName, b.managedFolder(".well-known/acme-challenge/x/").get());
@@ -471,5 +471,5 @@ fn everyCall(gpa: std.mem.Allocator) !void {
 }
 
 test "managed folders: every allocation failure is OutOfMemory, and nothing leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, everyCall, .{});
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, everyCall, .{});
 }
