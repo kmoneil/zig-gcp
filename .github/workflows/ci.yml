@@ -66,6 +66,19 @@ jobs:
           docker logs pubsub
           exit 1
 
+      # The Firestore emulator ships in the same image as Pub/Sub's.
+      - name: Start the Firestore emulator
+        run: |
+          docker run -d --name firestore -p 8087:8087 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud emulators firestore start --host-port=0.0.0.0:8087
+          for _ in $(seq 1 90); do
+            curl -sf http://127.0.0.1:8087/ >/dev/null && exit 0
+            sleep 2
+          done
+          docker logs firestore
+          exit 1
+
       - name: Start fake-gcs-server
         run: |
           # -public-host: the emulator serves the XML API's paths, which
@@ -93,6 +106,7 @@ jobs:
         env:
           PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
           STORAGE_EMULATOR_HOST: http://127.0.0.1:4443
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8087
         run: zig build test-integration --summary all
 
       - name: Examples
@@ -100,6 +114,7 @@ jobs:
         env:
           PUBSUB_EMULATOR_HOST: 127.0.0.1:8085
           STORAGE_EMULATOR_HOST: http://127.0.0.1:4443
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8087
         run: |
           zig build example-worker
           zig build example-publish -- orders 3
@@ -187,6 +202,23 @@ jobs:
           zig build example-gcs_cp -- "$RUNNER_TEMP/notify.txt" gs://zigps-notify/incoming/hello.txt
           timeout 120 zig build example-gcs_notify -- watch test zigps-uploads-watch --count 1 | tee "$RUNNER_TEMP/notify.log"
           grep -q "finalize gs://zigps-notify/incoming/hello.txt" "$RUNNER_TEMP/notify.log"
+          # Documents through the firestore example: written, changed in
+          # part, listed, read back, and deleted, which a read then misses.
+          zig build example-firestore -- set cities/LA "name=Los Angeles" population=3900000 nickname=LA
+          zig build example-firestore -- update cities/LA population=4000000 --delete nickname
+          zig build example-firestore -- set cities/LA/landmarks/tower height=300.5
+          zig build example-firestore -- get cities/LA | tee "$RUNNER_TEMP/firestore.log"
+          grep -q "population: 4000000" "$RUNNER_TEMP/firestore.log"
+          if grep -q nickname "$RUNNER_TEMP/firestore.log"; then
+            echo "update kept a field it was told to delete"
+            exit 1
+          fi
+          zig build example-firestore -- collections cities/LA | grep -qx landmarks
+          zig build example-firestore -- rm cities/LA
+          if zig build example-firestore -- get cities/LA; then
+            echo "rm left the document"
+            exit 1
+          fi
 
   # The unit tests with the optimizer on. Bugs that depend on it, such as a
   # read of undefined memory, can pass in Debug and fail here.

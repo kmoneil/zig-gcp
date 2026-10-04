@@ -47,6 +47,14 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "core", .module = core }},
     });
 
+    // Cloud Firestore. It imports core, never a service.
+    const firestore = b.addModule("firestore", .{
+        .root_source_file = b.path("src/firestore/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "core", .module = core }},
+    });
+
     // Every test build runs under std's test runner with one fix, which
     // keeps std.debug from swallowing a task's cancel (see the top of
     // tools/test_runner.zig).
@@ -70,6 +78,7 @@ pub fn build(b: *std.Build) void {
         .{ "pubsub", mod },
         .{ "secret_manager", secret_manager },
         .{ "storage", storage },
+        .{ "firestore", firestore },
     };
     // The nightly fuzz job runs one module per job, so each gets the whole
     // time budget: `--fuzz=N` fuzzes every property N times, and the
@@ -77,12 +86,12 @@ pub fn build(b: *std.Build) void {
     const only_module = b.option(
         []const u8,
         "module",
-        "Run only this module's unit tests: core, auth, pubsub, secret_manager or storage",
+        "Run only this module's unit tests: core, auth, pubsub, secret_manager, storage or firestore",
     );
     if (only_module) |name| {
         for (unit_modules) |entry| {
             if (std.mem.eql(u8, entry[0], name)) break;
-        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager or storage", .{name});
+        } else std.process.fatal("-Dmodule={s} names no module; use core, auth, pubsub, secret_manager, storage or firestore", .{name});
     }
     const test_step = b.step("test", "Run unit, property and fuzz-corpus tests");
     for (unit_modules) |entry| {
@@ -211,6 +220,25 @@ pub fn build(b: *std.Build) void {
     });
     const run_storage_integration = streamed(b, storage_integration_tests);
     integration_step.dependOn(&run_storage_integration.step);
+
+    // Cloud Firestore against its emulator (FIRESTORE_EMULATOR_HOST). The
+    // tests skip cleanly when it is not set.
+    const firestore_integration_tests = b.addTest(.{
+        .name = "firestore-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/firestore_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "firestore", .module = firestore },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    const run_firestore_integration = streamed(b, firestore_integration_tests);
+    integration_step.dependOn(&run_firestore_integration.step);
 
     // Cloud Storage's notifications end to end: fake-gcs-server publishing
     // to the Pub/Sub emulator. Skips unless both are set.
@@ -353,9 +381,9 @@ pub fn build(b: *std.Build) void {
     const run_fault = streamed(b, fault_tests);
     integration_step.dependOn(&run_fault.step);
 
-    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation" }) |name| {
-        // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam and
-        // secret_rotation pick their own credentials.
+    inline for (.{ "publish", "publisher", "worker", "whoami", "secret", "gcs_cp", "gcs_sign", "gcs_notify", "gcs_folders", "quickstart", "iam", "secret_rotation", "firestore" }) |name| {
+        // whoami, secret, gcs_cp, gcs_sign, gcs_notify, quickstart, iam,
+        // secret_rotation and firestore pick their own credentials.
         const imports: []const std.Build.Module.Import = if (std.mem.eql(u8, name, "whoami"))
             &.{ .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret"))
@@ -366,6 +394,8 @@ pub fn build(b: *std.Build) void {
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "secret_rotation"))
             &.{ .{ .name = "secret_manager", .module = secret_manager }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
+        else if (std.mem.eql(u8, name, "firestore"))
+            &.{ .{ .name = "firestore", .module = firestore }, .{ .name = "auth", .module = auth } }
         else if (std.mem.eql(u8, name, "gcs_notify") or std.mem.eql(u8, name, "quickstart"))
             &.{ .{ .name = "storage", .module = storage }, .{ .name = "pubsub", .module = mod }, .{ .name = "auth", .module = auth } }
         else

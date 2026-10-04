@@ -1,0 +1,351 @@
+//! A Firestore client: configuration, the HTTP connection pool, and the
+//! entry point for `Collection` and `Document` handles.
+//!
+//! Every call blocks the calling task until it completes, using the
+//! `std.Io` and allocator passed to `init`. A client must not be used from
+//! two tasks at once; give each task its own. A client reads and writes
+//! one database, `(default)` unless `Options.database_id` names another.
+
+const Client = @This();
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const core = @import("core");
+
+const Collection = @import("Collection.zig");
+const Document = @import("Document.zig");
+const Endpoint = @import("Endpoint.zig");
+const errors = @import("errors.zig");
+const names = @import("names.zig");
+const rpc = @import("rpc.zig");
+const types = @import("types.zig");
+const validate = @import("validate.zig");
+const Diagnostics = core.Diagnostics;
+const Error = errors.Error;
+const HttpTransport = core.transport.HttpTransport;
+const RetryPolicy = core.RetryPolicy;
+const TokenProvider = core.TokenProvider;
+const Transport = core.transport.Transport;
+
+gpa: Allocator,
+io: std.Io,
+/// Owned copy of `Options.project_id`.
+project_id: []const u8,
+/// Owned copy of `Options.database_id`.
+database_id: []const u8,
+/// Owned. Scheme, host and port, such as `https://firestore.googleapis.com`.
+base_url: []const u8,
+/// The caller's, or the emulator's administrator.
+token_provider: TokenProvider,
+/// True against an emulator, which never receives the caller's credentials.
+emulator: bool,
+retry: RetryPolicy,
+send_quota_project: bool,
+request_timeout_ms: u32,
+diagnostics: ?*Diagnostics,
+transport: Transport,
+/// The built-in transport, when `Options.transport` was null.
+http: ?*HttpTransport,
+/// Owned copy of `Options.user_agent`.
+user_agent: []const u8,
+/// The length of `projects/P/databases/D/documents/`, which every full
+/// name starts with and which counts against its 6 KiB.
+name_prefix_len: usize,
+
+pub const Options = struct {
+    /// Project id or number, such as `my-project`.
+    project_id: []const u8,
+    /// `(default)`, or a named database's id, such as `orders-eu`.
+    database_id: []const u8 = "(default)",
+    /// Null means production. Use `Endpoint.fromEnv(environ)` to honor
+    /// `FIRESTORE_EMULATOR_HOST`.
+    endpoint: ?Endpoint = null,
+    /// Null is only valid against an emulator, which never receives it
+    /// either way.
+    token_provider: ?TokenProvider = null,
+    retry: RetryPolicy = .{},
+    /// How long one request may take before it is `error.TimedOut`, which
+    /// is retried like any other transient failure. 0 removes the limit,
+    /// and nothing bounds a call then but the caller's own `std.Io`.
+    request_timeout_ms: u32 = 30_000,
+    /// Sends `x-goog-user-project` when the credentials name a project to
+    /// charge for quota, as a user's own credentials do.
+    send_quota_project: bool = true,
+    /// Printable ASCII.
+    user_agent: []const u8 = "zig-gcp-firestore/0.31",
+    /// Filled with details of every failed call; cleared by each new call.
+    diagnostics: ?*Diagnostics = null,
+    /// Sends requests through this instead of `std.http.Client`. Useful for
+    /// tests, including tests of code that uses this library.
+    transport: ?Transport = null,
+};
+
+/// The emulator's administrator. Its token is no secret; the emulator
+/// takes it as admin, and production would refuse it.
+var emulator_owner: core.StaticToken = .{ .token = "owner" };
+
+/// Copies what it keeps from `options`; nothing borrowed outlives the call
+/// except `diagnostics`, the token provider and the transport.
+pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
+    const diag = options.diagnostics;
+    if (diag) |d| d.clear();
+    if (!core.names.isProjectId(options.project_id)) {
+        if (diag) |d| d.print("invalid project id: expected 1 to 100 letters, digits, '-', '.', ':' or '_'", .{});
+        return error.InvalidResourceId;
+    }
+    if (!validate.isDatabaseId(options.database_id)) {
+        if (diag) |d| d.print("invalid database id: expected (default), or 4 to 63 lowercase letters, digits and '-', starting with a letter and ending with a letter or digit", .{});
+        return error.InvalidResourceId;
+    }
+    if (!options.retry.isValid()) {
+        if (diag) |d| d.print("invalid retry policy: max_attempts must be at least 1, multiplier finite and at least 1", .{});
+        return error.InvalidOptions;
+    }
+    if (!validate.isUserAgent(options.user_agent)) {
+        if (diag) |d| d.print("invalid user agent: expected printable ASCII", .{});
+        return error.InvalidOptions;
+    }
+
+    const endpoint = options.endpoint orelse Endpoint.production;
+    const emulator = endpoint.emulator;
+    const token_provider = if (emulator) emulator_owner.provider() else options.token_provider orelse {
+        if (diag) |d| d.print("no credentials: only an emulator endpoint works without Options.token_provider", .{});
+        return error.MissingCredentials;
+    };
+
+    const base_url = endpoint.baseUrl(gpa) catch |err| {
+        if (err == error.InvalidEndpoint) {
+            if (diag) |d| d.print("invalid endpoint: expected scheme://host[:port]", .{});
+        }
+        return err;
+    };
+    errdefer gpa.free(base_url);
+    // The caller's bearer token must not travel in cleartext.
+    if (!emulator and !std.mem.startsWith(u8, base_url, "https://")) {
+        if (diag) |d| d.print("invalid endpoint: endpoints that receive credentials must use https", .{});
+        return error.InvalidEndpoint;
+    }
+    const project_id = try gpa.dupe(u8, options.project_id);
+    errdefer gpa.free(project_id);
+    const database_id = try gpa.dupe(u8, options.database_id);
+    errdefer gpa.free(database_id);
+    const user_agent = try gpa.dupe(u8, options.user_agent);
+    errdefer gpa.free(user_agent);
+
+    var http: ?*HttpTransport = null;
+    const transport = options.transport orelse t: {
+        const h = try gpa.create(HttpTransport);
+        h.* = .init(gpa, io, user_agent);
+        http = h;
+        break :t h.transport();
+    };
+    return .{
+        .gpa = gpa,
+        .io = io,
+        .project_id = project_id,
+        .database_id = database_id,
+        .base_url = base_url,
+        .token_provider = token_provider,
+        .emulator = emulator,
+        .retry = options.retry,
+        // The emulator's administrator bills nobody.
+        .send_quota_project = options.send_quota_project and !emulator,
+        .request_timeout_ms = options.request_timeout_ms,
+        .diagnostics = diag,
+        .transport = transport,
+        .http = http,
+        .user_agent = user_agent,
+        .name_prefix_len = "projects//databases//documents/".len + project_id.len + database_id.len,
+    };
+}
+
+pub fn deinit(self: *Client) void {
+    if (self.http) |h| {
+        h.deinit();
+        self.gpa.destroy(h);
+    }
+    self.gpa.free(self.user_agent);
+    self.gpa.free(self.database_id);
+    self.gpa.free(self.project_id);
+    self.gpa.free(self.base_url);
+    self.* = undefined;
+}
+
+/// A handle for the collection at `path`, such as `cities`, or
+/// `cities/LA/landmarks` for a subcollection. Sends nothing; the path is
+/// checked by each call. The handle borrows the client and `path`, and
+/// must not outlive either.
+pub fn collection(self: *Client, path: []const u8) Collection {
+    return .{ .client = self, .path = .init(path) };
+}
+
+/// A handle for the document at `path`, such as `cities/LA`. Sends
+/// nothing; the path is checked by each call. The handle borrows the
+/// client and `path`, and must not outlive either.
+pub fn doc(self: *Client, path: []const u8) Document {
+    return .{ .client = self, .path = .init(path) };
+}
+
+/// The full name of the document at `path`, as a `Value.reference` takes
+/// it: `projects/P/databases/D/documents/PATH`, in `allocator`'s memory.
+/// `path` is not checked here; the write that carries the reference
+/// checks it.
+pub fn documentName(self: *const Client, allocator: Allocator, path: []const u8) Allocator.Error![]u8 {
+    return names.fullName(allocator, self.project_id, self.database_id, path);
+}
+
+/// One page of the ids of the database's top-level collections, in
+/// ascending order. A collection exists while any document lies below
+/// it.
+pub fn listCollectionIds(self: *Client, options: types.ListCollectionIdsOptions) Error!types.Owned(types.CollectionIdPage) {
+    rpc.begin(self);
+    return rpc.listCollectionIds(self, "", options);
+}
+
+const testing = std.testing;
+const test_util = @import("test_util.zig");
+
+fn testOptions(token: *test_util.FakeTokenProvider) Options {
+    return .{ .project_id = "extractctl", .token_provider = token.provider() };
+}
+
+test "init rejects bad options before allocating" {
+    const gpa = testing.failing_allocator;
+    var token: test_util.FakeTokenProvider = .{};
+    var diag: Diagnostics = .{};
+    var options = testOptions(&token);
+    options.diagnostics = &diag;
+
+    options.project_id = "a/b";
+    try testing.expectError(error.InvalidResourceId, Client.init(gpa, testing.io, options));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "invalid project id") != null);
+
+    options.project_id = "extractctl";
+    for ([_][]const u8{ "Orders", "abc", "(default", "a2345678-1234-1234-1234-123456789abc" }) |db| {
+        options.database_id = db;
+        try testing.expectError(error.InvalidResourceId, Client.init(gpa, testing.io, options));
+        try testing.expect(std.mem.indexOf(u8, diag.message(), "invalid database id") != null);
+    }
+
+    options.database_id = "(default)";
+    options.retry = .{ .max_attempts = 0 };
+    try testing.expectError(error.InvalidOptions, Client.init(gpa, testing.io, options));
+    options.retry = .{};
+    options.user_agent = "agent\r\nX: y";
+    try testing.expectError(error.InvalidOptions, Client.init(gpa, testing.io, options));
+
+    options.user_agent = "a";
+    options.token_provider = null;
+    try testing.expectError(error.MissingCredentials, Client.init(gpa, testing.io, options));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "no credentials") != null);
+}
+
+test "init: production, a named database, the emulator" {
+    var token: test_util.FakeTokenProvider = .{};
+    var prod: Client = try .init(testing.allocator, testing.io, testOptions(&token));
+    defer prod.deinit();
+    try testing.expectEqualStrings("https://firestore.googleapis.com", prod.base_url);
+    try testing.expectEqualStrings("(default)", prod.database_id);
+    try testing.expect(!prod.emulator);
+    try testing.expect(prod.send_quota_project);
+
+    var options = testOptions(&token);
+    options.database_id = "zigps-fs-1a2b";
+    var named: Client = try .init(testing.allocator, testing.io, options);
+    defer named.deinit();
+    const n = try named.documentName(testing.allocator, "c/x");
+    defer testing.allocator.free(n);
+    try testing.expectEqualStrings("projects/extractctl/databases/zigps-fs-1a2b/documents/c/x", n);
+    try testing.expectEqual("projects/extractctl/databases/zigps-fs-1a2b/documents/".len, named.name_prefix_len);
+
+    // The emulator needs no token provider, and never gets the caller's.
+    var emu: Client = try .init(testing.allocator, testing.io, .{
+        .project_id = "test",
+        .endpoint = .{ .url = "127.0.0.1:8087", .emulator = true },
+        .token_provider = token.provider(),
+    });
+    defer emu.deinit();
+    try testing.expectEqualStrings("http://127.0.0.1:8087", emu.base_url);
+    try testing.expect(emu.emulator);
+    try testing.expect(!emu.send_quota_project);
+    try testing.expect(emu.token_provider.ptr != token.provider().ptr);
+}
+
+test "credentials never go to a plain-http endpoint" {
+    var token: test_util.FakeTokenProvider = .{};
+    var diag: Diagnostics = .{};
+    var options = testOptions(&token);
+    options.diagnostics = &diag;
+    options.endpoint = .{ .url = "http://proxy.internal:8080" };
+    try testing.expectError(error.InvalidEndpoint, Client.init(testing.allocator, testing.io, options));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "must use https") != null);
+    options.endpoint = .{ .url = "ftp://host" };
+    try testing.expectError(error.InvalidEndpoint, Client.init(testing.allocator, testing.io, options));
+}
+
+test "init copies the strings it keeps" {
+    var token: test_util.FakeTokenProvider = .{};
+    var project = "project-1".*;
+    var database = "orders-eu".*;
+    var agent = "agent/1".*;
+    var client: Client = try .init(testing.allocator, testing.io, .{
+        .project_id = &project,
+        .database_id = &database,
+        .user_agent = &agent,
+        .token_provider = token.provider(),
+    });
+    defer client.deinit();
+    @memset(&project, 'x');
+    @memset(&database, 'x');
+    @memset(&agent, 'x');
+    try testing.expectEqualStrings("project-1", client.project_id);
+    try testing.expectEqualStrings("orders-eu", client.database_id);
+    try testing.expectEqualStrings("agent/1", client.user_agent);
+}
+
+test "init: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            var token: test_util.FakeTokenProvider = .{};
+            var client: Client = try .init(gpa, testing.io, .{
+                .project_id = "extractctl",
+                .database_id = "orders-eu",
+                .token_provider = token.provider(),
+            });
+            client.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+}
+
+test "golden: listCollectionIds at the root, paged" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "{\"collectionIds\":[\"cities\",\"users\"],\"nextPageToken\":\"tok+/=\"}" } },
+        .{ .respond = .{ .body = "{}" } },
+    }, .{});
+    defer h.deinit();
+    var first = try h.client.listCollectionIds(.{ .page_size = 2 });
+    defer first.deinit();
+    try h.expectRequest(0, .POST, "https://firestore.googleapis.com/v1/projects/extractctl/databases/(default)/documents:listCollectionIds", "{\"pageSize\":2}");
+    try testing.expectEqual(2, first.value.collection_ids.len);
+    try testing.expectEqualStrings("tok+/=", first.value.next_page_token.?);
+
+    var second = try h.client.listCollectionIds(.{ .page_token = first.value.next_page_token, .read_time = .{ .nanoseconds = 1_791_153_779_000_000_000 } });
+    defer second.deinit();
+    try h.expectRequest(1, .POST, "https://firestore.googleapis.com/v1/projects/extractctl/databases/(default)/documents:listCollectionIds", "{\"pageToken\":\"tok+/=\",\"readTime\":\"2026-10-04T22:42:59Z\"}");
+    try testing.expectEqual(0, second.value.collection_ids.len);
+    try testing.expectEqual(null, second.value.next_page_token);
+}
+
+test "golden: the emulator gets the administrator's token, production the caller's" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .body = "{}" } }}, .{ .emulator = true });
+    defer h.deinit();
+    var page = try h.client.listCollectionIds(.{});
+    defer page.deinit();
+    const r = try h.fake.request(0);
+    try testing.expectEqualStrings("http://127.0.0.1:8087/v1/projects/extractctl/databases/(default)/documents:listCollectionIds", r.url);
+    try testing.expectEqualStrings("owner", r.bearer.?);
+    try testing.expectEqual(0, h.token.calls);
+}
