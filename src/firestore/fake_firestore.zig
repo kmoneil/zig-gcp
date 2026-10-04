@@ -1184,6 +1184,7 @@ test "fake: values refused in the emulator's words" {
         .{ "{\"k\":{}}", "Cannot convert firestore.v1.Value with type unset." },
         .{ "{\"g\":{\"geoPointValue\":{\"latitude\":91,\"longitude\":0}}}", "outside permitted range -90.0 to 90.0" },
         .{ "{\"t\":{\"timestampValue\":\"0000-12-31T00:00:00Z\"}}", "Payload isn't valid for request." },
+        .{ "{\"k\":{\"unknownValue\":1}}", "Payload isn't valid for request." },
     };
     for (cases) |case| {
         const body = try std.fmt.allocPrint(a, "{s}{s}}}}}]}}", .{ w, case[0] });
@@ -1197,6 +1198,10 @@ test "fake: values refused in the emulator's words" {
     for (0..21) |_| try deep.writer.writeAll("}}}");
     try deep.writer.writeAll("}");
     try expectRefusal(try rawRequest(&server, a, .POST, ":commit", try std.fmt.allocPrint(a, "{s}{s}}}}}]}}", .{ w, deep.written() })), 400, "contains an invalid nested entity");
+    // A string one byte over.
+    const big = try a.alloc(u8, 1_048_488);
+    @memset(big, 'x');
+    try expectRefusal(try rawRequest(&server, a, .POST, ":commit", try std.fmt.allocPrint(a, "{s}{{\"s\":{{\"stringValue\":\"{s}\"}}}}}}}}]}}", .{ w, big })), 400, "The value of property \\\"s\\\" is longer than 1048487 bytes.");
     // Ids and paths.
     try expectRefusal(try rawRequest(&server, a, .GET, "/c/__x__", ""), 400, "__x__\\\" is invalid because it is reserved.");
     try expectRefusal(try rawRequest(&server, a, .GET, "/c/x?mask.fieldPaths=a-b", ""), 400, "Invalid property path \\\"a-b\\\".");
@@ -1205,6 +1210,32 @@ test "fake: values refused in the emulator's words" {
     try expectRefusal(try rawRequest(&server, a, .GET, "/c?pageToken=garbage", ""), 400, "invalid page token");
     // Nothing was stored by any of it.
     try testing.expectEqual(0, server.count("(default)"));
+}
+
+test "fake: ids and field paths that travel encoded, and ids it chooses" {
+    var h: test_util.FakeHarness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    for ([_][]const u8{ "a b%c+d", "a:b", "été", "x?y#z", "back\\slash" }) |id| {
+        _ = try h.client.collection("odd").doc(id).set(&.{.{ .name = "c`d", .value = .{ .map = &.{.{ .name = "e f", .value = .{ .string = id } }} } }}, .{});
+        var got = try h.client.collection("odd").doc(id).get(.{ .mask = &.{"`c\\`d`.`e f`"} });
+        defer got.deinit();
+        try testing.expectEqualStrings(id, got.value.id());
+        try testing.expectEqualStrings(id, got.value.get("c`d").?.get("e f").?.string);
+    }
+    var page = try h.client.collection("odd").list(.{ .mask = &.{"`c\\`d`"} });
+    defer page.deinit();
+    try testing.expectEqual(5, page.value.documents.len);
+
+    // The library always names the id; a bare POST lets the fake choose.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const made = try h.server.serve(.POST, "https://firestore.googleapis.com/v1/projects/p/databases/(default)/documents/auto", "{\"fields\":{}}", arena.allocator());
+    const snapshot = try codec.decodeSnapshot(arena.allocator(), made.body);
+    try testing.expectEqual(20, snapshot.id().len);
+    try expectRefusal(try h.server.serve(.PATCH, "https://firestore.googleapis.com/v1/projects/p/databases/(default)/documents/c/x", "{}", arena.allocator()), 400, "not modelled");
+    try expectRefusal(try h.server.serve(.GET, "https://firestore.googleapis.com/v1/projects/p/databases/(default)/documents/c?orderBy=v", "", arena.allocator()), 400, "not modelled");
+    try expectRefusal(try h.server.serve(.POST, "https://firestore.googleapis.com/v1/projects/p/databases/(default)/documents/c?documentId=x", "{\"fields\":{\"s\":{\"geoPointValue\":{\"latitude\":0,\"longitude\":181}}}}", arena.allocator()), 400, "longitude");
 }
 
 test "fake: answers as the emulator wrote them" {
@@ -1442,18 +1473,19 @@ fn randomFields(g: *test_util.ByteGen, a: Allocator) Allocator.Error![]const Fie
     return out;
 }
 
-/// A mask path of up to two random names, as segments and as text.
-fn randomMaskPath(g: *test_util.ByteGen, a: Allocator, fields: []const Field) Allocator.Error![]const []const u8 {
-    // Mostly names that are there, so the mask writes something.
-    const first = if (fields.len > 0 and g.boolean()) fields[g.intRange(usize, 0, fields.len - 1)].name else try std.fmt.allocPrint(a, "{s}{d}", .{ g.pick([]const u8, &names_pool), g.intRange(u8, 0, 2) });
-    if (g.intRange(u8, 0, 3) != 0) {
+/// A mask path of one or two names, drawn from the names the writes
+/// use: top-level fields `{k,a-b,é,m}{0,1,2}`, and the `k0` to `k2` that
+/// random maps hold, so a path often reaches into a map already there.
+fn randomMaskPath(g: *test_util.ByteGen, a: Allocator) Allocator.Error![]const []const u8 {
+    const first = try std.fmt.allocPrint(a, "{s}{d}", .{ g.pick([]const u8, &names_pool), g.intRange(u8, 0, 2) });
+    if (g.boolean()) {
         const one = try a.alloc([]const u8, 1);
         one[0] = first;
         return one;
     }
     const two = try a.alloc([]const u8, 2);
     two[0] = first;
-    two[1] = try std.fmt.allocPrint(a, "k{d}", .{g.intRange(u8, 0, 2)});
+    two[1] = try std.fmt.allocPrint(a, "{s}{d}", .{ g.pick([]const u8, &.{ "k", "a-b" }), g.intRange(u8, 0, 2) });
     return two;
 }
 
@@ -1494,20 +1526,11 @@ fn modelProperty(_: void, input: []const u8) !void {
                     try model.times.put(a, path, written.update_time);
                 }
             },
-            1 => { // update with a mask, the default precondition or none
-                const fields = try randomFields(&g, a);
+            1 => { // update through a mask: each path given a value, or deleted
                 var mask_list: std.ArrayList([]const u8) = .empty;
-                var segment_list: std.ArrayList([]const []const u8) = .empty;
-                // Every top-level field given, then a path or two more.
-                for (fields) |f| {
-                    const one = try a.alloc([]const u8, 1);
-                    one[0] = f.name;
-                    try segment_list.append(a, one);
-                }
-                for (0..g.intRange(u8, 0, 2)) |_| try segment_list.append(a, try randomMaskPath(&g, a, fields));
-                // Keep the paths that overlap none before them.
                 var kept: std.ArrayList([]const []const u8) = .empty;
-                for (segment_list.items) |segments| {
+                for (0..g.intRange(u8, 1, 3)) |_| {
+                    const segments = try randomMaskPath(&g, a);
                     const text = try maskText(a, segments);
                     for (mask_list.items) |other| {
                         if (names.fieldPathsOverlap(text, other)) break;
@@ -1516,14 +1539,12 @@ fn modelProperty(_: void, input: []const u8) !void {
                         try kept.append(a, segments);
                     }
                 }
-                // A field the kept paths do not cover would be refused.
-                var covered = true;
-                for (fields) |f| {
-                    for (kept.items) |segments| {
-                        if (std.mem.eql(u8, segments[0], f.name) and segments.len == 1) break;
-                    } else covered = false;
-                }
-                if (mask_list.items.len == 0 or !covered) continue;
+                // Values under some of the paths, the rest deletes; built
+                // as nested maps, so every value lies under its path.
+                var fields: []const Field = &.{};
+                for (kept.items) |segments| if (g.intRange(u8, 0, 2) != 0) {
+                    fields = try model.setAt(fields, segments, try codec.randomValue(&g, a, 2, false));
+                };
                 const must_exist = g.boolean();
                 const result = doc.update(fields, .{ .mask = mask_list.items, .precondition = if (must_exist) .{ .exists = true } else null });
                 if (must_exist and existing == null) {
