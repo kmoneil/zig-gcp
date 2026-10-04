@@ -12,6 +12,23 @@ including the ones that did not change.
   (docs/zig-std-workarounds.md), and a task that missed its own could
   keep `run` waiting on it forever; it now ends soon after on the flag.
   No API changed.
+- firestore: new module, stability `experimental`, in progress: a client
+  for Cloud Firestore's v1 REST API, against the default database or a
+  named one, and the emulator through `Endpoint.fromEnv`, which reads
+  `FIRESTORE_EMULATOR_HOST`. So far: documents read whole or through a
+  read mask, created (under an id of the caller's or a random one of 20
+  characters chosen before sending, so a create whose answer was lost
+  reads its own document back), set whole, updated through a field mask
+  (a masked path with no value deletes it, and one inside a map changes
+  only that), and deleted, each write held to an `exists` or update-time
+  precondition when asked; documents listed by page, and collection ids
+  listed at any level. Values are a `Value` union whose integers stay
+  `i64` and whose doubles carry NaN and the infinities; field names that
+  are not identifiers are quoted in backticks wherever they become paths.
+  Paths, ids, field paths, masks and values are checked against the
+  limits the emulator enforced before anything is sent. Writes travel
+  through `commit`, as Google's clients send them: the emulator misreads
+  a precondition's time as a query parameter.
 - core: `core.timestamp.format` writes an RFC 3339 timestamp as Google's
   servers do, in UTC with no fractional digits or 3, 6 or 9 of them.
   `core.timestamp.min`, `max` and `inRange` give the range it writes,

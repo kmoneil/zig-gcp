@@ -1,0 +1,410 @@
+//! Integration tests against the Firestore emulator: set
+//! FIRESTORE_EMULATOR_HOST, such as `127.0.0.1:8087`. With it unset, every
+//! test skips.
+//!
+//! Each test works in a project of its own, `zigps-` and 8 random hex
+//! digits, which the emulator creates on first use, and empties that
+//! project's databases through the emulator's documented endpoint after
+//! the test, even when the test fails.
+
+const std = @import("std");
+const core = @import("core");
+const firestore = @import("firestore");
+const testing = std.testing;
+const Value = firestore.Value;
+const Field = firestore.Field;
+
+const Fixture = struct {
+    env: std.process.Environ.Map,
+    diag: firestore.Diagnostics,
+    client: firestore.Client,
+    /// "zigps-" plus 8 random hex digits, unique per test.
+    project: [14]u8,
+    emulator: firestore.Endpoint,
+    /// Databases besides `(default)` that the test used, to empty too.
+    named: ?[]const u8 = null,
+
+    /// Returns false when no emulator is configured; the test should skip.
+    fn init(f: *Fixture) !bool {
+        return f.initDatabase("(default)");
+    }
+
+    fn initDatabase(f: *Fixture, database_id: []const u8) !bool {
+        const gpa = testing.allocator;
+        f.env = try testing.environ.createMap(gpa);
+        errdefer f.env.deinit();
+        f.emulator = firestore.Endpoint.fromEnv(&f.env) orelse {
+            f.env.deinit();
+            return false;
+        };
+        f.diag = .{};
+        f.named = null;
+        var random: [4]u8 = undefined;
+        testing.io.random(&random);
+        _ = try std.fmt.bufPrint(&f.project, "zigps-{x}", .{random});
+        f.client = try .init(gpa, testing.io, .{
+            .project_id = &f.project,
+            .database_id = database_id,
+            .endpoint = f.emulator,
+            .diagnostics = &f.diag,
+            .user_agent = "zig-gcp-firestore-integration/0.1",
+        });
+        if (!std.mem.eql(u8, database_id, "(default)")) f.named = database_id;
+        return true;
+    }
+
+    fn deinit(f: *Fixture) void {
+        f.clear("(default)");
+        if (f.named) |db| f.clear(db);
+        f.client.deinit();
+        f.env.deinit();
+    }
+
+    /// Empties one database of the test's project.
+    fn clear(f: *Fixture, database_id: []const u8) void {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const url = std.fmt.allocPrint(arena.allocator(), "{s}/emulator/v1/projects/{s}/databases/{s}/documents", .{ f.client.base_url, &f.project, database_id }) catch return;
+        _ = f.client.transport.send(.{ .method = .DELETE, .url = url, .timeout_ms = 10_000 }, arena.allocator()) catch {};
+    }
+
+    fn doc(f: *Fixture, path: []const u8) firestore.Document {
+        return f.client.doc(path);
+    }
+};
+
+fn expectDiag(f: *const Fixture, part: []const u8) !void {
+    if (std.mem.indexOf(u8, f.diag.message(), part) == null) {
+        std.debug.print("diagnostics: {s}\n", .{f.diag.message()});
+        return error.TestUnexpectedDiagnostics;
+    }
+}
+
+/// Equality as the wire sees it: NaN equals NaN.
+fn expectValueEqual(expected: Value, actual: Value) !void {
+    try testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .null => {},
+        .boolean => |b| try testing.expectEqual(b, actual.boolean),
+        .integer => |i| try testing.expectEqual(i, actual.integer),
+        .double => |d| if (std.math.isNan(d)) try testing.expect(std.math.isNan(actual.double)) else try testing.expectEqual(d, actual.double),
+        .timestamp => |t| try testing.expectEqual(t.nanoseconds, actual.timestamp.nanoseconds),
+        .string => |s| try testing.expectEqualStrings(s, actual.string),
+        .bytes => |b| try testing.expectEqualSlices(u8, b, actual.bytes),
+        .reference => |r| try testing.expectEqualStrings(r, actual.reference),
+        .geo_point => |g| {
+            try testing.expectEqual(g.latitude, actual.geo_point.latitude);
+            try testing.expectEqual(g.longitude, actual.geo_point.longitude);
+        },
+        .array => |items| {
+            try testing.expectEqual(items.len, actual.array.len);
+            for (items, actual.array) |e, a| try expectValueEqual(e, a);
+        },
+        .map => |fields| {
+            try testing.expectEqual(fields.len, actual.map.len);
+            for (fields) |e| try expectValueEqual(e.value, firestore.getField(actual.map, e.name) orelse return error.TestMissingField);
+        },
+    }
+}
+
+test "values: every kind goes in and comes back" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+
+    const ts_ns: i96 = 1_791_153_779_123_456_789;
+    const fields: []const Field = &.{
+        .{ .name = "null", .value = .null },
+        .{ .name = "false", .value = .{ .boolean = false } },
+        .{ .name = "true", .value = .{ .boolean = true } },
+        .{ .name = "zero", .value = .{ .integer = 0 } },
+        .{ .name = "max", .value = .{ .integer = std.math.maxInt(i64) } },
+        .{ .name = "min", .value = .{ .integer = std.math.minInt(i64) } },
+        .{ .name = "pi", .value = .{ .double = 3.141592653589793 } },
+        .{ .name = "three", .value = .{ .double = 3 } },
+        .{ .name = "tiny", .value = .{ .double = 5e-324 } },
+        .{ .name = "huge", .value = .{ .double = 1.7976931348623157e308 } },
+        .{ .name = "nan", .value = .{ .double = std.math.nan(f64) } },
+        .{ .name = "inf", .value = .{ .double = std.math.inf(f64) } },
+        .{ .name = "-inf", .value = .{ .double = -std.math.inf(f64) } },
+        .{ .name = "ts", .value = .{ .timestamp = .{ .nanoseconds = ts_ns } } },
+        .{ .name = "epoch", .value = .{ .timestamp = .{ .nanoseconds = 0 } } },
+        .{ .name = "first", .value = .{ .timestamp = core.timestamp.min } },
+        .{ .name = "string", .value = .{ .string = "é\"\\\n\x00 ünïcödé 🔥" } },
+        .{ .name = "empty", .value = .{ .string = "" } },
+        .{ .name = "bytes", .value = .{ .bytes = "\x00\xff\xfe\x80" } },
+        .{ .name = "ref", .value = .{ .reference = "projects/p/databases/(default)/documents/c/x" } },
+        .{ .name = "geo", .value = .{ .geo_point = .{ .latitude = 0, .longitude = -118.25 } } },
+        .{ .name = "array", .value = .{ .array = &.{ .{ .integer = 1 }, .{ .string = "two" }, .{ .map = &.{.{ .name = "in", .value = .{ .array = &.{} } }} } } } },
+        .{ .name = "emptyarray", .value = .{ .array = &.{} } },
+        .{ .name = "emptymap", .value = .{ .map = &.{} } },
+        .{ .name = "a-b.c`d\\é", .value = .{ .map = &.{.{ .name = "x y", .value = .{ .boolean = true } }} } },
+    };
+    _ = try f.doc("values/all").set(fields, .{});
+    var got = try f.doc("values/all").get(.{});
+    defer got.deinit();
+    try testing.expectEqual(fields.len, got.value.fields.len);
+    for (fields) |field| {
+        const back = got.value.get(field.name) orelse {
+            std.debug.print("missing field {s}\n", .{field.name});
+            return error.TestMissingField;
+        };
+        var expected = field.value;
+        // Measured: the server keeps microseconds, and drops the rest.
+        if (std.mem.eql(u8, field.name, "ts")) expected = .{ .timestamp = .{ .nanoseconds = ts_ns - 789 } };
+        expectValueEqual(expected, back) catch |err| {
+            std.debug.print("field {s}: sent {any}, got {any}\n", .{ field.name, field.value, back });
+            return err;
+        };
+    }
+}
+
+test "values: what the emulator changes on the way" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    _ = try f.doc("values/neg").set(&.{.{ .name = "z", .value = .{ .double = -0.0 } }}, .{});
+    var got = try f.doc("values/neg").get(.{});
+    defer got.deinit();
+    // The emulator answers -0.0 as 0.0; equal either way as numbers.
+    try testing.expectEqual(@as(f64, 0), got.value.get("z").?.double);
+}
+
+test "values: the server's own limits, past the client's checks" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    // A 1,500-byte name is the limit, and the emulator takes it.
+    const long = core.testing.repeat("k", 1500);
+    _ = try f.doc("limits/name").set(&.{.{ .name = long, .value = .null }}, .{});
+    // But a mask of the same 1,500 bytes is one past what it takes.
+    try testing.expectError(error.InvalidArgument, f.doc("limits/name").update(&.{.{ .name = long, .value = .{ .integer = 1 } }}, .{}));
+    try expectDiag(&f, "longer than 1500 bytes");
+    // A reference to a collection: refused by the client already.
+    try testing.expectError(error.InvalidArgument, f.doc("limits/ref").set(&.{.{ .name = "r", .value = .{ .reference = "projects/p/databases/(default)/documents/c" } }}, .{}));
+}
+
+test "documents: create, read, write, update, delete" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const cities = f.client.collection("cities");
+
+    var la = try cities.create(&.{
+        .{ .name = "name", .value = .{ .string = "Los Angeles" } },
+        .{ .name = "population", .value = .{ .integer = 3_900_000 } },
+    }, .{ .document_id = "LA" });
+    defer la.deinit();
+    try testing.expectEqualStrings("LA", la.value.id());
+    try testing.expectEqual(la.value.create_time.nanoseconds, la.value.update_time.nanoseconds);
+
+    // A second create of the same id.
+    try testing.expectError(error.AlreadyExists, cities.create(&.{}, .{ .document_id = "LA" }));
+
+    // An id of the library's own choosing.
+    var auto = try cities.create(&.{.{ .name = "name", .value = .{ .string = "Somewhere" } }}, .{});
+    defer auto.deinit();
+    try testing.expectEqual(20, auto.value.id().len);
+    var auto_read = try cities.doc(auto.value.id()).get(.{});
+    defer auto_read.deinit();
+    try testing.expectEqualStrings("Somewhere", auto_read.value.get("name").?.string);
+
+    // update under the update time just read, then again under the stale one.
+    const doc = cities.doc("LA");
+    const updated = try doc.update(&.{.{ .name = "population", .value = .{ .integer = 4_000_000 } }}, .{
+        .precondition = .{ .update_time = la.value.update_time },
+    });
+    try testing.expect(updated.update_time.nanoseconds > la.value.update_time.nanoseconds);
+    try testing.expectError(error.FailedPrecondition, doc.update(&.{.{ .name = "population", .value = .{ .integer = 1 } }}, .{
+        .precondition = .{ .update_time = la.value.update_time },
+    }));
+    try expectDiag(&f, "does not match the required base version");
+    try expectDiag(&f, "an earlier attempt may have landed");
+
+    var after = try doc.get(.{});
+    defer after.deinit();
+    try testing.expectEqual(4_000_000, after.value.get("population").?.integer);
+    try testing.expectEqualStrings("Los Angeles", after.value.get("name").?.string);
+    try testing.expectEqual(updated.update_time.nanoseconds, after.value.update_time.nanoseconds);
+
+    // set replaces the whole document.
+    _ = try doc.set(&.{.{ .name = "only", .value = .{ .boolean = true } }}, .{});
+    var replaced = try doc.get(.{});
+    defer replaced.deinit();
+    try testing.expectEqual(1, replaced.value.fields.len);
+
+    // update needs the document; set with exists == false refuses one.
+    try testing.expectError(error.NotFound, cities.doc("SF").update(&.{.{ .name = "x", .value = .null }}, .{}));
+    try testing.expectError(error.AlreadyExists, doc.set(&.{}, .{ .precondition = .{ .exists = false } }));
+    // Without a precondition, update writes a missing document.
+    _ = try cities.doc("SF").update(&.{.{ .name = "x", .value = .null }}, .{ .precondition = null });
+
+    // delete, then the missing document.
+    try doc.delete(.{ .precondition = .{ .exists = true } });
+    try testing.expectError(error.NotFound, doc.get(.{}));
+    try expectDiag(&f, "not found");
+    try doc.delete(.{});
+    try testing.expectError(error.NotFound, doc.delete(.{ .precondition = .{ .exists = true } }));
+}
+
+test "documents: masks delete, reach into maps, and read back part of a document" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const doc = f.doc("masks/m");
+    _ = try doc.set(&.{
+        .{ .name = "address", .value = .{ .map = &.{
+            .{ .name = "city", .value = .{ .string = "LA" } },
+            .{ .name = "zip", .value = .{ .string = "90001" } },
+        } } },
+        .{ .name = "nickname", .value = .{ .string = "City of Angels" } },
+        .{ .name = "a-b", .value = .{ .map = &.{.{ .name = "c`d", .value = .{ .integer = 1 } }} } },
+    }, .{});
+
+    // address.city changes, zip stays, nickname goes, a-b.c`d changes.
+    _ = try doc.update(&.{
+        .{ .name = "address", .value = .{ .map = &.{.{ .name = "city", .value = .{ .string = "Los Angeles" } }} } },
+        .{ .name = "a-b", .value = .{ .map = &.{.{ .name = "c`d", .value = .{ .integer = 2 } }} } },
+    }, .{ .mask = &.{ "address.city", "nickname", "`a-b`.`c\\`d`" } });
+    var got = try doc.get(.{});
+    defer got.deinit();
+    try testing.expectEqualStrings("Los Angeles", got.value.get("address").?.get("city").?.string);
+    try testing.expectEqualStrings("90001", got.value.get("address").?.get("zip").?.string);
+    try testing.expectEqual(null, got.value.get("nickname"));
+    try testing.expectEqual(2, got.value.get("a-b").?.get("c`d").?.integer);
+
+    // Deleting the last field of a map leaves the map, empty.
+    _ = try doc.update(&.{}, .{ .mask = &.{"`a-b`.`c\\`d`"} });
+    var emptied = try doc.get(.{});
+    defer emptied.deinit();
+    try testing.expectEqual(0, emptied.value.get("a-b").?.map.len);
+
+    // A read mask returns part of the document; __name__ alone none of it.
+    var part = try doc.get(.{ .mask = &.{ "address.zip", "missing" } });
+    defer part.deinit();
+    try testing.expectEqual(1, part.value.fields.len);
+    try testing.expectEqual(1, part.value.get("address").?.map.len);
+    try testing.expectEqualStrings("90001", part.value.get("address").?.get("zip").?.string);
+    var bare = try doc.get(.{ .mask = &.{"__name__"} });
+    defer bare.deinit();
+    try testing.expectEqual(0, bare.value.fields.len);
+}
+
+test "documents: ids that need encoding, subcollections, and odd names" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const odd = [_][]const u8{ "a b%c+d", "a:b", "été", "x?y#z", "[brackets]", "back\\slash", "dots.in.id", "...", "~tilde" };
+    for (odd) |id| {
+        _ = try f.client.collection("odd").doc(id).set(&.{.{ .name = "id", .value = .{ .string = id } }}, .{});
+        var got = try f.client.collection("odd").doc(id).get(.{});
+        defer got.deinit();
+        try testing.expectEqualStrings(id, got.value.id());
+        try testing.expectEqualStrings(id, got.value.get("id").?.string);
+    }
+
+    // A subcollection below a document that does not exist.
+    const tower = f.client.doc("cities/LA").collection("landmarks").doc("tower");
+    _ = try tower.set(&.{}, .{});
+    var t = try tower.get(.{});
+    defer t.deinit();
+    try testing.expectEqualStrings("cities/LA/landmarks/tower", t.value.path());
+    try testing.expectError(error.NotFound, f.doc("cities/LA").get(.{}));
+}
+
+test "listing: documents by page and order, collection ids at each level" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const items = f.client.collection("items");
+    for (0..7) |i| {
+        var id_buf: [8]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "i{d}", .{i});
+        _ = try items.doc(id).set(&.{.{ .name = "rank", .value = .{ .integer = @intCast(10 - i) } }}, .{});
+    }
+    _ = try f.doc("items/i0/sub/s").set(&.{}, .{});
+    _ = try f.doc("other/o/deep/d").set(&.{}, .{});
+
+    // Pages of three, by name, until the token runs out.
+    var seen: usize = 0;
+    var token_buf: [512]u8 = undefined;
+    var token: ?[]const u8 = null;
+    var pages: usize = 0;
+    while (true) {
+        var page = try items.list(.{ .page_size = 3, .page_token = token });
+        defer page.deinit();
+        pages += 1;
+        for (page.value.documents, 0..) |d, i| {
+            var want: [8]u8 = undefined;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "i{d}", .{seen + i}), d.id());
+        }
+        seen += page.value.documents.len;
+        const next = page.value.next_page_token orelse break;
+        @memcpy(token_buf[0..next.len], next);
+        token = token_buf[0..next.len];
+    }
+    try testing.expectEqual(7, seen);
+    try testing.expect(pages >= 3);
+
+    // Ordered by a field, descending, keys only.
+    var ranked = try items.list(.{ .order_by = &.{ .{ .field = "rank", .direction = .descending }, .{ .field = "__name__" } }, .mask = &.{"__name__"} });
+    defer ranked.deinit();
+    try testing.expectEqual(7, ranked.value.documents.len);
+    try testing.expectEqualStrings("i0", ranked.value.documents[0].id());
+    try testing.expectEqual(0, ranked.value.documents[0].fields.len);
+
+    // An empty collection is an empty page.
+    var none = try f.client.collection("nothing").list(.{});
+    defer none.deinit();
+    try testing.expectEqual(0, none.value.documents.len);
+
+    // Collection ids: at the root, and below documents, existing or not.
+    var root = try f.client.listCollectionIds(.{});
+    defer root.deinit();
+    try testing.expectEqual(2, root.value.collection_ids.len);
+    try testing.expectEqualStrings("items", root.value.collection_ids[0]);
+    try testing.expectEqualStrings("other", root.value.collection_ids[1]);
+    var one = try f.client.listCollectionIds(.{ .page_size = 1 });
+    defer one.deinit();
+    try testing.expectEqual(1, one.value.collection_ids.len);
+    try testing.expect(one.value.next_page_token != null);
+    var sub = try f.doc("items/i0").listCollectionIds(.{});
+    defer sub.deinit();
+    try testing.expectEqualStrings("sub", sub.value.collection_ids[0]);
+    var deep = try f.doc("other/o").listCollectionIds(.{});
+    defer deep.deinit();
+    try testing.expectEqualStrings("deep", deep.value.collection_ids[0]);
+    var empty = try f.doc("items/i1").listCollectionIds(.{});
+    defer empty.deinit();
+    try testing.expectEqual(0, empty.value.collection_ids.len);
+}
+
+test "named databases: separate from (default), no routing header needed" {
+    var f: Fixture = undefined;
+    if (!try f.initDatabase("zigps-named")) return error.SkipZigTest;
+    defer f.deinit();
+    _ = try f.doc("c/x").set(&.{.{ .name = "where", .value = .{ .string = "named" } }}, .{});
+    var got = try f.doc("c/x").get(.{});
+    defer got.deinit();
+    try testing.expect(std.mem.indexOf(u8, got.value.name, "/databases/zigps-named/") != null);
+
+    // The same path in (default) is another document.
+    var default: firestore.Client = try .init(testing.allocator, testing.io, .{
+        .project_id = &f.project,
+        .endpoint = f.emulator,
+    });
+    defer default.deinit();
+    try testing.expectError(error.NotFound, default.doc("c/x").get(.{}));
+}
+
+test "references: a full name built by the client goes in and comes back" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const name = try f.client.documentName(testing.allocator, "cities/LA");
+    defer testing.allocator.free(name);
+    _ = try f.doc("refs/r").set(&.{.{ .name = "city", .value = .{ .reference = name } }}, .{});
+    var got = try f.doc("refs/r").get(.{});
+    defer got.deinit();
+    try testing.expectEqualStrings(name, got.value.get("city").?.reference);
+}
