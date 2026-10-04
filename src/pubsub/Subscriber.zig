@@ -85,6 +85,11 @@ extend_buffer: [][]const u8,
 /// What the server said of each id in `extend_buffer`.
 extend_results: []types.AckResult,
 stopping: bool,
+/// Every task must end now, cancel delivered or not: `run` is being
+/// canceled, or its drain is past the workers. The janitor heeds this
+/// and not `stopping`, since a drain still needs leases extended and
+/// resolved messages sent.
+halted: bool,
 ran: bool,
 fatal: ?Error,
 fatal_diag: Diagnostics,
@@ -250,6 +255,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Subscriber {
         .extend_buffer = extend_buffer,
         .extend_results = extend_results,
         .stopping = false,
+        .halted = false,
         .ran = false,
         .fatal = null,
         .fatal_diag = .{},
@@ -294,6 +300,21 @@ pub fn deinit(self: *Subscriber) void {
 pub fn stop(self: *Subscriber) void {
     self.mutex.lockUncancelable(self.io);
     self.stopping = true;
+    self.cond.broadcast(self.io);
+    self.mutex.unlock(self.io);
+    self.queue.close(self.io);
+}
+
+/// Raises the flags every task watches, so each ends even when its cancel
+/// never lands: on macOS, std's unwinder can swallow a pending cancel
+/// (docs/zig-std-workarounds.md), and a cancel arrives once, so a task
+/// that missed its own would run on, and `run` would wait on it forever.
+/// The puller watches `stopping`, the workers their closed queue, and the
+/// janitor `halted`, each within a bounded wait.
+fn halt(self: *Subscriber) void {
+    self.mutex.lockUncancelable(self.io);
+    self.stopping = true;
+    self.halted = true;
     self.cond.broadcast(self.io);
     self.mutex.unlock(self.io);
     self.queue.close(self.io);
@@ -360,8 +381,9 @@ pub fn run(self: *Subscriber, handler: Handler) Error!void {
     var puller_running = true;
     defer if (puller_running) discard(puller_task.cancel(io));
     var janitor_task = io.concurrent(janitorLoop, .{self}) catch {
-        discard(puller_task.cancel(io));
-        puller_running = false;
+        // The flags go up before the defer above cancels the puller, in
+        // case that cancel never lands (docs/zig-std-workarounds.md).
+        self.halt();
         return concurrencyUnavailable(self);
     };
     var janitor_running = true;
@@ -382,7 +404,11 @@ pub fn run(self: *Subscriber, handler: Handler) Error!void {
     };
 
     // Wait for stop() or a fatal failure. Cancellation lands here too, and
-    // the defers above take the tasks down with us.
+    // the defers above take the tasks down with us. The flags go up before
+    // any of them waits on a cancel: on macOS, std's unwinder can swallow
+    // a task's pending cancel (docs/zig-std-workarounds.md), and a task
+    // that missed its own must still find out it is over.
+    errdefer self.halt();
     {
         self.mutex.lock(io) catch |err| return err;
         defer self.mutex.unlock(io);
@@ -395,6 +421,9 @@ pub fn run(self: *Subscriber, handler: Handler) Error!void {
     puller_running = false;
     self.queue.close(io);
     workers.await(io) catch {};
+    // The janitor's work ends with the workers'. The flag goes up first,
+    // in case its cancel never lands (docs/zig-std-workarounds.md).
+    self.halt();
     discard(janitor_task.cancel(io));
     janitor_running = false;
     self.flush(.final) catch {};
@@ -705,6 +734,14 @@ fn janitorLoop(self: *Subscriber) std.Io.Cancelable!void {
     var next_extension_ms = std.Io.Clock.awake.now(io).toMilliseconds() + self.tickMs();
     while (true) {
         try io.sleep(.fromMilliseconds(@min(ack_delay_ms, self.tickMs())), .awake);
+        {
+            // `halt` stands in for a cancel that never landed: without
+            // this, a swallowed cancel would leave the loop ticking forever
+            // and run() waiting on it (docs/zig-std-workarounds.md).
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.halted) return;
+        }
         // A cancel that lands during a flush has to end the loop here. The
         // request that noticed it has acknowledged it, and std delivers a
         // cancel once: the sleep above would never see it again, and run()
@@ -1667,6 +1704,9 @@ test "Subscriber: delivers, acknowledges, and stops from a handler" {
     try testing.expectEqual(5, counts.acked);
     try testing.expectEqual(0, counts.nacked);
     try testing.expectEqual(0, counts.handler_failures);
+    // On its way out, run raised the flags that end a task whose cancel
+    // never landed.
+    try testing.expect(h.subscriber.halted);
 }
 
 test "Subscriber: a failing handler releases the message, and redelivery succeeds" {
@@ -2186,6 +2226,9 @@ test "Subscriber: canceling run takes every task down and leaks nothing" {
     var running = try testing.io.concurrent(Subscriber.run, .{ &h.subscriber, h.handler.handler() });
     try testing.io.sleep(.fromMilliseconds(100), .awake);
     try testing.expectError(error.Canceled, running.cancel(testing.io));
+    // The cancel raised the flags on its way out, the rescue of any task
+    // whose own cancel was swallowed (docs/zig-std-workarounds.md).
+    try testing.expect(h.subscriber.halted);
 }
 
 /// Rounds of canceling a busy subscriber: every resolved message
@@ -2404,6 +2447,78 @@ test "Subscriber: stop returns when the janitor is canceled in the middle of a f
     // on its way out delivered it, so the message is not redelivered.
     try testing.expectEqual(1, h.fake.ackedCount());
     try testing.expectEqual(1, h.subscriber.stats().acked);
+}
+
+test "Subscriber: halt ends the janitor and the puller without any cancel" {
+    // On macOS, std's unwinder can swallow a task's pending cancel
+    // (docs/zig-std-workarounds.md), and a cancel arrives once, so the
+    // task would run on and run() would wait on it forever. The flags
+    // halt raises are the second line of defense: this drives each loop
+    // to its end without canceling anything.
+    const io = testing.io;
+    const Loops = struct {
+        fn janitor(s: *Subscriber, returned: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            defer returned.store(true, .release);
+            return s.janitorLoop();
+        }
+        fn puller(s: *Subscriber, returned: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            defer returned.store(true, .release);
+            return s.pullerLoop();
+        }
+        fn hasReturned(returned: *std.atomic.Value(bool)) bool {
+            return returned.load(.acquire);
+        }
+        fn pullStarted(fake: *FakePubSub) bool {
+            fake.mutex.lockUncancelable(fake.io);
+            defer fake.mutex.unlock(fake.io);
+            return fake.pull_wants.items.len > 0;
+        }
+        fn oneInFlight(s: *Subscriber) bool {
+            s.mutex.lockUncancelable(s.io);
+            defer s.mutex.unlock(s.io);
+            return s.inflight.items.len == 1;
+        }
+    };
+
+    // The janitor parked in its tick, and the puller in a held pull, as
+    // production's is for at most one long poll.
+    var h: Harness = undefined;
+    try h.init(.{ .tick_ms = 10 });
+    defer h.deinit();
+    var janitor_returned: std.atomic.Value(bool) = .init(false);
+    var puller_returned: std.atomic.Value(bool) = .init(false);
+    var janitor = try io.concurrent(Loops.janitor, .{ &h.subscriber, &janitor_returned });
+    var puller = try io.concurrent(Loops.puller, .{ &h.subscriber, &puller_returned });
+    if (!try waitUntil(5_000, &h.fake, Loops.pullStarted)) @panic("the puller never began its pull");
+    h.subscriber.halt();
+    if (!try waitUntil(5_000, &janitor_returned, Loops.hasReturned)) {
+        @panic("the janitor never saw the flag: halt cannot end it without a cancel");
+    }
+    // The server answering the held pull is what ends the puller's wait.
+    try h.fake.publish("wakes the puller");
+    if (!try waitUntil(5_000, &puller_returned, Loops.hasReturned)) {
+        @panic("the puller never saw the flag: halt cannot end it without a cancel");
+    }
+    try janitor.await(io);
+    try puller.await(io);
+    // The message that woke it was released for redelivery, not lost: the
+    // queue was closed and no worker ran.
+    try testing.expectEqual(1, h.subscriber.stats().nacked);
+
+    // A puller parked on flow control, the subscriber's own condition, is
+    // woken by halt's broadcast.
+    var full: Harness = undefined;
+    try full.init(.{ .max_outstanding = 1 });
+    defer full.deinit();
+    try full.fake.publish("fills the window");
+    var full_returned: std.atomic.Value(bool) = .init(false);
+    var full_puller = try io.concurrent(Loops.puller, .{ &full.subscriber, &full_returned });
+    if (!try waitUntil(5_000, &full.subscriber, Loops.oneInFlight)) @panic("the puller never filled the window");
+    full.subscriber.halt();
+    if (!try waitUntil(5_000, &full_returned, Loops.hasReturned)) {
+        @panic("the puller never woke from the flow-control wait");
+    }
+    try full_puller.await(io);
 }
 
 test "a batch released from many tasks at once is freed exactly once" {

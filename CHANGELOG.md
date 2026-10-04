@@ -4,6 +4,16 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.32.0 (unreleased)
+
+- pubsub: the Subscriber's and the Publisher's own tasks now also watch a
+  stop flag that `run` raises on every way out, cancel delivered or not.
+  On macOS, std's unwinder can swallow a task's pending cancel
+  (docs/zig-std-workarounds.md), and a task that missed its own could
+  keep `run` waiting on it forever; it now ends soon after on the flag.
+  No API changed.
+- auth, core, secret_manager and storage: unchanged.
+
 ## 0.31.0 (2026-10-03)
 
 - **Breaking:** Zig 0.17.0 is required, as `minimum_zig_version` says;

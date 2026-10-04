@@ -111,6 +111,9 @@ waiting: List,
 due: List,
 stopping: bool,
 ran: bool,
+/// Every task must end now, cancel delivered or not: `run` is on its
+/// way out.
+halted: bool,
 /// Messages accepted so far. A batch notes the number of its first.
 sequence: u64,
 /// Messages accepted and not yet resolved, and their bytes of request body.
@@ -403,6 +406,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Publisher {
         .due = .{},
         .stopping = false,
         .ran = false,
+        .halted = false,
         .sequence = 0,
         .outstanding = 0,
         .outstanding_bytes = 0,
@@ -549,6 +553,28 @@ pub fn stop(self: *Publisher) void {
     self.makeAllDue();
 }
 
+/// Raises the flag every task watches, so each ends even when its cancel
+/// never lands: on macOS, std's unwinder can swallow a pending cancel
+/// (docs/zig-std-workarounds.md), and a cancel arrives once, so a task
+/// that missed its own would wait on, and `run` would wait on it forever.
+/// The senders watch the flag in `take` and between attempts, the timer
+/// each round.
+fn halt(self: *Publisher) void {
+    self.mutex.lockUncancelable(self.io);
+    self.stopping = true;
+    self.halted = true;
+    self.cond.broadcast(self.io);
+    self.mutex.unlock(self.io);
+    self.timer_event.set(self.io);
+}
+
+/// Whether `halt` was called.
+fn isHalted(self: *Publisher) bool {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    return self.halted;
+}
+
 /// A consistent snapshot of the counters.
 pub fn stats(self: *Publisher) Stats {
     self.mutex.lockUncancelable(self.io);
@@ -578,14 +604,19 @@ pub fn run(self: *Publisher) Error!void {
     var timer = io.concurrent(timerLoop, .{self}) catch return self.cannotRun();
     var senders: std.Io.Group = .init;
     for (0..self.senders.len) |i| senders.concurrent(io, senderLoop, .{ self, i }) catch {
+        self.halt();
         senders.cancel(io);
         discard(timer.cancel(io));
         return self.cannotRun();
     };
 
     // Until stop() and the drain behind it. Cancellation lands here too, and
-    // the teardown below takes the tasks down with it.
+    // the teardown below takes the tasks down with it. The flag goes up
+    // before anything waits on a cancel: on macOS, std's unwinder can
+    // swallow a task's pending cancel (docs/zig-std-workarounds.md), and a
+    // task that missed its own must still find out it is over.
     const drained = self.awaitDrained();
+    self.halt();
     senders.cancel(io);
     discard(timer.cancel(io));
     // After a cancel, whatever is left never goes.
@@ -874,6 +905,9 @@ fn timerLoop(self: *Publisher) std.Io.Cancelable!void {
         const next = next: {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // `halt` sets the event and this flag: a cancel that never
+            // landed (docs/zig-std-workarounds.md) still ends the loop.
+            if (self.halted) return;
             // Cleared before looking, so a batch opened from here on sets it
             // again and the wait below returns at once.
             self.timer_event.reset();
@@ -930,17 +964,19 @@ fn tick(self: *Publisher) ?std.Io.Timestamp {
 
 fn senderLoop(self: *Publisher, index: usize) std.Io.Cancelable!void {
     while (true) {
-        const batch = try self.take();
+        const batch = (try self.take()) orelse return;
         try self.sendAndResolve(index, batch);
     }
 }
 
-/// Waits for a batch to send.
-fn take(self: *Publisher) std.Io.Cancelable!*Batch {
+/// Waits for a batch to send. Null means the publisher is halted and the
+/// sender is done, cancel delivered or not.
+fn take(self: *Publisher) std.Io.Cancelable!?*Batch {
     const io = self.io;
     try self.mutex.lock(io);
     defer self.mutex.unlock(io);
     while (true) {
+        if (self.halted) return null;
         if (self.tryTake()) |batch| return batch;
         try self.cond.wait(io, &self.mutex);
     }
@@ -1025,6 +1061,10 @@ fn sendBatch(self: *Publisher, client: *Client, diag: *Diagnostics, batch: *Batc
         } else |err| {
             if (err == error.Canceled) return err;
             if (!self.retry_publish or !rpc.isPublishRetryable(err, diag.http_status)) return err;
+            // The publisher is on its way out, and this sender's cancel may
+            // have been swallowed (docs/zig-std-workarounds.md): the last
+            // failure stands rather than retrying toward the deadline.
+            if (self.isHalted()) return err;
             const delay_ms = self.retry.backoffMs(attempt, core.rpc.entropy(io));
             // No time for another attempt: the failure stands.
             if (delay_ms >= msUntil(io, batch.deadline)) return err;
@@ -1643,6 +1683,24 @@ test "deadlines: a failure that clears in time is survived" {
     try testing.expectEqualStrings("1", try idOf(receipt));
     try testing.expectEqual(4, s.fake.requestCount());
     try testing.expectEqual(1, s.publisher.stats().succeeded);
+}
+
+test "deadlines: a halted publisher stops retrying between attempts" {
+    // halt stands in for a cancel the macOS unwinder swallowed
+    // (docs/zig-std-workarounds.md): a sender that missed its cancel must
+    // not keep retrying toward the deadline while run waits for it.
+    var s: Solo = undefined;
+    try s.init(.{ .publish_timeout_ms = 5_000 });
+    defer s.deinit();
+    // Without the halt, the retry after this answer would succeed.
+    s.fake.script = &.{.{ .status = .{ 503, "UNAVAILABLE" } }};
+    const receipt = try s.publishText("stranded");
+    defer receipt.release();
+    s.advance(10);
+    s.publisher.halt();
+    try s.publisher.sendDue();
+    try testing.expectError(error.Unavailable, idOf(receipt));
+    try testing.expectEqual(1, s.fake.requestCount());
 }
 
 test "deadlines: a batch still unsent at its deadline fails with TimedOut, never sent" {
@@ -2484,10 +2542,56 @@ test "run: canceling run fails what is unsent with PublisherStopped, and leaks n
     };
     try testing.expect(try waitUntil(5_000, &l.fake, Held.two));
     try testing.expectError(error.Canceled, l.cancel());
+    // The cancel raised the flag on its way out, the rescue of any task
+    // whose own cancel was swallowed (docs/zig-std-workarounds.md).
+    try testing.expect(l.publisher.halted);
     for (receipts) |r| try testing.expectError(error.PublisherStopped, r.wait());
     // In flight when canceled: the server may have them.
     try testing.expect(std.mem.indexOf(u8, receipts[0].diagnostics().message(), "may have stored") != null);
     try testing.expectEqual(4, l.publisher.stats().failed);
+}
+
+test "run: halt ends an idle sender and the timer without any cancel" {
+    // On macOS, std's unwinder can swallow a task's pending cancel
+    // (docs/zig-std-workarounds.md), and a cancel arrives once, so the
+    // task would wait on and run() would wait on it forever. The flag
+    // halt raises is the second line of defense: this drives both loops
+    // to their end without canceling anything.
+    const io = testing.io;
+    var l: Live = undefined;
+    try l.init(.{});
+    defer l.deinit();
+
+    const Loops = struct {
+        fn sender(p: *Publisher, returned: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            defer returned.store(true, .release);
+            return p.senderLoop(0);
+        }
+        fn timer(p: *Publisher, returned: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            defer returned.store(true, .release);
+            return p.timerLoop();
+        }
+        fn hasReturned(returned: *std.atomic.Value(bool)) bool {
+            return returned.load(.acquire);
+        }
+    };
+    var sender_returned: std.atomic.Value(bool) = .init(false);
+    var timer_returned: std.atomic.Value(bool) = .init(false);
+    var sender = try io.concurrent(Loops.sender, .{ &l.publisher, &sender_returned });
+    var timer = try io.concurrent(Loops.timer, .{ &l.publisher, &timer_returned });
+    // Let both park: the sender on the condition with nothing due, the
+    // timer on its event with no deadline.
+    try io.sleep(.fromMilliseconds(25), .awake);
+
+    l.publisher.halt();
+    if (!try waitUntil(5_000, &sender_returned, Loops.hasReturned)) {
+        @panic("a sender never saw the flag: halt cannot end it without a cancel");
+    }
+    if (!try waitUntil(5_000, &timer_returned, Loops.hasReturned)) {
+        @panic("the timer never saw the flag: halt cannot end it without a cancel");
+    }
+    try sender.await(io);
+    try timer.await(io);
 }
 
 /// Waits until the fake holds `n` requests, or panics after 5 s.
@@ -2957,4 +3061,7 @@ test "run: when no sender can start, the timer already running is taken down and
     try testing.expect(std.mem.indexOf(u8, diag.message(), "concurrent tasks") != null);
     try testing.expectError(error.PublisherStopped, receipt.wait());
     try testing.expectEqual(0, fake.requestCount());
+    // The flag went up before the timer's cancel, in case that cancel
+    // never landed.
+    try testing.expect(publisher.halted);
 }
