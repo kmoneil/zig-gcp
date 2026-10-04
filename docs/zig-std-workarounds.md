@@ -54,7 +54,11 @@ Two more are handled in this repository's tests:
   records stack traces, as `SafeAllocator` does in a Debug build, can
   lose a task's cancel the same way, a Subscriber's or Publisher's
   among them. Declaring `std_options_debug_io` in your root file, as
-  `tools/test_runner.zig` does, prevents it.
+  `tools/test_runner.zig` does, prevents it. As a second line of defense,
+  a Subscriber's and a Publisher's `run` also raises an internal stop
+  flag on every way out, and their tasks watch it within bounded waits,
+  so even a task whose cancel was swallowed ends soon after, instead of
+  leaving `run` waiting on it forever.
 - The same allocator grows a block in place only while nothing was
   handed out after it, which depends on what earlier runs did, so the
   same code made a different number of allocations from one run to the
