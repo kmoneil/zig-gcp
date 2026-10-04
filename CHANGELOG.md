@@ -12,7 +12,12 @@ including the ones that did not change.
   (docs/zig-std-workarounds.md), and a task that missed its own could
   keep `run` waiting on it forever; it now ends soon after on the flag.
   No API changed.
-- auth, core, secret_manager and storage: unchanged.
+- core: `core.timestamp.format` writes an RFC 3339 timestamp as Google's
+  servers do, in UTC with no fractional digits or 3, 6 or 9 of them.
+  `core.timestamp.min`, `max` and `inRange` give the range it writes,
+  that of `google.protobuf.Timestamp` (years 1 to 9999), and
+  `core.timestamp.max_len` the buffer it needs.
+- auth, secret_manager and storage: unchanged.
 
 ## 0.31.0 (2026-10-03)
 
