@@ -63,7 +63,8 @@ the integration tests and examples against the emulators; and coverage,
 whose summary and report are attached to each run.
 
 Every night it also fuzzes, one job per module, each starting from the
-corpus that earlier nights built up for it, and jobs of their own for
+corpus that earlier nights built up for it (kept for 30 days as the
+artifact `fuzz-corpus-<job>`), and jobs of their own for
 the properties too slow to share one: auth's RSA signing
 (`slow-auth`), pubsub's Publisher and Subscriber models (`slow-pubsub`,
 `slow-subscriber`) and its heavy properties (`heavy-pubsub`), storage's

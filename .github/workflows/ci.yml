@@ -333,10 +333,14 @@ jobs:
         # production's rules to heavy-storage: paths, a rename, and a
         # managed folder with a grant, per draw. 3.5 ms a run on a Mac (2K
         # and 12K on a built binary), about 9 ms at that job's CI ratio:
-        # roughly 3.6 minutes at 24K, inside the pending re-size from the
-        # 10-02 and 10-03 nightlies.
+        # roughly 3.6 minutes at 24K. Zig 0.17 (10-03) moved some jobs'
+        # costs: on its first nightly (10-04, run 37193062880) pubsub took
+        # 55 minutes where 0.16 took 113, and fault-gzip 80 where it took 41
+        # to 58. Only core passed its aim, at 96 minutes, so it drops to
+        # 850K. The rest wait for nights that start from a kept corpus: the
+        # 10-01, 10-02 and 10-03 nightlies all started without one.
         include:
-          - { job: core, module: core, filter: fuzz, iterations: 900K }
+          - { job: core, module: core, filter: fuzz, iterations: 850K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
           - { job: slow-auth, module: auth, filter: slow property, iterations: 100K }
           - { job: pubsub, module: pubsub, filter: fuzz, iterations: 1500K }
@@ -352,6 +356,10 @@ jobs:
           - { job: fault-gzip, module: storage, filter: fault property gzip|fault property compressed, iterations: 150 }
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    # actions: read finds and downloads the corpus an earlier run kept.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -359,13 +367,32 @@ jobs:
         with:
           version: 0.17.0
 
-      # Each run starts from the corpus the earlier runs built up.
+      # Each run starts from the corpus the earlier runs built up, kept as
+      # an artifact rather than in the cache. On a busy day the build caches
+      # of every run fill the cache's 10 GB, and it evicts the least recently
+      # used entry first: the corpus, read once a night. The nightlies
+      # found none on 8 of the 11 nights from 2026-09-23 to 10-03. The
+      # newest corpus from this branch or main is the one restored, as
+      # with the cache.
       - name: Restore the fuzz corpus
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .zig-cache/f
-          key: fuzz-corpus-${{ matrix.job }}-${{ github.run_id }}
-          restore-keys: fuzz-corpus-${{ matrix.job }}-
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: fuzz-corpus-${{ matrix.job }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -o pipefail
+          id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$NAME&per_page=100" --jq '
+            [.artifacts[] | select(.expired | not)
+              | select(.workflow_run.head_branch == env.BRANCH or .workflow_run.head_branch == "main")]
+            | sort_by(.created_at) | last | .id // empty')
+          if [ -z "$id" ]; then
+            echo "No $NAME artifact yet: this run starts from the seed corpus alone"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "$RUNNER_TEMP/corpus.zip"
+          mkdir -p .zig-cache/f
+          unzip -q -o "$RUNNER_TEMP/corpus.zip" -d .zig-cache/f
+          echo "Restored artifact $id: $(find .zig-cache/f -type f | wc -l) files"
 
       - name: Coverage-guided fuzzing
         env:
@@ -390,12 +417,16 @@ jobs:
             exit 1
           fi
 
+      # 30 days, so a corpus outlasts a few nights without a run.
       - name: Save the fuzz corpus
         if: always()
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
+          name: fuzz-corpus-${{ matrix.job }}
           path: .zig-cache/f
-          key: fuzz-corpus-${{ matrix.job }}-${{ github.run_id }}
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 30
 
       # `crash` is the failing input: a 4-byte little-endian length, then the
       # bytes. CONTRIBUTING.md says how to turn it into a regression test.
