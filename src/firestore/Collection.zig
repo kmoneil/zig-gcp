@@ -56,10 +56,9 @@ pub fn create(self: Collection, fields: []const types.Field, options: types.Crea
         return rpc.refuse(client, error.InvalidResourceId, "invalid document id: {s}", .{problem});
     }
     try rpc.checkFields(client, fields);
+    // The collection's path and the id were checked, so this is a
+    // document's path, at most 100 segments deep; only its length is new.
     const document_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ path, document_id });
-    if (names.pathProblem(document_path, .document)) |problem| {
-        return rpc.refuse(client, error.InvalidResourceId, "invalid document path: {s}", .{problem});
-    }
     if (document_path.len + client.name_prefix_len > validate.max_name_bytes) {
         return rpc.refuse(client, error.InvalidResourceId, "invalid document path: the full name is over 6 KiB", .{});
     }
@@ -253,6 +252,12 @@ test "create refuses bad ids and paths before anything is sent" {
     var h: test_util.Harness = undefined;
     try h.init(&.{}, .{});
     defer h.deinit();
+    // A collection path within 6 KiB, 4,659 bytes as a full name, whose
+    // new document is not: 6,160.
+    const long = test_util.repeat("i", 1500);
+    const collection = "c/" ++ long ++ "/c/" ++ long ++ "/c/" ++ long ++ "/" ++ test_util.repeat("c", 100);
+    try testing.expectError(error.InvalidResourceId, h.client.collection(collection).create(&.{}, .{ .document_id = long }));
+    try h.expectDiag("6 KiB");
     try testing.expectError(error.InvalidResourceId, h.client.collection("cities").create(&.{}, .{ .document_id = "a/b" }));
     try h.expectDiag("invalid document id");
     try testing.expectError(error.InvalidResourceId, h.client.collection("cities").create(&.{}, .{ .document_id = "__x__" }));

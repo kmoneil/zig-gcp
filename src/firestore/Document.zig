@@ -537,7 +537,7 @@ test "get, set, update and delete: every allocation failure is OutOfMemory witho
     const Run = struct {
         fn run(gpa: Allocator) !void {
             var fake: test_util.FakeTransport = .init(testing.allocator, &.{
-                .{ .respond = .{ .body = test_util.docBody("cities/LA", "{\"a\":{\"mapValue\":{\"fields\":{\"b\":{\"arrayValue\":{\"values\":[{\"integerValue\":\"1\"}]}}}}}}") } },
+                .{ .respond = .{ .body = test_util.docBody("cities/LA", "{\"a\":{\"mapValue\":{\"fields\":{\"b\":{\"arrayValue\":{\"values\":[{\"integerValue\":\"1\"},{\"bytesValue\":\"AP_-\"}]}}}}}}") } },
                 .{ .respond = .{ .body = test_util.commit_body } },
                 .{ .respond = .{ .body = test_util.commit_body } },
                 .{ .respond = .{ .body = test_util.delete_body } },
