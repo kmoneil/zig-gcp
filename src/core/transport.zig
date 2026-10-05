@@ -136,7 +136,9 @@ pub const StreamRequest = struct {
     };
 
     pub const Body = union(enum) {
-        /// No body and no Content-Length, as GET and DELETE send.
+        /// No body and no Content-Length, as GET and DELETE send. POST, PUT
+        /// and PATCH send an empty one, `Content-Length: 0`, since std
+        /// requires them to carry a body.
         none,
         /// Sent back to back with an exact Content-Length, without being
         /// copied into one buffer. A multipart body is framing, caller data,
@@ -534,6 +536,12 @@ pub const HttpTransport = struct {
                     },
                 };
                 streamed += n;
+                // What arrived goes on now, not when the buffer fills: a
+                // streamed answer's next message may be a while coming.
+                forward.writer.flush() catch {
+                    connection.closing = true;
+                    return error.WriteFailed;
+                };
             }
             forward.writer.flush() catch {
                 connection.closing = true;
@@ -641,7 +649,8 @@ fn sendBody(
     // streams into it, and readers require a writable destination.
     var body_buffer: [4096]u8 = undefined;
     switch (body) {
-        .none => return request.sendBodiless(),
+        // std asserts that a method that takes a body sends one.
+        .none => return if (request.method.requestHasBody()) sendBody(request, .{ .segments = &.{} }) else request.sendBodiless(),
         .segments => |segments| {
             var total: u64 = 0;
             for (segments) |s| total += s.len;
@@ -1981,6 +1990,73 @@ test "sendStream streams a chunked body and keeps the connection" {
     try testing.expectEqualStrings("{}", next.body);
     try serving.await(io);
     try testing.expectEqual(1, server.connections);
+}
+
+test "sendStream: a POST with no body sends an empty one" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"});
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    const res = try ht.transport().sendStream(.{ .method = .POST, .url = server.url(&buf, "/v1/x:run") }, arena.allocator());
+    try testing.expectEqualStrings("{}", res.body);
+    try serving.await(io);
+    try expectHeader(server.request(0), "content-length: 0\r\n");
+}
+
+test "sendStream hands each piece to the writer as it arrives, not when more comes" {
+    // A streamed answer's messages are handed on as they arrive, as
+    // Firestore's are: a short one must not wait in a buffer for the next.
+    const io = testing.io;
+    var open: std.atomic.Value(bool) = .init(false);
+    const head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n[{}\n\r\n";
+    var server: ScriptedServer = try .start(io, &.{head ++ "2\r\n]\n\r\n0\r\n\r\n"});
+    defer server.deinit(io);
+    server.pause = .{ .after = head.len, .open = &open };
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    // Opens the server's pause once the first piece has arrived.
+    const Watch = struct {
+        open: *std.atomic.Value(bool),
+        got: std.ArrayList(u8) = .empty,
+        writer: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = drain } },
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+            var n: usize = 0;
+            for (data[0 .. data.len - 1]) |d| {
+                self.got.appendSlice(testing.allocator, d) catch return error.WriteFailed;
+                n += d.len;
+            }
+            for (0..splat) |_| {
+                self.got.appendSlice(testing.allocator, data[data.len - 1]) catch return error.WriteFailed;
+                n += data[data.len - 1].len;
+            }
+            if (std.mem.indexOf(u8, self.got.items, "[{}") != null) self.open.store(true, .release);
+            return n;
+        }
+    };
+    var watch: Watch = .{ .open = &open };
+    defer watch.got.deinit(testing.allocator);
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    _ = try ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/v1/o?alt=media"),
+        .sink = .{ .writer = &watch.writer },
+    }, arena.allocator());
+    try serving.await(io);
+    try testing.expectEqualStrings("[{}\n]\n", watch.got.items);
+    try testing.expect(!server.pause_timed_out);
 }
 
 test "sendStream decompresses a gzip body on its way to the writer" {

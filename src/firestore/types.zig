@@ -357,6 +357,49 @@ pub const QueryOptions = struct {
     transaction: ?[]const u8 = null,
 };
 
+/// What `Client.runQueryEach` takes beside the query.
+pub const QueryStreamOptions = struct {
+    /// As `QueryOptions.read_time`.
+    read_time: ?std.Io.Timestamp = null,
+    /// As `QueryOptions.transaction`.
+    transaction: ?[]const u8 = null,
+    /// How long the whole answer may take to arrive, the handler's time
+    /// included, in place of the client's `request_timeout_ms`; 0 removes
+    /// the limit.
+    timeout_ms: u32 = default_stream_timeout_ms,
+};
+
+/// Five minutes: a streamed read's limit unless its options say otherwise.
+pub const default_stream_timeout_ms = 5 * 60 * 1000;
+
+/// What `Client.runQueryEach` hands each document to.
+pub const DocumentHandler = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Called once per document, in the query's order, as it arrives,
+        /// with a snapshot the handler owns: it may keep it, and must
+        /// `deinit` it, error or not. Returning an error stops the read,
+        /// and the call returns that error.
+        document: *const fn (ptr: *anyopaque, snapshot: Owned(Snapshot)) anyerror!void,
+    };
+
+    pub fn document(self: DocumentHandler, snapshot: Owned(Snapshot)) anyerror!void {
+        return self.vtable.document(self.ptr, snapshot);
+    }
+};
+
+/// How a streamed query ended.
+pub const QueryStreamEnd = struct {
+    /// Documents handed to the handler.
+    documents: u64,
+    /// When the results were read.
+    read_time: std.Io.Timestamp,
+    /// How many results the offset skipped, where the server says.
+    skipped_results: u64 = 0,
+};
+
 pub const QueryResult = struct {
     documents: []const Snapshot,
     /// When the results were read.
@@ -409,6 +452,52 @@ pub const RunTransactionOptions = struct {
     /// allow by default: a commit, or a read, that the server answers
     /// ABORTED runs it again, from the start, in a new transaction.
     max_attempts: u32 = 5,
+};
+
+/// What `Client.batchGetEach` takes beside the paths.
+pub const BatchGetStreamOptions = struct {
+    /// As `BatchGetOptions.mask`.
+    mask: ?[]const []const u8 = null,
+    /// As `BatchGetOptions.read_time`.
+    read_time: ?std.Io.Timestamp = null,
+    /// As `BatchGetOptions.transaction`.
+    transaction: ?[]const u8 = null,
+    /// As `QueryStreamOptions.timeout_ms`.
+    timeout_ms: u32 = default_stream_timeout_ms,
+};
+
+/// One path `Client.batchGetEach` read.
+pub const BatchGetItem = struct {
+    /// The path asked for, below the database, such as `cities/LA`.
+    path: []const u8,
+    /// The document, or null where it does not exist.
+    document: ?Snapshot,
+};
+
+/// What `Client.batchGetEach` hands each path's answer to.
+pub const BatchGetHandler = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Called once per distinct path, in the order the server answers,
+        /// as each answer arrives, with an item the handler owns, as
+        /// `DocumentHandler.VTable.document` says. Returning an error stops
+        /// the read, and the call returns that error.
+        item: *const fn (ptr: *anyopaque, item: Owned(BatchGetItem)) anyerror!void,
+    };
+
+    pub fn item(self: BatchGetHandler, it: Owned(BatchGetItem)) anyerror!void {
+        return self.vtable.item(self.ptr, it);
+    }
+};
+
+/// How a streamed `batchGet` ended.
+pub const BatchGetStreamEnd = struct {
+    /// Items handed to the handler: one per distinct path asked.
+    items: u64,
+    /// When the documents were read; null only when none were asked for.
+    read_time: ?std.Io.Timestamp,
 };
 
 pub const BatchGetResult = struct {

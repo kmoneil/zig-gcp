@@ -13,6 +13,7 @@ const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
+const stream = @import("stream.zig");
 const types = @import("types.zig");
 const Error = errors.Error;
 
@@ -73,6 +74,95 @@ pub fn batchGet(
     }
     return .{ .documents = documents, .read_time = read_time orelse return rpc.decodeFailed(client, error.InvalidResponse, "batchGet") };
 }
+
+/// Reads the documents at `paths` and hands each distinct one to
+/// `handler` as it arrives; see `stream.zig`. The call has begun.
+pub fn batchGetEach(
+    client: *Client,
+    paths: []const []const u8,
+    options: types.BatchGetStreamOptions,
+    handler: types.BatchGetHandler,
+) anyerror!types.BatchGetStreamEnd {
+    if (options.mask) |m| try rpc.checkMask(client, m, "read mask");
+    if (options.read_time) |t| try rpc.checkTime(client, t, "read time");
+    try rpc.checkTransaction(client, options.transaction, options.read_time);
+    if (paths.len == 0) return .{ .items = 0, .read_time = null };
+
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    // Each distinct path, and whether it has been answered; each is asked
+    // once, as the server answers it once.
+    var answered: std.StringArrayHashMapUnmanaged(bool) = .empty;
+    var full_names: std.ArrayList([]const u8) = .empty;
+    for (paths) |p| {
+        const checked = try rpc.checkedPath(client, a, .init(p), .document);
+        const entry = try answered.getOrPut(a, checked);
+        if (entry.found_existing) continue;
+        entry.value_ptr.* = false;
+        try full_names.append(a, try client.documentName(a, checked));
+    }
+    const url = writeUrl(a, client) catch return error.OutOfMemory;
+    const body = try codec.encodeBatchGet(a, full_names.items, .{ .mask = options.mask, .read_time = options.read_time, .transaction = options.transaction });
+
+    var each: Each = .{ .gpa = client.gpa, .handler = handler, .answered = &answered };
+    try stream.read(client, url, body, options.timeout_ms, each.reader(), "batchGet");
+    for (answered.keys(), answered.values()) |path, done| if (!done) {
+        if (client.diagnostics) |d| d.print("the batchGet answer said nothing of {s}", .{path});
+        return error.InvalidResponse;
+    };
+    return .{ .items = each.items, .read_time = each.read_time orelse return rpc.decodeFailed(client, error.InvalidResponse, "batchGet") };
+}
+
+/// A streamed batchGet's progress.
+const Each = struct {
+    gpa: Allocator,
+    handler: types.BatchGetHandler,
+    answered: *std.StringArrayHashMapUnmanaged(bool),
+    items: u64 = 0,
+    read_time: ?std.Io.Timestamp = null,
+
+    fn reader(self: *Each) stream.Reader {
+        return .{ .ptr = self, .message = message, .handed = handed, .reset = reset };
+    }
+
+    fn message(ptr: *anyopaque, bytes: []const u8, said: *stream.Said) anyerror!void {
+        const self: *Each = @ptrCast(@alignCast(ptr));
+        var owned: types.Owned(types.BatchGetItem) = try .init(self.gpa);
+        var given = false;
+        defer if (!given) owned.deinit();
+        var streamed: ?codec.StreamedError = null;
+        const e = codec.decodeBatchGetMessage(owned.arena.allocator(), bytes, &streamed) catch |err|
+            return said.failed(err, streamed, "batchGet");
+        if (e.read_time) |t| self.read_time = t;
+        const name = if (e.found) |f| f.name else e.missing orelse return;
+        const path = names.relativePath(name) orelse {
+            said.print("the batchGet response could not be decoded", .{});
+            return error.InvalidResponse;
+        };
+        // A document nobody asked for, or one answered already, is no
+        // answer to anything here.
+        const done = self.answered.getPtr(path) orelse return;
+        if (done.*) return;
+        done.* = true;
+        owned.value = .{ .path = path, .document = e.found };
+        given = true;
+        self.items += 1;
+        return self.handler.item(owned);
+    }
+
+    fn handed(ptr: *anyopaque) bool {
+        const self: *Each = @ptrCast(@alignCast(ptr));
+        return self.items > 0;
+    }
+
+    /// Before the first item nothing is marked answered: only a read time
+    /// may have been read.
+    fn reset(ptr: *anyopaque) void {
+        const self: *Each = @ptrCast(@alignCast(ptr));
+        self.read_time = null;
+    }
+};
 
 fn writeUrl(a: Allocator, client: *const Client) Writer.Error![]const u8 {
     var out: Writer.Allocating = .init(a);

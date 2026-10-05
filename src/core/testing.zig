@@ -819,6 +819,13 @@ pub const ScriptedServer = struct {
     close_on_accept: bool = false,
     /// How long to hold a connection open after its last reply.
     linger_ms: i64 = 0,
+    /// Writes the first reply's first `after` bytes, then waits for the
+    /// client to set `open`, up to two seconds, before the rest: a server
+    /// that has sent part of an answer and is still finding the rest.
+    pause: ?struct { after: usize, open: *std.atomic.Value(bool) } = null,
+    /// Whether a pause ran its two seconds out, the client never having
+    /// seen what came before it.
+    pause_timed_out: bool = false,
     seen: [8][2048]u8 = undefined,
     seen_len: [8]usize = @splat(0),
     /// Per request: the length and CRC-32C of the whole body, however much
@@ -879,7 +886,21 @@ pub const ScriptedServer = struct {
                     _ = reader.interface.discardRemaining() catch {};
                     return;
                 }
-                try writer.interface.writeAll(s.replies[next]);
+                var reply = s.replies[next];
+                if (next == 0) if (s.pause) |p| {
+                    try writer.interface.writeAll(reply[0..p.after]);
+                    try writer.interface.flush();
+                    reply = reply[p.after..];
+                    var waited: u32 = 0;
+                    while (!p.open.load(.acquire)) : (waited += 1) {
+                        if (waited == 200) {
+                            s.pause_timed_out = true;
+                            break;
+                        }
+                        try io.sleep(.fromMilliseconds(10), .awake);
+                    }
+                };
+                try writer.interface.writeAll(reply);
                 try writer.interface.flush();
                 next += 1;
             }

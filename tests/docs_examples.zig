@@ -161,6 +161,30 @@ fn everyCity(client: *firestore.Client, gpa: std.mem.Allocator) !usize {
 }
 // end snippet
 
+// snippet: firestore-each
+/// Writes the id of every city to `out` as each arrives, however many
+/// there are: memory holds one document at a time, not the answer.
+fn exportCities(client: *firestore.Client, out: *std.Io.Writer) !u64 {
+    const Export = struct {
+        out: *std.Io.Writer,
+
+        fn document(ptr: *anyopaque, snapshot: firestore.Owned(firestore.Snapshot)) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var city = snapshot;
+            defer city.deinit();
+            try self.out.print("{s}\n", .{city.value.id()});
+        }
+    };
+    var state: Export = .{ .out = out };
+    const end = try client.runQueryEach(
+        .{ .from = .{ .collection = "cities" } },
+        .{},
+        .{ .ptr = &state, .vtable = &.{ .document = Export.document } },
+    );
+    return end.documents;
+}
+// end snippet
+
 test "the Firestore guides' code, against a fake" {
     const commit = "{\"writeResults\":[{\"updateTime\":\"2026-10-05T12:00:00.000001Z\"}],\"commitTime\":\"2026-10-05T12:00:00.000001Z\"}";
     const la = "{\"name\":\"projects/my-project/databases/(default)/documents/cities/LA\",\"fields\":{\"population\":{\"integerValue\":\"3900000\"}},\"createTime\":\"2026-10-05T12:00:00.000001Z\",\"updateTime\":\"2026-10-05T12:00:00.000001Z\"}";
@@ -171,6 +195,7 @@ test "the Firestore guides' code, against a fake" {
         .{ .respond = .{ .body = commit } },
         .{ .respond = .{ .body = one_city } },
         .{ .respond = .{ .body = "{\"writeResults\":[{\"updateTime\":\"2026-10-05T12:00:00.000001Z\",\"transformResults\":[{\"integerValue\":\"1\"},{\"timestampValue\":\"2026-10-05T12:00:00Z\"}]}],\"commitTime\":\"2026-10-05T12:00:00.000001Z\"}" } },
+        .{ .respond = .{ .body = one_city } },
         .{ .respond = .{ .body = one_city } },
     });
     defer fake.deinit();
@@ -186,6 +211,10 @@ test "the Firestore guides' code, against a fake" {
     try countVisit(&client, "pages/home");
     try std.testing.expect(std.mem.indexOf(u8, (try fake.request(4)).body.?, "\"updateMask\":{\"fieldPaths\":[]}") != null);
     try std.testing.expectEqual(1, try everyCity(&client, std.testing.allocator));
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    try std.testing.expectEqual(1, try exportCities(&client, &out));
+    try std.testing.expectEqualStrings("LA\n", out.buffered());
 }
 
 const storage = @import("storage");

@@ -91,6 +91,12 @@ pub const StreamCall = struct {
     /// caller's business.
     retry: bool = true,
     retryable: *const fn (err: anyerror, http_status: u16) bool = retryableByDefault,
+    /// A writer sink that can take the body again from its first byte, as
+    /// a `JsonArraySplitter` that has handed nothing on can: after a
+    /// transport failure mid-body the engine asks it to start over, and
+    /// when it has, retries as it would a buffered body. Null: such a
+    /// failure is returned.
+    restart: ?Restart = null,
     /// Filled with the response head as soon as it arrives, even when the
     /// body then fails; see `transport.StreamRequest.head_out`. With
     /// engine-level retries the head is the latest attempt's.
@@ -113,6 +119,12 @@ pub const StreamCall = struct {
         none,
         /// Sent back to back with an exact Content-Length; replayable.
         segments: []const []const u8,
+    };
+
+    pub const Restart = struct {
+        ptr: *anyopaque,
+        /// Whether the sink has made itself ready for the body again.
+        restart: *const fn (ptr: *anyopaque) bool,
     };
 };
 
@@ -349,8 +361,11 @@ pub fn Engine(comptime log_scope: @EnumLiteral()) type {
                         error.ReadFailed, error.EndOfStream => |e| if (streamed != null) return e else unreachable,
                         else => |e| b: {
                             // A transport failure may have delivered part of
-                            // the body to a writer sink already.
-                            mid_body = call.sink == .writer;
+                            // the body to a writer sink already, which only a
+                            // sink that can start over takes back.
+                            if (call.sink == .writer) {
+                                mid_body = if (call.restart) |r| !r.restart(r.ptr) else true;
+                            }
                             break :b e;
                         },
                     };
@@ -1087,6 +1102,58 @@ test "executeStream: a writer sink retries a status but never a mid-body failure
     // Both requests went out: the 503 was retried, the cut was not.
     try testing.expectEqual(2, h.fake.stream_requests.items.len);
     try testing.expectEqualStrings("hello", out.buffered());
+}
+
+test "executeStream: a mid-body failure retries when the sink starts over, and not once it cannot" {
+    const Sink = struct {
+        out: std.Io.Writer,
+        /// Whether a restart is allowed; counts the times it was asked.
+        allow: bool,
+        asked: u32 = 0,
+
+        fn restart(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.asked += 1;
+            if (self.allow) _ = self.out.consumeAll();
+            return self.allow;
+        }
+    };
+    var h: Harness = undefined;
+    h.init(&.{
+        .{ .respond = .{ .status = 200, .body = "hello world\n", .cut_after = 5 } },
+        .{ .respond = .{ .status = 200, .body = "hello world\n" } },
+    });
+    defer h.deinit();
+    var out_buf: [64]u8 = undefined;
+    var sink: Sink = .{ .out = .fixed(&out_buf), .allow = true };
+    const res = try h.engine().executeStream(&h.arena, .{
+        .method = .GET,
+        .path = "/v1/o?alt=media",
+        .sink = .{ .writer = &sink.out },
+        .restart = .{ .ptr = &sink, .restart = Sink.restart },
+    });
+    try testing.expectEqual(200, res.status);
+    try testing.expectEqualStrings("hello world\n", sink.out.buffered());
+    try testing.expectEqual(1, sink.asked);
+    try testing.expectEqual(2, h.fake.stream_requests.items.len);
+
+    // A sink that cannot start over: the failure is returned, as without one.
+    var refusing: Harness = undefined;
+    refusing.init(&.{
+        .{ .respond = .{ .status = 200, .body = "hello world\n", .cut_after = 5 } },
+        .{ .respond = .{ .status = 200, .body = "hello world\n" } },
+    });
+    defer refusing.deinit();
+    var kept: Sink = .{ .out = .fixed(&out_buf), .allow = false };
+    try testing.expectError(error.ConnectionResetByPeer, refusing.engine().executeStream(&refusing.arena, .{
+        .method = .GET,
+        .path = "/v1/o?alt=media",
+        .sink = .{ .writer = &kept.out },
+        .restart = .{ .ptr = &kept, .restart = Sink.restart },
+    }));
+    try testing.expectEqual(1, kept.asked);
+    try testing.expectEqual(1, refusing.fake.stream_requests.items.len);
+    try testing.expectEqualStrings("hello", kept.out.buffered());
 }
 
 test "executeStream: the caller's writer failing is final" {

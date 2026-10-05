@@ -18,7 +18,31 @@ including the ones that did not change.
   and code in `Diagnostics`. It is not retried: it arrived in a success
   response, and a read that ran past its deadline would likely do so
   again.
-- auth, core, pubsub, secret_manager and storage: unchanged.
+- firestore: streamed reads. `Client.runQueryEach(query, options,
+  handler)` and `Client.batchGetEach(paths, options, handler)` hand each
+  document to a `DocumentHandler` or `BatchGetHandler` as it arrives,
+  holding one at a time, for answers past the 32 MiB a buffered read
+  holds (the emulator suite reads 200 MB in under 4 MB of memory).
+  Production sends each document as it finds it, the first of 50,000
+  after 0.2 s. An error the server sends after some documents is returned
+  after the handler has seen them; a connection that drops before the
+  first is read again, and after it is not, since a repeat would hand
+  documents over twice. `options.timeout_ms` bounds the whole read, five
+  minutes unless set. New types: `QueryStreamOptions`,
+  `BatchGetStreamOptions`, `DocumentHandler`, `BatchGetHandler`,
+  `BatchGetItem`, `QueryStreamEnd`, `BatchGetStreamEnd`,
+  `default_stream_timeout_ms`.
+- core: `JsonArraySplitter`, a `std.Io.Writer` that splits a streamed
+  JSON array into its elements as the bytes arrive, fuzzed against
+  parsing the whole array. `rpc.StreamCall.restart` lets a writer sink
+  that can take the body again from its first byte have a mid-body
+  failure retried.
+- core: **Fixed:** a streamed response body reaches the caller's writer
+  as each piece arrives; a piece under 4 KiB waited in the transport's
+  buffer for the next. And `transport.StreamRequest` with a POST, PUT or
+  PATCH and no body sends an empty one rather than failing std's
+  assertion.
+- auth, pubsub, secret_manager and storage: unchanged.
 
 ## 0.33.0 (2026-10-05)
 

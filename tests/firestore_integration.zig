@@ -657,6 +657,106 @@ test "queries: collection groups below a parent, and the document name" {
     try expectQueryIds(&f, .{ .from = .{ .group = "landmarks" }, .order_by = &.{.{ .field = "__name__" }}, .start_at = .{ .values = &.{.{ .reference = tower }}, .inclusive = false } }, &.{ "bridge", "moon" });
 }
 
+/// Counts what passes through to `child`: the bytes held now, and the most
+/// held at once. Atomic: a streamed read with a time limit runs on another
+/// task.
+const Peak = struct {
+    child: std.mem.Allocator,
+    live: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(self: *Peak) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn grew(self: *Peak, by: usize) void {
+        const now = self.live.fetchAdd(by, .monotonic) + by;
+        _ = self.peak.fetchMax(now, .monotonic);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Peak = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.grew(len);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *Peak = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        if (new_len > memory.len) self.grew(new_len - memory.len) else _ = self.live.fetchSub(memory.len - new_len, .monotonic);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *Peak = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        if (new_len > memory.len) self.grew(new_len - memory.len) else _ = self.live.fetchSub(memory.len - new_len, .monotonic);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Peak = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+        _ = self.live.fetchSub(memory.len, .monotonic);
+    }
+};
+
+/// Counts the documents and string bytes it is handed, keeping none.
+const Tally = struct {
+    documents: u64 = 0,
+    bytes: u64 = 0,
+
+    fn handler(t: *Tally) firestore.DocumentHandler {
+        return .{ .ptr = t, .vtable = &.{ .document = document } };
+    }
+
+    fn document(ptr: *anyopaque, snapshot: firestore.Owned(firestore.Snapshot)) anyerror!void {
+        const t: *Tally = @ptrCast(@alignCast(ptr));
+        var s = snapshot;
+        defer s.deinit();
+        t.documents += 1;
+        t.bytes += (s.value.get("s") orelse return error.TestExpectedField).string.len;
+    }
+};
+
+test "streaming: a 200 MB answer, read one document at a time in bounded memory" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const big = try testing.allocator.alloc(u8, 1_000_000);
+    defer testing.allocator.free(big);
+    var path_buf: [16]u8 = undefined;
+    for (0..200) |i| {
+        // Each document its own string, so nothing in the answer repeats.
+        @memset(big, 'a' + @as(u8, @intCast(i % 26)));
+        _ = try f.doc(try std.fmt.bufPrint(&path_buf, "big/d{d:0>3}", .{i})).set(&.{.{ .name = "s", .value = .{ .string = big } }}, .{});
+    }
+    const all: firestore.Query = .{ .from = .{ .collection = "big" } };
+    // Whole, it is over the transport's response limit.
+    try testing.expectError(error.ResponseTooLarge, f.client.runQuery(all, .{}));
+
+    var peak: Peak = .{ .child = testing.allocator };
+    var client: firestore.Client = try .init(peak.allocator(), testing.io, .{
+        .project_id = &f.project,
+        .endpoint = f.emulator,
+        .user_agent = "zig-gcp-firestore-integration/0.1",
+    });
+    defer client.deinit();
+    var tally: Tally = .{};
+    const end = try client.runQueryEach(all, .{}, tally.handler());
+    try testing.expectEqual(200, end.documents);
+    try testing.expectEqual(200, tally.documents);
+    try testing.expectEqual(200_000_000, tally.bytes);
+    // About one document's worth at a time: its JSON, its parse, and the
+    // transport's buffers.
+    const held = peak.peak.load(.monotonic);
+    if (held > 8 << 20) {
+        std.debug.print("peak {d} bytes\n", .{held});
+        return error.TestUnexpectedResult;
+    }
+}
+
 test "aggregations: count, sum and average, and the documents they see" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;
