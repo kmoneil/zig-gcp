@@ -15,11 +15,13 @@ const core = @import("core");
 const Collection = @import("Collection.zig");
 const Document = @import("Document.zig");
 const Endpoint = @import("Endpoint.zig");
+const batch_get = @import("batch_get.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
 const validate = @import("validate.zig");
+const writes_ = @import("writes.zig");
 const Diagnostics = core.Diagnostics;
 const Error = errors.Error;
 const HttpTransport = core.transport.HttpTransport;
@@ -40,6 +42,7 @@ token_provider: TokenProvider,
 /// True against an emulator, which never receives the caller's credentials.
 emulator: bool,
 retry: RetryPolicy,
+retry_unconditional_writes: bool,
 send_quota_project: bool,
 request_timeout_ms: u32,
 diagnostics: ?*Diagnostics,
@@ -64,6 +67,14 @@ pub const Options = struct {
     /// either way.
     token_provider: ?TokenProvider = null,
     retry: RetryPolicy = .{},
+    /// A write with transforms whose answer was lost may have landed, and
+    /// sent again it applies them twice: an increment counts twice. Such a
+    /// write is therefore retried only under a precondition a repeat
+    /// fails, an update time or `exists == false`. This retries it anyway,
+    /// as Google's own clients do. Writes without transforms are retried
+    /// either way: writing the same fields twice changes nothing a reader
+    /// can tell apart.
+    retry_unconditional_writes: bool = false,
     /// How long one request may take before it is `error.TimedOut`, which
     /// is retried like any other transient failure. 0 removes the limit,
     /// and nothing bounds a call then but the caller's own `std.Io`.
@@ -148,6 +159,7 @@ pub fn init(gpa: Allocator, io: std.Io, options: Options) Error!Client {
         .token_provider = token_provider,
         .emulator = emulator,
         .retry = options.retry,
+        .retry_unconditional_writes = options.retry_unconditional_writes,
         // The emulator's administrator bills nobody.
         .send_quota_project = options.send_quota_project and !emulator,
         .request_timeout_ms = options.request_timeout_ms,
@@ -192,6 +204,33 @@ pub fn doc(self: *Client, path: []const u8) Document {
 /// checks it.
 pub fn documentName(self: *const Client, allocator: Allocator, path: []const u8) Allocator.Error![]u8 {
     return names.fullName(allocator, self.project_id, self.database_id, path);
+}
+
+/// Applies `writes` in order, atomically: all of them, or none when one is
+/// refused. Each write is checked before anything is sent, as the server
+/// would check it; in a commit of several, the diagnostics name the write
+/// by its index. A document may be written more than once, each write
+/// seeing the one before, and takes at most 500 transforms in all. When
+/// the commit may be sent again after a lost answer is said at the top of
+/// `retry_unconditional_writes`.
+pub fn commit(self: *Client, writes: []const types.Write, options: types.CommitOptions) Error!types.Owned(types.CommitResult) {
+    _ = options;
+    rpc.begin(self);
+    var result: types.Owned(types.CommitResult) = try .init(self.gpa);
+    errdefer result.deinit();
+    result.value = try writes_.commit(self, writes, result.arena);
+    return result;
+}
+
+/// Reads the documents at `paths` in one request: each, in the order
+/// asked, or null where it does not exist. A path asked twice is answered
+/// twice; no paths sends nothing.
+pub fn batchGet(self: *Client, paths: []const []const u8, options: types.BatchGetOptions) Error!types.Owned(types.BatchGetResult) {
+    rpc.begin(self);
+    var result: types.Owned(types.BatchGetResult) = try .init(self.gpa);
+    errdefer result.deinit();
+    result.value = try batch_get.batchGet(self, paths, options, result.arena);
+    return result;
 }
 
 /// One page of the ids of the database's top-level collections, in

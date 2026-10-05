@@ -133,27 +133,37 @@ pub fn checkPrecondition(client: *Client, precondition: ?types.Precondition) Err
     }
 }
 
-/// Adds to a failed write's diagnostics what a retried write cannot rule
-/// out: that its own earlier attempt landed, its answer was lost, and the
-/// refusal is the precondition meeting that write. Said only where the
-/// precondition is one a repeat fails, `exists == false` meeting
-/// `AlreadyExists` or an update time meeting `FailedPrecondition`, and
-/// only when the client retries at all.
-pub fn noteRetriedWrite(client: *Client, err: anyerror, precondition: ?types.Precondition) void {
-    if (client.retry.max_attempts <= 1) return;
-    const p = precondition orelse return;
-    const own = switch (p) {
+/// What a retried write cannot rule out: that its own earlier attempt
+/// landed, its answer was lost, and the refusal is its precondition
+/// meeting that write.
+pub const retried_note = "; if this write was retried after a lost answer, an earlier attempt may have landed, and this is its precondition meeting that write: read the document to see";
+
+/// Whether `err` is what a repeat of a landed write meets under
+/// `precondition`: `exists == false` meets `AlreadyExists`, an update time
+/// meets `FailedPrecondition`.
+pub fn meetsOwnWrite(err: anyerror, precondition: ?types.Precondition) bool {
+    const p = precondition orelse return false;
+    return switch (p) {
         .exists => |e| !e and err == error.AlreadyExists,
         .update_time => err == error.FailedPrecondition,
     };
-    if (!own) return;
+}
+
+/// Adds `note` to the failed call's message, keeping its statuses.
+pub fn appendNote(client: *Client, note: []const u8) void {
     const d = client.diagnostics orelse return;
     var status_buf: [core.Diagnostics.max_status_len]u8 = undefined;
     const status_text = d.status();
     @memcpy(status_buf[0..status_text.len], status_text);
     var message_buf: [640]u8 = undefined;
-    const message = std.fmt.bufPrint(&message_buf, "{s}; if this write was retried after a lost answer, an earlier attempt may have landed, and this is its precondition meeting that write: read the document to see", .{d.message()}) catch d.message();
+    const message = std.fmt.bufPrint(&message_buf, "{s}{s}", .{ d.message(), note }) catch d.message();
     d.set(d.http_status, status_buf[0..status_text.len], message);
+}
+
+/// Adds `retried_note` where it applies, when the client retries at all.
+pub fn noteRetriedWrite(client: *Client, err: anyerror, precondition: ?types.Precondition) void {
+    if (client.retry.max_attempts <= 1) return;
+    if (meetsOwnWrite(err, precondition)) appendNote(client, retried_note);
 }
 
 /// `execute` for a write held to `precondition`, with the note above.

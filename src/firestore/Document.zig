@@ -11,12 +11,13 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const Collection = @import("Collection.zig");
+const batch_get = @import("batch_get.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
 const types = @import("types.zig");
-const validate = @import("validate.zig");
+const writes = @import("writes.zig");
 const Error = errors.Error;
 const Params = core.query.Params;
 
@@ -44,10 +45,19 @@ pub fn get(self: Document, options: types.GetOptions) Error!types.Owned(types.Sn
     const a = scratch.allocator();
     const path = try rpc.checkedPath(client, a, self.path, .document);
     if (options.mask) |m| try rpc.checkMask(client, m, "read mask");
-    const url = writeUrl(a, client, path, options.mask) catch return error.OutOfMemory;
 
     var result: types.Owned(types.Snapshot) = try .init(client.gpa);
     errdefer result.deinit();
+    if (options.read_time) |t| {
+        // Measured: the emulator refuses a read time as a query parameter,
+        // "Only timestamps past epoch are supported.", and takes it in
+        // batchGet's body.
+        const batch = try batch_get.batchGet(client, &.{path}, .{ .mask = options.mask, .read_time = t }, result.arena);
+        result.value = batch.documents[0] orelse
+            return rpc.refuse(client, error.NotFound, "the document did not exist at the read time", .{});
+        return result;
+    }
+    const url = writeUrl(a, client, path, options.mask) catch return error.OutOfMemory;
     const body = try rpc.execute(client, result.arena, .{ .method = .GET, .path = url });
     result.value = codec.decodeSnapshot(result.arena.allocator(), body) catch |err|
         return rpc.decodeFailed(client, err, "document");
@@ -56,32 +66,32 @@ pub fn get(self: Document, options: types.GetOptions) Error!types.Owned(types.Sn
 
 /// Writes the document whole: `fields` replace every field it had, and a
 /// missing document is created, unless `options.precondition` says
-/// otherwise. Retried after a lost answer: writing the same fields again
-/// changes nothing a reader could tell apart.
+/// otherwise; then `options.transforms` apply. Retried after a lost answer
+/// as `Client.Options.retry_unconditional_writes` describes.
 pub fn set(self: Document, fields: []const types.Field, options: types.SetOptions) Error!types.WriteResult {
     const client = self.client;
     rpc.begin(client);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
-    const a = scratch.allocator();
-    const path = try rpc.checkedPath(client, a, self.path, .document);
-    try rpc.checkFields(client, fields);
-    try rpc.checkPrecondition(client, options.precondition);
-    return commitOne(client, .{
-        .name = try client.documentName(a, path),
-        .op = .{ .update = .{ .fields = fields } },
+    const path = try rpc.checkedPath(client, scratch.allocator(), self.path, .document);
+    return writeOne(client, .{ .update = .{
+        .path = path,
+        .fields = fields,
+        .transforms = options.transforms,
         .precondition = options.precondition,
-    });
+    } });
 }
 
 /// Changes the fields `options.mask` names, by default the top-level
-/// names of `fields`, each replaced whole, and leaves the rest alone. A
-/// mask path with no value in `fields` deletes that field, and one inside
-/// a map, such as `address.city`, changes only that field of it. By
-/// default the document must exist (`error.NotFound` otherwise). Every
-/// value in `fields` must lie under a mask path, and no two mask paths may
-/// overlap, such as `a` and `a.b`: the server would ignore the one, or
-/// decide between the two. Retried after a lost answer, as `set` is.
+/// names of `fields`, each replaced whole, and leaves the rest alone; then
+/// `options.transforms` apply. A mask path with no value in `fields`
+/// deletes that field, and one inside a map, such as `address.city`,
+/// changes only that field of it. By default the document must exist
+/// (`error.NotFound` otherwise). Every value in `fields` must lie under a
+/// mask path, and no two mask paths may overlap, such as `a` and `a.b`:
+/// the server would ignore the one, or decide between the two. Retried
+/// after a lost answer as `Client.Options.retry_unconditional_writes`
+/// describes.
 pub fn update(self: Document, fields: []const types.Field, options: types.UpdateOptions) Error!types.WriteResult {
     const client = self.client;
     rpc.begin(client);
@@ -91,21 +101,16 @@ pub fn update(self: Document, fields: []const types.Field, options: types.Update
     const path = try rpc.checkedPath(client, a, self.path, .document);
     try rpc.checkFields(client, fields);
     const mask = options.mask orelse try defaultMask(a, fields);
-    if (mask.len == 0) return rpc.refuse(client, error.InvalidArgument, "an update needs at least one field or mask path: an empty mask would overwrite the whole document", .{});
-    try rpc.checkMask(client, mask, "update mask");
-    for (mask, 0..) |p, i| for (mask[0..i]) |q| {
-        if (names.fieldPathsOverlap(p, q)) return rpc.refuse(client, error.InvalidArgument, "the update mask paths {s} and {s} overlap", .{ q, p });
-    };
-    var where_buf: [160]u8 = undefined;
-    if (uncovered(mask, fields, &where_buf)) |where| {
-        return rpc.refuse(client, error.InvalidArgument, "the field {s} is outside the update mask, so it would not be written", .{where});
+    if (mask.len == 0 and options.transforms.len == 0) {
+        return rpc.refuse(client, error.InvalidArgument, "an update needs a field, a mask path or a transform: this one would change nothing", .{});
     }
-    try rpc.checkPrecondition(client, options.precondition);
-    return commitOne(client, .{
-        .name = try client.documentName(a, path),
-        .op = .{ .update = .{ .fields = fields, .mask = mask } },
+    return writeOne(client, .{ .update = .{
+        .path = path,
+        .fields = fields,
+        .mask = mask,
+        .transforms = options.transforms,
         .precondition = options.precondition,
-    });
+    } });
 }
 
 /// Deletes the document. Deleting a missing one succeeds unless
@@ -117,14 +122,8 @@ pub fn delete(self: Document, options: types.DeleteOptions) Error!void {
     rpc.begin(client);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
-    const a = scratch.allocator();
-    const path = try rpc.checkedPath(client, a, self.path, .document);
-    try rpc.checkPrecondition(client, options.precondition);
-    _ = try commitOne(client, .{
-        .name = try client.documentName(a, path),
-        .op = .delete,
-        .precondition = options.precondition,
-    });
+    const path = try rpc.checkedPath(client, scratch.allocator(), self.path, .document);
+    _ = try writeOne(client, .{ .delete = .{ .path = path, .precondition = options.precondition } });
 }
 
 /// One page of the ids of the collections directly below this document,
@@ -139,20 +138,12 @@ pub fn listCollectionIds(self: Document, options: types.ListCollectionIdsOptions
 }
 
 /// Commits one write and returns its update time: a delete's is the
-/// commit's own.
-fn commitOne(client: *Client, write: codec.Write) Error!types.WriteResult {
-    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
-    defer scratch.deinit();
-    const a = scratch.allocator();
-    const url = rpc.commitPath(a, client) catch return error.OutOfMemory;
-    const body = try codec.encodeCommit(a, &.{write});
+/// commit's own. The call has begun.
+fn writeOne(client: *Client, write: types.Write) Error!types.WriteResult {
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
-    const reply = try rpc.executeWrite(client, &response, .{ .method = .POST, .path = url, .body = body }, write.precondition);
-    const result = codec.decodeCommit(response.allocator(), reply) catch |err|
-        return rpc.decodeFailed(client, err, "commit");
-    if (result.update_times.len != 1) return rpc.decodeFailed(client, error.InvalidResponse, "commit");
-    return .{ .update_time = result.update_times[0] orelse result.commit_time };
+    const result = try writes.commit(client, &.{write}, &response);
+    return .{ .update_time = result.writes[0].update_time orelse result.commit_time };
 }
 
 /// The request path for reading the document at `path`.
@@ -170,60 +161,6 @@ fn defaultMask(a: Allocator, fields: []const types.Field) Allocator.Error![]cons
     const mask = try a.alloc([]const u8, fields.len);
     for (fields, mask) |f, *m| m.* = try names.fieldPathOf(a, f.name);
     return mask;
-}
-
-/// How a mask path relates to the field at a path of names.
-const Relation = enum {
-    /// The mask path is the field's path or a map above it: the field is
-    /// written.
-    covers,
-    /// The mask path names a field inside this one.
-    inside,
-    unrelated,
-};
-
-fn relation(mask_path: []const u8, field_names: []const []const u8) Relation {
-    var it: names.FieldPathIterator = .init(mask_path);
-    for (field_names) |name| {
-        // Checked already, so the path parses.
-        const segment = (it.next() catch return .unrelated) orelse return .covers;
-        if (!segment.eql(name)) return .unrelated;
-    }
-    return if ((it.next() catch null) == null) .covers else .inside;
-}
-
-/// The path of a value in `fields` that no mask path writes, quoted, into
-/// `where_buf`; null when every value is written.
-fn uncovered(mask: []const []const u8, fields: []const types.Field, where_buf: []u8) ?[]const u8 {
-    var stack: [validate.max_value_depth + 1][]const u8 = undefined;
-    const depth = uncoveredBelow(mask, fields, &stack, 0) orelse return null;
-    var w: Writer = .fixed(where_buf);
-    for (stack[0..depth], 0..) |name, i| {
-        if (i > 0) w.writeByte('.') catch break;
-        names.writeFieldSegment(&w, name) catch break;
-    }
-    return w.buffered();
-}
-
-/// The depth of the first unwritten value's path, left in `stack`.
-fn uncoveredBelow(mask: []const []const u8, fields: []const types.Field, stack: [][]const u8, depth: usize) ?usize {
-    for (fields) |f| {
-        stack[depth] = f.name;
-        const path = stack[0 .. depth + 1];
-        var inside = false;
-        for (mask) |m| switch (relation(m, path)) {
-            .covers => break,
-            .inside => inside = true,
-            .unrelated => {},
-        } else {
-            // Nothing writes it whole; a mask path inside it writes part of
-            // it, and only a map has parts. The fields were checked, so the
-            // nesting fits the stack.
-            if (!inside or f.value != .map or depth + 1 >= stack.len) return depth + 1;
-            if (uncoveredBelow(mask, f.value.map, stack, depth + 1)) |d| return d;
-        }
-    }
-    return null;
 }
 
 const testing = std.testing;
@@ -432,7 +369,7 @@ test "update refuses what the server would misapply" {
     const la = h.client.doc("cities/LA");
     // An empty mask would overwrite the whole document.
     try testing.expectError(error.InvalidArgument, la.update(&.{}, .{}));
-    try h.expectDiag("at least one field");
+    try h.expectDiag("would change nothing");
     try testing.expectError(error.InvalidArgument, la.update(&.{}, .{ .mask = &.{} }));
     // Overlapping paths: the emulator takes them, Google's clients refuse.
     try testing.expectError(error.InvalidArgument, la.update(&.{}, .{ .mask = &.{ "a", "a.b" } }));
@@ -467,11 +404,11 @@ test "update: mask coverage, the cases that pass" {
         } } },
         .{ .name = "e.f", .value = .null },
     };
-    try testing.expectEqual(null, uncovered(&.{ "a", "`e.f`" }, fields, &where_buf));
-    try testing.expectEqual(null, uncovered(&.{ "a.b", "a.c", "`e.f`" }, fields, &where_buf));
-    try testing.expectEqual(null, uncovered(&.{ "a.b", "a.c.d", "`e.f`", "zzz" }, fields, &where_buf));
-    try testing.expectEqualStrings("`e.f`", uncovered(&.{ "a", "e.f" }, fields, &where_buf).?);
-    try testing.expectEqualStrings("a.c.d", uncovered(&.{ "a.b", "a.c.x", "`e.f`" }, fields, &where_buf).?);
+    try testing.expectEqual(null, writes.uncovered(&.{ "a", "`e.f`" }, fields, &where_buf));
+    try testing.expectEqual(null, writes.uncovered(&.{ "a.b", "a.c", "`e.f`" }, fields, &where_buf));
+    try testing.expectEqual(null, writes.uncovered(&.{ "a.b", "a.c.d", "`e.f`", "zzz" }, fields, &where_buf));
+    try testing.expectEqualStrings("`e.f`", writes.uncovered(&.{ "a", "e.f" }, fields, &where_buf).?);
+    try testing.expectEqualStrings("a.c.d", writes.uncovered(&.{ "a.b", "a.c.x", "`e.f`" }, fields, &where_buf).?);
 }
 
 test "golden: delete, plain and held to a precondition" {

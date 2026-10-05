@@ -65,6 +65,9 @@ pub const FakeFirestore = struct {
 
     pub const Reply = struct { status: u16, body: []const u8 };
 
+    /// What one write of a commit answers.
+    const WriteOutcome = struct { has_time: bool = false, transform_results: []const Val = &.{} };
+
     pub const Doc = struct {
         fields: []const Entry,
         create_us: i64,
@@ -143,6 +146,7 @@ pub const FakeFirestore = struct {
         if (route.verb) |verb| {
             if (method == .POST and std.mem.eql(u8, verb, "commit") and route.segments.len == 0) return self.commit(arena, route, body);
             if (method == .POST and std.mem.eql(u8, verb, "listCollectionIds") and route.segments.len % 2 == 0) return self.listCollectionIds(arena, route, body);
+            if (method == .POST and std.mem.eql(u8, verb, "batchGet") and route.segments.len == 0) return self.batchGet(arena, route, body);
             return fail(arena, 400, "INVALID_ARGUMENT", "fake: verb not modelled");
         }
         if (route.segments.len == 0) return fail(arena, 404, "NOT_FOUND", "fake: no such route");
@@ -273,6 +277,74 @@ pub const FakeFirestore = struct {
         try jw.endObject();
     }
 
+    /// Answers in the order of the documents' names, not the order asked,
+    /// which the server does not keep either, and a name asked twice once.
+    fn batchGet(self: *FakeFirestore, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const tree = parseJson(arena, body) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (tree != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (tree.object.get("readTime") != null or tree.object.get("transaction") != null or tree.object.get("newTransaction") != null) {
+            return fail(arena, 400, "INVALID_ARGUMENT", "fake: read times and transactions are not modelled");
+        }
+        var masks: ?[]const []const []const u8 = null;
+        if (tree.object.get("mask")) |m| {
+            var texts: std.ArrayList([]const u8) = .empty;
+            if (m != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+            if (m.object.get("fieldPaths")) |pj| {
+                if (pj != .array) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+                for (pj.array.items) |item| {
+                    if (item != .string) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+                    try texts.append(arena, item.string);
+                }
+            }
+            masks = (try parseMasks(arena, texts.items)) orelse return try badPath(arena, texts.items);
+        }
+        var asked: std.StringArrayHashMapUnmanaged(void) = .empty;
+        if (tree.object.get("documents")) |docs| {
+            if (docs != .array) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+            for (docs.array.items) |item| {
+                if (item != .string) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+                try asked.put(arena, item.string, {});
+            }
+        }
+        const ordered = asked.keys();
+        std.mem.sort([]const u8, ordered, {}, lessBytes);
+        var out: Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        jw.beginArray() catch return error.OutOfMemory;
+        for (ordered) |name| {
+            const prefix = try std.fmt.allocPrint(arena, "projects/{s}/databases/", .{route.project});
+            // Measured: a name in another database is answered missing.
+            const in_db = try std.fmt.allocPrint(arena, "projects/{s}/databases/{s}/documents/", .{ route.project, route.database });
+            if (!std.mem.startsWith(u8, name, prefix)) return fail(arena, 400, "INVALID_ARGUMENT", "Document name is not in this project.");
+            var d: ?*Doc = null;
+            if (std.mem.startsWith(u8, name, in_db)) {
+                const path = name[in_db.len..];
+                var n: usize = 0;
+                var it = std.mem.splitScalar(u8, path, '/');
+                while (it.next()) |_| n += 1;
+                if (n % 2 != 0) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Document name \"{s}\" lacks \"/\".", .{name}));
+                d = self.docs.get(try std.fmt.allocPrint(arena, "{s}|{s}", .{ route.database, path }));
+            }
+            writeBatchElement(&jw, arena, name, d, masks, self.now_us) catch return error.OutOfMemory;
+        }
+        jw.endArray() catch return error.OutOfMemory;
+        return ok(arena, out.written());
+    }
+
+    fn writeBatchElement(jw: *Stringify, arena: Allocator, name: []const u8, d: ?*Doc, masks: ?[]const []const []const u8, now_us: i64) !void {
+        try jw.beginObject();
+        if (d) |found| {
+            try jw.objectField("found");
+            try writeDoc(jw, arena, name, found, masks);
+        } else {
+            try jw.objectField("missing");
+            try jw.write(name);
+        }
+        try jw.objectField("readTime");
+        try writeTime(jw, now_us);
+        try jw.endObject();
+    }
+
     fn create(self: *FakeFirestore, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
         const collection = try join(arena, route.segments);
         var id_buf: [20]u8 = undefined;
@@ -304,9 +376,10 @@ pub const FakeFirestore = struct {
         // of them land.
         var staged: std.StringArrayHashMapUnmanaged(?*Doc) = .empty;
         const commit_us = self.now_us + 1000;
-        const results = try arena.alloc(bool, writes.array.items.len);
-        for (writes.array.items, results) |w, *has_time| {
-            if (try self.stage(arena, route, w, commit_us, &staged, has_time)) |refusal| return refusal;
+        const results = try arena.alloc(WriteOutcome, writes.array.items.len);
+        for (writes.array.items, results) |w, *outcome| {
+            outcome.* = .{};
+            if (try self.stage(arena, route, w, commit_us, &staged, outcome)) |refusal| return refusal;
         }
         self.now_us = commit_us;
         var it = staged.iterator();
@@ -322,22 +395,34 @@ pub const FakeFirestore = struct {
         return self.committed(arena, results);
     }
 
-    fn committed(self: *FakeFirestore, arena: Allocator, results: []const bool) Allocator.Error!Reply {
+    fn committed(self: *FakeFirestore, arena: Allocator, results: []const WriteOutcome) Allocator.Error!Reply {
         var out: Writer.Allocating = .init(arena);
         var jw: Stringify = .{ .writer = &out.writer };
         writeCommitted(&jw, results, self.now_us) catch return error.OutOfMemory;
         return ok(arena, out.written());
     }
 
-    fn writeCommitted(jw: *Stringify, results: []const bool, now_us: i64) !void {
+    fn writeCommitted(jw: *Stringify, results: []const WriteOutcome, now_us: i64) !void {
+        // Measured: a commit of no writes answers `{}`.
+        if (results.len == 0) {
+            try jw.beginObject();
+            try jw.endObject();
+            return;
+        }
         try jw.beginObject();
         try jw.objectField("writeResults");
         try jw.beginArray();
-        for (results) |has_time| {
+        for (results) |outcome| {
             try jw.beginObject();
-            if (has_time) {
+            if (outcome.has_time) {
                 try jw.objectField("updateTime");
                 try writeTime(jw, now_us);
+            }
+            if (outcome.transform_results.len > 0) {
+                try jw.objectField("transformResults");
+                try jw.beginArray();
+                for (outcome.transform_results) |v| try writeVal(jw, v);
+                try jw.endArray();
             }
             try jw.endObject();
         }
@@ -355,7 +440,7 @@ pub const FakeFirestore = struct {
         w: std.json.Value,
         commit_us: i64,
         staged: *std.StringArrayHashMapUnmanaged(?*Doc),
-        has_time: *bool,
+        outcome: *WriteOutcome,
     ) Allocator.Error!?Reply {
         if (w != .object) return try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
         const o = w.object;
@@ -374,8 +459,8 @@ pub const FakeFirestore = struct {
         }
 
         if (delete != null) {
+            if (o.get("updateTransforms") != null) return try fail(arena, 400, "INVALID_ARGUMENT", "A delete cannot carry transforms.");
             try staged.put(arena, key, null);
-            has_time.* = false;
             return null;
         }
         var parser: ValueParser = .{ .arena = arena };
@@ -402,6 +487,16 @@ pub const FakeFirestore = struct {
             }
             fields = result;
         }
+        if (o.get("updateTransforms")) |t| {
+            const applied = try applyTransforms(arena, fields, t, commit_us);
+            switch (applied) {
+                .refused => |r| return r,
+                .done => |done| {
+                    fields = done.fields;
+                    outcome.transform_results = try deepCopyVals(self.store.allocator(), done.results);
+                },
+            }
+        }
         const d = try self.store.allocator().create(Doc);
         d.* = .{
             .fields = try deepCopy(self.store.allocator(), fields),
@@ -409,7 +504,7 @@ pub const FakeFirestore = struct {
             .update_us = commit_us,
         };
         try staged.put(arena, key, d);
-        has_time.* = true;
+        outcome.has_time = true;
         return null;
     }
 
@@ -560,7 +655,7 @@ fn parseUrl(arena: Allocator, url: []const u8) Allocator.Error!?FakeFirestore.Ro
         var segs = std.mem.splitScalar(u8, remaining, '/');
         while (segs.next()) |s| try raw.append(arena, s);
         const last = raw.items[raw.items.len - 1];
-        for ([_][]const u8{ ":listCollectionIds", ":commit" }) |v| if (std.mem.endsWith(u8, last, v)) {
+        for ([_][]const u8{ ":listCollectionIds", ":commit", ":batchGet" }) |v| if (std.mem.endsWith(u8, last, v)) {
             verb = v[1..];
             raw.items[raw.items.len - 1] = last[0 .. last.len - v.len];
         };
@@ -903,6 +998,169 @@ fn copyVal(a: Allocator, v: FakeFirestore.Val) Allocator.Error!FakeFirestore.Val
         .map => |m| .{ .map = try deepCopy(a, m) },
         else => v,
     };
+}
+
+// Transforms applied
+
+const Applied = union(enum) {
+    refused: FakeFirestore.Reply,
+    done: struct { fields: []const FakeFirestore.Entry, results: []const FakeFirestore.Val },
+};
+
+fn applyTransforms(arena: Allocator, start: []const FakeFirestore.Entry, transforms: std.json.Value, commit_us: i64) Allocator.Error!Applied {
+    if (transforms != .array) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.") };
+    var fields = start;
+    var paths: std.ArrayList([]const []const u8) = .empty;
+    const results = try arena.alloc(FakeFirestore.Val, transforms.array.items.len);
+    for (transforms.array.items, results) |t, *result| {
+        if (t != .object) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.") };
+        const path_json = t.object.get("fieldPath") orelse return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.") };
+        if (path_json != .string) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.") };
+        const segments = (try parseMasks(arena, &.{path_json.string})) orelse return .{ .refused = try badPath(arena, &.{path_json.string}) };
+        const path = segments[0];
+        // Measured: one field and one inside it cannot both be transformed.
+        for (paths.items) |other| {
+            const n = @min(other.len, path.len);
+            var same_prefix = true;
+            for (other[0..n], path[0..n]) |x, y| if (!std.mem.eql(u8, x, y)) {
+                same_prefix = false;
+            };
+            if (same_prefix and other.len != path.len) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
+                arena,
+                "Cannot transform property {s} and its nested property at the same time.",
+                .{(if (other.len < path.len) other else path)[n - 1]},
+            )) };
+        }
+        try paths.append(arena, path);
+
+        const current = lookup(fields, path);
+        var parser: ValueParser = .{ .arena = arena };
+        const new: FakeFirestore.Val, result.* = op: {
+            if (t.object.get("setToServerValue")) |v| {
+                if (v != .string or !std.mem.eql(u8, v.string, "REQUEST_TIME")) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.") };
+                // Measured: to the millisecond.
+                const at: FakeFirestore.Val = .{ .timestamp_us = @divFloor(commit_us, 1000) * 1000 };
+                break :op .{ at, at };
+            }
+            inline for (.{ "increment", "maximum", "minimum" }) |kind| if (t.object.get(kind)) |v| {
+                const operand = parser.value(v, path[path.len - 1], 0, false) orelse return .{ .refused = try parser.refusal() };
+                if (operand != .integer and operand != .double) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Input must be int64 or double.") };
+                const value = if (comptime std.mem.eql(u8, kind, "increment")) increment(current, operand) else extreme(current, operand, comptime std.mem.eql(u8, kind, "maximum"));
+                break :op .{ value, value };
+            };
+            inline for (.{ "appendMissingElements", "removeAllFromArray" }) |kind| if (t.object.get(kind)) |v| {
+                if (v != .object) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.") };
+                var inputs: std.ArrayList(FakeFirestore.Val) = .empty;
+                if (v.object.get("values")) |values| {
+                    if (values != .array) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.") };
+                    // Measured: the emulator took an array among them.
+                    for (values.array.items) |item| try inputs.append(arena, parser.value(item, path[path.len - 1], 1, false) orelse return .{ .refused = try parser.refusal() });
+                }
+                const existing: []const FakeFirestore.Val = if (current) |c| (if (c == .array) c.array else &.{}) else &.{};
+                var out: std.ArrayList(FakeFirestore.Val) = .empty;
+                if (comptime std.mem.eql(u8, kind, "appendMissingElements")) {
+                    try out.appendSlice(arena, existing);
+                    for (inputs.items) |in| {
+                        for (out.items) |e| {
+                            if (equivalent(e, in)) break;
+                        } else try out.append(arena, in);
+                    }
+                } else {
+                    for (existing) |e| {
+                        for (inputs.items) |in| {
+                            if (equivalent(e, in)) break;
+                        } else try out.append(arena, e);
+                    }
+                }
+                break :op .{ .{ .array = out.items }, .null };
+            };
+            return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "A transform must name one operation.") };
+        };
+        fields = try setAt(arena, fields, path, new);
+    }
+    return .{ .done = .{ .fields = fields, .results = results } };
+}
+
+/// Measured: integers saturate, a double makes a double, and a field that
+/// is no number takes the operand.
+fn increment(current: ?FakeFirestore.Val, operand: FakeFirestore.Val) FakeFirestore.Val {
+    const c = current orelse return operand;
+    if (c == .integer and operand == .integer) {
+        return .{ .integer = std.math.add(i64, c.integer, operand.integer) catch
+            if (operand.integer > 0) std.math.maxInt(i64) else std.math.minInt(i64) };
+    }
+    const a = asDouble(c) orelse return operand;
+    return .{ .double = a + asDouble(operand).? };
+}
+
+/// Measured: a field that is no number takes the operand, NaN wins, and
+/// of two equal numbers the stored one stays, type and all.
+fn extreme(current: ?FakeFirestore.Val, operand: FakeFirestore.Val, maximum: bool) FakeFirestore.Val {
+    const c = current orelse return operand;
+    if (asDouble(c) == null) return operand;
+    if (isNan(c)) return c;
+    if (isNan(operand)) return operand;
+    const order = compareNumbers(c, operand);
+    if (order == .eq) return c;
+    return if ((order == .lt) == maximum) operand else c;
+}
+
+fn asDouble(v: FakeFirestore.Val) ?f64 {
+    return switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .double => |d| d,
+        else => null,
+    };
+}
+
+fn isNan(v: FakeFirestore.Val) bool {
+    return v == .double and std.math.isNan(v.double);
+}
+
+/// Exact for two integers; through doubles otherwise.
+fn compareNumbers(a: FakeFirestore.Val, b: FakeFirestore.Val) std.math.Order {
+    if (a == .integer and b == .integer) return std.math.order(a.integer, b.integer);
+    return std.math.order(asDouble(a).?, asDouble(b).?);
+}
+
+/// Firestore's equality for the array transforms, as measured: numbers
+/// across integer and double, NaN equal to NaN, maps by field whatever
+/// their order.
+fn equivalent(a: FakeFirestore.Val, b: FakeFirestore.Val) bool {
+    if (asDouble(a) != null and asDouble(b) != null) {
+        if (isNan(a) or isNan(b)) return isNan(a) and isNan(b);
+        return compareNumbers(a, b) == .eq;
+    }
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .null => true,
+        .boolean => |x| x == b.boolean,
+        .timestamp_us => |x| x == b.timestamp_us,
+        .string => |x| std.mem.eql(u8, x, b.string),
+        .bytes => |x| std.mem.eql(u8, x, b.bytes),
+        .reference => |x| std.mem.eql(u8, x, b.reference),
+        .geo => |x| x[0] == b.geo[0] and x[1] == b.geo[1],
+        .array => |x| arr: {
+            if (x.len != b.array.len) break :arr false;
+            for (x, b.array) |p, q| if (!equivalent(p, q)) break :arr false;
+            break :arr true;
+        },
+        .map => |x| map: {
+            if (x.len != b.map.len) break :map false;
+            for (x) |e| {
+                const other = lookup(b.map, &.{e.name}) orelse break :map false;
+                if (!equivalent(e.value, other)) break :map false;
+            }
+            break :map true;
+        },
+        .integer, .double => unreachable,
+    };
+}
+
+fn deepCopyVals(a: Allocator, values: []const FakeFirestore.Val) Allocator.Error![]const FakeFirestore.Val {
+    const out = try a.alloc(FakeFirestore.Val, values.len);
+    for (values, out) |v, *o| o.* = try copyVal(a, v);
+    return out;
 }
 
 // Values out
@@ -1293,9 +1551,12 @@ test "fake: a commit lands whole or not at all" {
     // Two writes, one time; a delete's result is empty.
     const both = try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[{\"update\":{\"name\":\"" ++ n ++ "y\",\"fields\":{}}},{\"delete\":\"" ++ n ++ "x\"}]}");
     const r = try codec.decodeCommit(a, both.body);
-    try testing.expectEqual(r.commit_time.nanoseconds, r.update_times[0].?.nanoseconds);
-    try testing.expectEqual(null, r.update_times[1]);
+    try testing.expectEqual(r.commit_time.?.nanoseconds, r.writes[0].update_time.?.nanoseconds);
+    try testing.expectEqual(null, r.writes[1].update_time);
     try testing.expectEqual(null, server.doc("(default)", "c/x"));
+    // Measured: a precondition sees the commit's earlier writes.
+    try testing.expectEqual(200, (try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[{\"delete\":\"" ++ n ++ "y\"},{\"update\":{\"name\":\"" ++ n ++ "y\",\"fields\":{}},\"currentDocument\":{\"exists\":false}}]}")).status);
+    try testing.expect(server.doc("(default)", "c/y") != null);
     // A name in another database is refused.
     try expectRefusal(try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[{\"delete\":\"projects/p/databases/other/documents/c/x\"}]}"), 400, "not in this database");
 }
@@ -1339,6 +1600,152 @@ test "fake: lost answers, and how the client takes them" {
     h.server.refuse_next = 2;
     _ = try cities.doc("NY").set(&.{}, .{});
     try testing.expect(h.server.doc("(default)", "cities/NY") != null);
+}
+
+test "fake: transforms answer as the emulator answered them" {
+    var h: test_util.FakeHarness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    h.client.retry_unconditional_writes = true;
+    const I = struct {
+        fn int(n: i64) Value {
+            return .{ .integer = n };
+        }
+        fn dbl(d: f64) Value {
+            return .{ .double = d };
+        }
+    };
+    // Each case: what the field held (null: missing), the transform, and
+    // what the emulator answered, 2026-10-05.
+    const nan = std.math.nan(f64);
+    const cases = [_]struct { ?Value, types.Transform.Op, Value }{
+        .{ I.int(5), .{ .increment = .{ .integer = 1 } }, I.int(6) },
+        .{ I.int(std.math.maxInt(i64)), .{ .increment = .{ .integer = 1 } }, I.int(std.math.maxInt(i64)) },
+        .{ I.int(std.math.minInt(i64)), .{ .increment = .{ .integer = -5 } }, I.int(std.math.minInt(i64)) },
+        .{ I.int(5), .{ .increment = .{ .double = 0.5 } }, I.dbl(5.5) },
+        .{ null, .{ .increment = .{ .integer = 3 } }, I.int(3) },
+        .{ .{ .string = "a" }, .{ .increment = .{ .integer = 2 } }, I.int(2) },
+        .{ null, .{ .increment = .{ .double = nan } }, I.dbl(nan) },
+        .{ I.int(3), .{ .maximum = .{ .double = 3.0 } }, I.int(3) },
+        .{ I.dbl(3.0), .{ .maximum = .{ .integer = 3 } }, I.dbl(3.0) },
+        .{ I.int(5), .{ .maximum = .{ .double = 7.5 } }, I.dbl(7.5) },
+        .{ I.dbl(1.5), .{ .minimum = .{ .integer = 1 } }, I.int(1) },
+        .{ I.int(0), .{ .maximum = .{ .double = nan } }, I.dbl(nan) },
+        .{ I.dbl(nan), .{ .minimum = .{ .integer = 4 } }, I.dbl(nan) },
+        .{ null, .{ .minimum = .{ .integer = 4 } }, I.int(4) },
+        .{ I.int(9), .{ .minimum = .{ .integer = 4 } }, I.int(4) },
+        .{ I.int(9), .{ .maximum = .{ .integer = 4 } }, I.int(9) },
+    };
+    for (cases, 0..) |case, i| {
+        var id_buf: [8]u8 = undefined;
+        const path = try std.fmt.bufPrint(&id_buf, "t/{d}", .{i});
+        var r = try h.client.commit(&.{.{ .update = .{
+            .path = path,
+            .fields = if (case[0]) |v| &.{.{ .name = "x", .value = v }} else &.{},
+            .transforms = &.{.{ .field_path = "x", .op = case[1] }},
+        } }}, .{});
+        defer r.deinit();
+        codec.expectValueEqual(case[2], r.value.writes[0].transform_results[0]) catch |err| {
+            std.debug.print("case {d}: got {any}\n", .{ i, r.value.writes[0].transform_results[0] });
+            return err;
+        };
+        var got = try h.client.doc(path).get(.{});
+        defer got.deinit();
+        try codec.expectValueEqual(case[2], got.value.get("x").?);
+    }
+
+    // The array transforms: 3 and 3.0 are one, NaN is NaN, null is null,
+    // a value given twice is added once, and maps match field by field.
+    _ = try h.client.doc("t/arr").set(&.{
+        .{ .name = "a", .value = .{ .array = &.{ I.int(3), I.dbl(nan), .null } } },
+        .{ .name = "m", .value = .{ .array = &.{.{ .map = &.{ .{ .name = "x", .value = I.int(1) }, .{ .name = "y", .value = I.int(2) } } }} } },
+    }, .{ .transforms = &.{
+        .{ .field_path = "a", .op = .{ .append_missing = &.{ I.dbl(3.0), I.dbl(nan), .null, I.int(4), I.int(4), I.dbl(4.0) } } },
+        .{ .field_path = "b", .op = .{ .append_missing = &.{I.int(1)} } },
+        .{ .field_path = "c", .op = .{ .remove_all = &.{I.int(1)} } },
+        .{ .field_path = "m", .op = .{ .append_missing = &.{.{ .map = &.{ .{ .name = "y", .value = I.dbl(2.0) }, .{ .name = "x", .value = I.int(1) } } }} } },
+    } });
+    var arr = try h.client.doc("t/arr").get(.{});
+    defer arr.deinit();
+    try codec.expectValueEqual(.{ .array = &.{ I.int(3), I.dbl(nan), .null, I.int(4) } }, arr.value.get("a").?);
+    try codec.expectValueEqual(.{ .array = &.{I.int(1)} }, arr.value.get("b").?);
+    try codec.expectValueEqual(.{ .array = &.{} }, arr.value.get("c").?);
+    try testing.expectEqual(1, arr.value.get("m").?.array.len);
+    _ = try h.client.doc("t/arr").update(&.{}, .{ .transforms = &.{.{ .field_path = "a", .op = .{ .remove_all = &.{ I.dbl(3.0), I.dbl(nan) } } }} });
+    var removed = try h.client.doc("t/arr").get(.{});
+    defer removed.deinit();
+    try codec.expectValueEqual(.{ .array = &.{ .null, I.int(4) } }, removed.value.get("a").?);
+
+    // Server time: to the millisecond, the same in every field of a commit;
+    // transforms on a nested path make the maps on the way.
+    var times = try h.client.commit(&.{.{ .update = .{ .path = "t/time", .transforms = &.{
+        .{ .field_path = "a", .op = .server_time },
+        .{ .field_path = "deep.b", .op = .server_time },
+    } } }}, .{});
+    defer times.deinit();
+    const ta = times.value.writes[0].transform_results[0].timestamp;
+    try testing.expectEqual(ta, times.value.writes[0].transform_results[1].timestamp);
+    try testing.expectEqual(0, @mod(ta.nanoseconds, std.time.ns_per_ms));
+    var timed = try h.client.doc("t/time").get(.{});
+    defer timed.deinit();
+    try testing.expectEqual(ta, timed.value.get("deep").?.get("b").?.timestamp);
+}
+
+test "fake: transform refusals, and transforms beside a mask" {
+    var server: FakeFirestore = .init(testing.allocator);
+    defer server.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const n = "projects/p/databases/(default)/documents/t/a";
+    try expectRefusal(try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[{\"update\":{\"name\":\"" ++ n ++ "\",\"fields\":{}},\"updateMask\":{\"fieldPaths\":[]},\"updateTransforms\":[{\"fieldPath\":\"m\",\"setToServerValue\":\"REQUEST_TIME\"},{\"fieldPath\":\"m.b\",\"increment\":{\"integerValue\":\"1\"}}]}]}"), 400, "Cannot transform property m and its nested property at the same time.");
+    try expectRefusal(try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[{\"update\":{\"name\":\"" ++ n ++ "\",\"fields\":{}},\"updateTransforms\":[{\"fieldPath\":\"n\",\"increment\":{\"stringValue\":\"x\"}}]}]}"), 400, "Input must be int64 or double.");
+    try expectRefusal(try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[{\"delete\":\"" ++ n ++ "\",\"updateTransforms\":[]}]}"), 400, "cannot carry transforms");
+    try testing.expectEqual(0, server.count("(default)"));
+    // An empty mask keeps what is there; no mask replaces it first.
+    _ = try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[{\"update\":{\"name\":\"" ++ n ++ "\",\"fields\":{\"keep\":{\"integerValue\":\"1\"},\"n\":{\"integerValue\":\"5\"}}}}]}");
+    _ = try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[{\"update\":{\"name\":\"" ++ n ++ "\",\"fields\":{}},\"updateMask\":{\"fieldPaths\":[]},\"updateTransforms\":[{\"fieldPath\":\"n\",\"increment\":{\"integerValue\":\"1\"}}]}]}");
+    try testing.expectEqual(2, server.doc("(default)", "t/a").?.fields.len);
+    _ = try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[{\"update\":{\"name\":\"" ++ n ++ "\",\"fields\":{}},\"updateTransforms\":[{\"fieldPath\":\"n\",\"increment\":{\"integerValue\":\"1\"}}]}]}");
+    try testing.expectEqual(1, server.doc("(default)", "t/a").?.fields.len);
+    try testing.expectEqual(1, server.doc("(default)", "t/a").?.fields[0].value.integer);
+    // Measured: a commit of nothing answers `{}`.
+    try testing.expectEqualStrings("{}", (try rawRequest(&server, a, .POST, ":commit", "{\"writes\":[]}")).body);
+}
+
+test "fake: batchGet through the client, and a transform's lost answer" {
+    var h: test_util.FakeHarness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    _ = try h.client.doc("c/b").set(&.{.{ .name = "v", .value = .{ .integer = 2 } }}, .{});
+    _ = try h.client.doc("c/a").set(&.{ .{ .name = "v", .value = .{ .integer = 1 } }, .{ .name = "w", .value = .null } }, .{});
+    var r = try h.client.batchGet(&.{ "c/b", "c/none", "c/a", "c/b" }, .{ .mask = &.{"v"} });
+    defer r.deinit();
+    try testing.expectEqual(2, r.value.documents[0].?.get("v").?.integer);
+    try testing.expectEqual(null, r.value.documents[1]);
+    try testing.expectEqual(1, r.value.documents[2].?.get("v").?.integer);
+    try testing.expectEqual(1, r.value.documents[2].?.fields.len);
+    try testing.expectEqual(2, r.value.documents[3].?.get("v").?.integer);
+    // The fake keeps no history.
+    try testing.expectError(error.InvalidArgument, h.client.doc("c/a").get(.{ .read_time = .{ .nanoseconds = 1_791_072_000_000_000_000 } }));
+
+    // An increment whose answer was lost landed; it is not sent again.
+    h.server.lose_answers = 1;
+    try testing.expectError(error.Unavailable, h.client.doc("c/a").update(&.{}, .{ .transforms = &.{.{ .field_path = "v", .op = .{ .increment = .{ .integer = 10 } } }} }));
+    try h.expectDiag("may or may not have landed");
+    var after = try h.client.doc("c/a").get(.{});
+    defer after.deinit();
+    try testing.expectEqual(11, after.value.get("v").?.integer);
+    // Under the update time just read, a repeat meets its own write.
+    h.server.lose_answers = 1;
+    try testing.expectError(error.FailedPrecondition, h.client.doc("c/a").update(&.{}, .{
+        .transforms = &.{.{ .field_path = "v", .op = .{ .increment = .{ .integer = 10 } } }},
+        .precondition = .{ .update_time = after.value.update_time },
+    }));
+    try h.expectDiag("an earlier attempt may have landed");
+    var once = try h.client.doc("c/a").get(.{});
+    defer once.deinit();
+    try testing.expectEqual(21, once.value.get("v").?.integer);
 }
 
 test "fake: every allocation failure through a full path is OutOfMemory without leaks" {
@@ -1409,12 +1816,118 @@ const Model = struct {
         return out.items;
     }
 
-    fn valueAt(fields: []const Field, segments: []const []const u8) ?Value {
+    pub fn valueAt(fields: []const Field, segments: []const []const u8) ?Value {
         const v = types.getField(fields, segments[0]) orelse return null;
         if (segments.len == 1) return v;
         return if (v == .map) valueAt(v.map, segments[1..]) else null;
     }
 };
+
+/// The model's own reading of the transforms, from the documentation and
+/// what the emulator answered; see "fake: transforms answer as the
+/// emulator answered them".
+const ModelTransforms = struct {
+    fn number(v: ?Value) ?f64 {
+        const x = v orelse return null;
+        return switch (x) {
+            .integer => |i| @floatFromInt(i),
+            .double => |d| d,
+            else => null,
+        };
+    }
+
+    fn fromNumeric(n: types.Numeric) Value {
+        return switch (n) {
+            .integer => |i| .{ .integer = i },
+            .double => |d| .{ .double = d },
+        };
+    }
+
+    fn increment(current: ?Value, n: types.Numeric) Value {
+        const operand = fromNumeric(n);
+        const c = current orelse return operand;
+        if (c == .integer and n == .integer) {
+            const sum = @as(i128, c.integer) + n.integer;
+            return .{ .integer = @intCast(std.math.clamp(sum, std.math.minInt(i64), std.math.maxInt(i64))) };
+        }
+        const x = number(c) orelse return operand;
+        return .{ .double = x + number(operand).? };
+    }
+
+    fn extreme(current: ?Value, n: types.Numeric, maximum: bool) Value {
+        const operand = fromNumeric(n);
+        const c = current orelse return operand;
+        const x = number(c) orelse return operand;
+        const y = number(operand).?;
+        if (std.math.isNan(x)) return c;
+        if (std.math.isNan(y)) return operand;
+        const order: std.math.Order = if (c == .integer and n == .integer) std.math.order(c.integer, n.integer) else std.math.order(x, y);
+        if (order == .eq) return c;
+        return if ((order == .lt) == maximum) operand else c;
+    }
+
+    fn same(a: Value, b: Value) bool {
+        if (number(a)) |x| {
+            const y = number(b) orelse return false;
+            if (std.math.isNan(x) or std.math.isNan(y)) return std.math.isNan(x) and std.math.isNan(y);
+            if (a == .integer and b == .integer) return a.integer == b.integer;
+            return x == y;
+        }
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .null => true,
+            .boolean => |x| x == b.boolean,
+            .string => |x| std.mem.eql(u8, x, b.string),
+            .map => |x| x.len == b.map.len and for (x) |f| {
+                const other = types.getField(b.map, f.name) orelse break false;
+                if (!same(f.value, other)) break false;
+            } else true,
+            else => false,
+        };
+    }
+
+    fn arrayOf(current: ?Value) []const Value {
+        const c = current orelse return &.{};
+        return if (c == .array) c.array else &.{};
+    }
+
+    fn appendMissing(a: Allocator, current: ?Value, values: []const Value) Allocator.Error!Value {
+        var out: std.ArrayList(Value) = .empty;
+        try out.appendSlice(a, arrayOf(current));
+        for (values) |v| {
+            for (out.items) |e| {
+                if (same(e, v)) break;
+            } else try out.append(a, v);
+        }
+        return .{ .array = out.items };
+    }
+
+    fn removeAll(a: Allocator, current: ?Value, values: []const Value) Allocator.Error!Value {
+        var out: std.ArrayList(Value) = .empty;
+        for (arrayOf(current)) |e| {
+            for (values) |v| {
+                if (same(e, v)) break;
+            } else try out.append(a, e);
+        }
+        return .{ .array = out.items };
+    }
+};
+
+fn randomNumeric(g: *test_util.ByteGen) types.Numeric {
+    return switch (g.intRange(u8, 0, 5)) {
+        0 => .{ .integer = g.pick(i64, &.{ 0, 1, 3, -2, std.math.maxInt(i64), std.math.minInt(i64) }) },
+        1 => .{ .double = g.pick(f64, &.{ 0.5, 3.0, -1.25, std.math.nan(f64), std.math.inf(f64) }) },
+        else => .{ .integer = g.intRange(u8, 0, 4) },
+    };
+}
+
+/// Values that collide often under Firestore's equality.
+fn randomElements(g: *test_util.ByteGen, a: Allocator) Allocator.Error![]const Value {
+    const pool = [_]Value{ .null, .{ .integer = 3 }, .{ .double = 3.0 }, .{ .integer = 4 }, .{ .double = std.math.nan(f64) }, .{ .string = "a" }, .{ .boolean = true }, .{ .map = &.{.{ .name = "x", .value = .{ .integer = 1 } }} }, .{ .map = &.{.{ .name = "x", .value = .{ .double = 1.0 } }} } };
+    const out = try a.alloc(Value, g.intRange(u8, 0, 3));
+    for (out) |*v| v.* = pool[g.intRange(usize, 0, pool.len - 1)];
+    return out;
+}
 
 /// What the server keeps of a value: microseconds, and 0.0 for -0.0.
 fn normalized(a: Allocator, v: Value) Allocator.Error!Value {
@@ -1461,7 +1974,7 @@ fn expectSameValue(expected: Value, actual: Value) anyerror!void {
     }
 }
 
-const paths = [_][]const u8{ "c/a", "c/b", "c/a/s/x", "d/y" };
+const model_paths = [_][]const u8{ "c/a", "c/b", "c/a/s/x", "d/y" };
 const names_pool = [_][]const u8{ "k", "a-b", "é", "m" };
 
 fn randomFields(g: *test_util.ByteGen, a: Allocator) Allocator.Error![]const Field {
@@ -1510,10 +2023,10 @@ fn modelProperty(_: void, input: []const u8) !void {
 
     var steps: usize = 0;
     while (steps < 12 and g.pos < g.bytes.len) : (steps += 1) {
-        const path = g.pick([]const u8, &paths);
+        const path = g.pick([]const u8, &model_paths);
         const doc = h.client.doc(path);
         const existing = model.docs.get(path);
-        switch (g.intRange(u8, 0, 4)) {
+        switch (g.intRange(u8, 0, 7)) {
             0 => { // set, sometimes held to exists == false
                 const fields = try randomFields(&g, a);
                 const must_be_new = g.intRange(u8, 0, 3) == 0;
@@ -1582,6 +2095,65 @@ fn modelProperty(_: void, input: []const u8) !void {
                     const written = try result;
                     try model.docs.put(a, path, &.{});
                     try model.times.put(a, path, written.update_time);
+                }
+            },
+            5 => { // transforms alone, through a commit
+                var transforms: std.ArrayList(types.Transform) = .empty;
+                var texts: std.ArrayList([]const u8) = .empty;
+                var segment_lists: std.ArrayList([]const []const u8) = .empty;
+                for (0..g.intRange(u8, 1, 3)) |_| {
+                    const segments = try randomMaskPath(&g, a);
+                    const text = try maskText(a, segments);
+                    // Equal paths may repeat; overlapping ones are refused.
+                    for (texts.items) |other| {
+                        if (names.fieldPathsOverlap(text, other) and !names.fieldPathsEqual(text, other)) break;
+                    } else {
+                        try texts.append(a, text);
+                        try segment_lists.append(a, segments);
+                        try transforms.append(a, .{ .field_path = text, .op = switch (g.intRange(u8, 0, 5)) {
+                            0 => .server_time,
+                            1 => .{ .increment = randomNumeric(&g) },
+                            2 => .{ .maximum = randomNumeric(&g) },
+                            3 => .{ .minimum = randomNumeric(&g) },
+                            4 => .{ .append_missing = try randomElements(&g, a) },
+                            else => .{ .remove_all = try randomElements(&g, a) },
+                        } });
+                    }
+                }
+                var result = try h.client.commit(&.{.{ .update = .{ .path = path, .mask = &.{}, .transforms = transforms.items } }}, .{});
+                defer result.deinit();
+                const answered = result.value.writes[0].transform_results;
+                try testing.expectEqual(transforms.items.len, answered.len);
+                var next: []const Field = existing orelse &.{};
+                for (transforms.items, segment_lists.items, answered) |t, segments, got| {
+                    const current = Model.valueAt(next, segments);
+                    const value, const expected: Value = switch (t.op) {
+                        .server_time => .{ got, got },
+                        .increment => |n| .{ ModelTransforms.increment(current, n), ModelTransforms.increment(current, n) },
+                        .maximum => |n| .{ ModelTransforms.extreme(current, n, true), ModelTransforms.extreme(current, n, true) },
+                        .minimum => |n| .{ ModelTransforms.extreme(current, n, false), ModelTransforms.extreme(current, n, false) },
+                        .append_missing => |values| .{ try ModelTransforms.appendMissing(a, current, values), .null },
+                        .remove_all => |values| .{ try ModelTransforms.removeAll(a, current, values), .null },
+                    };
+                    codec.expectValueEqual(expected, got) catch |err| {
+                        std.debug.print("{s} {s}: was {any}, expected {any}, got {any}\n", .{ path, t.field_path, current, expected, got });
+                        return err;
+                    };
+                    next = try model.setAt(next, segments, try normalized(a, value));
+                }
+                try model.docs.put(a, path, next);
+                try model.times.put(a, path, result.value.writes[0].update_time.?);
+            },
+            6 => { // several documents at once, some twice, some missing
+                var asked: [4][]const u8 = undefined;
+                const n = g.intRange(usize, 1, asked.len);
+                for (asked[0..n]) |*p| p.* = g.pick([]const u8, &model_paths);
+                var r = try h.client.batchGet(asked[0..n], .{});
+                defer r.deinit();
+                for (asked[0..n], r.value.documents) |p, d| {
+                    if (model.docs.get(p)) |fields| {
+                        try expectSameFields(fields, (d orelse return error.TestExpectedDocument).fields);
+                    } else try testing.expectEqual(null, d);
                 }
             },
             else => { // a read, checked against the model

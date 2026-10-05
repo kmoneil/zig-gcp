@@ -4,6 +4,8 @@
 //!     ... -- add cities name=Somewhere
 //!     ... -- get cities/LA
 //!     ... -- update cities/LA population=4000000 --delete nickname
+//!     ... -- incr cities/LA visits 1
+//!     ... -- getall cities/LA cities/SF
 //!     ... -- ls cities
 //!     ... -- collections [cities/LA]
 //!     ... -- rm cities/LA
@@ -11,6 +13,9 @@
 //! A value that reads as an integer is one, likewise a double, `true`,
 //! `false` and `null`; anything else is a string. `update` changes only
 //! the fields named and must find the document; `set` replaces it whole.
+//! `incr` adds to a number on the server, creating the field (and the
+//! document) when missing, so concurrent increments never lose one;
+//! `getall` reads several documents in one request.
 //! `--project` names the project, by default GOOGLE_CLOUD_PROJECT, or
 //! `test` against the emulator; `--database` a named database.
 //!
@@ -30,6 +35,8 @@ const usage =
     \\       firestore add COLLECTION_PATH FIELD=VALUE...
     \\       firestore get DOC_PATH
     \\       firestore update DOC_PATH FIELD=VALUE... [--delete FIELD]...
+    \\       firestore incr DOC_PATH FIELD AMOUNT
+    \\       firestore getall DOC_PATH...
     \\       firestore ls COLLECTION_PATH
     \\       firestore collections [DOC_PATH]
     \\       firestore rm DOC_PATH
@@ -108,6 +115,28 @@ pub fn main(init: std.process.Init) !void {
             break :written doc.update(fields, .{ .mask = mask }) catch |err| return fail(err, &diag);
         };
         try out.print("written at {d} ns\n", .{written.update_time.nanoseconds});
+    } else if (std.mem.eql(u8, command, "incr")) {
+        if (p.len != 4) return badUsage(out);
+        const amount: firestore.Numeric = if (std.fmt.parseInt(i64, p[3], 10)) |n| .{ .integer = n } else |_| .{
+            .double = std.fmt.parseFloat(f64, p[3]) catch return badUsage(out),
+        };
+        // A commit, for the transform's result: the field's new value.
+        var result = client.commit(&.{.{ .update = .{
+            .path = p[1],
+            .mask = &.{},
+            .transforms = &.{.{ .field_path = try firestore.field_path.ofName(arena, p[2]), .op = .{ .increment = amount } }},
+        } }}, .{}) catch |err| return fail(err, &diag);
+        defer result.deinit();
+        try out.print("{s} is now ", .{p[2]});
+        try printValue(out, result.value.writes[0].transform_results[0]);
+        try out.writeAll("\n");
+    } else if (std.mem.eql(u8, command, "getall")) {
+        if (p.len < 2) return badUsage(out);
+        var r = client.batchGet(p[1..], .{}) catch |err| return fail(err, &diag);
+        defer r.deinit();
+        for (p[1..], r.value.documents) |path, d| {
+            if (d) |doc| try printDoc(out, doc) else try out.print("{s}: missing\n", .{path});
+        }
     } else if (std.mem.eql(u8, command, "get")) {
         if (p.len != 2) return badUsage(out);
         var got = client.doc(p[1]).get(.{}) catch |err| return fail(err, &diag);
