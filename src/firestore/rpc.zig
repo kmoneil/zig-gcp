@@ -53,6 +53,12 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
     return engine(client).execute(response, call);
 }
 
+/// Sends `call` with its answer streamed into `call.sink`; see
+/// `core.rpc.StreamCall`. The response arena holds the head only.
+pub fn executeStream(client: *Client, response: *std.heap.ArenaAllocator, call: core.rpc.StreamCall) core.rpc.StreamCallError!core.transport.StreamResponse {
+    return engine(client).executeStream(response, call);
+}
+
 /// `execute` for calls whose response body is not needed.
 pub fn executeDiscard(client: *Client, call: Call) Error!void {
     return engine(client).executeDiscard(call);

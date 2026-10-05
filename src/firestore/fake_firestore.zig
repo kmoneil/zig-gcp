@@ -77,6 +77,14 @@ pub const FakeFirestore = struct {
     /// inside the same 200, DEADLINE_EXCEEDED, as production does past a
     /// deadline (measured 2026-10-05).
     deadline_after: ?u32 = null,
+    /// The next streamed answer stops after this many of its bytes, as a
+    /// connection that drops mid-answer.
+    drop_after_bytes: ?usize = null,
+    /// Bytes per write of a streamed answer, which arrives in pieces as a
+    /// chunked one does.
+    stream_piece: usize = 61,
+    /// Streamed requests served.
+    stream_requests: u32 = 0,
     /// By id.
     transactions: std.StringHashMapUnmanaged(*Txn) = .empty,
     next_transaction: u64 = 1,
@@ -133,7 +141,32 @@ pub const FakeFirestore = struct {
     }
 
     pub fn transport(self: *FakeFirestore) tp.Transport {
-        return .{ .ptr = self, .vtable = &.{ .send = send } };
+        return .{ .ptr = self, .vtable = &.{ .send = send, .sendStream = sendStream } };
+    }
+
+    fn sendStream(ptr: *anyopaque, req: tp.StreamRequest, arena: Allocator) tp.StreamError!tp.StreamResponse {
+        const self: *FakeFirestore = @ptrCast(@alignCast(ptr));
+        self.stream_requests += 1;
+        const body: []const u8 = switch (req.body) {
+            .none => "",
+            .segments => |segments| try std.mem.concat(arena, u8, segments),
+            // Firestore's requests are JSON held in memory.
+            .stream => return error.HttpProtocolError,
+        };
+        const reply = self.serve(req.method, req.url, body, arena) catch return error.OutOfMemory;
+        if (req.head_out) |out| out.* = .{ .status = reply.status, .headers = &.{} };
+        // Only a success streams to the sink writer, as the transport has it.
+        if (reply.status >= 300 or req.sink != .writer) return .{ .status = reply.status, .body = reply.body };
+        const w = req.sink.writer;
+        const drop = self.drop_after_bytes;
+        self.drop_after_bytes = null;
+        const sent = if (drop) |d| @min(d, reply.body.len) else reply.body.len;
+        var i: usize = 0;
+        while (i < sent) : (i += self.stream_piece) {
+            w.writeAll(reply.body[i..@min(i + self.stream_piece, sent)]) catch return error.WriteFailed;
+        }
+        if (sent < reply.body.len) return error.ConnectionResetByPeer;
+        return .{ .status = reply.status, .bytes_streamed = sent };
     }
 
     fn send(ptr: *anyopaque, req: tp.Request, arena: Allocator) tp.Error!tp.Response {
@@ -3160,6 +3193,29 @@ fn maskText(a: Allocator, segments: []const []const u8) Allocator.Error![]const 
     return out.written();
 }
 
+/// Keeps each document `runQueryEach` hands over.
+const Kept = struct {
+    docs: std.ArrayList(types.Owned(types.Snapshot)) = .empty,
+
+    fn handler(k: *Kept) types.DocumentHandler {
+        return .{ .ptr = k, .vtable = &.{ .document = document } };
+    }
+
+    fn document(ptr: *anyopaque, snapshot: types.Owned(types.Snapshot)) anyerror!void {
+        const k: *Kept = @ptrCast(@alignCast(ptr));
+        var s = snapshot;
+        k.docs.append(testing.allocator, s) catch |err| {
+            s.deinit();
+            return err;
+        };
+    }
+
+    fn deinit(k: *Kept) void {
+        for (k.docs.items) |*d| d.deinit();
+        k.docs.deinit(testing.allocator);
+    }
+};
+
 fn modelProperty(_: void, input: []const u8) !void {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -3308,6 +3364,42 @@ fn modelProperty(_: void, input: []const u8) !void {
             7 => { // a query, sometimes cut off by its deadline: the whole result or the error, never part
                 const cut = g.intRange(u8, 0, 2) == 0;
                 if (cut) h.server.deadline_after = g.intRange(u32, 0, 2);
+                if (g.intRange(u8, 0, 1) == 0) {
+                    // Streamed, sometimes dropped: always a prefix of the
+                    // answer, and success only with all of it.
+                    if (g.intRange(u8, 0, 2) == 0) h.server.drop_after_bytes = g.intRange(usize, 0, 1200);
+                    h.server.stream_piece = g.intRange(usize, 1, 300);
+                    var kept: Kept = .{};
+                    defer kept.deinit();
+                    const outcome = h.client.runQueryEach(.{ .from = .{ .collection = "c" } }, .{}, kept.handler());
+                    var expected: usize = 0;
+                    for ([_][]const u8{ "c/a", "c/b" }) |p| if (model.docs.get(p)) |fields| {
+                        if (expected < kept.docs.items.len) {
+                            try testing.expectEqualStrings(p[2..], kept.docs.items[expected].value.id());
+                            try expectSameFields(fields, kept.docs.items[expected].value.fields);
+                        }
+                        expected += 1;
+                    };
+                    if (outcome) |end| {
+                        try testing.expect(!cut or h.server.deadline_after == null);
+                        try testing.expectEqual(expected, kept.docs.items.len);
+                        try testing.expectEqual(expected, end.documents);
+                    } else |err| {
+                        // A drop in the closing bracket fails a read that
+                        // handed everything over: production sends no
+                        // `done` to say the answer was whole.
+                        try testing.expect(kept.docs.items.len <= expected);
+                        switch (err) {
+                            error.DeadlineExceeded => try testing.expect(cut),
+                            // A drop before the first document was read again.
+                            error.ConnectionResetByPeer => try testing.expect(kept.docs.items.len > 0),
+                            else => return err,
+                        }
+                    }
+                    h.server.drop_after_bytes = null;
+                    h.server.deadline_after = null;
+                    continue;
+                }
                 const result = h.client.runQuery(.{ .from = .{ .collection = "c" } }, .{});
                 if (cut) {
                     try testing.expectError(error.DeadlineExceeded, result);

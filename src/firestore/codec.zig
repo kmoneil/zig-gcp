@@ -434,19 +434,28 @@ pub fn decodeBatchGet(arena: Allocator, body: []const u8, streamed: *?StreamedEr
     const tree = try parseTree(arena, body);
     if (tree != .array) return error.InvalidResponse;
     const out = try arena.alloc(BatchGetElement, tree.array.items.len);
-    for (tree.array.items, out) |item, *e| {
-        const obj = objectOf(item) orelse return error.InvalidResponse;
-        try checkStreamed(obj, streamed);
-        e.* = .{};
-        if (present(obj, "found")) |f| e.found = try snapshotFrom(arena, f);
-        if (present(obj, "missing")) |m| {
-            if (m != .string or m.string.len == 0) return error.InvalidResponse;
-            e.missing = m.string;
-        }
-        if (e.found != null and e.missing != null) return error.InvalidResponse;
-        if (present(obj, "readTime")) |_| e.read_time = try requiredTime(obj, "readTime");
-    }
+    for (tree.array.items, out) |item, *e| e.* = try batchGetElementFrom(arena, item, streamed);
     return out;
+}
+
+/// One message of a `batchGet` answer, from its own bytes, as a streamed
+/// read hands it over.
+pub fn decodeBatchGetMessage(arena: Allocator, bytes: []const u8, streamed: *?StreamedError) StreamDecodeError!BatchGetElement {
+    return batchGetElementFrom(arena, try parseTree(arena, bytes), streamed);
+}
+
+fn batchGetElementFrom(arena: Allocator, item: std.json.Value, streamed: *?StreamedError) StreamDecodeError!BatchGetElement {
+    const obj = objectOf(item) orelse return error.InvalidResponse;
+    try checkStreamed(obj, streamed);
+    var e: BatchGetElement = .{};
+    if (present(obj, "found")) |f| e.found = try snapshotFrom(arena, f);
+    if (present(obj, "missing")) |m| {
+        if (m != .string or m.string.len == 0) return error.InvalidResponse;
+        e.missing = m.string;
+    }
+    if (e.found != null and e.missing != null) return error.InvalidResponse;
+    if (present(obj, "readTime")) |_| e.read_time = try requiredTime(obj, "readTime");
+    return e;
 }
 
 /// The `runQuery` answer: one JSON array of stream messages, measured on
@@ -462,20 +471,42 @@ pub fn decodeRunQuery(arena: Allocator, body: []const u8, streamed: *?StreamedEr
     var read_time: ?std.Io.Timestamp = null;
     var skipped: u64 = 0;
     for (tree.array.items) |item| {
-        const obj = objectOf(item) orelse return error.InvalidResponse;
-        try checkStreamed(obj, streamed);
-        if (present(obj, "document")) |d| try documents.append(arena, try snapshotFrom(arena, d));
-        if (present(obj, "readTime")) |_| read_time = try requiredTime(obj, "readTime");
-        if (present(obj, "skippedResults")) |n| {
-            const text = numberText(n) orelse return error.InvalidResponse;
-            skipped +|= std.fmt.parseInt(u64, text, 10) catch return error.InvalidResponse;
-        }
+        const m = try queryMessageFrom(arena, item, streamed);
+        if (m.document) |d| try documents.append(arena, d);
+        if (m.read_time) |t| read_time = t;
+        skipped +|= m.skipped_results;
     }
     return .{
         .documents = documents.items,
         .read_time = read_time orelse return error.InvalidResponse,
         .skipped_results = skipped,
     };
+}
+
+/// One message of a `runQuery` answer.
+pub const QueryMessage = struct {
+    document: ?types.Snapshot = null,
+    read_time: ?std.Io.Timestamp = null,
+    skipped_results: u64 = 0,
+};
+
+/// One message of a `runQuery` answer, from its own bytes, as a streamed
+/// read hands it over.
+pub fn decodeQueryMessage(arena: Allocator, bytes: []const u8, streamed: *?StreamedError) StreamDecodeError!QueryMessage {
+    return queryMessageFrom(arena, try parseTree(arena, bytes), streamed);
+}
+
+fn queryMessageFrom(arena: Allocator, item: std.json.Value, streamed: *?StreamedError) StreamDecodeError!QueryMessage {
+    const obj = objectOf(item) orelse return error.InvalidResponse;
+    try checkStreamed(obj, streamed);
+    var m: QueryMessage = .{};
+    if (present(obj, "document")) |d| m.document = try snapshotFrom(arena, d);
+    if (present(obj, "readTime")) |_| m.read_time = try requiredTime(obj, "readTime");
+    if (present(obj, "skippedResults")) |n| {
+        const text = numberText(n) orelse return error.InvalidResponse;
+        m.skipped_results = std.fmt.parseInt(u64, text, 10) catch return error.InvalidResponse;
+    }
+    return m;
 }
 
 /// The `runAggregationQuery` answer: one JSON array whose result message

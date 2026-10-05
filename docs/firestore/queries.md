@@ -10,6 +10,7 @@ test holds it to the emulator over hundreds of random queries.
 
 **On this page:** [A query](#a-query) · [Conditions](#conditions) ·
 [Null and NaN](#null-and-nan) · [Order](#order) · [Cursors](#cursors) ·
+[Large answers, as they arrive](#large-answers-as-they-arrive) ·
 [Collection groups](#collection-groups) · [Aggregations](#aggregations) ·
 [What the server refuses](#what-the-server-refuses)
 
@@ -126,6 +127,63 @@ fn everyCity(client: *firestore.Client, gpa: std.mem.Allocator) !usize {
 That is the rule Google's clients follow when they build a cursor from a
 document. `limit_to_last`, a client-side trick in those libraries, is
 not here; reverse the order instead.
+
+## Large answers, as they arrive
+
+`runQuery` reads the whole answer into memory before it returns, and an
+answer over the transport's response limit, 32 MiB by default, fails
+with `error.ResponseTooLarge`: about 75,000 small documents.
+`client.runQueryEach(query, options, handler)` hands each document over
+as it arrives instead, in the query's order, holding one at a time:
+
+<!-- snippet: tests/docs_examples.zig#firestore-each -->
+```zig
+/// Writes the id of every city to `out` as each arrives, however many
+/// there are: memory holds one document at a time, not the answer.
+fn exportCities(client: *firestore.Client, out: *std.Io.Writer) !u64 {
+    const Export = struct {
+        out: *std.Io.Writer,
+
+        fn document(ptr: *anyopaque, snapshot: firestore.Owned(firestore.Snapshot)) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var city = snapshot;
+            defer city.deinit();
+            try self.out.print("{s}\n", .{city.value.id()});
+        }
+    };
+    var state: Export = .{ .out = out };
+    const end = try client.runQueryEach(
+        .{ .from = .{ .collection = "cities" } },
+        .{},
+        .{ .ptr = &state, .vtable = &.{ .document = Export.document } },
+    );
+    return end.documents;
+}
+```
+
+- **Memory**: one document's answer at a time, whatever the total. The
+  emulator suite reads 200 MB this way while holding under 4 MB.
+- **Ownership**: the handler owns each snapshot it is handed, and must
+  `deinit` it, kept or not.
+- **Speed**: production sends each document as it finds it; measured,
+  the first of 50,000 arrived after 0.2 s, the last after 4.8 s.
+- **Errors**: one the server sends after some documents, such as
+  `error.DeadlineExceeded` for a query that ran too long, is returned
+  after the handler has seen the documents before it; so is an error the
+  handler returns, which stops the read.
+- **Retries**: a status the server answers is retried as `runQuery`'s
+  would be, and so is a connection that drops before the first
+  document. After that the error is returned: a repeat would hand the
+  same documents over again. Resume with a cursor after the last one.
+- **Time**: `options.timeout_ms`, five minutes unless set, bounds the
+  whole read, the handler's time included; 0 removes the limit. With a
+  limit, the handler runs on another task of the client's `Io` while the
+  call waits.
+
+`client.batchGetEach(paths, options, handler)` does the same for
+`batchGet`: each distinct path is handed over once, found or not
+(`document` null), in the order the server answers, which in production
+is by name.
 
 ## Collection groups
 

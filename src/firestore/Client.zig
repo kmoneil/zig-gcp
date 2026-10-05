@@ -234,6 +234,17 @@ pub fn batchGet(self: *Client, paths: []const []const u8, options: types.BatchGe
     return result;
 }
 
+/// Reads the documents at `paths` in one request and hands each to
+/// `handler` as it arrives, holding one at a time: `batchGet` for more
+/// documents than fit in memory at once. Each distinct path is handed
+/// over once, found or not, in the order the server answers, which in
+/// production is by name. Errors, retries and the time limit are as
+/// `runQueryEach` has them. No paths sends nothing.
+pub fn batchGetEach(self: *Client, paths: []const []const u8, options: types.BatchGetStreamOptions, handler: types.BatchGetHandler) anyerror!types.BatchGetStreamEnd {
+    rpc.begin(self);
+    return batch_get.batchGetEach(self, paths, options, handler);
+}
+
 /// Runs `handler` in a transaction: its reads join the transaction and its
 /// writes are committed together when it returns, all or none. When the
 /// server answers ABORTED, from the commit or a read, as it does when
@@ -270,6 +281,25 @@ pub fn runQuery(self: *Client, query: types.Query, options: types.QueryOptions) 
     errdefer result.deinit();
     result.value = try query_.run(self, query, options, result.arena);
     return result;
+}
+
+/// Runs `query` and hands each result to `handler` as it arrives, in the
+/// query's order, holding one at a time: for answers too large to hold
+/// whole, or to start on the first result before the last arrives.
+/// `runQuery` reads the whole answer into memory, at most the transport's
+/// response limit, 32 MiB by default.
+///
+/// An error the server sends after some documents, such as
+/// `error.DeadlineExceeded` for a query that ran too long, is returned
+/// after the handler has seen the documents before it; so is the
+/// handler's own. A connection that drops before the first document is
+/// tried again, as `runQuery` would be; after it, the error is returned,
+/// since a repeat would hand the documents over again. With a time limit,
+/// `options.timeout_ms`, the handler runs on another task of the client's
+/// `Io` while the call waits.
+pub fn runQueryEach(self: *Client, query: types.Query, options: types.QueryStreamOptions, handler: types.DocumentHandler) anyerror!types.QueryStreamEnd {
+    rpc.begin(self);
+    return query_.runEach(self, query, options, handler);
 }
 
 /// Counts, sums or averages `query`'s results on the server, without

@@ -136,6 +136,7 @@ take field paths: `address.city`, or `` `a-b`.c ``.
 | `collection.list(options)` | One page of a collection's documents | |
 | `client.listCollectionIds(options)`, `document.listCollectionIds(options)` | The collections at the root, or below a document | |
 | `client.runQuery(query, options)` | Filters, orders, cursors, offset, limit and select, over a collection or a collection group | [Queries](queries.md) |
+| `client.runQueryEach(query, options, handler)`, `client.batchGetEach(paths, options, handler)` | The same reads, each document handed over as it arrives, in the memory of one | [Large answers](queries.md#large-answers-as-they-arrive) |
 | `client.runAggregationQuery(query, aggregations, options)` | Count, sum and average, on the server | [Aggregations](queries.md#aggregations) |
 | `client.runTransaction(handler, options)` | Reads and writes together, run again on contention | [Transactions](transactions.md) |
 | `client.beginTransaction(options)`, `client.rollback(id)` | A transaction driven by hand | [Transactions](transactions.md#by-hand) |

@@ -22,6 +22,7 @@ const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
+const stream = @import("stream.zig");
 const types = @import("types.zig");
 const validate = @import("validate.zig");
 const Error = errors.Error;
@@ -57,6 +58,68 @@ pub fn run(client: *Client, query: types.Query, options: types.QueryOptions, res
     return codec.decodeRunQuery(response.allocator(), reply, &streamed) catch |err|
         return rpc.streamFailed(client, err, streamed, "runQuery");
 }
+
+/// Runs `query` and hands each document to `handler` as it arrives; see
+/// `stream.zig`. The call has begun.
+pub fn runEach(client: *Client, query: types.Query, options: types.QueryStreamOptions, handler: types.DocumentHandler) anyerror!types.QueryStreamEnd {
+    var scratch: std.heap.ArenaAllocator = .init(client.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const parent = try check(client, a, query);
+    if (options.read_time) |t| try rpc.checkTime(client, t, "read time");
+    try rpc.checkTransaction(client, options.transaction, options.read_time);
+    const url = writeUrl(a, client, parent, ":runQuery") catch return error.OutOfMemory;
+    const body = try encode(a, query, null, .{ .read_time = options.read_time, .transaction = options.transaction });
+
+    var each: Each = .{ .gpa = client.gpa, .handler = handler };
+    try stream.read(client, url, body, options.timeout_ms, each.reader(), "runQuery");
+    return .{
+        .documents = each.documents,
+        .read_time = each.read_time orelse return rpc.decodeFailed(client, error.InvalidResponse, "runQuery"),
+        .skipped_results = each.skipped,
+    };
+}
+
+/// A streamed query's progress.
+const Each = struct {
+    gpa: Allocator,
+    handler: types.DocumentHandler,
+    documents: u64 = 0,
+    read_time: ?std.Io.Timestamp = null,
+    skipped: u64 = 0,
+
+    fn reader(self: *Each) stream.Reader {
+        return .{ .ptr = self, .message = message, .handed = handed, .reset = reset };
+    }
+
+    fn message(ptr: *anyopaque, bytes: []const u8, said: *stream.Said) anyerror!void {
+        const self: *Each = @ptrCast(@alignCast(ptr));
+        // Decoded into the arena the handler will own, so a document is
+        // handed over without a copy.
+        var owned: types.Owned(types.Snapshot) = try .init(self.gpa);
+        var given = false;
+        defer if (!given) owned.deinit();
+        var streamed: ?codec.StreamedError = null;
+        const m = codec.decodeQueryMessage(owned.arena.allocator(), bytes, &streamed) catch |err|
+            return said.failed(err, streamed, "runQuery");
+        if (m.read_time) |t| self.read_time = t;
+        self.skipped +|= m.skipped_results;
+        owned.value = m.document orelse return;
+        given = true;
+        self.documents += 1;
+        return self.handler.document(owned);
+    }
+
+    fn handed(ptr: *anyopaque) bool {
+        const self: *Each = @ptrCast(@alignCast(ptr));
+        return self.documents > 0;
+    }
+
+    fn reset(ptr: *anyopaque) void {
+        const self: *Each = @ptrCast(@alignCast(ptr));
+        self.* = .{ .gpa = self.gpa, .handler = self.handler };
+    }
+};
 
 /// Runs `aggregations` over `query`'s results. The call has begun.
 pub fn aggregate(

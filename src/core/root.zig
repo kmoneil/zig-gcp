@@ -53,6 +53,10 @@ pub const WipingAllocator = @import("WipingAllocator.zig");
 /// A writer that counts what passes through it to another writer.
 pub const CountingWriter = @import("CountingWriter.zig");
 
+/// A writer that splits a streamed JSON array into its elements as they
+/// arrive, as Firestore's streamed answers travel.
+pub const JsonArraySplitter = @import("JsonArraySplitter.zig");
+
 /// CRC-32C, the checksum Google sends beside payload bytes.
 pub const crc32c = @import("crc32c.zig");
 
@@ -78,6 +82,7 @@ pub const testing = @import("testing.zig");
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("CountingWriter.zig");
+    _ = @import("JsonArraySplitter.zig");
     _ = @import("Signer.zig");
     _ = @import("StaticToken.zig");
     _ = @import("TokenProvider.zig");
