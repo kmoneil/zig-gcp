@@ -66,6 +66,11 @@ including the ones that did not change.
   reason a failed precondition has, told apart by its message. IAM's
   refusal of such a grant, `error.FailedPrecondition` until now, is
   `error.PublicAccessPrevented` too.
+- docs: new guides, `docs/storage/acls.md` and `docs/storage/hmac.md`,
+  with what production was measured to do where Google's documentation
+  says otherwise; `examples/gcs_sign.zig` signs with an HMAC key from
+  `GCS_HMAC_ACCESS_ID` and `GCS_HMAC_SECRET`, with no credentials, and CI
+  runs it against the emulator.
 - core: `Owned(T).initWiping` makes a result whose memory, the response
   it was decoded from included, is zeroed when `deinit` frees it, for
   results that hold a secret.

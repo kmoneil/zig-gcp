@@ -142,6 +142,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "pubsub", .module = mod },
                 .{ .name = "secret_manager", .module = secret_manager },
                 .{ .name = "firestore", .module = firestore },
+                .{ .name = "storage", .module = storage },
                 .{ .name = "core", .module = core },
             },
         }),

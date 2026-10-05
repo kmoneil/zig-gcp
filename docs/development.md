@@ -258,6 +258,23 @@ GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth application-default pri
     zig build test-integration-gcp -Dtest-filter="keys:"
 ```
 
+### Access control lists and HMAC keys
+
+The ACL tests make buckets of their own, as the bucket tests do, with
+public access prevention enforced so no list they write can grant the
+public anything. The HMAC key tests make keys for the service account
+`GCP_TEST_HMAC_ACCOUNT` names, sign a GET, a PUT and a POST policy with
+a fresh key and use them with no credentials, and delete every key they
+made, and any a crashed run left for that account. The token needs
+`storage.hmacKeys.*` (HMAC Key Admin, or Editor), which Storage Admin
+does not grant.
+
+```sh
+GCP_TEST_PROJECT=my-project GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    GCP_TEST_HMAC_ACCOUNT=signer@my-project.iam.gserviceaccount.com \
+    zig build test-integration-gcp -Dtest-filter="ACLs" -Dtest-filter="HMAC"
+```
+
 ### Notifications against Google
 
 A bucket in the project, and a token allowed to manage its notifications

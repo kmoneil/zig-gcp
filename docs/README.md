@@ -34,6 +34,8 @@ Google, not only what Google documents, and where the emulators differ.
 | [Writing objects](storage/writing-objects.md) | Preconditions, retries and idempotency tokens, metadata after the upload, compose, and copies that change what they carry |
 | [Signed URLs and POST policies](storage/signed-urls.md) | Requests and browser uploads without credentials, and who can sign them |
 | [Buckets](storage/buckets.md) | Settings and lifecycle rules, versions and soft delete, retention and holds, requester pays, IAM |
+| [Access control lists](storage/acls.md) | Per-object grants on buckets without uniform access: reading, changing safely, canned lists |
+| [HMAC keys](storage/hmac.md) | A service account's second credential: making and retiring keys, and signing with one |
 | [Encryption keys](storage/encryption.md) | Customer-supplied keys and Cloud KMS keys |
 | [Notifications](storage/notifications.md) | A Pub/Sub message for every change to a bucket's objects, and what each change publishes |
 | [Folders](storage/folders.md) | Hierarchical buckets, atomic tree renames, and managed folders with policies of their own |

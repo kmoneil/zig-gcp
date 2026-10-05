@@ -92,6 +92,11 @@ a URL signed through IAM may last no longer, and `signedUrl` refuses a
 longer one before asking IAM. A key file's URL may last the seven days
 Cloud Storage allows.
 
+Each of those signs as `.{ .rsa = signer }`. An [HMAC key](hmac.md) signs
+too, as `.{ .hmac = .{ .access_id, .secret } }`: with
+`GOOG4-HMAC-SHA256`, on this machine, with no credentials at all, for up
+to seven days or until the key is deactivated or deleted.
+
 ## POST policies: uploads from a plain HTML form
 
 A signed URL allows one request. A POST policy allows one kind of

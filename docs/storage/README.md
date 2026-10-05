@@ -54,6 +54,8 @@ it differs from Cloud Storage.
 | [Buckets](buckets.md) | Settings and lifecycle rules, versions and soft delete, retention and holds, requester pays, IAM |
 | [Folders](folders.md) | Hierarchical buckets, folders and atomic tree renames, and managed folders with policies of their own |
 | [Encryption keys](encryption.md) | Customer-supplied keys and Cloud KMS keys |
+| [Access control lists](acls.md) | Per-object grants on buckets without uniform access: reading, changing safely, canned lists |
+| [HMAC keys](hmac.md) | A service account's second credential: making and retiring keys, and signing with one |
 | [Notifications](notifications.md) | A Pub/Sub message for every change to a bucket's objects, decoded |
 | [The emulator](emulator.md) | What fake-gcs-server does differently, and how the tests cover it |
 
@@ -77,8 +79,11 @@ it differs from Cloud Storage.
 | `client.listSoftDeletedBuckets(page)`, `bucket.restore(generation)` | Deleted buckets, and one brought back | [Soft delete](buckets.md#versions-and-soft-delete) |
 | `.composeFrom(sources, options)` | Writes this object from up to 32 others in the bucket, server-side | [Compose](writing-objects.md#compose) |
 | `bucket.lockRetentionPolicy(metageneration)` | Makes a bucket's retention policy permanent | [Retention](buckets.md#retention-and-holds) |
-| `.signedUrl(.{ .rsa = signer }, options)`, `bucket.signedUrl(.{ .rsa = signer }, options)` | A V4 signed URL, which lets whoever holds it make one request without credentials until it expires | [Signed URLs](signed-urls.md#signed-urls) |
-| `.postPolicy(.{ .rsa = signer }, options)`, `bucket.postPolicy(.{ .rsa = signer }, options)` | A V4 POST policy, which lets a plain HTML form upload what the policy allows, without credentials, until it expires | [POST policies](signed-urls.md#post-policies-uploads-from-a-plain-html-form) |
+| `.signedUrl(signer, options)`, `bucket.signedUrl(signer, options)` | A V4 signed URL, which lets whoever holds it make one request without credentials until it expires; `signer` is `.{ .rsa = s }` or `.{ .hmac = key }` | [Signed URLs](signed-urls.md#signed-urls) |
+| `.postPolicy(signer, options)`, `bucket.postPolicy(signer, options)` | A V4 POST policy, which lets a plain HTML form upload what the policy allows, without credentials, until it expires | [POST policies](signed-urls.md#post-policies-uploads-from-a-plain-html-form) |
+| `bucket.acl()`, `bucket.defaultObjectAcl()`, `.acl()`, then `.get()`, `.entry(entity)`, `.grant(entity, role)`, `.revoke(entity)`, `.set(entries, guard)` | A bucket's, its new objects', or an object's access control list, read and changed whole under a guard | [ACLs](acls.md) |
+| `predefined_acl` on every write, `with_acl` on reads | A canned list applied as an object is written, and the list read with its metadata | [Canned lists](acls.md#canned-lists) |
+| `client.createHmacKey(account, options)`, `.listHmacKeys(options)`, `.hmacKey(access_id)`, then `.get()`, `.setState(state, options)`, `.delete()`, `.deactivateAndDelete()` | A service account's HMAC keys | [HMAC keys](hmac.md) |
 | `.withBillingProject(project)`, `bucket.withBillingProject(project)` | A handle whose every request bills `project`, as a requester pays bucket needs | [Requester pays](buckets.md#requester-pays) |
 | `.withEncryptionKey(&key)` | A handle for an object under a customer-supplied key | [Encryption keys](encryption.md) |
 | `bucket.createNotification(config)`, `.getNotification(id)`, `.listNotifications()`, `.deleteNotification(id)` | Pub/Sub messages for every change to the bucket's objects | [Notifications](notifications.md) |
