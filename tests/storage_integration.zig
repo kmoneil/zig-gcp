@@ -1163,6 +1163,52 @@ test "keys: an emulator takes a customer-supplied key and a Cloud KMS key on eve
     composed.deinit();
 }
 
+test "ACLs: fake-gcs-server takes a predefined list on every upload path, and reads it back under projection=full" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var created = try f.bucket().create(.{});
+    created.deinit();
+    var diag: storage.Diagnostics = .{};
+    var client = try smallChunkClient(&f, &diag);
+    defer client.deinit();
+    const bucket = client.bucket(&f.bucket_name);
+    const data = try testing.allocator.alloc(u8, 700 * 1024);
+    defer testing.allocator.free(data);
+    @memset(data, 'a');
+
+    // fake-gcs-server keeps only `publicRead` as asked, as `allUsers`
+    // READER; any other list, or none, is an entity production never sends,
+    // `projectOwner-test-project`, read as `.other`. It sends no owner.
+    var one = try bucket.object("one").upload(data[0..10], .{ .predefined_acl = .public_read });
+    one.deinit();
+    var reader: std.Io.Reader = .fixed(data);
+    var streamed = try bucket.object("streamed").uploadFrom(&reader, .{ .predefined_acl = .public_read });
+    streamed.deinit();
+    var parts = try bucket.object("parts").uploadParallel(.{ .data = data }, .{ .predefined_acl = .public_read });
+    parts.deinit();
+    var private = try bucket.object("private").upload("x", .{ .predefined_acl = .private });
+    private.deinit();
+    for ([_][]const u8{ "one", "streamed", "parts" }) |name| {
+        errdefer std.debug.print("{s}: {s}\n", .{ name, diag.message() });
+        var got = try bucket.object(name).get(.{ .with_acl = true });
+        defer got.deinit();
+        const entries = got.value.acl.?;
+        try testing.expectEqual(1, entries.len);
+        try testing.expect(entries[0].entity == .all_users);
+        try testing.expectEqual(.reader, entries[0].role);
+    }
+    var got = try bucket.object("private").get(.{ .with_acl = true });
+    defer got.deinit();
+    try testing.expectEqualStrings("projectOwner-test-project", got.value.acl.?[0].entity.other);
+    var plain = try bucket.object("private").get(.{});
+    defer plain.deinit();
+    try testing.expectEqual(null, plain.value.acl);
+    var page = try bucket.listObjects(.{ .with_acl = true });
+    defer page.deinit();
+    for (page.value.objects) |info| try testing.expect(info.acl != null);
+}
+
 test "IAM: fake-gcs-server serves no bucket IAM call, so each is NotFound" {
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;

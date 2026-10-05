@@ -36,6 +36,7 @@ const dl = @import("download.zig");
 const encryption = @import("encryption.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
+const acl = @import("acl.zig");
 const types = @import("types.zig");
 const xml = @import("xml.zig");
 const Error = @import("errors.zig").Error;
@@ -86,6 +87,8 @@ pub const Start = struct {
     metadata: []const types.Metadata = &.{},
     /// The Cloud KMS key to encrypt the object under, already checked.
     kms_key_name: ?[]const u8 = null,
+    /// The object's canned access control list, as `x-goog-acl`.
+    predefined_acl: ?types.PredefinedAcl = null,
 };
 
 /// Starts an upload of `object` and returns its id, which lives in
@@ -129,6 +132,7 @@ fn startHeaders(arena: Allocator, meta: Start, key: *const encryption.KeyHeaders
     var headers: std.ArrayList(core.transport.Header) = .empty;
     try headers.appendSlice(arena, key.slice());
     if (meta.kms_key_name) |name| try headers.append(arena, .{ .name = "x-goog-encryption-kms-key-name", .value = name });
+    if (meta.predefined_acl) |p| try headers.append(arena, .{ .name = "x-goog-acl", .value = acl.predefinedXmlName(p) });
     const fixed = [_]struct { []const u8, ?[]const u8 }{
         .{ "Cache-Control", meta.cache_control },
         .{ "Content-Disposition", meta.content_disposition },
@@ -489,6 +493,16 @@ test "start: the metadata as headers, and the id from the answer" {
     try testing.expectEqualStrings("zig", sent.header("x-goog-meta-origin").?);
     try testing.expectEqualStrings("7", sent.header("x-goog-meta-run").?);
     try testing.expectEqualStrings("ya29.test-token", sent.bearer.?);
+}
+
+test "start: a predefined list goes as x-goog-acl, under the XML API's name" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .body = start_answer } }}, .{});
+    defer h.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try start(&h.client, arena.allocator(), "b", "a", .{ .content_type = "text/plain", .predefined_acl = .bucket_owner_full_control });
+    try testing.expectEqualStrings("bucket-owner-full-control", (try h.fake.streamRequest(0)).header("x-goog-acl").?);
 }
 
 test "start: answers that name no upload" {

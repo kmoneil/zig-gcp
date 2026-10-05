@@ -98,6 +98,8 @@ const core = @import("core");
 const Header = core.transport.Header;
 const Method = core.transport.Method;
 const xml = @import("xml.zig");
+const acl = @import("acl.zig");
+const types = @import("types.zig");
 const FakeBuckets = @import("fake_buckets.zig").FakeBuckets;
 
 pub const FakeMultipart = struct {
@@ -269,6 +271,8 @@ pub const FakeMultipart = struct {
         key_sha256: ?[32]u8 = null,
         /// The Cloud KMS key its start named. Owned.
         kms_key_name: ?[]u8 = null,
+        /// The canned access control list its start's `x-goog-acl` named.
+        predefined_acl: ?types.PredefinedAcl = null,
     };
 
     const Part = struct {
@@ -298,6 +302,8 @@ pub const FakeMultipart = struct {
         /// The keys its start named. The name is owned.
         key_sha256: ?[32]u8 = null,
         kms_key_name: ?[]u8 = null,
+        /// The canned access control list its start named.
+        predefined_acl: ?types.PredefinedAcl = null,
         /// The holds and retention its start's metadata asked for.
         holds: Holds = .{},
         retention: ?Retention = null,
@@ -330,6 +336,9 @@ pub const FakeMultipart = struct {
         key_sha256: ?[32]u8 = null,
         /// The Cloud KMS key it is stored under, without a version. Owned.
         kms_key_name: ?[]u8 = null,
+        /// The canned access control list its write named, or null for
+        /// the bucket's default object list.
+        predefined_acl: ?types.PredefinedAcl = null,
         holds: Holds = .{},
         /// Its own retention: until when, on the fake's clock.
         retention: ?Retention = null,
@@ -1153,6 +1162,10 @@ pub const FakeMultipart = struct {
                     .ok => |k| k,
                     .refused => |reply| return reply,
                 };
+                const predefined: ?types.PredefinedAcl = if (headerValue(headers, "x-goog-acl")) |name| xmlPredefined(name) orelse return .{
+                    .status = 400,
+                    .body = "<?xml version='1.0' encoding='UTF-8'?><Error><Code>InvalidArgument</Code><Message>Invalid argument.</Message><Details>Invalid canned ACL</Details></Error>",
+                } else null;
                 // The reply first: once the upload is stored, nothing
                 // may fail and free what it owns.
                 const id_text = try arena.print("VXBs+{d}=", .{self.next_upload});
@@ -1176,6 +1189,7 @@ pub const FakeMultipart = struct {
                     .metadata = metadata,
                     .key_sha256 = keys.key_sha256,
                     .kms_key_name = kms,
+                    .predefined_acl = predefined,
                 });
                 self.next_upload += 1;
                 return .{ .status = 200, .body = reply_body };
@@ -1318,6 +1332,7 @@ pub const FakeMultipart = struct {
             .metadata = u.metadata,
             .key_sha256 = u.key_sha256,
             .kms_key_name = u.kms_key_name,
+            .predefined_acl = u.predefined_acl,
             // The XML API sets no hold; the bucket's default applies.
             .holds = self.newHolds(bucket, .{}),
             .retained_from_ns = self.now(),
@@ -1408,6 +1423,7 @@ pub const FakeMultipart = struct {
             .gzip = meta.gzip(),
             .key_sha256 = keys.key_sha256,
             .kms_key_name = kms,
+            .predefined_acl = target.predefined_acl,
             .holds = .{ .temporary = meta.temporaryHold, .event_based = meta.eventBasedHold },
             .retention = retention,
         });
@@ -1499,6 +1515,7 @@ pub const FakeMultipart = struct {
 
         const o = try self.store(s.bucket, s.name, s.bytes.items, s.content_type, s.gzip, s.key_sha256, s.kms_key_name, s.holds);
         o.retention = s.retention;
+        o.predefined_acl = s.predefined_acl;
         s.done = o.generation;
         s.bytes.clearAndFree(self.gpa);
         return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, s.bucket, false, true) };
@@ -1594,6 +1611,7 @@ pub const FakeMultipart = struct {
         };
         const o = try self.store(target.bucket, meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip(), keys.key_sha256, keys.kms_key_name, holds);
         o.retention = retention;
+        o.predefined_acl = target.predefined_acl;
         try self.ensureParents(target.bucket, meta.name);
         return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, true) };
     }
@@ -2761,6 +2779,7 @@ fn copyStored(gpa: Allocator, o: *const FakeMultipart.Stored, generation: u64) A
         .served = served,
         .key_sha256 = o.key_sha256,
         .kms_key_name = kms,
+        .predefined_acl = o.predefined_acl,
         .holds = o.holds,
         .retention = o.retention,
         .metageneration = o.metageneration,
@@ -2861,6 +2880,7 @@ const ResumableTarget = struct {
     /// The start's `userProject`, which the session URL carries on.
     user_project: ?[]const u8 = null,
     kms_key_name: ?[]const u8 = null,
+    predefined_acl: ?types.PredefinedAcl = null,
 };
 
 const InsertTarget = struct {
@@ -2868,7 +2888,14 @@ const InsertTarget = struct {
     /// Checked against the live object the metadata names.
     conditions: Conditions,
     kms_key_name: ?[]const u8 = null,
+    predefined_acl: ?types.PredefinedAcl = null,
 };
+
+/// A canned list as the XML API's `x-goog-acl` names it, or null.
+fn xmlPredefined(name: []const u8) ?types.PredefinedAcl {
+    for (std.enums.values(types.PredefinedAcl)) |p| if (std.mem.eql(u8, acl.predefinedXmlName(p), name)) return p;
+    return null;
+}
 
 const Target = union(enum) {
     bucket: FakeBuckets.Target,
@@ -2953,15 +2980,19 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         var multipart_type = false;
         var user_project: ?[]const u8 = null;
         var kms_key_name: ?[]const u8 = null;
+        var predefined_acl: ?types.PredefinedAcl = null;
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
             if (try conditions.take(param)) continue;
+            // Only the names this library sends; anything else fails the
+            // test that sent it.
+            if (std.mem.startsWith(u8, param, "predefinedAcl=")) predefined_acl = acl.predefinedOf(param["predefinedAcl=".len..]) orelse return error.HttpProtocolError;
             if (std.mem.eql(u8, param, "uploadType=resumable")) resumable_type = true;
             if (std.mem.eql(u8, param, "uploadType=multipart")) multipart_type = true;
             if (std.mem.startsWith(u8, param, "userProject=")) user_project = try decode(arena, param["userProject=".len..]);
             if (std.mem.startsWith(u8, param, "kmsKeyName=")) kms_key_name = try decode(arena, param["kmsKeyName=".len..]);
         }
-        if (multipart_type) return .{ .insert = .{ .bucket = bucket, .conditions = conditions, .kms_key_name = kms_key_name } };
+        if (multipart_type) return .{ .insert = .{ .bucket = bucket, .conditions = conditions, .kms_key_name = kms_key_name, .predefined_acl = predefined_acl } };
         if (!resumable_type) return error.HttpProtocolError;
         return .{ .resumable = .{
             .bucket = bucket,
@@ -2969,6 +3000,7 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
             .origin = url[0..path_start],
             .user_project = user_project,
             .kms_key_name = kms_key_name,
+            .predefined_acl = predefined_acl,
         } };
     }
     if (std.mem.eql(u8, path, "/storage/v1/b")) return .{ .bucket = try bucketTarget(arena, null, query) };

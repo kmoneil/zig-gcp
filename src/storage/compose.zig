@@ -52,7 +52,7 @@ pub fn compose(
     try check(client.diagnostics, sources, options);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
-    const path = try names.composePath(scratch.allocator(), bucket, object, options.preconditions, options.kms_key_name);
+    const path = try names.composePath(scratch.allocator(), bucket, object, options.preconditions, options.kms_key_name, options.predefined_acl);
     const body = try encode(scratch.allocator(), sources, options);
 
     var result: types.Owned(types.ObjectInfo) = try .init(client.gpa);

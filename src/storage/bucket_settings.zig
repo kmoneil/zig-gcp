@@ -30,6 +30,7 @@ const Stringify = std.json.Stringify;
 const core = @import("core");
 
 const Client = @import("Client.zig");
+const acl = @import("acl.zig");
 const codec = @import("codec.zig");
 const idempotency = @import("idempotency.zig");
 const names = @import("names.zig");
@@ -46,10 +47,11 @@ pub fn update(client: *Client, bucket: []const u8, changes: types.BucketUpdate) 
     try checkUpdate(client.diagnostics, changes);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
-    const path = try names.bucketPatchPath(scratch.allocator(), bucket, .{
+    const patch_path = try names.bucketPatchPath(scratch.allocator(), bucket, .{
         .if_metageneration_match = changes.if_metageneration_match,
         .if_metageneration_not_match = changes.if_metageneration_not_match,
     });
+    const path = try predefinedParams(scratch.allocator(), patch_path, changes.predefined_acl, changes.predefined_default_object_acl);
     const body = try encodeUpdate(scratch.allocator(), changes);
     // A repeated bucket patch runs again, as measured: the token changes no
     // retry here.
@@ -125,6 +127,18 @@ pub fn lock(client: *Client, bucket: []const u8, metageneration: u64) Error!type
     return result;
 }
 
+/// `path` with a bucket's canned lists as parameters, the way Cloud Storage
+/// takes them on an insert and a patch.
+pub fn predefinedParams(
+    arena: Allocator,
+    path: []const u8,
+    bucket_acl: ?types.PredefinedBucketAcl,
+    default_object_acl: ?types.PredefinedAcl,
+) Allocator.Error![]const u8 {
+    const with_bucket = if (bucket_acl) |p| try names.withParam(arena, path, "predefinedAcl", acl.predefinedBucketName(p)) else path;
+    return if (default_object_acl) |p| try names.withParam(arena, with_bucket, "predefinedDefaultObjectAcl", acl.predefinedName(p)) else with_bucket;
+}
+
 // Checks
 
 /// Every setting of a new bucket, before anything is sent.
@@ -151,6 +165,12 @@ pub fn checkConfig(diag: ?*core.Diagnostics, config: types.BucketConfig) CheckEr
             return refuse(diag, "Object retention config is not supported for hierarchical namespace buckets.", .{});
         }
     }
+    // Uniform access keeps no lists, and a hierarchical namespace brings it
+    // unless refused above.
+    const uniform = config.uniform_bucket_level_access orelse config.hierarchical_namespace;
+    if (uniform and (config.predefined_acl != null or config.predefined_default_object_acl != null)) {
+        return refuse(diag, "a predefined access control list needs a bucket without uniform bucket-level access, which keeps none", .{});
+    }
 }
 
 /// An update: something to change, and every new value valid.
@@ -173,6 +193,9 @@ pub fn checkUpdate(diag: ?*core.Diagnostics, changes: types.BucketUpdate) CheckE
     if (changes.storage_class) |class| if (class.len == 0) {
         return refuse(diag, "storage_class is empty; null leaves the class as it is", .{});
     };
+    if (changes.uniform_bucket_level_access == true and (changes.predefined_acl != null or changes.predefined_default_object_acl != null)) {
+        return refuse(diag, "a predefined access control list cannot be applied in the update that turns uniform bucket-level access on, which keeps no lists", .{});
+    }
     if (!changesSomething(changes)) return refuse(diag, "the update changes nothing", .{});
 }
 
@@ -187,7 +210,8 @@ fn changesSomething(changes: types.BucketUpdate) bool {
         changes.requester_pays != null or changes.default_kms_key_name != .keep or
         changes.lifecycle != null or changes.uniform_bucket_level_access != null or
         changes.public_access_prevention != null or changes.storage_class != null or
-        changes.retention_period_s != .keep or changes.default_event_based_hold != null;
+        changes.retention_period_s != .keep or changes.default_event_based_hold != null or
+        changes.predefined_acl != null or changes.predefined_default_object_acl != null;
 }
 
 fn checkLabels(diag: ?*core.Diagnostics, labels: []const types.Label) CheckError!void {
@@ -512,7 +536,17 @@ fn writeUpdate(jw: *Stringify, changes: types.BucketUpdate) Stringify.Error!void
         .clear => try writeRetentionPolicy(jw, null),
     }
     if (changes.default_event_based_hold) |on| try writeDefaultHold(jw, on);
+    // Each canned list beside an empty list of its kind, as Google's
+    // clients send them: a list that is not empty beside one is 409.
+    if (changes.predefined_acl != null) try writeEmptyList(jw, "acl");
+    if (changes.predefined_default_object_acl != null) try writeEmptyList(jw, "defaultObjectAcl");
     try jw.endObject();
+}
+
+fn writeEmptyList(jw: *Stringify, name: []const u8) Stringify.Error!void {
+    try jw.objectField(name);
+    try jw.beginArray();
+    try jw.endArray();
 }
 
 fn writeVersioning(jw: *Stringify, on: bool) Stringify.Error!void {

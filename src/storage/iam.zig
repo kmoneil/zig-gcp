@@ -12,10 +12,11 @@
 //!   IAM write moves the metageneration.
 //! - A write under a stale etag is 412 `conditionNotMet`, "At least one of
 //!   the pre-conditions you specified did not hold.", reported here as
-//!   `error.Aborted`. The other two 412s an IAM write met stay
-//!   `error.FailedPrecondition`: a condition on a bucket without uniform
-//!   access, and `allUsers` or `allAuthenticatedUsers` under public access
-//!   prevention. `If-Match` is ignored.
+//!   `error.Aborted`. The other two 412s an IAM write met are not: a
+//!   condition on a bucket without uniform access stays
+//!   `error.FailedPrecondition`, and `allUsers` or `allAuthenticatedUsers`
+//!   under public access prevention is `error.PublicAccessPrevented`, as an
+//!   access control list's grant is. `If-Match` is ignored.
 //! - A write without `bindings` removes every binding, the legacy ones too.
 //! - A bucket takes only Cloud Storage's roles, and no basic role.
 //! - `testIamPermissions` takes at most 84 permissions, none twice, only
@@ -277,14 +278,14 @@ test "bucket IAM: the stale etag's 412 is Aborted, and a grant starts over on it
         try testing.expectError(error.Aborted, h.client.bucket("b").setIamPolicy(.{ .etag = "CAE=" }));
         try h.expectRequestCount(1);
     }
-    inline for (.{ ubla_body, pap_body }) |body| {
+    inline for (.{ .{ ubla_body, error.FailedPrecondition }, .{ pap_body, error.PublicAccessPrevented } }) |case| {
         var h: test_util.Harness = undefined;
         try h.init(&.{
             .{ .respond = .{ .body = fresh } },
-            .{ .respond = .{ .status = 412, .body = body } },
+            .{ .respond = .{ .status = 412, .body = case[0] } },
         }, .{});
         defer h.deinit();
-        try testing.expectError(error.FailedPrecondition, h.client.bucket("b").addIamBinding("roles/storage.objectViewer", "allUsers"));
+        try testing.expectError(case[1], h.client.bucket("b").addIamBinding("roles/storage.objectViewer", "allUsers"));
         // Not a concurrent change: no second round.
         try h.expectRequestCount(2);
         try testing.expectEqualStrings("conditionNotMet", h.diag.status());
@@ -403,7 +404,7 @@ test "bucket IAM against production's rules: legacy bindings, a grant once in an
 
     // Public access prevention, and a condition without uniform access:
     // each refused in its own words, and neither a concurrent change.
-    try testing.expectError(error.FailedPrecondition, b.addIamBinding("roles/storage.objectViewer", "allUsers"));
+    try testing.expectError(error.PublicAccessPrevented, b.addIamBinding("roles/storage.objectViewer", "allUsers"));
     try testing.expect(std.mem.indexOf(u8, f.diag.message(), "public access prevention") != null);
     const fine = f.client.bucket("zigps-iam-fine");
     var fine_policy = try fine.iamPolicy();

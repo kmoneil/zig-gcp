@@ -8,7 +8,9 @@
 //! `error.AlreadyExists` (HTTP 409), and a failed generation precondition is
 //! `error.FailedPrecondition` (HTTP 412). One 403 is told apart by its
 //! reason and message: an object kept by retention or a hold is
-//! `error.ObjectRetained`, not `error.PermissionDenied`.
+//! `error.ObjectRetained`, not `error.PermissionDenied`. So are a 400 and a
+//! 412 about access control lists: `error.UniformAccessEnabled` and
+//! `error.PublicAccessPrevented`.
 
 const core = @import("core");
 
@@ -46,6 +48,18 @@ pub const Error = core.rpc.Error || core.Signer.Error || error{
     /// message; `Diagnostics` says what to grant. A fresh grant took a few
     /// seconds to apply when measured. Never retried.
     TopicNotPublishable,
+    /// The bucket has uniform bucket-level access, so it keeps no access
+    /// control lists: every ACL call, and every write that carries a
+    /// predefined list, is refused, and IAM decides access instead. HTTP
+    /// 400 `invalid`, told apart from other refusals by Cloud Storage's
+    /// message, as measured 2026-10-05. Never retried.
+    UniformAccessEnabled,
+    /// A grant to `allUsers` or `allAuthenticatedUsers` under public access
+    /// prevention, whether by an access control list, a predefined list or
+    /// an IAM policy. HTTP 412 `conditionNotMet`, the reason a failed
+    /// precondition has, told apart by Cloud Storage's message. Never
+    /// retried.
+    PublicAccessPrevented,
     /// A resumable session vanished (HTTP 404 or 410 on its URI) and the
     /// source cannot be replayed. The caller reopens the source and
     /// retries; `upload` starts a new session itself, since its bytes are

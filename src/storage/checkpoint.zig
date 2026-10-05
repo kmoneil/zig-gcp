@@ -22,7 +22,9 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const core = @import("core");
 
+const acl = @import("acl.zig");
 const mp = @import("xml_multipart.zig");
+const types = @import("types.zig");
 
 /// Where a transfer keeps its state between processes. `CheckpointFile` is
 /// the built-in implementation; a caller who keeps state elsewhere, a
@@ -190,6 +192,9 @@ pub const State = union(enum) {
         key_sha256: ?[]const u8 = null,
         /// The Cloud KMS key the session began under, for the same reason.
         kms_key_name: ?[]const u8 = null,
+        /// The canned access control list the session began with: the
+        /// object gets it, whatever a resume asks for.
+        predefined_acl: ?types.PredefinedAcl = null,
 
         pub const Gzip = struct {
             level: u4,
@@ -228,6 +233,9 @@ pub const State = union(enum) {
         /// over.
         key_sha256: ?[]const u8 = null,
         kms_key_name: ?[]const u8 = null,
+        /// The canned access control list the upload began with, for the
+        /// same reason.
+        predefined_acl: ?types.PredefinedAcl = null,
     };
 };
 
@@ -259,6 +267,7 @@ pub fn encodeAlloc(gpa: Allocator, state: State) Allocator.Error![]u8 {
             .gzip_zig = if (s.gzip) |g| g.zig else null,
             .key_sha256 = s.key_sha256,
             .kms_key_name = s.kms_key_name,
+            .predefined_acl = if (s.predefined_acl) |p| acl.predefinedName(p) else null,
         }) catch return error.OutOfMemory,
         .upload_parallel => |s| jw.write(.{
             .version = 1,
@@ -277,6 +286,7 @@ pub fn encodeAlloc(gpa: Allocator, state: State) Allocator.Error![]u8 {
             .billing_project = s.billing_project,
             .key_sha256 = s.key_sha256,
             .kms_key_name = s.kms_key_name,
+            .predefined_acl = if (s.predefined_acl) |p| acl.predefinedName(p) else null,
         }) catch return error.OutOfMemory,
     }
     return out.toOwnedSlice();
@@ -309,6 +319,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
         billing_project: ?[]const u8 = null,
         key_sha256: ?[]const u8 = null,
         kms_key_name: ?[]const u8 = null,
+        predefined_acl: ?[]const u8 = null,
     };
     const wire = std.json.parseFromSliceLeaky(Wire, arena, bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -322,6 +333,10 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
     // Older states name neither; a named one is what this library writes.
     if (wire.key_sha256) |text| if (!isSha256Text(text)) return error.CheckpointFailed;
     if (wire.kms_key_name) |name| if (!@import("bucket_settings.zig").isKmsKeyName(name) or !core.transport.isValidHeaderValue(name)) return error.CheckpointFailed;
+    // Older states name none. A name this library does not write reads as
+    // none, and then the state no longer encodes to its own bytes, which
+    // the canonical check below refuses.
+    const predefined_acl: ?types.PredefinedAcl = if (wire.predefined_acl) |name| acl.predefinedOf(name) else null;
     // Where a state names a part size, the plan must reproduce exactly the
     // pieces the earlier run saved: a part size `plan` would grow named a
     // plan that never was.
@@ -367,6 +382,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
             .gzip = gzip,
             .key_sha256 = wire.key_sha256,
             .kms_key_name = wire.kms_key_name,
+            .predefined_acl = predefined_acl,
         } };
     } else if (std.mem.eql(u8, wire.kind, "uploadParallel")) blk: {
         const mtime = wire.mtime orelse return error.CheckpointFailed;
@@ -394,6 +410,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) error{ CheckpointFailed, OutOf
             .billing_project = wire.billing_project,
             .key_sha256 = wire.key_sha256,
             .kms_key_name = wire.kms_key_name,
+            .predefined_acl = predefined_acl,
         } };
     } else return error.CheckpointFailed;
 
@@ -760,6 +777,52 @@ test "upload states: the billing project, written last, older states without it,
         const forged = try arena.print("{{\"version\":1,\"kind\":\"uploadParallel\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5000," ++
             "\"mtime\":1,\"upload_id\":\"u\",\"part_size\":1024,\"billing_project\":\"{s}\"}}", .{bad});
         errdefer std.debug.print("forged: {s}\n", .{forged});
+        try testing.expectError(error.CheckpointFailed, parse(arena, forged));
+    }
+}
+
+test "upload states: the predefined list under its JSON name, older states without it, and an unknown one refused" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const file_bytes = try encodeAlloc(arena, .{ .upload_file = .{
+        .bucket = "b",
+        .object = "o",
+        .size = 5,
+        .mtime = 1,
+        .session = "https://s",
+        .predefined_acl = .bucket_owner_read,
+    } });
+    try testing.expectEqualStrings(
+        "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5,\"mtime\":1," ++
+            "\"session\":\"https://s\",\"predefined_acl\":\"bucketOwnerRead\"}",
+        file_bytes,
+    );
+    try testing.expectEqual(.bucket_owner_read, (try parse(arena, file_bytes)).upload_file.predefined_acl.?);
+
+    const parallel_bytes = try encodeAlloc(arena, .{ .upload_parallel = .{
+        .bucket = "b",
+        .object = "o",
+        .size = 5000,
+        .mtime = 1,
+        .upload_id = "u",
+        .part_size = 1024,
+        .temp = null,
+        .if_generation_match = null,
+        .if_generation_not_match = null,
+        .if_metageneration_match = null,
+        .if_metageneration_not_match = null,
+        .predefined_acl = .private,
+    } });
+    try testing.expect(std.mem.endsWith(u8, parallel_bytes, ",\"predefined_acl\":\"private\"}"));
+    try testing.expectEqual(.private, (try parse(arena, parallel_bytes)).upload_parallel.predefined_acl.?);
+
+    // A state from before the field began with no list.
+    try testing.expectEqual(null, (try parse(arena, "{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5,\"mtime\":1,\"session\":\"https://s\"}")).upload_file.predefined_acl);
+    // Only the names this library writes: not the XML API's, not a bucket's.
+    for ([_][]const u8{ "project-private", "publicReadWrite", "", "PRIVATE" }) |bad| {
+        const forged = try arena.print("{{\"version\":1,\"kind\":\"uploadFile\",\"bucket\":\"b\",\"object\":\"o\",\"size\":5,\"mtime\":1," ++
+            "\"session\":\"https://s\",\"predefined_acl\":\"{s}\"}}", .{bad});
         try testing.expectError(error.CheckpointFailed, parse(arena, forged));
     }
 }

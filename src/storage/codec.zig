@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const Stringify = std.json.Stringify;
 const Writer = std.Io.Writer;
 const core = @import("core");
+const acl = @import("acl.zig");
 const types = @import("types.zig");
 
 pub const DecodeError = error{ InvalidResponse, OutOfMemory };
@@ -288,6 +289,9 @@ const WireObject = struct {
     /// buffer Timestamp format" in a notification's payload, its
     /// documentation says, which could be either text or seconds and nanos.
     retention: ?struct { mode: ?[]const u8 = null, retainUntilTime: ?std.json.Value = null } = null,
+    /// Only under `projection=full`, and only to a caller who may read it.
+    acl: ?[]const acl.WireEntry = null,
+    owner: ?acl.WireOwner = null,
 };
 
 const WireObjectPage = struct {
@@ -474,6 +478,8 @@ fn objectFromWire(arena: Allocator, wire: WireObject) DecodeError!types.ObjectIn
                 .unknown,
             .retain_until = (try timeOf(arena, r.retainUntilTime)) orelse return error.InvalidResponse,
         } else null,
+        .acl = try acl.entriesFromWire(arena, wire.acl),
+        .owner = acl.ownerFromWire(wire.owner),
     };
 }
 

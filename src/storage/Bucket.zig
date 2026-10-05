@@ -73,8 +73,10 @@ pub fn create(self: Bucket, config: types.BucketConfig) Error!types.Owned(types.
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
     const collection = try names.bucketsPath(scratch.allocator(), project, .{});
-    // Object retention is turned on by a parameter, never in the body.
-    const path = if (config.object_retention) try std.mem.concat(scratch.allocator(), u8, &.{ collection, "&enableObjectRetention=true" }) else collection;
+    // Object retention is turned on by a parameter, never in the body, and
+    // so are the canned lists.
+    const retained = if (config.object_retention) try names.withParam(scratch.allocator(), collection, "enableObjectRetention", "true") else collection;
+    const path = try bucket_settings.predefinedParams(scratch.allocator(), retained, config.predefined_acl, config.predefined_default_object_acl);
     const body = try bucket_settings.encodeConfig(scratch.allocator(), self.name, config);
     var token: idempotency.Token = undefined;
     token.init(self.client);
@@ -705,6 +707,27 @@ test "golden: listObjects of every version, and of soft-deleted objects" {
     try testing.expectEqual(null, u.time_deleted);
     try testing.expectEqual(null, u.restore_token);
     try testing.expectEqual(2, soft.value.prefixes.len);
+}
+
+test "golden: listObjects with each object's access control list" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"kind":"storage#objects","items":[
+        \\ {"name":"a.txt","generation":"1","owner":{"entity":"user-zig-gcp@extractctl.iam.gserviceaccount.com"},
+        \\  "acl":[{"entity":"user-zig-gcp@extractctl.iam.gserviceaccount.com","role":"OWNER"}]},
+        \\ {"name":"b.txt","generation":"2"}]}
+        } },
+    }, .{});
+    defer h.deinit();
+    var page = try h.client.bucket("b").listObjects(.{ .with_acl = true, .prefix = "a" });
+    defer page.deinit();
+    try h.expectRequest(0, .GET, "https://storage.googleapis.com/storage/v1/b/b/o?projection=full&prefix=a", null);
+    try testing.expectEqual(1, page.value.objects[0].acl.?.len);
+    try testing.expectEqual(.owner, page.value.objects[0].acl.?[0].role);
+    // An object listed without one, as one the caller may not read the
+    // list of would be.
+    try testing.expectEqual(null, page.value.objects[1].acl);
 }
 
 test "listObjects: versions and soft_deleted together are refused before sending" {

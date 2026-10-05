@@ -138,6 +138,8 @@ const Persist = struct {
     /// Cloud KMS key: what the parts go up under.
     key_sha256: ?[]const u8 = null,
     kms_key_name: ?[]const u8 = null,
+    /// The canned access control list the upload begins with.
+    predefined_acl: ?types.PredefinedAcl = null,
 };
 
 /// With a checkpoint, which failures still abort the upload, drop the
@@ -187,6 +189,7 @@ fn resumeOrStart(
         .preconditions = options.preconditions,
         .resumed = try loadUploadState(client, cp, state_arena.allocator(), bucket, object),
         .kms_key_name = options.kms_key_name,
+        .predefined_acl = options.predefined_acl,
     };
     var sha_buf: [44]u8 = undefined;
     persist.key_sha256 = encryption.sha256Text(client.encryption_key, &sha_buf);
@@ -203,6 +206,11 @@ fn resumeOrStart(
             // The parts already sent are under the keys the upload began
             // with, and the finish would need them.
             logging.warn("{s}: the checkpoint's upload began under another encryption key, or none; abandoning it and starting over", .{object});
+            abandonResumed(client, bucket, s);
+            persist.resumed = null;
+        } else if (s.predefined_acl != persist.predefined_acl) {
+            // The start fixed the object's list.
+            logging.warn("{s}: the checkpoint's upload began with another predefined access control list, or none; abandoning it and starting over", .{object});
             abandonResumed(client, bucket, s);
             persist.resumed = null;
         }
@@ -293,6 +301,7 @@ fn saveUploadState(client: *Client, p: *const Persist, upload_id: []const u8, pa
         .billing_project = client.billing_project,
         .key_sha256 = p.key_sha256,
         .kms_key_name = p.kms_key_name,
+        .predefined_acl = p.predefined_acl,
     } };
     const bytes = try checkpoint.encodeAlloc(client.gpa, state);
     defer client.gpa.free(bytes);
@@ -594,6 +603,7 @@ fn fallback(
         .size = size,
         .preconditions = options.preconditions,
         .kms_key_name = options.kms_key_name,
+        .predefined_acl = options.predefined_acl,
     };
     switch (source) {
         .data => |data| return target.upload(data, upload_options),
@@ -657,6 +667,7 @@ fn join(
             .content_language = options.content_language,
             .metadata = options.metadata,
             .kms_key_name = options.kms_key_name,
+            .predefined_acl = options.predefined_acl,
         });
         if (persist) |p| saveUploadState(client, p, id, plan.part_size) catch |err| {
             // An upload the checkpoint never recorded would only linger:

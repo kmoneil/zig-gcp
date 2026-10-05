@@ -22,6 +22,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
+const acl = @import("acl.zig");
 const encryption = @import("encryption.zig");
 const idempotency = @import("idempotency.zig");
 const retention = @import("retention.zig");
@@ -49,10 +50,14 @@ pub fn update(
         options.generation,
         options.preconditions,
     );
-    const path = if (options.override_unlocked_retention) try scratch.allocator().print(
-        "{s}{c}overrideUnlockedRetention=true",
-        .{ object_path, @as(u8, if (std.mem.indexOfScalar(u8, object_path, '?') == null) '?' else '&') },
-    ) else object_path;
+    const unlocked = if (options.override_unlocked_retention)
+        try names.withParam(scratch.allocator(), object_path, "overrideUnlockedRetention", "true")
+    else
+        object_path;
+    const path = if (options.predefined_acl) |p|
+        try names.withParam(scratch.allocator(), unlocked, "predefinedAcl", acl.predefinedName(p))
+    else
+        unlocked;
     const body = try encode(scratch.allocator(), options);
 
     var result: types.Owned(types.ObjectInfo) = try .init(client.gpa);
@@ -198,6 +203,15 @@ fn write(jw: *Stringify, options: types.MetadataUpdate) Stringify.Error!void {
         .keep => {},
         .set => |r| try codec.writeRetention(jw, r),
         .clear => try codec.writeRetentionRemoved(jw),
+    }
+    // A canned list goes as a parameter, beside an empty `acl`, as Google's
+    // clients send it: with a list that is not empty, the patch is 409
+    // "Cannot provide both a predefinedAcl and access controls.", and an
+    // empty one alone is ignored, as measured 2026-10-05.
+    if (options.predefined_acl != null) {
+        try jw.objectField("acl");
+        try jw.beginArray();
+        try jw.endArray();
     }
     try jw.endObject();
 }

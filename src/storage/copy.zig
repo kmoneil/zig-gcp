@@ -84,6 +84,7 @@ pub fn copy(
         .source_generation = options.source_generation,
         .preconditions = options.preconditions,
         .destination_kms_key_name = options.kms_key_name,
+        .destination_predefined_acl = options.predefined_acl,
     };
     var source_key: encryption.KeyHeaders = undefined;
     source_key.init(client.encryption_key, .copy_source);
