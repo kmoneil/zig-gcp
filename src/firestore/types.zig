@@ -118,6 +118,10 @@ pub const GetOptions = struct {
     /// `error.NotFound`. The read goes through `batchGet`, which takes
     /// the time in its body.
     read_time: ?std.Io.Timestamp = null,
+    /// A transaction to read in, by the id `Client.beginTransaction`
+    /// returned; not with `read_time`. Also through `batchGet`: measured,
+    /// the emulator hangs on a transaction as a query parameter.
+    transaction: ?[]const u8 = null,
 };
 
 pub const SetOptions = struct {
@@ -228,7 +232,13 @@ pub const Write = union(enum) {
     };
 };
 
-pub const CommitOptions = struct {};
+pub const CommitOptions = struct {
+    /// Commits this transaction, by the id `Client.beginTransaction`
+    /// returned. Its commit is sent once, never again after a lost
+    /// answer: a repeat of one that landed would answer ABORTED, as if it
+    /// had not.
+    transaction: ?[]const u8 = null,
+};
 
 /// What one write of a commit did.
 pub const CommittedWrite = struct {
@@ -343,6 +353,8 @@ pub const Cursor = struct {
 pub const QueryOptions = struct {
     /// Read as of then; see `GetOptions.read_time`.
     read_time: ?std.Io.Timestamp = null,
+    /// As `GetOptions.transaction`.
+    transaction: ?[]const u8 = null,
 };
 
 pub const QueryResult = struct {
@@ -376,6 +388,27 @@ pub const BatchGetOptions = struct {
     mask: ?[]const []const u8 = null,
     /// As `GetOptions.read_time`.
     read_time: ?std.Io.Timestamp = null,
+    /// As `GetOptions.transaction`.
+    transaction: ?[]const u8 = null,
+};
+
+/// What a transaction begun with `Client.beginTransaction` may do.
+pub const TransactionOptions = union(enum) {
+    /// Reads and writes. Reads lock what they read until the commit.
+    read_write,
+    /// Reads only, every one as of one time: now, or `read_time`.
+    read_only: struct { read_time: ?std.Io.Timestamp = null },
+};
+
+pub const RunTransactionOptions = struct {
+    /// Reads only: the transaction never writes, and is never run again.
+    read_only: bool = false,
+    /// With `read_only`, read as of then.
+    read_time: ?std.Io.Timestamp = null,
+    /// How many times the handler may run in all, as Google's clients
+    /// allow by default: a commit, or a read, that the server answers
+    /// ABORTED runs it again, from the start, in a new transaction.
+    max_attempts: u32 = 5,
 };
 
 pub const BatchGetResult = struct {

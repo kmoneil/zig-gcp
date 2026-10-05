@@ -699,3 +699,104 @@ test "queries at a past time see the documents as they were" {
     defer sum_then.deinit();
     try testing.expectEqual(1, sum_then.value.values[0].integer);
 }
+
+/// Adds one to `counters/c`'s `n` in a transaction, `times` times over.
+const Incrementer = struct {
+    client: firestore.Client,
+    runs: u32 = 0,
+
+    fn run(ptr: *anyopaque, txn: *firestore.Transaction) anyerror!void {
+        const self: *Incrementer = @ptrCast(@alignCast(ptr));
+        self.runs += 1;
+        var got = try txn.get("counters/c", .{});
+        defer got.deinit();
+        try txn.update("counters/c", &.{.{ .name = "n", .value = .{ .integer = got.value.get("n").?.integer + 1 } }}, .{});
+    }
+
+    fn handler(self: *Incrementer) firestore.TransactionHandler {
+        return .{ .ptr = self, .vtable = &.{ .run = run } };
+    }
+
+    fn loop(self: *Incrementer, times: u32) anyerror!void {
+        for (0..times) |_| try self.client.runTransaction(self.handler(), .{ .max_attempts = 20 });
+    }
+};
+
+test "transactions: concurrent increments never lose one" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    _ = try f.doc("counters/c").set(&.{.{ .name = "n", .value = .{ .integer = 0 } }}, .{});
+    // Three tasks, each with a client of its own, contend for one counter.
+    var workers: [3]Incrementer = undefined;
+    for (&workers) |*w| w.* = .{ .client = try .init(testing.allocator, testing.io, .{
+        .project_id = &f.project,
+        .endpoint = f.emulator,
+        .retry = .{ .initial_backoff_ms = 20, .max_backoff_ms = 200 },
+    }) };
+    defer for (&workers) |*w| w.client.deinit();
+    const times = 4;
+    var futures: [3]std.Io.Future(anyerror!void) = undefined;
+    for (&workers, &futures) |*w, *fut| fut.* = try testing.io.concurrent(Incrementer.loop, .{ w, times });
+    var failure: ?anyerror = null;
+    for (&futures) |*fut| fut.await(testing.io) catch |err| {
+        failure = err;
+    };
+    if (failure) |err| return err;
+    var got = try f.doc("counters/c").get(.{});
+    defer got.deinit();
+    try testing.expectEqual(3 * times, got.value.get("n").?.integer);
+    var runs: u32 = 0;
+    for (workers) |w| runs += w.runs;
+    // Every increment landed once, however many runs it took.
+    try testing.expect(runs >= 3 * times);
+}
+
+test "transactions: reads see what was there when read, and a rollback lets go" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    _ = try f.doc("c/a").set(&.{.{ .name = "v", .value = .{ .integer = 1 } }}, .{});
+    var t = try f.client.beginTransaction(.read_write);
+    defer t.deinit();
+    var read = try f.client.batchGet(&.{ "c/a", "c/none" }, .{ .transaction = t.value });
+    defer read.deinit();
+    try testing.expectEqual(1, read.value.documents[0].?.get("v").?.integer);
+    try testing.expectEqual(null, read.value.documents[1]);
+    // Rolled back, its lock on c/a is gone: a plain write goes through at once.
+    try f.client.rollback(t.value);
+    _ = try f.doc("c/a").set(&.{.{ .name = "v", .value = .{ .integer = 2 } }}, .{});
+    // And the transaction is over.
+    try testing.expectError(error.Aborted, f.client.commit(&.{.{ .delete = .{ .path = "c/a" } }}, .{ .transaction = t.value }));
+    try expectDiag(&f, "no longer valid");
+    try testing.expectError(error.InvalidArgument, f.client.rollback("Zm9vYmFy"));
+}
+
+/// Reads `c/a` in a read-only transaction, and keeps what it saw.
+const Reader = struct {
+    seen: i64 = 0,
+    fn run(ptr: *anyopaque, txn: *firestore.Transaction) anyerror!void {
+        const self: *Reader = @ptrCast(@alignCast(ptr));
+        var q = try txn.runQuery(.{ .from = .{ .collection = "c" } });
+        defer q.deinit();
+        self.seen = q.value.documents[0].get("v").?.integer;
+    }
+};
+
+test "transactions: read-only, now and at a past time; a write in one is refused" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const first = try f.doc("c/a").set(&.{.{ .name = "v", .value = .{ .integer = 1 } }}, .{});
+    _ = try f.doc("c/a").set(&.{.{ .name = "v", .value = .{ .integer = 2 } }}, .{});
+    var reader: Reader = .{};
+    const h: firestore.TransactionHandler = .{ .ptr = &reader, .vtable = &.{ .run = Reader.run } };
+    try f.client.runTransaction(h, .{ .read_only = true });
+    try testing.expectEqual(2, reader.seen);
+    try f.client.runTransaction(h, .{ .read_only = true, .read_time = first.update_time });
+    try testing.expectEqual(1, reader.seen);
+    var ro = try f.client.beginTransaction(.{ .read_only = .{} });
+    defer ro.deinit();
+    try testing.expectError(error.InvalidArgument, f.client.commit(&.{.{ .delete = .{ .path = "c/a" } }}, .{ .transaction = ro.value }));
+    try expectDiag(&f, "Cannot modify entities in a read-only transaction.");
+}

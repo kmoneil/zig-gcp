@@ -84,6 +84,16 @@ fn isUuidLike(id: []const u8) bool {
     return true;
 }
 
+/// A transaction's id as it travels: base64 text, which the server makes.
+pub fn isTransactionId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 4096) return false;
+    for (id) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '+', '/', '=', '-', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
 /// User agents become a header value: printable ASCII.
 pub fn isUserAgent(text: []const u8) bool {
     if (text.len == 0) return false;

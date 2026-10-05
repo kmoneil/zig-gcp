@@ -15,6 +15,7 @@ const core = @import("core");
 const Collection = @import("Collection.zig");
 const Document = @import("Document.zig");
 const Endpoint = @import("Endpoint.zig");
+const Transaction = @import("Transaction.zig");
 const batch_get = @import("batch_get.zig");
 const query_ = @import("query.zig");
 const errors = @import("errors.zig");
@@ -215,11 +216,10 @@ pub fn documentName(self: *const Client, allocator: Allocator, path: []const u8)
 /// the commit may be sent again after a lost answer is said at the top of
 /// `retry_unconditional_writes`.
 pub fn commit(self: *Client, writes: []const types.Write, options: types.CommitOptions) Error!types.Owned(types.CommitResult) {
-    _ = options;
     rpc.begin(self);
     var result: types.Owned(types.CommitResult) = try .init(self.gpa);
     errdefer result.deinit();
-    result.value = try writes_.commit(self, writes, result.arena);
+    result.value = try writes_.commit(self, writes, options.transaction, result.arena);
     return result;
 }
 
@@ -232,6 +232,34 @@ pub fn batchGet(self: *Client, paths: []const []const u8, options: types.BatchGe
     errdefer result.deinit();
     result.value = try batch_get.batchGet(self, paths, options, result.arena);
     return result;
+}
+
+/// Runs `handler` in a transaction: its reads join the transaction and its
+/// writes are committed together when it returns, all or none. When the
+/// server answers ABORTED, from the commit or a read, as it does when
+/// another transaction holds what this one needs, the handler runs again
+/// in a new transaction, up to `options.max_attempts` times in all, the
+/// client's retry policy spacing the attempts. Any other error, the
+/// handler's own included, rolls the transaction back and is returned.
+/// A transaction lasts at most 270 s, and expires after 60 s idle.
+pub fn runTransaction(self: *Client, handler: Transaction.Handler, options: types.RunTransactionOptions) anyerror!void {
+    return Transaction.run(self, handler, options);
+}
+
+/// Begins a transaction and returns its id, for reads and a commit that
+/// name it; `runTransaction` is the usual way. End it with a commit or
+/// `rollback`, or it holds its locks until it expires.
+pub fn beginTransaction(self: *Client, options: types.TransactionOptions) Error!types.Owned([]const u8) {
+    rpc.begin(self);
+    return Transaction.begin(self, options, null);
+}
+
+/// Ends a transaction without writing anything, freeing what it holds.
+/// One already committed answers success; an unknown id
+/// `error.InvalidArgument`.
+pub fn rollback(self: *Client, transaction: []const u8) Error!void {
+    rpc.begin(self);
+    return Transaction.rollback(self, transaction);
 }
 
 /// Runs `query` and returns every result, as one answer. Checked first as

@@ -239,6 +239,14 @@ jobs:
           test "$(grep -c '^cities/' "$RUNNER_TEMP/query.log")" = 2
           head -1 "$RUNNER_TEMP/query.log" | grep -qx "cities/NY"
           zig build example-firestore -- count cities state == CA | grep -qx 2
+          # A transaction: 25 moved, then a move of more than is left refused.
+          zig build example-firestore -- set accounts/alice balance=100
+          zig build example-firestore -- transfer accounts/alice accounts/bob balance 25 | grep -qx "moved 25: accounts/alice now holds 75, accounts/bob 25"
+          if zig build example-firestore -- transfer accounts/alice accounts/bob balance 500; then
+            echo "transfer moved more than there was"
+            exit 1
+          fi
+          zig build example-firestore -- get accounts/bob | grep -q "balance: 25"
           zig build example-firestore -- rm cities/LA
           if zig build example-firestore -- get cities/LA; then
             echo "rm left the document"

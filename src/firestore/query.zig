@@ -47,8 +47,9 @@ pub fn run(client: *Client, query: types.Query, options: types.QueryOptions, res
     const a = scratch.allocator();
     const parent = try check(client, a, query);
     if (options.read_time) |t| try rpc.checkTime(client, t, "read time");
+    try rpc.checkTransaction(client, options.transaction, options.read_time);
     const url = writeUrl(a, client, parent, ":runQuery") catch return error.OutOfMemory;
-    const body = try encode(a, query, null, options.read_time);
+    const body = try encode(a, query, null, options);
 
     // A read: asking again is harmless.
     const reply = try rpc.execute(client, response, .{ .method = .POST, .path = url, .body = body });
@@ -78,13 +79,14 @@ pub fn aggregate(
     const a = scratch.allocator();
     const parent = try check(client, a, query);
     if (options.read_time) |t| try rpc.checkTime(client, t, "read time");
+    try rpc.checkTransaction(client, options.transaction, options.read_time);
     const url = writeUrl(a, client, parent, ":runAggregationQuery") catch return error.OutOfMemory;
     // A select means nothing to an aggregation, and the emulator refuses a
     // sum or average over one of names only: "Aggregation over non-key
     // properties is not supported for base query that only returns keys."
     var unselected = query;
     unselected.select = null;
-    const body = try encode(a, unselected, aggregations, options.read_time);
+    const body = try encode(a, unselected, aggregations, options);
 
     const reply = try rpc.execute(client, response, .{ .method = .POST, .path = url, .body = body });
     return codec.decodeAggregation(response.allocator(), reply, aggregations.len) catch |err|
@@ -207,14 +209,14 @@ fn writeUrl(a: Allocator, client: *const Client, parent: []const u8, verb: []con
 
 /// The `runQuery` body, or the `runAggregationQuery` one when
 /// `aggregations` is set. The query has been checked.
-pub fn encode(a: Allocator, query: types.Query, aggregations: ?[]const types.Aggregation, read_time: ?std.Io.Timestamp) Allocator.Error![]u8 {
+pub fn encode(a: Allocator, query: types.Query, aggregations: ?[]const types.Aggregation, options: types.QueryOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(a);
     var jw: Stringify = .{ .writer = &out.writer };
-    writeBody(&jw, query, aggregations, read_time) catch return error.OutOfMemory;
+    writeBody(&jw, query, aggregations, options) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn writeBody(jw: *Stringify, query: types.Query, aggregations: ?[]const types.Aggregation, read_time: ?std.Io.Timestamp) Stringify.Error!void {
+fn writeBody(jw: *Stringify, query: types.Query, aggregations: ?[]const types.Aggregation, options: types.QueryOptions) Stringify.Error!void {
     try jw.beginObject();
     if (aggregations) |aggs| {
         try jw.objectField("structuredAggregationQuery");
@@ -230,9 +232,13 @@ fn writeBody(jw: *Stringify, query: types.Query, aggregations: ?[]const types.Ag
         try jw.objectField("structuredQuery");
         try writeStructuredQuery(jw, query);
     }
-    if (read_time) |t| {
+    if (options.read_time) |t| {
         try jw.objectField("readTime");
         try codec.writeTimestamp(jw, t);
+    }
+    if (options.transaction) |t| {
+        try jw.objectField("transaction");
+        try jw.write(t);
     }
     try jw.endObject();
 }

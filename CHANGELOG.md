@@ -45,7 +45,15 @@ including the ones that did not change.
   ranges and `array_contains` against null or NaN, which match nothing
   either, are refused, as are lists past the server's sizes.
   `Client.runAggregationQuery` counts, sums and averages a query's
-  results on the server, at most five at a time.
+  results on the server, at most five at a time. `Client.runTransaction`
+  runs a handler in a transaction: its reads join it, its writes are
+  kept and committed together, and when the server answers ABORTED, as
+  contention makes it, the handler runs again in a new transaction that
+  names the last one, up to five times, spaced by the retry policy, each
+  failure rolled back. A transaction's commit is sent once, since a
+  repeat of one that landed would answer ABORTED and run it twice.
+  `beginTransaction`, `rollback` and a `transaction` option on reads and
+  `commit` are there for driving one by hand.
 - core: `core.timestamp.format` writes an RFC 3339 timestamp as Google's
   servers do, in UTC with no fractional digits or 3, 6 or 9 of them.
   `core.timestamp.min`, `max` and `inRange` give the range it writes,
