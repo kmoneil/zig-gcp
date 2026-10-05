@@ -9,6 +9,7 @@ const Object = @This();
 const std = @import("std");
 const core = @import("core");
 
+const AclList = @import("AclList.zig");
 const Client = @import("Client.zig");
 const codec = @import("codec.zig");
 const compose_impl = @import("compose.zig");
@@ -90,6 +91,14 @@ fn forCall(self: Object, copy: *Client) Error!Object {
     var billed_self = self;
     billed_self.client = copy;
     return billed_self;
+}
+
+/// The object's access control list, which says who may read it and
+/// who may change the list, where its bucket's uniform bucket-level access
+/// is off. A guarded write is held to the generation it read, so a list is
+/// never written onto a newer object of the name. Sends nothing.
+pub fn acl(self: Object) AclList {
+    return .{ .client = self.client, .bucket = self.bucket, .object = self.name, .target = .object, .billing_project = self.billing_project };
 }
 
 /// The object's metadata: the live generation, or the one `options` names,

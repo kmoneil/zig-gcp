@@ -4951,3 +4951,94 @@ test "66. ACLs: a predefined list on every write, read back as production keeps 
     try testing.expectEqual(null, plain.value.acl);
     try testing.expectEqual(null, plain.value.owner);
 }
+
+test "67. ACLs: each list read, granted, revoked and set whole, the owner kept, a stale guard refused, and uniform access" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const gpa = testing.allocator;
+    var created = f.bucket().create(.{
+        .location = "us-central1",
+        .soft_delete_retention_s = 0,
+        .uniform_bucket_level_access = false,
+        .public_access_prevention = .enforced,
+    }) catch |err| return f.report(err);
+    const number = try std.fmt.allocPrint(gpa, "{d}", .{created.value.project_number.?});
+    defer gpa.free(number);
+    created.deinit();
+    defer f.deleteEveryVersion() catch {};
+    const b = f.bucket();
+    // Google's own logs group: real, and harmless to name.
+    const group: storage.AclEntity = .{ .group = "cloud-storage-analytics@google.com" };
+
+    // A new bucket's list: projectPrivate, its project owners the owner.
+    var fresh = b.acl().get() catch |err| return f.report(err);
+    defer fresh.deinit();
+    const owners: storage.AclEntity = .{ .project = .{ .team = .owners, .number = number } };
+    try testing.expect(storage.acl.sameEntity(owners, fresh.value.owner.?));
+    const fresh_text = try aclSummary(gpa, fresh.value.entries);
+    defer gpa.free(fresh_text);
+    const expected_fresh = try std.fmt.allocPrint(gpa, "project-editors-{s} owner; project-owners-{s} owner; project-viewers-{s} reader", .{ number, number, number });
+    defer gpa.free(expected_fresh);
+    try testing.expectEqualStrings(expected_fresh, fresh_text);
+
+    // Granted, changed, revoked: back to back, as one bucket takes about
+    // one update a second, the rest ridden out by the retry policy.
+    var granted = b.acl().grant(group, .reader) catch |err| return f.report(err);
+    granted.deinit();
+    var changed = b.acl().grant(group, .writer) catch |err| return f.report(err);
+    changed.deinit();
+    var one = b.acl().entry(group) catch |err| return f.report(err);
+    try testing.expectEqual(.writer, one.value.role);
+    one.deinit();
+    var revoked = b.acl().revoke(group) catch |err| return f.report(err);
+    revoked.deinit();
+    try testing.expectError(error.NotFound, b.acl().entry(group));
+    try testing.expectError(error.InvalidArgument, b.acl().revoke(owners));
+    try testing.expectError(error.PublicAccessPrevented, b.acl().grant(.all_users, .reader));
+
+    // The default list emptied, then given one entry.
+    var emptied = b.defaultObjectAcl().set(&.{}, .{}) catch |err| return f.report(err);
+    try testing.expectEqual(0, emptied.value.entries.len);
+    emptied.deinit();
+    var default = b.defaultObjectAcl().grant(group, .reader) catch |err| return f.report(err);
+    try testing.expectEqual(1, default.value.entries.len);
+    default.deinit();
+
+    // An object's list: its writer the owner, a grant, a guarded set
+    // without the owner, who comes back, and a stale guard refused.
+    var put = b.object("acl/o").upload("o", .{}) catch |err| return f.report(err);
+    put.deinit();
+    var object = b.object("acl/o").acl().grant(group, .reader) catch |err| return f.report(err);
+    defer object.deinit();
+    const owner = object.value.owner.?;
+    try testing.expect(owner == .user);
+    // allAuthenticatedUsers under prevention: refused, the list unchanged.
+    try testing.expectError(error.PublicAccessPrevented, b.object("acl/o").acl().set(&.{.{ .entity = .all_authenticated_users, .role = .reader }}, .{
+        .if_metageneration_match = object.value.metageneration,
+        .if_generation_match = object.value.generation,
+    }));
+    var set_whole = b.object("acl/o").acl().set(&.{.{ .entity = group, .role = .owner }}, .{
+        .if_metageneration_match = object.value.metageneration,
+        .if_generation_match = object.value.generation,
+    }) catch |err| return f.report(err);
+    defer set_whole.deinit();
+    const set_text = try aclSummary(gpa, set_whole.value.entries);
+    defer gpa.free(set_text);
+    const expected_set = try std.fmt.allocPrint(gpa, "group-cloud-storage-analytics@google.com owner; user-{s} owner", .{owner.user});
+    defer gpa.free(expected_set);
+    try testing.expectEqualStrings(expected_set, set_text);
+    try testing.expectError(error.Aborted, b.object("acl/o").acl().set(&.{}, .{ .if_metageneration_match = object.value.metageneration }));
+    try testing.expectError(error.InvalidArgument, b.object("acl/o").acl().grant(owner, .reader));
+    var owner_only = b.object("acl/o").acl().set(&.{}, .{}) catch |err| return f.report(err);
+    try testing.expectEqual(1, owner_only.value.entries.len);
+    owner_only.deinit();
+
+    // Uniform access keeps none.
+    var uniform = f.update(.{ .uniform_bucket_level_access = true }) catch |err| return f.report(err);
+    uniform.deinit();
+    try testing.expectError(error.UniformAccessEnabled, b.acl().get());
+    try testing.expectError(error.UniformAccessEnabled, b.defaultObjectAcl().get());
+    try testing.expectError(error.UniformAccessEnabled, b.object("acl/o").acl().get());
+    try testing.expectError(error.UniformAccessEnabled, b.object("acl/o").acl().grant(group, .reader));
+}

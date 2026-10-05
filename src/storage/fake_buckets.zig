@@ -80,6 +80,7 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const ObjectMap = std.json.ObjectMap;
 const core = @import("core");
+const fake_acl = @import("fake_acl.zig");
 const Method = core.transport.Method;
 
 pub const FakeBuckets = struct {
@@ -136,6 +137,11 @@ pub const FakeBuckets = struct {
         bindings: ?[]const core.iam.Binding = null,
         /// Folders are real resources here. Create-time only.
         hns: bool = false,
+        /// Its access control list and default object list, kept under
+        /// uniform access too, as production keeps them, but neither shown
+        /// nor changed then.
+        acl: []const fake_acl.Entry = fake_acl.project_private,
+        default_acl: []const fake_acl.Entry = fake_acl.project_private,
         /// The folders, by their full path with the trailing slash, in
         /// creation order; listing sorts.
         folders: std.StringArrayHashMapUnmanaged(FolderState) = .empty,
@@ -227,6 +233,21 @@ pub const FakeBuckets = struct {
         notification: ?NotificationTarget = null,
         /// `.../iam` or `.../iam/testPermissions`.
         iam: ?IamTarget = null,
+        /// `projection=full`: the lists and the owner too.
+        full: bool = false,
+        /// A canned list, by its JSON name, on a create or a patch.
+        predefined_acl: ?[]const u8 = null,
+        predefined_default_object_acl: ?[]const u8 = null,
+        /// `.../acl` or `.../defaultObjectAcl`, or one entry of either.
+        acl: ?AclTarget = null,
+    };
+
+    pub const AclList = enum { bucket, default_object };
+
+    pub const AclTarget = struct {
+        list: AclList,
+        /// One entry's entity, as the path spells it; null for the list.
+        entity: ?[]const u8 = null,
     };
 
     pub const IamTarget = union(enum) {
@@ -268,9 +289,10 @@ pub const FakeBuckets = struct {
         const name = target.name orelse {
             if (method != .POST or target.project == null) return error.HttpProtocolError;
             self.counts.creates += 1;
-            return self.create(body, target.object_retention, target.project.?, arena);
+            return self.create(body, target, arena);
         };
         if (target.notification) |n| return self.serveNotification(method, name, n, body, arena);
+        if (target.acl) |t| return self.serveAcl(method, name, t, arena);
         if (target.iam) |iam| return self.serveIam(method, name, iam, body, arena);
         if (target.lock) {
             if (method != .POST) return error.HttpProtocolError;
@@ -281,7 +303,7 @@ pub const FakeBuckets = struct {
             .GET => {
                 self.counts.reads += 1;
                 const stored = self.buckets.getPtr(name) orelse return notFound();
-                return .{ .status = 200, .body = try render(arena, stored.resource) };
+                return .{ .status = 200, .body = try renderStored(arena, stored, target.full) };
             },
             .PATCH => {
                 self.counts.patches += 1;
@@ -296,7 +318,9 @@ pub const FakeBuckets = struct {
         }
     }
 
-    fn create(self: *FakeBuckets, body: []const u8, object_retention: bool, project: []const u8, arena: Allocator) Error!Reply {
+    fn create(self: *FakeBuckets, body: []const u8, target: Target, arena: Allocator) Error!Reply {
+        const object_retention = target.object_retention;
+        const project = target.project.?;
         const a = self.arena.allocator();
         const parsed = std.json.parseFromSliceLeaky(Value, arena, body, .{}) catch return self.invalid(arena, "Parse Error");
         const fields = objectOf(parsed) orelse return self.invalid(arena, "the body is not an object");
@@ -353,9 +377,24 @@ pub const FakeBuckets = struct {
             if (object_retention) return self.invalid(arena, "Object retention config is not supported for hierarchical namespace buckets.");
             try next.put(a, "hierarchicalNamespace", try flagObject(a, "enabled", true));
         }
-        try self.buckets.put(a, owned_name, .{ .resource = next, .metageneration = 1, .project = try a.dupe(u8, project), .hns = hns });
+        // The canned lists, or `projectPrivate`; uniform access keeps none.
+        var lists: [2][]const fake_acl.Entry = .{ fake_acl.project_private, fake_acl.project_private };
+        for ([_]?[]const u8{ target.predefined_acl, target.predefined_default_object_acl }, &lists, 0..) |name_param, *list, i| {
+            const canned = name_param orelse continue;
+            if (uniformAccess(next)) return refusalReply(try fake_acl.uniformRefusal(arena, .write_bucket));
+            list.* = (if (i == 0) fake_acl.bucketList(canned) else fake_acl.objectList(canned)) orelse return self.invalidFmt(arena, "Invalid predefined ACL \"{s}\"", .{canned});
+            if (publicAccessPrevented(next) and fake_acl.isPublic(list.*)) return refusalReply(fake_acl.prevention_refusal);
+        }
+        try self.buckets.put(a, owned_name, .{
+            .resource = next,
+            .metageneration = 1,
+            .project = try a.dupe(u8, project),
+            .hns = hns,
+            .acl = lists[0],
+            .default_acl = lists[1],
+        });
         self.next_generation += 1;
-        return .{ .status = 200, .body = try render(arena, next) };
+        return .{ .status = 200, .body = try renderStored(arena, self.buckets.getPtr(owned_name).?, target.full) };
     }
 
     /// Whether a create's body asks for a hierarchical namespace.
@@ -383,15 +422,40 @@ pub const FakeBuckets = struct {
         const fields = objectOf(parsed) orelse return self.invalid(arena, "the body is not an object");
         // Measured: an empty patch changes nothing, the metageneration
         // included.
-        if (fields.count() == 0) return .{ .status = 200, .body = try render(arena, stored.resource) };
+        if (fields.count() == 0 and target.predefined_acl == null and target.predefined_default_object_acl == null) {
+            return .{ .status = 200, .body = try renderStored(arena, stored, target.full) };
+        }
 
         const a = self.arena.allocator();
         var next = try cloneObject(a, stored.resource);
+        // The lists, before anything changes: a refused one leaves the
+        // bucket as it was.
+        var lists: [2][]const fake_acl.Entry = .{ stored.acl, stored.default_acl };
+        for ([_][]const u8{ "acl", "defaultObjectAcl" }, [_]?[]const u8{ target.predefined_acl, target.predefined_default_object_acl }, &lists, 0..) |field, canned_name, *list, i| {
+            const kind: fake_acl.Kind = if (i == 0) .bucket else .default_object;
+            const given = fields.get(field);
+            const given_items = if (given) |g| (if (g == .array) g.array.items.len else 1) else 0;
+            if ((given != null or canned_name != null) and uniformAccess(stored.resource)) {
+                return refusalReply(try fake_acl.uniformRefusal(arena, .write_bucket));
+            }
+            if (canned_name) |canned| {
+                if (given_items > 0) return refusalReply(fake_acl.both_refusal);
+                list.* = (if (i == 0) fake_acl.bucketList(canned) else fake_acl.objectList(canned)) orelse return self.invalidFmt(arena, "Invalid predefined ACL \"{s}\"", .{canned});
+                if (publicAccessPrevented(stored.resource) and fake_acl.isPublic(list.*)) return refusalReply(fake_acl.prevention_refusal);
+            } else if (given_items > 0) {
+                // An empty list is ignored, as measured.
+                switch (try fake_acl.fromBody(a, given.?, kind, if (i == 0) fake_acl.owners else null, publicAccessPrevented(stored.resource))) {
+                    .list => |l| list.* = l,
+                    .refused => |r| return refusalReply(r),
+                }
+            }
+        }
         var it = fields.iterator();
         while (it.next()) |entry| {
             // Measured: a patch naming hierarchicalNamespace answers 200,
             // drops the field silently, and still moves the metageneration.
             if (std.mem.eql(u8, entry.key_ptr.*, "hierarchicalNamespace")) continue;
+            if (std.mem.eql(u8, entry.key_ptr.*, "acl") or std.mem.eql(u8, entry.key_ptr.*, "defaultObjectAcl")) continue;
             self.apply(&next, entry.key_ptr.*, entry.value_ptr.*, false) catch |err| switch (err) {
                 error.Invalid => return self.refused(arena),
                 error.OutOfMemory => return error.OutOfMemory,
@@ -401,7 +465,9 @@ pub const FakeBuckets = struct {
         try next.put(a, "metageneration", .{ .string = try a.print("{d}", .{stored.metageneration}) });
         try next.put(a, "updated", .{ .string = "2026-09-29T14:07:47.529Z" });
         stored.resource = next;
-        return .{ .status = 200, .body = try render(arena, next) };
+        stored.acl = lists[0];
+        stored.default_acl = lists[1];
+        return .{ .status = 200, .body = try renderStored(arena, stored, target.full) };
     }
 
     /// `lockRetentionPolicy`, as measured.
@@ -425,6 +491,41 @@ pub const FakeBuckets = struct {
         try next.put(a, "metageneration", .{ .string = try a.print("{d}", .{stored.metageneration}) });
         stored.resource = next;
         return .{ .status = 200, .body = try render(arena, next) };
+    }
+
+    /// A list's single-entry reads. Its writes this library never sends,
+    /// so they fail the test.
+    fn serveAcl(self: *FakeBuckets, method: Method, name: []const u8, target: AclTarget, arena: Allocator) Error!Reply {
+        if (method != .GET) return error.HttpProtocolError;
+        self.counts.reads += 1;
+        const stored = self.buckets.getPtr(name) orelse return notFound();
+        if (uniformAccess(stored.resource)) return refusalReply(try fake_acl.uniformRefusal(arena, .read_bucket));
+        const list = if (target.list == .bucket) stored.acl else stored.default_acl;
+        const entity = target.entity orelse return .{ .status = 200, .body = try fake_acl.listBody(arena, list, if (target.list == .bucket) .bucket else .default_object) };
+        return refusalReply(try fake_acl.entryBody(arena, list, entity));
+    }
+
+    /// The default object list new objects in `bucket` get.
+    pub fn defaultAcl(self: *const FakeBuckets, bucket: []const u8) []const fake_acl.Entry {
+        const stored = self.buckets.getPtr(bucket) orelse return fake_acl.project_private;
+        return stored.default_acl;
+    }
+
+    /// The bucket's own list, as kept.
+    pub fn bucketAcl(self: *const FakeBuckets, bucket: []const u8) []const fake_acl.Entry {
+        const stored = self.buckets.getPtr(bucket) orelse return &.{};
+        return stored.acl;
+    }
+
+    /// Whether public access prevention is enforced on `bucket`.
+    pub fn isPrevented(self: *const FakeBuckets, bucket: []const u8) bool {
+        const stored = self.buckets.getPtr(bucket) orelse return false;
+        return publicAccessPrevented(stored.resource);
+    }
+
+    /// The arena lists are kept in, which lives as long as the fake.
+    pub fn listArena(self: *FakeBuckets) Allocator {
+        return self.arena.allocator();
     }
 
     /// Makes `topic`, a `//pubsub.googleapis.com/` name, refuse the
@@ -1363,6 +1464,35 @@ fn renderNotifications(arena: Allocator, items: []const ObjectMap) Allocator.Err
 
 fn render(arena: Allocator, object: ObjectMap) Allocator.Error![]const u8 {
     return std.json.Stringify.valueAlloc(arena, Value{ .object = object }, .{});
+}
+
+/// The bucket as a read answers it: under `projection=full`, with its
+/// lists and owner, unless uniform access hides them. An empty default
+/// object list is left out, as measured.
+fn renderStored(arena: Allocator, stored: *const FakeBuckets.Stored, full: bool) Allocator.Error![]const u8 {
+    if (!full or uniformAccess(stored.resource)) return render(arena, stored.resource);
+    var shown = try cloneObject(arena, stored.resource);
+    try shown.put(arena, "acl", try entriesValue(arena, stored.acl));
+    if (stored.default_acl.len > 0) try shown.put(arena, "defaultObjectAcl", try entriesValue(arena, stored.default_acl));
+    var owner: ObjectMap = .empty;
+    try owner.put(arena, "entity", .{ .string = fake_acl.owners });
+    try shown.put(arena, "owner", .{ .object = owner });
+    return render(arena, shown);
+}
+
+fn entriesValue(arena: Allocator, list: []const fake_acl.Entry) Allocator.Error!Value {
+    var items: std.json.Array = .init(arena);
+    for (list) |e| {
+        var entry: ObjectMap = .empty;
+        try entry.put(arena, "entity", .{ .string = e.entity });
+        try entry.put(arena, "role", .{ .string = e.role });
+        try items.append(.{ .object = entry });
+    }
+    return .{ .array = items };
+}
+
+fn refusalReply(r: fake_acl.Refusal) FakeBuckets.Reply {
+    return .{ .status = r.status, .body = r.body };
 }
 
 fn defaultSoftDelete(a: Allocator) Allocator.Error!Value {

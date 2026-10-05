@@ -240,6 +240,74 @@ const WireRewrite = struct {
     resource: ?WireObject = null,
 };
 
+/// What a bucket or object read with `projection=full` says about its
+/// access control lists. A list the resource leaves out is null: not
+/// readable by the caller, under uniform access, or, for a default object
+/// list, empty, which Cloud Storage answers by leaving it out, as measured
+/// 2026-10-05.
+pub const AclResource = struct {
+    acl: ?[]const types.AclEntry,
+    default_object_acl: ?[]const types.AclEntry,
+    owner: ?types.AclEntity,
+    metageneration: u64,
+    generation: ?u64,
+    uniform_bucket_level_access: bool,
+};
+
+pub fn decodeAclResource(arena: Allocator, body: []const u8) DecodeError!AclResource {
+    const wire = try parseWire(struct {
+        acl: ?[]const acl.WireEntry = null,
+        defaultObjectAcl: ?[]const acl.WireEntry = null,
+        owner: ?acl.WireOwner = null,
+        metageneration: ?std.json.Value = null,
+        generation: ?std.json.Value = null,
+        iamConfiguration: ?WireIamConfiguration = null,
+    }, arena, body);
+    const metageneration = try u64FromValue(wire.metageneration);
+    // A guarded write needs it: a resource without one cannot be written.
+    if (metageneration == 0) return error.InvalidResponse;
+    const iam: WireIamConfiguration = wire.iamConfiguration orelse .{};
+    return .{
+        .acl = try acl.entriesFromWire(arena, wire.acl),
+        .default_object_acl = try acl.entriesFromWire(arena, wire.defaultObjectAcl),
+        .owner = acl.ownerFromWire(wire.owner),
+        .metageneration = metageneration,
+        .generation = try optionalU64FromValue(wire.generation),
+        .uniform_bucket_level_access = if (iam.uniformBucketLevelAccess) |u| u.enabled orelse false else false,
+    };
+}
+
+/// One entry, from a single-entry read.
+pub fn decodeAclEntry(arena: Allocator, body: []const u8) DecodeError!types.AclEntry {
+    return acl.entryFromWire(try parseWire(acl.WireEntry, arena, body));
+}
+
+/// The entries of a whole-list body: what a guarded write sends, each
+/// entry's entity and role and nothing else, which the server sets.
+pub fn encodeAclBody(arena: Allocator, field: []const u8, entries: []const types.AclEntry) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeAclBody(&jw, arena, field, entries) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeAclBody(jw: *Stringify, arena: Allocator, field: []const u8, entries: []const types.AclEntry) (Stringify.Error || Allocator.Error)!void {
+    try jw.beginObject();
+    try jw.objectField(field);
+    try jw.beginArray();
+    for (entries) |entry| {
+        try jw.beginObject();
+        try jw.objectField("entity");
+        try jw.write(try acl.entityText(arena, entry.entity));
+        try jw.objectField("role");
+        // Checked before encoding: an unknown role is never sent.
+        try jw.write(acl.roleName(entry.role).?);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+}
+
 /// One Bucket resource.
 pub fn decodeBucket(arena: Allocator, body: []const u8) DecodeError!types.BucketInfo {
     return bucketFromWire(arena, try parseWire(WireBucket, arena, body));

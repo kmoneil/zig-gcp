@@ -23,6 +23,19 @@ including the ones that did not change.
   beside uniform bucket-level access, which keeps none. Measured in
   production on 2026-10-05, including what Google's documentation gets
   wrong: an empty list sent alone is ignored, not applied.
+- storage: `AclList`, a handle on one list: `Bucket.acl`,
+  `Bucket.defaultObjectAcl` and `Object.acl`. `get` reads the whole list
+  with its owner and the metageneration a guarded write takes; `entry`
+  reads one; `grant` and `revoke` read, change and write the list back
+  under that metageneration, starting over when another change came in
+  between, as `addIamBinding` does; `set` replaces it whole, under an
+  `AclGuard`. Cloud Storage's single-entry writes are not used: they take
+  no condition and no idempotency token deduplicates them, as measured.
+  Refused before sending: taking OWNER from the owner (the server refuses
+  less, or quietly puts it back), a role the list does not take, a
+  project named by ID (stored under its number, it could never be found
+  again), an entity twice, and more than 100 entries. An empty list is
+  sent as `private`, since the server ignores an empty one.
 - storage: **Breaking, for an exhaustive switch:** two new errors.
   `error.UniformAccessEnabled` is a list on a bucket with uniform
   bucket-level access, a 400 told apart by its message; and

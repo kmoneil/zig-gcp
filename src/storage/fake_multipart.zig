@@ -99,6 +99,7 @@ const Header = core.transport.Header;
 const Method = core.transport.Method;
 const xml = @import("xml.zig");
 const acl = @import("acl.zig");
+const fake_acl = @import("fake_acl.zig");
 const types = @import("types.zig");
 const FakeBuckets = @import("fake_buckets.zig").FakeBuckets;
 
@@ -115,6 +116,8 @@ pub const FakeMultipart = struct {
     soft_delete: bool = false,
     /// The objects' bucket, and every bucket served, bills the requester.
     requester_pays: bool = false,
+    /// The account every write comes from, which owns what it writes.
+    principal: []const u8 = "zig-gcp@extractctl.iam.gserviceaccount.com",
     /// The one project a requester may bill.
     billable: []const u8 = "extractctl",
     /// Cloud Storage's service agent may use every Cloud KMS key; off,
@@ -339,6 +342,10 @@ pub const FakeMultipart = struct {
         /// The canned access control list its write named, or null for
         /// the bucket's default object list.
         predefined_acl: ?types.PredefinedAcl = null,
+        /// Its owner, `user-` and the writer, and its list, as Cloud
+        /// Storage keeps them; in the bucket fake's arena.
+        owner: []const u8 = "",
+        acl: []const fake_acl.Entry = &.{},
         holds: Holds = .{},
         /// Its own retention: until when, on the fake's clock.
         retention: ?Retention = null,
@@ -409,6 +416,8 @@ pub const FakeMultipart = struct {
         const metadata = try self.gpa.alloc(Header, 0);
         errdefer self.gpa.free(metadata);
         try self.objects.ensureUnusedCapacity(self.gpa, 1);
+        // Made before the object is stored: nothing may fail after.
+        const made = try self.newAcl("", null);
         if (self.liveIndex(name)) |i| {
             var replaced = self.objects.orderedRemove(i);
             freeStored(self.gpa, &replaced);
@@ -420,8 +429,41 @@ pub const FakeMultipart = struct {
             .content_type = content_type,
             .metadata = metadata,
             .retained_from_ns = self.now(),
+            .owner = made.owner,
+            .acl = made.acl,
         });
         self.next_generation += 1;
+    }
+
+    const NewAcl = struct { owner: []const u8, acl: []const fake_acl.Entry };
+
+    /// A new object's owner, the writer, and its list: the canned one its
+    /// write named, or the bucket's default list, as measured. Made before
+    /// the object is stored, so that nothing fails after.
+    fn newAcl(self: *FakeMultipart, bucket: []const u8, predefined: ?types.PredefinedAcl) Allocator.Error!NewAcl {
+        const a = self.buckets.listArena();
+        const owner = try std.mem.concat(a, u8, &.{ "user-", self.principal });
+        const canned = if (predefined) |p| fake_acl.objectList(acl.predefinedName(p)).? else null;
+        return .{ .owner = owner, .acl = try fake_acl.newObjectList(a, owner, canned, self.buckets.defaultAcl(bucket)) };
+    }
+
+    /// What a write naming a canned list meets: uniform access refuses any,
+    /// and public access prevention a public one, as measured.
+    fn cannedRefusal(self: *FakeMultipart, bucket: []const u8, predefined: ?types.PredefinedAcl, xml_api: bool, arena: Allocator) Allocator.Error!?Reply {
+        const p = predefined orelse return null;
+        const refused = if (self.buckets.isUniform(bucket))
+            try fake_acl.uniformRefusal(arena, .insert_object)
+        else if (self.buckets.isPrevented(bucket) and fake_acl.isPublic(fake_acl.objectList(acl.predefinedName(p)).?))
+            fake_acl.prevention_refusal
+        else
+            return null;
+        if (!xml_api) return .{ .status = refused.status, .body = refused.body };
+        // The fake's own body: it parses.
+        const message = (std.json.parseFromSliceLeaky(struct { @"error": struct { message: []const u8 } }, arena, refused.body, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        }).@"error".message;
+        return .{ .status = refused.status, .body = try arena.print("<?xml version='1.0' encoding='UTF-8'?><Error><Code>{s}</Code><Message>{s}</Message></Error>", .{ if (refused.status == 412) "PreconditionFailed" else "InvalidArgument", message }) };
     }
 
     /// Stores an object as gzip-compressed, as another writer would have:
@@ -676,8 +718,19 @@ pub const FakeMultipart = struct {
                     // as HTTP's If-None-Match is.
                     .not_match_failed => return .{ .status = 304, .body = "" },
                 }
+                if (target.acl_read) |r| {
+                    if (self.buckets.isUniform(target.bucket)) {
+                        const refused = try fake_acl.uniformRefusal(arena, .read_object);
+                        return .{ .status = refused.status, .body = refused.body };
+                    }
+                    const answer = switch (r) {
+                        .list => fake_acl.Refusal{ .status = 200, .body = try fake_acl.listBody(arena, o.acl, .object) },
+                        .entry => |entity| try fake_acl.entryBody(arena, o.acl, entity),
+                    };
+                    return .{ .status = answer.status, .body = answer.body };
+                }
                 // Without its key, an object under one names no checksum.
-                return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, given != .none) };
+                return .{ .status = 200, .body = try objectJsonFull(self, arena, o, o.name, o.generation, target.bucket, false, given != .none, target.full) };
             },
             .media => {
                 self.counts.media += 1;
@@ -721,14 +774,38 @@ pub const FakeMultipart = struct {
             .hold => {},
             .match_failed, .not_match_failed => return condition_failed,
         }
-        const bad = "{\"error\":{\"code\":400,\"message\":\"this fake patches holds alone: ";
+        const bad = "{\"error\":{\"code\":400,\"message\":\"this fake patches holds, retention and lists alone: ";
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return .{ .status = 400, .body = bad ++ "a body that is not JSON\"}}" };
         if (parsed != .object) return .{ .status = 400, .body = bad ++ "a body that is not an object\"}}" };
         var holds = o.holds;
         var retention = o.retention;
+        var list = o.acl;
+        // The list, before anything changes, as measured: uniform access
+        // refuses any, a canned list beside a list that is not empty is
+        // 409, and an empty list alone is ignored.
+        const given = parsed.object.get("acl");
+        const given_items: usize = if (given) |g| (if (g == .array) g.array.items.len else 1) else 0;
+        if (given != null or target.predefined_acl != null) {
+            if (self.buckets.isUniform(target.bucket)) {
+                const refused = try fake_acl.uniformRefusal(arena, .write_object);
+                return .{ .status = refused.status, .body = refused.body };
+            }
+            const prevented = self.buckets.isPrevented(target.bucket);
+            const a = self.buckets.listArena();
+            if (target.predefined_acl) |name| {
+                if (given_items > 0) return .{ .status = fake_acl.both_refusal.status, .body = fake_acl.both_refusal.body };
+                const canned = fake_acl.objectList(name) orelse return .{ .status = 400, .body = bad ++ "a canned list production does not take\"}}" };
+                if (prevented and fake_acl.isPublic(canned)) return .{ .status = 412, .body = fake_acl.prevention_refusal.body };
+                list = try fake_acl.newObjectList(a, o.owner, canned, &.{});
+            } else if (given_items > 0) switch (try fake_acl.fromBody(a, given.?, .object, o.owner, prevented)) {
+                .list => |l| list = l,
+                .refused => |r| return .{ .status = r.status, .body = r.body },
+            };
+        }
         var it = parsed.object.iterator();
         while (it.next()) |entry| {
             const value = entry.value_ptr.*;
+            if (std.mem.eql(u8, entry.key_ptr.*, "acl")) continue;
             if (std.mem.eql(u8, entry.key_ptr.*, "retention")) {
                 switch (try self.retentionChange(target, o.retention, value, arena)) {
                     .refused => |reply| return reply,
@@ -747,8 +824,9 @@ pub const FakeMultipart = struct {
         if (o.holds.event_based orelse false and !(holds.event_based orelse false)) o.retained_from_ns = self.now();
         o.holds = holds;
         o.retention = retention;
+        o.acl = list;
         o.metageneration += 1;
-        return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, false) };
+        return .{ .status = 200, .body = try objectJsonFull(self, arena, o, o.name, o.generation, target.bucket, false, false, target.full) };
     }
 
     const RetentionOutcome = union(enum) { next: ?Retention, refused: Reply };
@@ -1166,6 +1244,7 @@ pub const FakeMultipart = struct {
                     .status = 400,
                     .body = "<?xml version='1.0' encoding='UTF-8'?><Error><Code>InvalidArgument</Code><Message>Invalid argument.</Message><Details>Invalid canned ACL</Details></Error>",
                 } else null;
+                if (try self.cannedRefusal(target.bucket, predefined, true, arena)) |refusal| return refusal;
                 // The reply first: once the upload is stored, nothing
                 // may fail and free what it owns.
                 const id_text = try arena.print("VXBs+{d}=", .{self.next_upload});
@@ -1316,6 +1395,7 @@ pub const FakeMultipart = struct {
         };
         const reply_headers = try replyHeaders(arena, all_headers[0..if (keyed) 1 else 2]);
         try self.objects.ensureUnusedCapacity(self.gpa, 1);
+        const made = try self.newAcl(bucket, u.predefined_acl);
         self.next_generation += 1;
         // A finish replaces any object of the name.
         for (self.objects.items, 0..) |o, i| if (std.mem.eql(u8, o.name, u.name)) {
@@ -1333,6 +1413,8 @@ pub const FakeMultipart = struct {
             .key_sha256 = u.key_sha256,
             .kms_key_name = u.kms_key_name,
             .predefined_acl = u.predefined_acl,
+            .owner = made.owner,
+            .acl = made.acl,
             // The XML API sets no hold; the bucket's default applies.
             .holds = self.newHolds(bucket, .{}),
             .retained_from_ns = self.now(),
@@ -1373,6 +1455,7 @@ pub const FakeMultipart = struct {
     ) Allocator.Error!Reply {
         self.counts.session_starts += 1;
         _ = content_type;
+        if (try self.cannedRefusal(target.bucket, target.predefined_acl, false, arena)) |refusal| return refusal;
         const keys = switch (self.writeKeys(requestKey(headers, object_key_prefix), target.kms_key_name, false)) {
             .ok => |k| k,
             .refused => |reply| return reply,
@@ -1513,9 +1596,12 @@ pub const FakeMultipart = struct {
         // Refused at the final PUT, after every byte went up.
         if (try self.keptLive(.json, s.bucket, s.name, arena)) |refusal| return refusal;
 
+        const made = try self.newAcl(s.bucket, s.predefined_acl);
         const o = try self.store(s.bucket, s.name, s.bytes.items, s.content_type, s.gzip, s.key_sha256, s.kms_key_name, s.holds);
         o.retention = s.retention;
         o.predefined_acl = s.predefined_acl;
+        o.owner = made.owner;
+        o.acl = made.acl;
         s.done = o.generation;
         s.bytes.clearAndFree(self.gpa);
         return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, s.bucket, false, true) };
@@ -1609,9 +1695,13 @@ pub const FakeMultipart = struct {
             .refused => |reply| return reply,
             .ok => |r| r,
         };
+        if (try self.cannedRefusal(target.bucket, target.predefined_acl, false, arena)) |refusal| return refusal;
+        const made = try self.newAcl(target.bucket, target.predefined_acl);
         const o = try self.store(target.bucket, meta.name, parts.data, meta.contentType orelse "application/octet-stream", meta.gzip(), keys.key_sha256, keys.kms_key_name, holds);
         o.retention = retention;
         o.predefined_acl = target.predefined_acl;
+        o.owner = made.owner;
+        o.acl = made.acl;
         try self.ensureParents(target.bucket, meta.name);
         return .{ .status = 200, .body = try objectJson(self, arena, o, o.name, o.generation, target.bucket, false, true) };
     }
@@ -2601,6 +2691,23 @@ fn objectJson(
     wrong_crc: bool,
     keyed_request: bool,
 ) Allocator.Error![]const u8 {
+    return objectJsonFull(self, arena, o, name, generation, bucket, wrong_crc, keyed_request, false);
+}
+
+/// `objectJson`, and under `projection=full` the list and the owner too,
+/// unless uniform access hides them.
+fn objectJsonFull(
+    self: *const FakeMultipart,
+    arena: Allocator,
+    o: *const FakeMultipart.Stored,
+    name: []const u8,
+    generation: u64,
+    bucket: []const u8,
+    wrong_crc: bool,
+    keyed_request: bool,
+    full: bool,
+) Allocator.Error![]const u8 {
+    const shown = full and !self.buckets.isUniform(bucket);
     var out: std.Io.Writer.Allocating = .init(arena);
     var jw: std.json.Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
     const crc = core.crc32c.toBase64(core.crc32c.hash(o.bytes) ^ @intFromBool(wrong_crc));
@@ -2629,6 +2736,8 @@ fn objectJson(
             .mode = if (r.locked) "Locked" else "Unlocked",
             .retainUntilTime = try rfc3339(arena, r.until_ns),
         }) else null,
+        .acl = if (shown) @as(?[]const fake_acl.Entry, o.acl) else null,
+        .owner = if (shown) @as(?struct { entity: []const u8 }, .{ .entity = o.owner }) else null,
     }) catch return error.OutOfMemory;
     return out.written();
 }
@@ -2780,6 +2889,8 @@ fn copyStored(gpa: Allocator, o: *const FakeMultipart.Stored, generation: u64) A
         .key_sha256 = o.key_sha256,
         .kms_key_name = kms,
         .predefined_acl = o.predefined_acl,
+        .owner = o.owner,
+        .acl = o.acl,
         .holds = o.holds,
         .retention = o.retention,
         .metageneration = o.metageneration,
@@ -2837,7 +2948,15 @@ const JsonTarget = struct {
     conditions: Conditions = .{},
     /// `overrideUnlockedRetention=true`, on a patch.
     override_unlocked_retention: bool = false,
+    /// `projection=full`: the list and the owner too.
+    full: bool = false,
+    /// A patch's canned list, by its JSON name.
+    predefined_acl: ?[]const u8 = null,
+    /// `.../acl`, or one entry of it: a read of the list itself.
+    acl_read: ?AclRead = null,
 };
+
+const AclRead = union(enum) { list, entry: []const u8 };
 
 const RestoreTarget = struct {
     bucket: []const u8,
@@ -3008,6 +3127,16 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         const after = path["/storage/v1/b/".len..];
         if (std.mem.indexOfScalar(u8, after, '/')) |slash| {
             const tail = after[slash..];
+            // A bucket's own list and its default object list, or one
+            // entry of either.
+            for ([_]struct { []const u8, FakeBuckets.AclList }{ .{ "/acl", .bucket }, .{ "/defaultObjectAcl", .default_object } }) |route| {
+                if (!std.mem.startsWith(u8, tail, route[0])) continue;
+                const entry = tail[route[0].len..];
+                if (entry.len > 0 and entry[0] != '/') continue;
+                var target = try bucketTarget(arena, try decode(arena, after[0..slash]), query);
+                target.acl = .{ .list = route[1], .entity = if (entry.len > 1) try decode(arena, entry[1..]) else null };
+                return .{ .bucket = target };
+            }
             const policy = std.mem.eql(u8, tail, "/iam");
             if (policy or std.mem.eql(u8, tail, "/iam/testPermissions")) {
                 return .{ .bucket = try iamTarget(arena, try decode(arena, after[0..slash]), query, policy) };
@@ -3152,6 +3281,8 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
         var media = false;
         var soft_deleted = false;
         var override = false;
+        var full = false;
+        var predefined_param: ?[]const u8 = null;
         var conditions: Conditions = .{};
         var params = std.mem.splitScalar(u8, query, '&');
         while (params.next()) |param| {
@@ -3166,7 +3297,22 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
                 soft_deleted = true;
             } else if (std.mem.eql(u8, param, "overrideUnlockedRetention=true")) {
                 override = true;
+            } else if (std.mem.eql(u8, param, "projection=full")) {
+                full = true;
+            } else if (std.mem.startsWith(u8, param, "predefinedAcl=")) {
+                predefined_param = try decode(arena, param["predefinedAcl=".len..]);
             }
+        }
+        // A name is one strictly encoded segment, so a slash here is the
+        // list's.
+        if (std.mem.indexOf(u8, object_part, "/acl")) |at| {
+            const rest_of = object_part[at + "/acl".len ..];
+            if (rest_of.len == 0 or rest_of[0] == '/') return .{ .json = .{
+                .bucket = bucket,
+                .name = try decode(arena, object_part[0..at]),
+                .generation = generation,
+                .acl_read = if (rest_of.len > 1) .{ .entry = try decode(arena, rest_of[1..]) } else .list,
+            } };
         }
         if (std.mem.endsWith(u8, object_part, "/restore")) return .{ .restore = .{
             .bucket = bucket,
@@ -3191,6 +3337,8 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
             .soft_deleted = soft_deleted,
             .conditions = conditions,
             .override_unlocked_retention = override,
+            .full = full,
+            .predefined_acl = predefined_param,
         } };
     }
 
@@ -3233,8 +3381,14 @@ fn bucketTarget(arena: Allocator, name: ?[]const u8, query: []const u8) core.tra
         if (std.mem.startsWith(u8, param, "project=")) {
             target.project = try decode(arena, param["project=".len..]);
         } else if (std.mem.eql(u8, param, "projection=noAcl") or std.mem.startsWith(u8, param, "userProject=")) {
-            // What every bucket answer here leaves out anyway, and the
-            // project `billingRefusal` has already read.
+            // What every bucket answer here leaves out unless asked, and
+            // the project `billingRefusal` has already read.
+        } else if (std.mem.eql(u8, param, "projection=full")) {
+            target.full = true;
+        } else if (std.mem.startsWith(u8, param, "predefinedAcl=")) {
+            target.predefined_acl = try decode(arena, param["predefinedAcl=".len..]);
+        } else if (std.mem.startsWith(u8, param, "predefinedDefaultObjectAcl=")) {
+            target.predefined_default_object_acl = try decode(arena, param["predefinedDefaultObjectAcl=".len..]);
         } else if (std.mem.startsWith(u8, param, "ifMetagenerationMatch=")) {
             target.if_metageneration_match = std.fmt.parseInt(u64, param["ifMetagenerationMatch=".len..], 10) catch
                 return error.HttpProtocolError;

@@ -696,6 +696,32 @@ pub const AclEntry = struct {
     entity_id: ?[]const u8 = null,
 };
 
+/// An access control list as read or written: a bucket's, its default
+/// object list, or an object's, with what a guarded write needs.
+pub const Acl = struct {
+    entries: []const AclEntry,
+    /// Who always keeps OWNER, which nothing can take from them: the
+    /// bucket's project owners, or the account that wrote the object. Null
+    /// for a default object list, whose objects are owned by their writers.
+    owner: ?AclEntity = null,
+    /// The bucket's or object's metageneration when read or written: what
+    /// `AclGuard.if_metageneration_match` takes.
+    metageneration: u64,
+    /// The object's generation, which `AclGuard.if_generation_match`
+    /// takes; null for a bucket's lists.
+    generation: ?u64 = null,
+};
+
+/// The conditions a whole-list write is held to. With
+/// `if_metageneration_match`, a write is safe to retry: a repeat of one
+/// that landed fails rather than overwrite a change made in between.
+pub const AclGuard = struct {
+    if_metageneration_match: ?u64 = null,
+    /// An object's only: write the list only while this is the live
+    /// generation.
+    if_generation_match: ?u64 = null,
+};
+
 /// A canned access control list for an object, applied whole in place of
 /// any it had. The owner, who wrote the object, is always OWNER. As
 /// measured 2026-10-05:
