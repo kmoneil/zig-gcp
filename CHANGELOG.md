@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.33.0 (unreleased)
+## 0.33.0 (2026-10-05)
 
 - storage: access control lists, read and canned. `GetOptions.with_acl`
   and `ListOptions.with_acl` read an object's list and owner
