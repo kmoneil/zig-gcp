@@ -36,6 +36,18 @@ including the ones that did not change.
   project named by ID (stored under its number, it could never be found
   again), an entity twice, and more than 100 entries. An empty list is
   sent as `private`, since the server ignores an empty one.
+- storage: HMAC keys, what S3-style tools and signatures authenticate
+  with. `Client.createHmacKey` makes one for a service account of the
+  project and answers its secret, which Cloud Storage never shows again,
+  in memory zeroed when freed; it is sent once, never again after a lost
+  answer, since a repeat makes a second key, and such a failure says how
+  to find the key. `Client.listHmacKeys` pages through them;
+  `Client.hmacKey` hands out an `HmacKey`, whose `get`, `setState`,
+  `delete` and `deactivateAndDelete` do the rest. A change to the state a
+  key has, and a delete of a deleted key, are answered as done, as are a
+  stale etag and a lost answer once a read finds the key as asked: Cloud
+  Storage checks the etag first, so a repeat of a change that landed
+  meets its own moved etag. Measured in production on 2026-10-05.
 - storage: **Breaking, for an exhaustive switch:** two new errors.
   `error.UniformAccessEnabled` is a list on a bucket with uniform
   bucket-level access, a 400 told apart by its message; and
@@ -44,7 +56,10 @@ including the ones that did not change.
   reason a failed precondition has, told apart by its message. IAM's
   refusal of such a grant, `error.FailedPrecondition` until now, is
   `error.PublicAccessPrevented` too.
-- auth, core, firestore, pubsub and secret_manager: unchanged.
+- core: `Owned(T).initWiping` makes a result whose memory, the response
+  it was decoded from included, is zeroed when `deinit` frees it, for
+  results that hold a secret.
+- auth, firestore, pubsub and secret_manager: unchanged.
 
 ## 0.32.0 (2026-10-05)
 

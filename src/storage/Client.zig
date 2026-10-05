@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const core = @import("core");
 
 const Bucket = @import("Bucket.zig");
+const HmacKey = @import("HmacKey.zig");
 const Endpoint = @import("Endpoint.zig");
 const checkpoint = @import("checkpoint.zig");
 const codec = @import("codec.zig");
@@ -336,6 +337,73 @@ pub fn serviceAgent(self: *Client) Error!types.Owned([]const u8) {
     const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
     result.value = codec.decodeServiceAgent(result.arena.allocator(), body) catch |err|
         return rpc.decodeFailed(self, err, "service agent");
+    return result;
+}
+
+/// Makes an HMAC key for `service_account_email`, an account of the
+/// project `options.project` names (the client's by default): Cloud
+/// Storage's service agent, or an account of another project, is refused.
+/// The answer holds the key's secret, which Cloud Storage never shows
+/// again: keep it, as a credential, before `deinit` zeroes it. An account
+/// holds at most 10 keys that are not deleted.
+///
+/// Sent once, never again after a lost answer: a repeat makes a second
+/// key, an idempotency token or not, as measured 2026-10-05, and a key
+/// whose secret nobody has still counts toward the 10. Such a failure says
+/// so in `Diagnostics`; `listHmacKeys` finds the key to deactivate and
+/// delete.
+pub fn createHmacKey(self: *Client, service_account_email: []const u8, options: types.HmacCreateOptions) Error!types.Owned(types.NewHmacKey) {
+    rpc.begin(self);
+    if (service_account_email.len == 0) {
+        if (self.diagnostics) |d| d.print("the service account email is empty", .{});
+        return error.InvalidArgument;
+    }
+    const project = options.project orelse try rpc.requireProject(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const path = try names.hmacKeysPath(scratch.allocator(), project, .{ .create = service_account_email });
+
+    // The answer carries the secret: its memory is zeroed when freed.
+    var result: types.Owned(types.NewHmacKey) = try .initWiping(self.gpa);
+    errdefer result.deinit();
+    const body = rpc.execute(self, result.arena, .{ .method = .POST, .path = path, .retry = false }) catch |err| {
+        if (core.isRetryable(err)) if (self.diagnostics) |d| d.print(
+            "{t}: the create may or may not have made a key, whose secret is then lost; listHmacKeys with this account finds it to deactivate and delete",
+            .{err},
+        );
+        return err;
+    };
+    result.value = codec.decodeNewHmacKey(result.arena.allocator(), body) catch |err| {
+        // A success that could not be read made a key all the same.
+        if (err == error.InvalidResponse) if (self.diagnostics) |d| d.print(
+            "the create's answer could not be read, without a secret or an access ID, though it may have made a key; listHmacKeys with this account finds it to deactivate and delete",
+            .{},
+        );
+        return err;
+    };
+    return result;
+}
+
+/// A handle on the HMAC key `access_id`, in the client's project. Sends
+/// nothing.
+pub fn hmacKey(self: *Client, access_id: []const u8) HmacKey {
+    return .{ .client = self, .access_id = access_id };
+}
+
+/// One page of HMAC keys: the project's, or one account's. Needs
+/// `Options.project_id` unless `options.project` names one.
+pub fn listHmacKeys(self: *Client, options: types.HmacListOptions) Error!types.Owned(types.HmacKeyPage) {
+    rpc.begin(self);
+    const project = options.project orelse try rpc.requireProject(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const path = try names.hmacKeysPath(scratch.allocator(), project, .{ .list = options });
+
+    var result: types.Owned(types.HmacKeyPage) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeHmacKeyPage(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "HMAC key list");
     return result;
 }
 

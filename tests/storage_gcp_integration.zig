@@ -35,6 +35,13 @@
 //! transport: it closes real connections partway through real bodies, so
 //! every recovery here is a recovery against Google.
 //!
+//! The HMAC key test makes keys for the service account
+//! GCP_TEST_HMAC_ACCOUNT names, in GCP_TEST_PROJECT, and skips without
+//! both; it deletes every key it made, and any that a crashed run left
+//! active or inactive for that account. It needs storage.hmacKeys.*, which
+//! Storage Admin does not grant and HMAC Key Admin or Editor does. An
+//! account holds at most 10 keys that are not deleted.
+//!
 //! The bucket tests make buckets of their own, named `zigps-` plus random
 //! hex, in the project GCP_TEST_PROJECT names, and delete them when they
 //! end; they skip without it. They need storage.buckets.create, get,
@@ -5041,4 +5048,63 @@ test "67. ACLs: each list read, granted, revoked and set whole, the owner kept, 
     try testing.expectError(error.UniformAccessEnabled, b.defaultObjectAcl().get());
     try testing.expectError(error.UniformAccessEnabled, b.object("acl/o").acl().get());
     try testing.expectError(error.UniformAccessEnabled, b.object("acl/o").acl().grant(group, .reader));
+}
+
+test "68. HMAC keys: made, read, listed, deactivated and deleted, each change confirmed and each refusal in production's words" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const account = f.env.get("GCP_TEST_HMAC_ACCOUNT") orelse return error.SkipZigTest;
+    const client = &f.client;
+
+    // Keys a crashed run left for the account go first: it holds 10.
+    var leftover = client.listHmacKeys(.{ .service_account_email = account }) catch |err| return f.report(err);
+    for (leftover.value.keys) |key| client.hmacKey(key.access_id).deactivateAndDelete() catch |err| return f.report(err);
+    leftover.deinit();
+
+    var made = client.createHmacKey(account, .{}) catch |err| return f.report(err);
+    defer made.deinit();
+    const key = client.hmacKey(made.value.info.access_id);
+    defer key.deactivateAndDelete() catch {};
+    try testing.expectEqual(61, made.value.info.access_id.len);
+    try testing.expect(std.mem.startsWith(u8, made.value.info.access_id, "GOOG"));
+    try testing.expectEqual(40, made.value.secret.len);
+    try testing.expectEqual(.active, made.value.info.state);
+    try testing.expectEqualStrings(account, made.value.info.service_account_email);
+
+    var read = key.get() catch |err| return f.report(err);
+    defer read.deinit();
+    try testing.expectEqualStrings(made.value.info.etag, read.value.etag);
+    var listed = client.listHmacKeys(.{ .service_account_email = account }) catch |err| return f.report(err);
+    defer listed.deinit();
+    try testing.expectEqual(1, listed.value.keys.len);
+
+    // Already active: answered as read. Deactivated under its etag, which
+    // then is stale; an active key is refused a delete.
+    var same = key.setState(.active, .{}) catch |err| return f.report(err);
+    same.deinit();
+    try testing.expectError(error.InvalidArgument, key.delete());
+    try testing.expect(std.mem.indexOf(u8, f.diag.message(), "ACTIVE state") != null);
+    var off = key.setState(.inactive, .{ .etag = read.value.etag }) catch |err| return f.report(err);
+    defer off.deinit();
+    try testing.expectEqual(.inactive, off.value.state);
+    try testing.expect(!std.mem.eql(u8, read.value.etag, off.value.etag));
+    try testing.expectError(error.FailedPrecondition, key.setState(.active, .{ .etag = read.value.etag }));
+    // The etag stale but the key as asked: answered as read.
+    var as_asked = key.setState(.inactive, .{ .etag = read.value.etag }) catch |err| return f.report(err);
+    as_asked.deinit();
+
+    key.delete() catch |err| return f.report(err);
+    key.delete() catch |err| return f.report(err);
+    var gone = key.get() catch |err| return f.report(err);
+    defer gone.deinit();
+    try testing.expectEqual(.deleted, gone.value.state);
+    var live = client.listHmacKeys(.{ .service_account_email = account }) catch |err| return f.report(err);
+    defer live.deinit();
+    try testing.expectEqual(0, live.value.keys.len);
+    try testing.expectError(error.InvalidArgument, key.setState(.active, .{}));
+    try testing.expectEqualStrings("Deleted keys cannot be updated.", f.diag.message());
+
+    try testing.expectError(error.NotFound, client.hmacKey("GOOG1ENOSUCHKEYXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX").get());
+    try testing.expectError(error.NotFound, client.createHmacKey("zigps-nobody@extractctl.iam.gserviceaccount.com", .{}));
 }
