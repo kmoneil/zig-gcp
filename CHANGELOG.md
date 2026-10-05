@@ -4,6 +4,35 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.33.0 (unreleased)
+
+- storage: access control lists, read and canned. `GetOptions.with_acl`
+  and `ListOptions.with_acl` read an object's list and owner
+  (`projection=full`) into `ObjectInfo.acl` and `ObjectInfo.owner`: null
+  when not asked for, when the caller may not read them, or under uniform
+  bucket-level access, never an empty list in their place. An entry is an
+  `AclEntity`, a union of Cloud Storage's grantees, and an `AclRole`;
+  `storage.acl.parseEntity`, `writeEntity` and `sameEntity` read, spell
+  and compare entities as the server stores them, emails in lower case.
+  A `PredefinedAcl` goes on every object write, `upload`, `uploadFrom`,
+  `uploadFile`, `uploadParallel` (as the XML API's `x-goog-acl`),
+  `copyTo`, `composeFrom` and `updateMetadata`, and a
+  `PredefinedBucketAcl` and default object list on `Bucket.create` and
+  `Bucket.update`. A checkpointed upload remembers the list it began
+  with, and starts over under another. Lists are refused before sending
+  beside uniform bucket-level access, which keeps none. Measured in
+  production on 2026-10-05, including what Google's documentation gets
+  wrong: an empty list sent alone is ignored, not applied.
+- storage: **Breaking, for an exhaustive switch:** two new errors.
+  `error.UniformAccessEnabled` is a list on a bucket with uniform
+  bucket-level access, a 400 told apart by its message; and
+  `error.PublicAccessPrevented` is a grant to `allUsers` or
+  `allAuthenticatedUsers` under public access prevention, a 412 with the
+  reason a failed precondition has, told apart by its message. IAM's
+  refusal of such a grant, `error.FailedPrecondition` until now, is
+  `error.PublicAccessPrevented` too.
+- auth, core, firestore, pubsub and secret_manager: unchanged.
+
 ## 0.32.0 (2026-10-05)
 
 - pubsub: the Subscriber's and the Publisher's own tasks now also watch a

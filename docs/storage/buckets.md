@@ -338,9 +338,10 @@ handle names its project on every IAM call, as on every other.
   names for them; testing permissions takes any.
 - **Conditions** need uniform bucket-level access. Without it, a
   conditional binding is `error.FailedPrecondition`, with Cloud
-  Storage's words in `Diagnostics`; so is `allUsers` or
-  `allAuthenticatedUsers` under public access prevention. A policy with
-  a condition is written as version 3 by itself.
+  Storage's words in `Diagnostics`. `allUsers` or
+  `allAuthenticatedUsers` under public access prevention is
+  `error.PublicAccessPrevented`, as an access control list's grant is.
+  A policy with a condition is written as version 3 by itself.
 - **The legacy bindings.** A new bucket's policy grants
   `roles/storage.legacyBucketOwner` and its siblings to
   `projectOwner:`, `projectEditor:` and `projectViewer:` the project's

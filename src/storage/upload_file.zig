@@ -139,12 +139,16 @@ fn resumeOrStart(
     const key_sha256 = encryption.sha256Text(client.encryption_key, &sha_buf);
     var saved = try loadState(client, cp, state_arena.allocator(), bucket, object);
     if (saved) |s| if (!shape.matches(s) or s.mtime != mtime or
-        !encryption.sameOptional(s.key_sha256, key_sha256) or !encryption.sameOptional(s.kms_key_name, options.kms_key_name))
+        !encryption.sameOptional(s.key_sha256, key_sha256) or !encryption.sameOptional(s.kms_key_name, options.kms_key_name) or
+        s.predefined_acl != options.predefined_acl)
     {
         if (s.size != shape.size or s.mtime != mtime) {
             logging.warn("{s}: the source file changed under the checkpoint; cancelling the old session and starting over", .{object});
         } else if (!shape.matches(s)) {
             logging.warn("{s}: the checkpoint's upload was compressed another way, or by another Zig; cancelling the old session and starting over", .{object});
+        } else if (s.predefined_acl != options.predefined_acl) {
+            // The session fixed the object's list when it began.
+            logging.warn("{s}: the checkpoint's upload began with another predefined access control list, or none; cancelling the old session and starting over", .{object});
         } else {
             logging.warn("{s}: the checkpoint's upload began under another encryption key, or none; cancelling the old session and starting over", .{object});
         }
@@ -176,6 +180,7 @@ fn resumeOrStart(
                 .gzip = shape.gzip,
                 .key_sha256 = key_sha256,
                 .kms_key_name = options.kms_key_name,
+                .predefined_acl = options.predefined_acl,
             } }) catch |err| {
                 // A session the checkpoint never recorded would only take
                 // writes for a week: drop it again before any data moves.

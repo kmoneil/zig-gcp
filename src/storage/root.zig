@@ -50,6 +50,18 @@ pub const LabelChange = @import("types.zig").LabelChange;
 pub const LabelEdit = @import("types.zig").LabelEdit;
 pub const LifecycleRule = @import("types.zig").LifecycleRule;
 pub const PublicAccessPrevention = @import("types.zig").PublicAccessPrevention;
+pub const AclRole = @import("types.zig").AclRole;
+pub const AclEntity = @import("types.zig").AclEntity;
+pub const AclEntry = @import("types.zig").AclEntry;
+pub const PredefinedAcl = @import("types.zig").PredefinedAcl;
+pub const PredefinedBucketAcl = @import("types.zig").PredefinedBucketAcl;
+/// Access control list entities as Cloud Storage spells them: read from a
+/// string, written to one, and compared as the server stores them.
+pub const acl = struct {
+    pub const parseEntity = @import("acl.zig").parseEntity;
+    pub const writeEntity = @import("acl.zig").writeEntity;
+    pub const sameEntity = @import("acl.zig").sameEntity;
+};
 pub const CopyOptions = @import("types.zig").CopyOptions;
 pub const DeleteOptions = @import("types.zig").DeleteOptions;
 pub const DownloadOptions = @import("types.zig").DownloadOptions;
@@ -125,6 +137,7 @@ pub const transport = core.transport;
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("acl.zig");
     _ = @import("Bucket.zig");
     _ = @import("bucket_settings.zig");
     _ = @import("Client.zig");

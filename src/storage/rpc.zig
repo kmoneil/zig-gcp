@@ -10,6 +10,7 @@ const Writer = std.Io.Writer;
 const core = @import("core");
 
 const Client = @import("Client.zig");
+const acl = @import("acl.zig");
 const codec = @import("codec.zig");
 const errors = @import("errors.zig");
 const folders = @import("folders.zig");
@@ -66,8 +67,9 @@ fn engine(client: *Client) Engine {
 }
 
 /// The engine for one request, with diagnostics of its own when the client
-/// keeps none: whether a refusal is `ObjectRetained` or
-/// `TopicNotPublishable` is read from them.
+/// keeps none: whether a refusal is `ObjectRetained`,
+/// `TopicNotPublishable`, `UniformAccessEnabled` or `PublicAccessPrevented`
+/// is read from them.
 fn engineWith(client: *Client, local: *core.Diagnostics) Engine {
     var e = engine(client);
     if (e.diagnostics == null) e.diagnostics = local;
@@ -77,6 +79,14 @@ fn engineWith(client: *Client, local: *core.Diagnostics) Engine {
 /// Whether a failed request was refused for a retained or held object.
 fn retained(e: Engine, err: anyerror) bool {
     return retention.isRetained(err, e.diagnostics.?);
+}
+
+/// The error an access control refusal is, or null for any other failure:
+/// both arrive under statuses that mean other things too.
+fn accessRefusal(e: Engine, err: anyerror) ?error{ UniformAccessEnabled, PublicAccessPrevented } {
+    if (acl.isUniformAccessRefusal(err, e.diagnostics.?)) return error.UniformAccessEnabled;
+    if (acl.isPublicAccessRefusal(err, e.diagnostics.?)) return error.PublicAccessPrevented;
+    return null;
 }
 
 /// What became of an object a failed upload deleted again, for the
@@ -207,6 +217,7 @@ pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) 
     return e.execute(response, billed_call) catch |err| {
         hint(client, err);
         if (retained(e, err)) return error.ObjectRetained;
+        if (accessRefusal(e, err)) |refused| return refused;
         if (notifications.isNotPublishable(err, e.diagnostics.?)) return error.TopicNotPublishable;
         if (folders.refinedConflict(err, e.diagnostics.?)) |refined| return refined;
         return err;
@@ -228,6 +239,7 @@ pub fn executeIamWrite(client: *Client, response: *std.heap.ArenaAllocator, call
     const e = engineWith(client, &local);
     return e.execute(response, billed_call) catch |err| {
         hint(client, err);
+        if (accessRefusal(e, err)) |refused| return refused;
         if (iam.isConcurrentChange(err, e.diagnostics.?)) return error.Aborted;
         return err;
     };
@@ -245,14 +257,15 @@ pub fn executeDiscard(client: *Client, call: Call) Error!void {
     return e.executeDiscard(billed_call) catch |err| {
         hint(client, err);
         if (retained(e, err)) return error.ObjectRetained;
+        if (accessRefusal(e, err)) |refused| return refused;
         if (folders.refinedConflict(err, e.diagnostics.?)) |refined| return refined;
         return err;
     };
 }
 
 pub const StreamCall = core.rpc.StreamCall;
-pub const StreamCallError = core.rpc.StreamCallError || error{ObjectRetained};
-pub const StreamBodyError = core.rpc.StreamBodyError || error{ObjectRetained};
+pub const StreamCallError = core.rpc.StreamCallError || error{ ObjectRetained, UniformAccessEnabled, PublicAccessPrevented };
+pub const StreamBodyError = core.rpc.StreamBodyError || error{ ObjectRetained, UniformAccessEnabled, PublicAccessPrevented };
 
 /// Sends a streaming JSON API call and returns the first 2xx response
 /// whole: status, headers, and the body, buffered or delivered to the sink.
@@ -271,6 +284,7 @@ pub fn executeStream(
     return e.executeStream(response, billed_call) catch |err| {
         hint(client, err);
         if (retained(e, err)) return error.ObjectRetained;
+        if (accessRefusal(e, err)) |refused| return refused;
         return err;
     };
 }
@@ -289,6 +303,7 @@ pub fn executeXml(
     return e.executeStream(response, billed_call) catch |err| {
         hint(client, err);
         if (retained(e, err)) return error.ObjectRetained;
+        if (accessRefusal(e, err)) |refused| return refused;
         return err;
     };
 }
@@ -308,6 +323,7 @@ pub fn executeXmlBody(
     return e.executeStreamBody(response, billed_call, body) catch |err| {
         hint(client, err);
         if (retained(e, err)) return error.ObjectRetained;
+        if (accessRefusal(e, err)) |refused| return refused;
         return err;
     };
 }

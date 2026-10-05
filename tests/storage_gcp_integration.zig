@@ -4493,7 +4493,7 @@ test "60. IAM: a bucket's policy read, granted once in any case, tested, revoked
     try testing.expectEqualStrings("conditionNotMet", f.diag.status());
 
     // Refused by Cloud Storage, in its own words.
-    try testing.expectError(error.FailedPrecondition, b.addIamBinding(role, "allUsers"));
+    try testing.expectError(error.PublicAccessPrevented, b.addIamBinding(role, "allUsers"));
     try testing.expect(std.mem.indexOf(u8, f.diag.message(), "public access prevention") != null);
     try testing.expectError(error.InvalidArgument, b.addIamBinding("roles/pubsub.publisher", member));
     try testing.expect(std.mem.indexOf(u8, f.diag.message(), "is not supported for this resource") != null);
@@ -4825,4 +4825,129 @@ test "65. managed folders: a grant scopes another principal's reads to the prefi
     b.object("scope/in.txt").delete(.{ .generation = in_generation }) catch |err| return f.report(err);
     b.object("outside.txt").delete(.{ .generation = out_generation }) catch |err| return f.report(err);
     b.managedFolder("scope/").delete(.{}) catch |err| return f.report(err);
+}
+
+/// The roles of `entries`, by entity spelled out, sorted, for comparing a
+/// list with what production was measured to give.
+fn aclSummary(gpa: Allocator, entries: []const storage.AclEntry) ![]u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (lines.items) |line| gpa.free(line);
+        lines.deinit(gpa);
+    }
+    for (entries) |entry| {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        try storage.acl.writeEntity(&out.writer, entry.entity);
+        try out.writer.print(" {t}", .{entry.role});
+        try lines.append(gpa, try out.toOwnedSlice());
+    }
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    return std.mem.join(gpa, "; ", lines.items);
+}
+
+test "66. ACLs: a predefined list on every write, read back as production keeps it, and the refusals of public access prevention and uniform access" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const gpa = testing.allocator;
+    // Prevention enforced: no list here can ever grant the public anything.
+    var created = f.bucket().create(.{
+        .location = "us-central1",
+        .soft_delete_retention_s = 0,
+        .uniform_bucket_level_access = false,
+        .public_access_prevention = .enforced,
+        .predefined_acl = .private,
+        .predefined_default_object_acl = .bucket_owner_read,
+    }) catch |err| return f.report(err);
+    const number = created.value.project_number.?;
+    created.deinit();
+    defer f.deleteEveryVersion() catch {};
+    const b = f.bucket();
+    const owners = try std.fmt.allocPrint(gpa, "project-owners-{d}", .{number});
+    defer gpa.free(owners);
+
+    // Three parts of a parallel upload, at Cloud Storage's smallest.
+    const data = try pattern(gpa, 66, 11 * 1024 * 1024);
+    defer gpa.free(data);
+    // Each write, the list it names, and what production keeps besides the
+    // writer as OWNER: the uploader is the token's own account.
+    const Case = struct { name: []const u8, extra: []const u8 };
+    var cases: std.ArrayList(Case) = .empty;
+    defer cases.deinit(gpa);
+    var one = b.object("acl/default").upload("d", .{}) catch |err| return f.report(err);
+    one.deinit();
+    try cases.append(gpa, .{ .name = "acl/default", .extra = "READER" }); // the bucket's default object list
+    var private = b.object("acl/private").upload("p", .{ .predefined_acl = .private }) catch |err| return f.report(err);
+    private.deinit();
+    try cases.append(gpa, .{ .name = "acl/private", .extra = "" });
+    var reader: std.Io.Reader = .fixed(data);
+    var streamed = b.object("acl/streamed").uploadFrom(&reader, .{ .predefined_acl = .bucket_owner_full_control }) catch |err| return f.report(err);
+    streamed.deinit();
+    try cases.append(gpa, .{ .name = "acl/streamed", .extra = "OWNER" });
+    var parts = b.object("acl/parts").uploadParallel(.{ .data = data }, .{ .part_size = 5 * 1024 * 1024, .predefined_acl = .bucket_owner_read }) catch |err| return f.report(err);
+    parts.deinit();
+    try cases.append(gpa, .{ .name = "acl/parts", .extra = "READER" });
+    // A create-only parallel upload finishes under a temporary name and is
+    // moved into place: the list must survive the move.
+    var moved = b.object("acl/moved").uploadParallel(.{ .data = data }, .{
+        .part_size = 5 * 1024 * 1024,
+        .predefined_acl = .bucket_owner_full_control,
+        .preconditions = .does_not_exist,
+    }) catch |err| return f.report(err);
+    moved.deinit();
+    try cases.append(gpa, .{ .name = "acl/moved", .extra = "OWNER" });
+    var copied = b.object("acl/private").copyTo(b.object("acl/copied"), .{ .predefined_acl = .bucket_owner_full_control }) catch |err| return f.report(err);
+    copied.deinit();
+    try cases.append(gpa, .{ .name = "acl/copied", .extra = "OWNER" });
+    var composed = b.object("acl/composed").composeFrom(&.{ .{ .name = "acl/default" }, .{ .name = "acl/private" } }, .{ .predefined_acl = .private }) catch |err| return f.report(err);
+    composed.deinit();
+    try cases.append(gpa, .{ .name = "acl/composed", .extra = "" });
+
+    for (cases.items) |case| {
+        errdefer std.debug.print("object {s}\n", .{case.name});
+        var got = b.object(case.name).get(.{ .with_acl = true }) catch |err| return f.report(err);
+        defer got.deinit();
+        const owner = got.value.owner.?;
+        try testing.expect(owner == .user);
+        const summary = try aclSummary(gpa, got.value.acl.?);
+        defer gpa.free(summary);
+        const expected = if (case.extra.len == 0)
+            try std.fmt.allocPrint(gpa, "user-{s} owner", .{owner.user})
+        else
+            try std.fmt.allocPrint(gpa, "{s} {s}; user-{s} owner", .{ owners, if (std.mem.eql(u8, case.extra, "OWNER")) "owner" else "reader", owner.user });
+        defer gpa.free(expected);
+        try testing.expectEqualStrings(expected, summary);
+    }
+
+    // A patch replaces the whole list.
+    var patched = b.object("acl/streamed").updateMetadata(.{ .predefined_acl = .private }) catch |err| return f.report(err);
+    patched.deinit();
+    var after = b.object("acl/streamed").get(.{ .with_acl = true }) catch |err| return f.report(err);
+    defer after.deinit();
+    try testing.expectEqual(1, after.value.acl.?.len);
+    var page = b.listObjects(.{ .with_acl = true, .prefix = "acl/" }) catch |err| return f.report(err);
+    defer page.deinit();
+    try testing.expectEqual(cases.items.len, page.value.objects.len);
+    for (page.value.objects) |info| try testing.expect(info.acl.?.len >= 1);
+
+    // Public access prevention refuses a public list on any write.
+    try testing.expectError(error.PublicAccessPrevented, b.object("acl/public").upload("x", .{ .predefined_acl = .public_read }));
+    try testing.expectError(error.PublicAccessPrevented, b.object("acl/private").updateMetadata(.{ .predefined_acl = .authenticated_read }));
+
+    // A bucket list, then uniform access, which keeps none.
+    var listed = f.update(.{ .predefined_acl = .project_private }) catch |err| return f.report(err);
+    listed.deinit();
+    var uniform = f.update(.{ .uniform_bucket_level_access = true }) catch |err| return f.report(err);
+    uniform.deinit();
+    try testing.expectError(error.UniformAccessEnabled, b.object("acl/after").upload("x", .{ .predefined_acl = .private }));
+    try testing.expectError(error.UniformAccessEnabled, b.object("acl/private").updateMetadata(.{ .predefined_acl = .private }));
+    var plain = b.object("acl/private").get(.{ .with_acl = true }) catch |err| return f.report(err);
+    defer plain.deinit();
+    try testing.expectEqual(null, plain.value.acl);
+    try testing.expectEqual(null, plain.value.owner);
 }

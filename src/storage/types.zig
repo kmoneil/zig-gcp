@@ -84,6 +84,14 @@ pub const ObjectInfo = struct {
     retention_expiration_time: ?[]const u8 = null,
     /// Its own retention, in a bucket with object retention enabled.
     retention: ?ObjectRetention = null,
+    /// Its access control list, read only when asked for:
+    /// `GetOptions.with_acl`, `ListOptions.with_acl`. Null when not asked
+    /// for, when the caller may not read it (that takes
+    /// `storage.objects.getIamPolicy`), and in a bucket with uniform
+    /// bucket-level access, which keeps none.
+    acl: ?[]const AclEntry = null,
+    /// Who owns it, as `acl` is read: the account that wrote it.
+    owner: ?AclEntity = null,
 
     /// The value of the custom metadata entry named `key`, or null.
     pub fn metadataValue(self: ObjectInfo, key: []const u8) ?[]const u8 {
@@ -120,6 +128,9 @@ pub const ListOptions = struct {
     /// folders. Cloud Storage takes it only with the `/` delimiter, so
     /// without one it is refused before sending, as measured 2026-10-02.
     include_folders_as_prefixes: bool = false,
+    /// Read each object's access control list and owner too
+    /// (`projection=full`).
+    with_acl: bool = false,
 };
 
 pub const ObjectPage = struct {
@@ -207,6 +218,9 @@ pub const ComposeOptions = struct {
     /// bucket's default, which a compose that names none gets, whatever
     /// keys its sources are under.
     kms_key_name: ?[]const u8 = null,
+    /// A canned access control list for the composite, which otherwise
+    /// gets the bucket's default object list, as a copy does.
+    predefined_acl: ?PredefinedAcl = null,
 };
 
 /// An object's own retention, in a bucket created with
@@ -279,6 +293,9 @@ pub const MetadataUpdate = struct {
     override_unlocked_retention: bool = false,
     /// Change one older generation's metadata instead of the live one.
     generation: ?u64 = null,
+    /// Replace the object's whole access control list with a canned one.
+    /// The owner keeps OWNER whatever the list.
+    predefined_acl: ?PredefinedAcl = null,
     /// `if_metageneration_match` is what makes this safe to retry.
     preconditions: Preconditions = .{},
 };
@@ -338,6 +355,12 @@ pub const UploadOptions = struct {
     event_based_hold: ?bool = null,
     /// The object's own retention, in a bucket with object retention.
     retention: ?ObjectRetention = null,
+    /// A canned access control list for the object, in place of the
+    /// bucket's default object list. A bucket with uniform bucket-level
+    /// access refuses any (`error.UniformAccessEnabled`), and one under
+    /// public access prevention refuses `.public_read` and
+    /// `.authenticated_read` (`error.PublicAccessPrevented`).
+    predefined_acl: ?PredefinedAcl = null,
 };
 
 /// How `UploadOptions.gzip` compresses.
@@ -405,6 +428,8 @@ pub const ParallelUploadOptions = struct {
     checkpoint: ?Checkpoint = null,
     /// As `UploadOptions.kms_key_name`.
     kms_key_name: ?[]const u8 = null,
+    /// As `UploadOptions.predefined_acl`.
+    predefined_acl: ?PredefinedAcl = null,
 };
 
 /// Where `Object.downloadParallel` writes.
@@ -509,6 +534,9 @@ pub const GetOptions = struct {
     /// With `soft_deleted`, in a bucket with hierarchical namespace: which
     /// of the soft-deleted objects of that name and generation.
     restore_token: ?[]const u8 = null,
+    /// Read the object's access control list and owner too
+    /// (`projection=full`).
+    with_acl: bool = false,
 };
 
 pub const DeleteOptions = struct {
@@ -557,6 +585,10 @@ pub const CopyOptions = struct {
     /// The copy's own retention, which it never carries from the source.
     /// Setting it is a change, as the holds are.
     retention: ?ObjectRetention = null,
+    /// A canned access control list for the copy. Without one, the copy
+    /// gets the destination bucket's default object list with the caller
+    /// as owner, never the source's list, as measured 2026-10-05.
+    predefined_acl: ?PredefinedAcl = null,
 };
 
 /// What an update does to a setting that can be taken away: `.keep`,
@@ -604,6 +636,99 @@ pub const PublicAccessPrevention = enum {
     /// A value the server sent that this library does not know. Never
     /// sent: a config or update carrying it is refused.
     unknown,
+};
+
+/// What an access control list entry grants. A bucket's list takes all
+/// three; an object's, and a bucket's default object list, take `owner`
+/// and `reader` only.
+pub const AclRole = enum {
+    owner,
+    /// Buckets only: create, replace and delete the bucket's objects.
+    writer,
+    reader,
+    /// A role the server sent that this library does not know. Never sent.
+    unknown,
+};
+
+/// Who an access control list entry grants to, as Cloud Storage spells it:
+/// `user-EMAIL`, `group-EMAIL`, `domain-DOMAIN`, `project-TEAM-NUMBER`,
+/// `allUsers` or `allAuthenticatedUsers`. It is written into a request
+/// when sent, so building one allocates nothing.
+pub const AclEntity = union(enum) {
+    /// A Google account or service account, by email. Cloud Storage keeps
+    /// emails in lower case, as measured 2026-10-05, and refuses one it
+    /// does not know.
+    user: []const u8,
+    /// A Google group, by email.
+    group: []const u8,
+    /// Every account of a Google Workspace or Cloud Identity domain.
+    domain: []const u8,
+    /// A project's owners, editors or viewers.
+    project: Project,
+    /// Anyone on the Internet. Refused under public access prevention.
+    all_users,
+    /// Anyone signed in to a Google account. Refused likewise.
+    all_authenticated_users,
+    /// A form this library does not model, such as `user-` and a numeric
+    /// ID, kept as the server sent it.
+    other: []const u8,
+
+    pub const Project = struct {
+        team: Team,
+        /// The project's number. Cloud Storage takes an ID too, but stores
+        /// the number, so an entry named by ID could never be found again.
+        number: []const u8,
+    };
+
+    pub const Team = enum { owners, editors, viewers };
+};
+
+/// One entry of an access control list.
+pub const AclEntry = struct {
+    entity: AclEntity,
+    role: AclRole,
+    /// The address of a user or group entry, as Cloud Storage keeps it.
+    email: ?[]const u8 = null,
+    /// The domain of a domain entry.
+    domain: ?[]const u8 = null,
+    /// An ID Cloud Storage keeps for some entities; none of the entries
+    /// measured carried one.
+    entity_id: ?[]const u8 = null,
+};
+
+/// A canned access control list for an object, applied whole in place of
+/// any it had. The owner, who wrote the object, is always OWNER. As
+/// measured 2026-10-05:
+pub const PredefinedAcl = enum {
+    /// The owner, and `allAuthenticatedUsers` READER.
+    authenticated_read,
+    /// The owner, and the bucket's project owners OWNER.
+    bucket_owner_full_control,
+    /// The owner, and the bucket's project owners READER.
+    bucket_owner_read,
+    /// The owner alone.
+    private,
+    /// The owner, project owners and editors OWNER, project viewers READER:
+    /// a new bucket's default.
+    project_private,
+    /// The owner, and `allUsers` READER.
+    public_read,
+};
+
+/// A canned access control list for a bucket, applied whole in place of
+/// any it had. The project's owners are always OWNER.
+pub const PredefinedBucketAcl = enum {
+    /// Project owners OWNER, and `allAuthenticatedUsers` READER.
+    authenticated_read,
+    /// Project owners OWNER alone.
+    private,
+    /// Project owners and editors OWNER, project viewers READER: a new
+    /// bucket's list.
+    project_private,
+    /// Project owners OWNER, and `allUsers` READER.
+    public_read,
+    /// Project owners OWNER, and `allUsers` WRITER.
+    public_read_write,
 };
 
 /// A rule Cloud Storage applies to a bucket's objects, about once a day:
@@ -715,6 +840,13 @@ pub const BucketConfig = struct {
     /// versioning, retention policies and object retention, refused here
     /// in the server's words.
     hierarchical_namespace: bool = false,
+    /// The bucket's access control list, in place of `.project_private`,
+    /// which a new bucket gets. Only without uniform bucket-level access,
+    /// which keeps no lists: refused before sending beside it.
+    predefined_acl: ?PredefinedBucketAcl = null,
+    /// The list objects written without one of their own get, in place of
+    /// `.project_private`. Only without uniform bucket-level access.
+    predefined_default_object_acl: ?PredefinedAcl = null,
 };
 
 /// A bucket's retention policy: every object is kept at least `period_s`
@@ -892,6 +1024,14 @@ pub const BucketUpdate = struct {
     /// locked policy can only be lengthened.
     retention_period_s: Change(u64) = .keep,
     default_event_based_hold: ?bool = null,
+    /// Replace the bucket's whole access control list, or its default
+    /// object list, with a canned one. The project's owners keep OWNER on
+    /// the bucket. Refused before sending in an update that turns uniform
+    /// bucket-level access on; on a bucket that already has it, Cloud
+    /// Storage refuses it (`error.UniformAccessEnabled`). A default object
+    /// list change takes up to 30 seconds to reach new objects.
+    predefined_acl: ?PredefinedBucketAcl = null,
+    predefined_default_object_acl: ?PredefinedAcl = null,
     /// Change the bucket only while its metageneration is this: what makes
     /// the update safe to retry.
     if_metageneration_match: ?u64 = null,

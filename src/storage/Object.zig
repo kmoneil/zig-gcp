@@ -385,7 +385,11 @@ fn uploadCompressed(self: Object, input: gzip_upload.Input, options: types.Uploa
 fn sendMultipart(self: Object, data: []const u8, options: types.UploadOptions, checksum: ?[8]u8) Error!types.Owned(types.ObjectInfo) {
     var scratch: std.heap.ArenaAllocator = .init(self.client.gpa);
     defer scratch.deinit();
-    const path = try names.uploadMultipartPath(scratch.allocator(), self.bucket, options.preconditions, options.kms_key_name);
+    const path = try names.uploadMultipartPath(scratch.allocator(), self.bucket, .{
+        .preconditions = options.preconditions,
+        .kms_key_name = options.kms_key_name,
+        .predefined_acl = options.predefined_acl,
+    });
     const parts = try multipart.build(scratch.allocator(), self.client.io, self.name, options, checksum);
 
     var result: types.Owned(types.ObjectInfo) = try .init(self.client.gpa);
@@ -1044,6 +1048,46 @@ test "golden: get a noncurrent generation, and a soft-deleted one by its generat
     try testing.expectError(error.InvalidArgument, h.client.bucket("b").object("u").get(.{ .soft_deleted = true }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "by its generation") != null);
     try h.expectRequestCount(2);
+}
+
+test "golden: get with its access control list, as production answered it" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"kind":"storage#object","name":"a.txt","bucket":"zigps-acl-c8db87","generation":"1791214570572809","metageneration":"1",
+        \\ "owner":{"entity":"user-zig-gcp@extractctl.iam.gserviceaccount.com"},
+        \\ "acl":[{"kind":"storage#objectAccessControl","object":"a.txt","generation":"1791214570572809",
+        \\  "id":"zigps-acl-c8db87/a.txt/1791214570572809/project-owners-82150720798","bucket":"zigps-acl-c8db87",
+        \\  "entity":"project-owners-82150720798","role":"OWNER","etag":"CImYyKGao5cDEAE=",
+        \\  "projectTeam":{"projectNumber":"82150720798","team":"owners"}},
+        \\ {"kind":"storage#objectAccessControl","entity":"project-viewers-82150720798","role":"READER",
+        \\  "projectTeam":{"projectNumber":"82150720798","team":"viewers"}},
+        \\ {"kind":"storage#objectAccessControl","entity":"user-zig-gcp@extractctl.iam.gserviceaccount.com","role":"OWNER",
+        \\  "email":"zig-gcp@extractctl.iam.gserviceaccount.com"}]}
+        } },
+        .{ .respond = .{ .body = "{\"name\":\"b.txt\",\"generation\":\"2\"}" } },
+    }, .{});
+    defer h.deinit();
+    const obj = h.client.bucket("zigps-acl-c8db87").object("a.txt");
+
+    var full = try obj.get(.{ .with_acl = true, .generation = 1791214570572809 });
+    defer full.deinit();
+    try h.expectRequest(0, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-acl-c8db87/o/a.txt?projection=full&generation=1791214570572809", null);
+    const entries = full.value.acl.?;
+    try testing.expectEqual(3, entries.len);
+    try testing.expectEqual(.owners, entries[0].entity.project.team);
+    try testing.expectEqualStrings("82150720798", entries[0].entity.project.number);
+    try testing.expectEqual(.reader, entries[1].role);
+    try testing.expectEqualStrings("zig-gcp@extractctl.iam.gserviceaccount.com", entries[2].email.?);
+    try testing.expectEqualStrings("zig-gcp@extractctl.iam.gserviceaccount.com", full.value.owner.?.user);
+
+    // Not asked for, or not readable: no list at all, which is not an
+    // empty one.
+    var plain = try h.client.bucket("zigps-acl-c8db87").object("b.txt").get(.{});
+    defer plain.deinit();
+    try h.expectRequest(1, .GET, "https://storage.googleapis.com/storage/v1/b/zigps-acl-c8db87/o/b.txt", null);
+    try testing.expectEqual(null, plain.value.acl);
+    try testing.expectEqual(null, plain.value.owner);
 }
 
 test "exists: found, missing, and a failure that is neither" {

@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 const query = @import("core").query;
+const acl = @import("acl.zig");
 const types = @import("types.zig");
 
 /// `/storage/v1/b?project=...` with paging, for bucket create and list.
@@ -14,6 +15,18 @@ pub fn bucketsPath(arena: Allocator, project: []const u8, page: types.PageOption
     var out: Writer.Allocating = .init(arena);
     write(&out.writer, .{ .project = project, .page_size = page.page_size, .page_token = page.page_token }) catch
         return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// `path` with one more query parameter, `name=value` with the value
+/// encoded, after whatever query it already has.
+pub fn withParam(arena: Allocator, path: []const u8, name: []const u8, value: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeAll(path) catch return error.OutOfMemory;
+    w.writeByte(if (std.mem.indexOfScalar(u8, path, '?') == null) '?' else '&') catch return error.OutOfMemory;
+    w.print("{s}=", .{name}) catch return error.OutOfMemory;
+    query.writeValue(w, value) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
@@ -357,6 +370,7 @@ pub fn objectsPath(arena: Allocator, bucket: []const u8, options: types.ListOpti
         .versions = options.versions,
         .soft_deleted = options.soft_deleted,
         .folders_as_prefixes = options.include_folders_as_prefixes,
+        .full_acl = options.with_acl,
         .page_size = options.page_size,
         .page_token = options.page_token,
     }) catch return error.OutOfMemory;
@@ -374,6 +388,7 @@ pub fn objectGetPath(arena: Allocator, bucket: []const u8, object: []const u8, o
         .preconditions = options.preconditions,
         .soft_deleted = options.soft_deleted,
         .restore_token = options.restore_token,
+        .full_acl = options.with_acl,
     }) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
@@ -405,6 +420,7 @@ pub fn composePath(
     object: []const u8,
     preconditions: types.Preconditions,
     kms_key_name: ?[]const u8,
+    predefined_acl: ?types.PredefinedAcl,
 ) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
     write(&out.writer, .{
@@ -413,6 +429,7 @@ pub fn composePath(
         .compose = true,
         .preconditions = preconditions,
         .kms_key_name = kms_key_name,
+        .destination_predefined_acl = predefined_acl,
     }) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
@@ -447,6 +464,8 @@ pub const RewriteParams = struct {
     preconditions: types.Preconditions = .{},
     /// The Cloud KMS key that encrypts the copy.
     destination_kms_key_name: ?[]const u8 = null,
+    /// The copy's canned access control list.
+    destination_predefined_acl: ?types.PredefinedAcl = null,
     /// Continues an earlier call's work.
     rewrite_token: ?[]const u8 = null,
 };
@@ -488,6 +507,7 @@ fn writeRewrite(
     if (rewrite.if_source_metageneration_match) |m| try params.addInt("ifSourceMetagenerationMatch", m);
     try writePreconditions(&params, rewrite.preconditions);
     try params.addOptional("destinationKmsKeyName", rewrite.destination_kms_key_name);
+    if (rewrite.destination_predefined_acl) |p| try params.add("destinationPredefinedAcl", acl.predefinedName(p));
     try params.addOptional("rewriteToken", rewrite.rewrite_token);
 }
 
@@ -527,32 +547,39 @@ fn writeMove(
     try writePreconditions(&params, preconditions);
 }
 
-/// `/upload/storage/v1/b/{bucket}/o?uploadType=multipart`, with the
-/// Cloud KMS key to encrypt under, if any. The object name travels in the
-/// metadata part, not here.
-pub fn uploadMultipartPath(arena: Allocator, bucket: []const u8, preconditions: types.Preconditions, kms_key_name: ?[]const u8) Allocator.Error![]u8 {
+/// What an upload's path says beside the bucket: the conditions, the
+/// Cloud KMS key to encrypt under, and the canned access control list.
+pub const UploadParams = struct {
+    preconditions: types.Preconditions = .{},
+    kms_key_name: ?[]const u8 = null,
+    predefined_acl: ?types.PredefinedAcl = null,
+};
+
+/// `/upload/storage/v1/b/{bucket}/o?uploadType=multipart`. The object name
+/// travels in the metadata part, not here.
+pub fn uploadMultipartPath(arena: Allocator, bucket: []const u8, upload: UploadParams) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
-    writeUpload(&out.writer, bucket, "multipart", preconditions, kms_key_name) catch return error.OutOfMemory;
+    writeUpload(&out.writer, bucket, "multipart", upload) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
 /// `/upload/storage/v1/b/{bucket}/o?uploadType=resumable`, which opens a
-/// session, with the Cloud KMS key to encrypt under, if any. The object
-/// name travels in the metadata body.
-pub fn uploadResumablePath(arena: Allocator, bucket: []const u8, preconditions: types.Preconditions, kms_key_name: ?[]const u8) Allocator.Error![]u8 {
+/// session. The object name travels in the metadata body.
+pub fn uploadResumablePath(arena: Allocator, bucket: []const u8, upload: UploadParams) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
-    writeUpload(&out.writer, bucket, "resumable", preconditions, kms_key_name) catch return error.OutOfMemory;
+    writeUpload(&out.writer, bucket, "resumable", upload) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn writeUpload(w: *Writer, bucket: []const u8, upload_type: []const u8, preconditions: types.Preconditions, kms_key_name: ?[]const u8) Writer.Error!void {
+fn writeUpload(w: *Writer, bucket: []const u8, upload_type: []const u8, upload: UploadParams) Writer.Error!void {
     try w.writeAll("/upload/storage/v1/b/");
     try query.writeStrictSegment(w, bucket);
     try w.print("/o?uploadType={s}", .{upload_type});
     var params: query.Params = .init(w);
     params.separator = '&';
-    try writePreconditions(&params, preconditions);
-    try params.addOptional("kmsKeyName", kms_key_name);
+    try writePreconditions(&params, upload.preconditions);
+    try params.addOptional("kmsKeyName", upload.kms_key_name);
+    if (upload.predefined_acl) |p| try params.add("predefinedAcl", acl.predefinedName(p));
 }
 
 /// Writes a bucket or object name into an XML API path, as signed URLs and
@@ -618,6 +645,8 @@ const Parts = struct {
     alt_media: bool = false,
     /// `projection=noAcl`.
     no_acl: bool = false,
+    /// `projection=full`: the access control lists and owner too.
+    full_acl: bool = false,
     project: ?[]const u8 = null,
     generation: ?u64 = null,
     preconditions: types.Preconditions = .{},
@@ -634,6 +663,7 @@ const Parts = struct {
     copy_source_acl: bool = false,
     restore_token: ?[]const u8 = null,
     kms_key_name: ?[]const u8 = null,
+    destination_predefined_acl: ?types.PredefinedAcl = null,
     page_size: u32 = 0,
     page_token: ?[]const u8 = null,
 };
@@ -654,10 +684,12 @@ fn write(w: *Writer, parts: Parts) Writer.Error!void {
     var params: query.Params = .init(w);
     if (parts.alt_media) try params.add("alt", "media");
     if (parts.no_acl) try params.add("projection", "noAcl");
+    if (parts.full_acl) try params.add("projection", "full");
     try params.addOptional("project", parts.project);
     if (parts.generation) |g| try params.addInt("generation", g);
     try writePreconditions(&params, parts.preconditions);
     try params.addOptional("kmsKeyName", parts.kms_key_name);
+    if (parts.destination_predefined_acl) |p| try params.add("destinationPredefinedAcl", acl.predefinedName(p));
     try params.addOptional("prefix", parts.prefix);
     try params.addOptional("delimiter", parts.delimiter);
     try params.addOptional("matchGlob", parts.match_glob);
@@ -746,7 +778,7 @@ test "media and upload paths" {
     );
     try expectPath(
         "/upload/storage/v1/b/my-bucket/o?uploadType=multipart",
-        try uploadMultipartPath(gpa, "my-bucket", .{}, null),
+        try uploadMultipartPath(gpa, "my-bucket", .{}),
     );
 }
 
@@ -843,22 +875,37 @@ test "preconditions become their query parameters, in every position" {
     // Upload paths already carry a query; conditions append to it.
     try expectPath(
         "/upload/storage/v1/b/b/o?uploadType=multipart&ifGenerationMatch=0",
-        try uploadMultipartPath(gpa, "b", .does_not_exist, null),
+        try uploadMultipartPath(gpa, "b", .{ .preconditions = .does_not_exist }),
     );
     try expectPath(
         "/upload/storage/v1/b/b/o?uploadType=resumable&ifGenerationMatch=12",
-        try uploadResumablePath(gpa, "b", .{ .if_generation_match = 12 }, null),
+        try uploadResumablePath(gpa, "b", .{ .preconditions = .{ .if_generation_match = 12 } }),
     );
-    try expectPath("/upload/storage/v1/b/b/o?uploadType=resumable", try uploadResumablePath(gpa, "b", .{}, null));
+    try expectPath("/upload/storage/v1/b/b/o?uploadType=resumable", try uploadResumablePath(gpa, "b", .{}));
     // A Cloud KMS key rides along as a strict query value.
     try expectPath(
         "/upload/storage/v1/b/b/o?uploadType=resumable&ifGenerationMatch=0&kmsKeyName=projects%2Fp%2Flocations%2Fus%2FkeyRings%2Fr%2FcryptoKeys%2Fk",
-        try uploadResumablePath(gpa, "b", .does_not_exist, "projects/p/locations/us/keyRings/r/cryptoKeys/k"),
+        try uploadResumablePath(gpa, "b", .{ .preconditions = .does_not_exist, .kms_key_name = "projects/p/locations/us/keyRings/r/cryptoKeys/k" }),
     );
     try expectPath(
         "/upload/storage/v1/b/b/o?uploadType=multipart&kmsKeyName=k%20%26x",
-        try uploadMultipartPath(gpa, "b", .{}, "k &x"),
+        try uploadMultipartPath(gpa, "b", .{ .kms_key_name = "k &x" }),
     );
+    // A canned access control list goes last, under its JSON name.
+    try expectPath(
+        "/upload/storage/v1/b/b/o?uploadType=multipart&ifGenerationMatch=0&predefinedAcl=bucketOwnerFullControl",
+        try uploadMultipartPath(gpa, "b", .{ .preconditions = .does_not_exist, .predefined_acl = .bucket_owner_full_control }),
+    );
+    try expectPath(
+        "/upload/storage/v1/b/b/o?uploadType=resumable&predefinedAcl=projectPrivate",
+        try uploadResumablePath(gpa, "b", .{ .predefined_acl = .project_private }),
+    );
+    try expectPath(
+        "/storage/v1/b/b/o/c/compose?ifGenerationMatch=0&destinationPredefinedAcl=private",
+        try composePath(gpa, "b", "c", .does_not_exist, null, .private),
+    );
+    try expectPath("/storage/v1/b/b?projection=noAcl&predefinedAcl=private", try withParam(gpa, "/storage/v1/b/b?projection=noAcl", "predefinedAcl", "private"));
+    try expectPath("/storage/v1/b/b/o/a?x=a%20b", try withParam(gpa, "/storage/v1/b/b/o/a", "x", "a b"));
     try expectPath("/storage/v1/projects/my-project/serviceAccount", try serviceAgentPath(gpa, "my-project"));
 }
 
@@ -916,5 +963,10 @@ test "rewrite paths name both objects and carry the loop's state" {
             .if_source_metageneration_match = 3,
             .preconditions = .does_not_exist,
         }),
+    );
+    // The copy's canned list, before the loop's token.
+    try expectPath(
+        "/storage/v1/b/s/o/a/rewriteTo/b/d/o/b?destinationPredefinedAcl=bucketOwnerRead&rewriteToken=t",
+        try rewritePath(gpa, "s", "a", "d", "b", .{ .destination_predefined_acl = .bucket_owner_read, .rewrite_token = "t" }),
     );
 }
