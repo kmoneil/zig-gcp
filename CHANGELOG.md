@@ -4,6 +4,22 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.34.0 (unreleased)
+
+- firestore: **Fixed:** an error the server sends inside a streamed
+  answer fails the call with that error. Production answers a query that
+  runs past its deadline with the documents it found and then
+  `DEADLINE_EXCEEDED`, inside the same 200 response (measured
+  2026-10-05). `runQuery` skipped the error and answered the documents
+  before it as the whole result; `batchGet` and `Document.get` at a read
+  time or in a transaction answered `error.InvalidResponse`; aggregations
+  answered `error.InvalidResponse` too. Each now returns the error the
+  server sent, `error.DeadlineExceeded` here, with its status, message
+  and code in `Diagnostics`. It is not retried: it arrived in a success
+  response, and a read that ran past its deadline would likely do so
+  again.
+- auth, core, pubsub, secret_manager and storage: unchanged.
+
 ## 0.33.0 (2026-10-05)
 
 - storage: access control lists, read and canned. `GetOptions.with_acl`

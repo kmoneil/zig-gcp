@@ -21,6 +21,24 @@ const Value = types.Value;
 
 pub const DecodeError = error{ InvalidResponse, OutOfMemory };
 
+/// What decoding a streamed answer fails with: `error.Streamed` is an error
+/// the server sent inside the answer, filled into the caller's
+/// `StreamedError`.
+pub const StreamDecodeError = DecodeError || error{Streamed};
+
+/// An error the server sent as an element of a streamed answer, after the
+/// messages before it, in a 200 response. Measured on production
+/// (2026-10-05): a query past its deadline answers the documents it found
+/// and then `{"error": {"code": 504, "message": ..., "status":
+/// "DEADLINE_EXCEEDED", "details": [...]}}`. The strings live where the
+/// answer was decoded.
+pub const StreamedError = struct {
+    /// The HTTP status it carries; 0 when it carries none.
+    code: u16 = 0,
+    status: []const u8 = "",
+    message: []const u8 = "",
+};
+
 /// Deepest nesting of maps and arrays a response may hold. The server
 /// stores at most 20; this leaves room without letting a broken response
 /// recurse without end.
@@ -410,13 +428,15 @@ pub const BatchGetElement = struct {
 
 /// The `batchGet` answer: one JSON array of stream messages, measured on
 /// the emulator, in no particular order and with a name asked twice
-/// answered once.
-pub fn decodeBatchGet(arena: Allocator, body: []const u8) DecodeError![]const BatchGetElement {
+/// answered once; production sorts them by name, the missing last. An
+/// error inside it is `error.Streamed`, told in `streamed`.
+pub fn decodeBatchGet(arena: Allocator, body: []const u8, streamed: *?StreamedError) StreamDecodeError![]const BatchGetElement {
     const tree = try parseTree(arena, body);
     if (tree != .array) return error.InvalidResponse;
     const out = try arena.alloc(BatchGetElement, tree.array.items.len);
     for (tree.array.items, out) |item, *e| {
         const obj = objectOf(item) orelse return error.InvalidResponse;
+        try checkStreamed(obj, streamed);
         e.* = .{};
         if (present(obj, "found")) |f| e.found = try snapshotFrom(arena, f);
         if (present(obj, "missing")) |m| {
@@ -432,8 +452,10 @@ pub fn decodeBatchGet(arena: Allocator, body: []const u8) DecodeError![]const Ba
 /// The `runQuery` answer: one JSON array of stream messages, measured on
 /// the emulator: a document with its read time each, a lone read time for
 /// an empty result, `done` riding on the last, and, from production,
-/// `skippedResults` counting what an offset passed over.
-pub fn decodeRunQuery(arena: Allocator, body: []const u8) DecodeError!types.QueryResult {
+/// `skippedResults` counting what an offset passed over. An error inside
+/// it, after documents or not, is `error.Streamed`, told in `streamed`:
+/// the documents before it are not the whole result.
+pub fn decodeRunQuery(arena: Allocator, body: []const u8, streamed: *?StreamedError) StreamDecodeError!types.QueryResult {
     const tree = try parseTree(arena, body);
     if (tree != .array) return error.InvalidResponse;
     var documents: std.ArrayList(types.Snapshot) = .empty;
@@ -441,6 +463,7 @@ pub fn decodeRunQuery(arena: Allocator, body: []const u8) DecodeError!types.Quer
     var skipped: u64 = 0;
     for (tree.array.items) |item| {
         const obj = objectOf(item) orelse return error.InvalidResponse;
+        try checkStreamed(obj, streamed);
         if (present(obj, "document")) |d| try documents.append(arena, try snapshotFrom(arena, d));
         if (present(obj, "readTime")) |_| read_time = try requiredTime(obj, "readTime");
         if (present(obj, "skippedResults")) |n| {
@@ -457,14 +480,16 @@ pub fn decodeRunQuery(arena: Allocator, body: []const u8) DecodeError!types.Quer
 
 /// The `runAggregationQuery` answer: one JSON array whose result message
 /// holds each aggregation under the alias it was sent with, `a0` to
-/// `a{count - 1}`.
-pub fn decodeAggregation(arena: Allocator, body: []const u8, count: usize) DecodeError!types.AggregationResult {
+/// `a{count - 1}`. An error inside it is `error.Streamed`, told in
+/// `streamed`.
+pub fn decodeAggregation(arena: Allocator, body: []const u8, count: usize, streamed: *?StreamedError) StreamDecodeError!types.AggregationResult {
     const tree = try parseTree(arena, body);
     if (tree != .array) return error.InvalidResponse;
     var values: ?[]Value = null;
     var read_time: ?std.Io.Timestamp = null;
     for (tree.array.items) |item| {
         const obj = objectOf(item) orelse return error.InvalidResponse;
+        try checkStreamed(obj, streamed);
         if (present(obj, "readTime")) |_| read_time = try requiredTime(obj, "readTime");
         const result = objectOf(present(obj, "result") orelse continue) orelse return error.InvalidResponse;
         if (values != null) return error.InvalidResponse;
@@ -527,6 +552,27 @@ fn objectOf(v: std.json.Value) ?std.json.ObjectMap {
         .object => |o| o,
         else => null,
     };
+}
+
+/// `error.Streamed` when the stream message `obj` is an error, with what
+/// it says in `out`. Read leniently: whatever its shape, an error ends the
+/// answer.
+fn checkStreamed(obj: std.json.ObjectMap, out: *?StreamedError) error{Streamed}!void {
+    const e = present(obj, "error") orelse return;
+    var streamed: StreamedError = .{};
+    if (objectOf(e)) |fields| {
+        if (present(fields, "code")) |code| {
+            if (numberText(code)) |text| streamed.code = std.fmt.parseInt(u16, text, 10) catch 0;
+        }
+        if (present(fields, "status")) |status| if (status == .string) {
+            streamed.status = status.string;
+        };
+        if (present(fields, "message")) |message| if (message == .string) {
+            streamed.message = message.string;
+        };
+    }
+    out.* = streamed;
+    return error.Streamed;
 }
 
 /// The member `key` of `obj`, unless it is missing or `null`.
