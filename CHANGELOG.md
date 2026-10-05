@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.32.0 (unreleased)
+## 0.32.0 (2026-10-05)
 
 - pubsub: the Subscriber's and the Publisher's own tasks now also watch a
   stop flag that `run` raises on every way out, cancel delivered or not.
@@ -12,11 +12,11 @@ including the ones that did not change.
   (docs/zig-std-workarounds.md), and a task that missed its own could
   keep `run` waiting on it forever; it now ends soon after on the flag.
   No API changed.
-- firestore: new module, stability `experimental`, in progress: a client
-  for Cloud Firestore's v1 REST API, against the default database or a
-  named one, and the emulator through `Endpoint.fromEnv`, which reads
-  `FIRESTORE_EMULATOR_HOST`. So far: documents read whole or through a
-  read mask, created (under an id of the caller's or a random one of 20
+- firestore: new module, stability `experimental`: a client for Cloud
+  Firestore's v1 REST API, against the default database or a named one,
+  and the emulator through `Endpoint.fromEnv`, which reads
+  `FIRESTORE_EMULATOR_HOST`. Documents are read whole or through a read
+  mask, created (under an id of the caller's or a random one of 20
   characters chosen before sending, so a create whose answer was lost
   reads its own document back), set whole, updated through a field mask
   (a masked path with no value deletes it, and one inside a map changes
