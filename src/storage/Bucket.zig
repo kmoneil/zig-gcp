@@ -7,6 +7,7 @@ const Bucket = @This();
 const std = @import("std");
 const core = @import("core");
 
+const AclList = @import("AclList.zig");
 const Client = @import("Client.zig");
 const Folder = @import("Folder.zig");
 const ManagedFolder = @import("ManagedFolder.zig");
@@ -393,6 +394,18 @@ fn iamResource(self: Bucket) Error!iam.Resource {
 
 /// A handle for the object `name` in this bucket. Sends nothing. The handle
 /// borrows the client and both names, and must not outlive them.
+/// The bucket's own access control list, which says who may list,
+/// create and delete its objects and read its metadata, where uniform
+/// bucket-level access is off. Sends nothing.
+pub fn acl(self: Bucket) AclList {
+    return .{ .client = self.client, .bucket = self.name, .target = .bucket, .billing_project = self.billing_project };
+}
+
+/// The list objects written without one of their own get. Sends nothing.
+pub fn defaultObjectAcl(self: Bucket) AclList {
+    return .{ .client = self.client, .bucket = self.name, .target = .default_object, .billing_project = self.billing_project };
+}
+
 pub fn object(self: Bucket, name: []const u8) Object {
     return .{ .client = self.client, .bucket = self.name, .name = name, .billing_project = self.billing_project };
 }

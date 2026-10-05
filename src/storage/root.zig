@@ -53,6 +53,9 @@ pub const PublicAccessPrevention = @import("types.zig").PublicAccessPrevention;
 pub const AclRole = @import("types.zig").AclRole;
 pub const AclEntity = @import("types.zig").AclEntity;
 pub const AclEntry = @import("types.zig").AclEntry;
+pub const Acl = @import("types.zig").Acl;
+pub const AclGuard = @import("types.zig").AclGuard;
+pub const AclList = @import("AclList.zig");
 pub const PredefinedAcl = @import("types.zig").PredefinedAcl;
 pub const PredefinedBucketAcl = @import("types.zig").PredefinedBucketAcl;
 /// Access control list entities as Cloud Storage spells them: read from a
@@ -138,6 +141,8 @@ pub const transport = core.transport;
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("acl.zig");
+    _ = @import("AclList.zig");
+    _ = @import("fake_acl.zig");
     _ = @import("Bucket.zig");
     _ = @import("bucket_settings.zig");
     _ = @import("Client.zig");

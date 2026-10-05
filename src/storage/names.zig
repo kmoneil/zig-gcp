@@ -358,6 +358,52 @@ fn writeBucketTestPermissions(w: *Writer, bucket: []const u8, permissions: []con
     for (permissions) |permission| try params.add("permissions", permission);
 }
 
+/// `/storage/v1/b/{bucket}` or `/storage/v1/b/{bucket}/o/{object}` with
+/// `projection=full` and a whole-list write's conditions: where an access
+/// control list is read with what guards its write, and written.
+pub fn aclResourcePath(arena: Allocator, bucket: []const u8, object: ?[]const u8, guard: types.AclGuard) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    write(&out.writer, .{
+        .bucket = bucket,
+        .object = object,
+        .full_acl = true,
+        .preconditions = .{
+            .if_generation_match = guard.if_generation_match,
+            .if_metageneration_match = guard.if_metageneration_match,
+        },
+    }) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+/// Which list a single-entry path names.
+pub const AclTarget = enum { bucket, default_object, object };
+
+/// `.../acl`, `.../defaultObjectAcl` or `.../o/{object}/acl`, and one
+/// entry of it when `entity` names one, as one strictly encoded segment.
+pub fn aclEntryPath(arena: Allocator, bucket: []const u8, object: ?[]const u8, target: AclTarget, entity: ?[]const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeAclEntry(&out.writer, bucket, object, target, entity) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeAclEntry(w: *Writer, bucket: []const u8, object: ?[]const u8, target: AclTarget, entity: ?[]const u8) Writer.Error!void {
+    try w.writeAll("/storage/v1/b/");
+    try query.writeStrictSegment(w, bucket);
+    switch (target) {
+        .bucket => try w.writeAll("/acl"),
+        .default_object => try w.writeAll("/defaultObjectAcl"),
+        .object => {
+            try w.writeAll("/o/");
+            try query.writeStrictSegment(w, object.?);
+            try w.writeAll("/acl");
+        },
+    }
+    if (entity) |e| {
+        try w.writeByte('/');
+        try query.writeStrictSegment(w, e);
+    }
+}
+
 /// `/storage/v1/b/{bucket}/o` with listing options.
 pub fn objectsPath(arena: Allocator, bucket: []const u8, options: types.ListOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
@@ -907,6 +953,23 @@ test "preconditions become their query parameters, in every position" {
     try expectPath("/storage/v1/b/b?projection=noAcl&predefinedAcl=private", try withParam(gpa, "/storage/v1/b/b?projection=noAcl", "predefinedAcl", "private"));
     try expectPath("/storage/v1/b/b/o/a?x=a%20b", try withParam(gpa, "/storage/v1/b/b/o/a", "x", "a b"));
     try expectPath("/storage/v1/projects/my-project/serviceAccount", try serviceAgentPath(gpa, "my-project"));
+}
+
+test "access control list paths: the guarded resource, and each list and entry" {
+    const gpa = testing.allocator;
+    try expectPath("/storage/v1/b/b?projection=full", try aclResourcePath(gpa, "b", null, .{}));
+    try expectPath(
+        "/storage/v1/b/b/o/a%2Fb?projection=full&ifGenerationMatch=7&ifMetagenerationMatch=2",
+        try aclResourcePath(gpa, "b", "a/b", .{ .if_generation_match = 7, .if_metageneration_match = 2 }),
+    );
+    try expectPath("/storage/v1/b/b/acl", try aclEntryPath(gpa, "b", null, .bucket, null));
+    try expectPath("/storage/v1/b/b/defaultObjectAcl/allUsers", try aclEntryPath(gpa, "b", null, .default_object, "allUsers"));
+    // An entity is one segment: its `@` and `+` encoded, as Node's client
+    // encodes them.
+    try expectPath(
+        "/storage/v1/b/b/o/a%2Fb/acl/user-a%2Bb%40example.com",
+        try aclEntryPath(gpa, "b", "a/b", .object, "user-a+b@example.com"),
+    );
 }
 
 test "XML API paths keep the name's slashes and encode the rest" {
