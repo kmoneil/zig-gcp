@@ -70,7 +70,8 @@ the properties too slow to share one: auth's RSA signing
 `slow-subscriber`) and its heavy properties (`heavy-pubsub`), storage's
 slow and heavy properties (`slow-storage`, `heavy-storage`), and its
 fault properties, which drive whole transfers through injected faults
-(`fault-storage`, `fault-gzip`). A test that fails while being fuzzed
+(`fault-storage`, `fault-gzip`), and Firestore's model of writes against
+its fake (`heavy-firestore`). A test that fails while being fuzzed
 fails its job, and the input is attached to the run as
 `fuzz-failure-<job>`, such as `fuzz-failure-pubsub`.
 
@@ -110,6 +111,39 @@ a read-only Pub/Sub call with the token it gets:
 ```sh
 AUTH_TEST_CREDENTIALS=$HOME/.config/gcloud/application_default_credentials.json \
     PUBSUB_TEST_PROJECT=my-project zig build test-integration
+```
+
+### Firestore
+
+Three suites, each skipping without what it needs. Against the
+emulator, every test in a project of its own:
+
+```sh
+gcloud emulators firestore start --host-port=127.0.0.1:8087
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8087 zig build test-integration
+```
+
+The unit test that holds `FakeFirestore` to the emulator, over 400
+random queries and aggregations per seed, five seeds; it skips without
+the emulator, and `FIRESTORE_DIFF_SEED` replays one seed:
+
+```sh
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8087 \
+    zig build test -Dmodule=firestore "-Dtest-filter=emulator differential"
+```
+
+Against production, in a named database made for the run and deleted
+after it; the suite refuses `(default)`. Firestore's free quota covers
+one database per project, the first made, so in a project that already
+has one, the run is billed, a fraction of a cent. A deleted database's
+id cannot be used again for about 5 minutes.
+
+```sh
+DB=zigps-fs-$(openssl rand -hex 4)
+gcloud firestore databases create --database=$DB --location=us-central1
+GCP_TEST_PROJECT=my-project FIRESTORE_TEST_DATABASE=$DB \
+    GCP_TEST_TOKEN=$(gcloud auth print-access-token) zig build test-integration-gcp
+gcloud firestore databases delete --database=$DB
 ```
 
 ### Secret Manager and bucket settings

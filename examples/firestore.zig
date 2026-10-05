@@ -245,6 +245,7 @@ fn parseFields(arena: std.mem.Allocator, pairs: []const []const u8) ![]const fir
     return fields;
 }
 
+// snippet: transfer
 /// Moves `amount` of `field` from one document to another, as a
 /// transaction's handler: run again from the start whenever the server
 /// aborts the transaction, so it only reads and writes through `txn`.
@@ -279,6 +280,7 @@ const Transfer = struct {
         return if (v == .integer) v.integer else 0;
     }
 };
+// end snippet
 
 fn parseOp(text: []const u8) ?firestore.Operator {
     const ops = std.StaticStringMap(firestore.Operator).initComptime(.{

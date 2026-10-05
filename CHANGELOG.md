@@ -56,7 +56,11 @@ including the ones that did not change.
   `commit` are there for driving one by hand. The module has been run
   against production Firestore, in a named database, and a field path of
   1,500 bytes, which production refuses though the documentation allows
-  it, is now refused before sending.
+  it, is now refused before sending. Guides in `docs/firestore/` cover
+  values and documents, writing, queries and aggregations, transactions,
+  and the emulator's differences from production; the README lists the
+  module, and two nightly fuzz jobs, `firestore` and `heavy-firestore`,
+  fuzz it.
 - core: `decodeErrorBody` and `decodeErrorInfos` read an error sent inside
   the JSON array a streamed REST answer travels in, `[{"error": ...}]`,
   as Firestore's runQuery sends one in production; the status there

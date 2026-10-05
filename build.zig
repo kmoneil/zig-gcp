@@ -141,6 +141,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "pubsub", .module = mod },
                 .{ .name = "secret_manager", .module = secret_manager },
+                .{ .name = "firestore", .module = firestore },
                 .{ .name = "core", .module = core },
             },
         }),
