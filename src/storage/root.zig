@@ -56,6 +56,13 @@ pub const AclEntry = @import("types.zig").AclEntry;
 pub const Acl = @import("types.zig").Acl;
 pub const AclGuard = @import("types.zig").AclGuard;
 pub const AclList = @import("AclList.zig");
+pub const HmacKey = @import("HmacKey.zig");
+pub const HmacKeyState = @import("types.zig").HmacKeyState;
+pub const HmacKeyInfo = @import("types.zig").HmacKeyInfo;
+pub const NewHmacKey = @import("types.zig").NewHmacKey;
+pub const HmacCreateOptions = @import("types.zig").HmacCreateOptions;
+pub const HmacListOptions = @import("types.zig").HmacListOptions;
+pub const HmacKeyPage = @import("types.zig").HmacKeyPage;
 pub const PredefinedAcl = @import("types.zig").PredefinedAcl;
 pub const PredefinedBucketAcl = @import("types.zig").PredefinedBucketAcl;
 /// Access control list entities as Cloud Storage spells them: read from a
@@ -142,7 +149,9 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("acl.zig");
     _ = @import("AclList.zig");
+    _ = @import("HmacKey.zig");
     _ = @import("fake_acl.zig");
+    _ = @import("fake_hmac.zig");
     _ = @import("Bucket.zig");
     _ = @import("bucket_settings.zig");
     _ = @import("Client.zig");

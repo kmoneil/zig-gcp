@@ -308,6 +308,76 @@ fn writeAclBody(jw: *Stringify, arena: Allocator, field: []const u8, entries: []
     try jw.endObject();
 }
 
+const WireHmacKey = struct {
+    accessId: ?[]const u8 = null,
+    projectId: ?[]const u8 = null,
+    serviceAccountEmail: ?[]const u8 = null,
+    state: ?[]const u8 = null,
+    timeCreated: ?[]const u8 = null,
+    updated: ?[]const u8 = null,
+    etag: ?[]const u8 = null,
+};
+
+/// A key's metadata. One that names no access ID could not be addressed
+/// again, so it is `InvalidResponse`.
+fn hmacKeyFromWire(wire: WireHmacKey) DecodeError!types.HmacKeyInfo {
+    return .{
+        .access_id = nonEmpty(wire.accessId) orelse return error.InvalidResponse,
+        .project_id = wire.projectId orelse "",
+        .service_account_email = wire.serviceAccountEmail orelse "",
+        .state = hmacStateOf(wire.state orelse ""),
+        .time_created = wire.timeCreated orelse "",
+        .updated = wire.updated orelse "",
+        .etag = wire.etag orelse "",
+    };
+}
+
+pub fn hmacStateOf(text: []const u8) types.HmacKeyState {
+    if (std.mem.eql(u8, text, "ACTIVE")) return .active;
+    if (std.mem.eql(u8, text, "INACTIVE")) return .inactive;
+    if (std.mem.eql(u8, text, "DELETED")) return .deleted;
+    return .unknown;
+}
+
+/// A state as the wire spells it, or null for one never sent.
+pub fn hmacStateName(state: types.HmacKeyState) ?[]const u8 {
+    return switch (state) {
+        .active => "ACTIVE",
+        .inactive => "INACTIVE",
+        .deleted, .unknown => null,
+    };
+}
+
+/// A create's answer: the metadata, and the secret, which must be there.
+pub fn decodeNewHmacKey(arena: Allocator, body: []const u8) DecodeError!types.NewHmacKey {
+    const wire = try parseWire(struct { metadata: ?WireHmacKey = null, secret: ?[]const u8 = null }, arena, body);
+    return .{
+        .info = try hmacKeyFromWire(wire.metadata orelse return error.InvalidResponse),
+        .secret = nonEmpty(wire.secret) orelse return error.InvalidResponse,
+    };
+}
+
+pub fn decodeHmacKeyInfo(arena: Allocator, body: []const u8) DecodeError!types.HmacKeyInfo {
+    return hmacKeyFromWire(try parseWire(WireHmacKey, arena, body));
+}
+
+/// One page of keys. A page of none has no `items`.
+pub fn decodeHmacKeyPage(arena: Allocator, body: []const u8) DecodeError!types.HmacKeyPage {
+    const wire = try parseWire(struct { items: ?[]const WireHmacKey = null, nextPageToken: ?[]const u8 = null }, arena, body);
+    const listed = wire.items orelse &.{};
+    const keys = try arena.alloc(types.HmacKeyInfo, listed.len);
+    for (listed, keys) |w, *key| key.* = try hmacKeyFromWire(w);
+    return .{ .keys = keys, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+/// An update's body: the state, and the etag it is conditioned on.
+pub fn encodeHmacUpdate(arena: Allocator, state: []const u8, etag: ?[]const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer, .options = .{ .emit_null_optional_fields = false } };
+    jw.write(.{ .state = state, .etag = etag }) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
 /// One Bucket resource.
 pub fn decodeBucket(arena: Allocator, body: []const u8) DecodeError!types.BucketInfo {
     return bucketFromWire(arena, try parseWire(WireBucket, arena, body));

@@ -722,6 +722,75 @@ pub const AclGuard = struct {
     if_generation_match: ?u64 = null,
 };
 
+/// What an HMAC key may do.
+pub const HmacKeyState = enum {
+    /// Signs requests: the state a new key starts in.
+    active,
+    /// Refused wherever it signed, until made active again; only an
+    /// inactive key can be deleted.
+    inactive,
+    /// Deleted for good. Still read, and listed with `show_deleted`, for a
+    /// while after; it no longer counts toward the 10 keys an account may
+    /// hold.
+    deleted,
+    /// A state the server sent that this library does not know. Never sent.
+    unknown,
+};
+
+/// An HMAC key, without its secret, which Cloud Storage keeps to itself.
+pub const HmacKeyInfo = struct {
+    /// What a signature names its key by: `GOOG1E` and 55 more letters and
+    /// digits, 61 in all, as measured 2026-10-05.
+    access_id: []const u8,
+    /// The project that owns the key's service account.
+    project_id: []const u8,
+    service_account_email: []const u8,
+    state: HmacKeyState,
+    /// RFC 3339.
+    time_created: []const u8,
+    updated: []const u8,
+    /// What `HmacKey.setState` takes as a condition: it moves with every
+    /// change.
+    etag: []const u8,
+};
+
+/// A key just created: its metadata, and its secret, which Cloud Storage
+/// returns this once and never again. The secret is 40 characters of
+/// base64, used as it is, never decoded; it lives in memory that
+/// `deinit` zeroes, and this library never logs it or puts it in
+/// `Diagnostics`.
+pub const NewHmacKey = struct {
+    info: HmacKeyInfo,
+    secret: []const u8,
+};
+
+/// What `Client.createHmacKey` takes beside the account.
+pub const HmacCreateOptions = struct {
+    /// The project that owns the service account, where the key is made.
+    /// Null: `Options.project_id`.
+    project: ?[]const u8 = null,
+};
+
+/// What `Client.listHmacKeys` asks for.
+pub const HmacListOptions = struct {
+    /// Null: `Options.project_id`.
+    project: ?[]const u8 = null,
+    /// Only this account's keys.
+    service_account_email: ?[]const u8 = null,
+    /// Deleted keys too, which are listed for a while after.
+    show_deleted: bool = false,
+    /// At most 250, the server's limit. 0 lets the server choose.
+    page_size: u32 = 0,
+    page_token: ?[]const u8 = null,
+};
+
+pub const HmacKeyPage = struct {
+    keys: []const HmacKeyInfo,
+    /// Pass as `page_token` for the next page, which may be empty and
+    /// still carry another token. Null on the last page.
+    next_page_token: ?[]const u8,
+};
+
 /// A canned access control list for an object, applied whole in place of
 /// any it had. The owner, who wrote the object, is always OWNER. As
 /// measured 2026-10-05:

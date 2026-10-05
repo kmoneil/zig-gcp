@@ -102,6 +102,7 @@ const acl = @import("acl.zig");
 const fake_acl = @import("fake_acl.zig");
 const types = @import("types.zig");
 const FakeBuckets = @import("fake_buckets.zig").FakeBuckets;
+const FakeHmacKeys = @import("fake_hmac.zig").FakeHmacKeys;
 
 pub const FakeMultipart = struct {
     gpa: Allocator,
@@ -131,6 +132,8 @@ pub const FakeMultipart = struct {
     /// Buckets and their settings, apart from the objects above, which
     /// belong to whatever bucket a request names.
     buckets: FakeBuckets,
+    /// The project's HMAC keys.
+    hmac: FakeHmacKeys,
     next_upload: u32 = 1,
     next_session: u32 = 1,
     next_generation: u64 = 1_000,
@@ -203,7 +206,7 @@ pub const FakeMultipart = struct {
         session_stale_bytes: u64 = 0,
     };
 
-    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification, folder, managed, operation, layout };
+    pub const Kind = enum { start, part, finish, abort, list, read, delete, media, move, session_start, session_put, session_cancel, insert, bucket, restore, patch, notification, folder, managed, operation, layout, hmac };
 
     pub const Fault = enum {
         none,
@@ -357,7 +360,7 @@ pub const FakeMultipart = struct {
     };
 
     pub fn init(gpa: Allocator, io: std.Io) FakeMultipart {
-        return .{ .gpa = gpa, .io = io, .buckets = .init(gpa) };
+        return .{ .gpa = gpa, .io = io, .buckets = .init(gpa), .hmac = .init(gpa) };
     }
 
     pub fn deinit(self: *FakeMultipart) void {
@@ -372,6 +375,7 @@ pub const FakeMultipart = struct {
         for (self.kept.items) |*k| freeKept(self.gpa, k);
         self.kept.deinit(self.gpa);
         self.buckets.deinit();
+        self.hmac.deinit();
         self.* = undefined;
     }
 
@@ -587,6 +591,7 @@ pub const FakeMultipart = struct {
                 else => return error.HttpProtocolError,
             },
             .layout => if (method == .GET) .layout else return error.HttpProtocolError,
+            .hmac => .hmac,
             .restore => if (method == .POST) .restore else return error.HttpProtocolError,
             .session => switch (method) {
                 .PUT => .session_put,
@@ -608,7 +613,7 @@ pub const FakeMultipart = struct {
             .xml => |x| if (x.query == .part) x.query.part.number else 0,
             .json => |j| if (j.media) mediaPart(headers) else 0,
             .session => if (kind == .session_put) sessionPart(headers) else 0,
-            .move, .resumable, .insert, .bucket, .restore, .folders, .managed, .operations, .layout => 0,
+            .move, .resumable, .insert, .bucket, .restore, .folders, .managed, .operations, .layout, .hmac => 0,
         };
         if (try self.billingRefusal(target, url, headers, arena)) |refusal| return refusal;
         if (try keyRefusal(kind, target, url, headers, arena)) |refusal| return refusal;
@@ -684,6 +689,13 @@ pub const FakeMultipart = struct {
             .managed => |t| try self.serveManaged(method, t, body, arena),
             .operations => |t| try self.serveOperations(method, t, arena),
             .layout => |bucket| try self.serveLayout(bucket, arena),
+            .hmac => |t| hmac: {
+                const r = self.hmac.serve(method, t, body, arena) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.HttpProtocolError => return error.HttpProtocolError,
+                };
+                break :hmac Reply{ .status = r.status, .body = r.body };
+            },
             .restore => |t| try self.restoreObject(t, arena),
             .session => |id| if (kind == .session_put)
                 try self.sessionPut(id, headers, body, fault, arena)
@@ -1318,7 +1330,7 @@ pub const FakeMultipart = struct {
                 if (fault == .gone) return self.drop(index, gone);
                 return self.listParts(index, target, arena);
             },
-            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification, .folder, .managed, .operation, .layout => unreachable,
+            .read, .delete, .media, .move, .session_start, .session_put, .session_cancel, .insert, .bucket, .restore, .patch, .notification, .folder, .managed, .operation, .layout, .hmac => unreachable,
         }
     }
 
@@ -3029,6 +3041,8 @@ const Target = union(enum) {
     operations: OpsTarget,
     /// A `.../storageLayout` read's bucket.
     layout: []const u8,
+    /// `/storage/v1/projects/{project}/hmacKeys`, or one key.
+    hmac: FakeHmacKeys.Target,
     /// A session URL's id.
     session: []const u8,
 };
@@ -3121,6 +3135,33 @@ fn parseTarget(arena: Allocator, url: []const u8) core.transport.Error!Target {
             .kms_key_name = kms_key_name,
             .predefined_acl = predefined_acl,
         } };
+    }
+    if (std.mem.startsWith(u8, path, "/storage/v1/projects/")) {
+        const after = path["/storage/v1/projects/".len..];
+        const slash = std.mem.indexOfScalar(u8, after, '/') orelse return error.HttpProtocolError;
+        const tail = after[slash..];
+        if (!std.mem.startsWith(u8, tail, "/hmacKeys")) return error.HttpProtocolError;
+        var target: FakeHmacKeys.Target = .{ .project = try decode(arena, after[0..slash]) };
+        const key_part = tail["/hmacKeys".len..];
+        if (key_part.len > 0) {
+            if (key_part[0] != '/' or key_part.len == 1) return error.HttpProtocolError;
+            target.access_id = try decode(arena, key_part[1..]);
+        }
+        if (query.len > 0) {
+            var params = std.mem.splitScalar(u8, query, '&');
+            while (params.next()) |param| {
+                if (std.mem.startsWith(u8, param, "serviceAccountEmail=")) {
+                    target.service_account_email = try decode(arena, param["serviceAccountEmail=".len..]);
+                } else if (std.mem.eql(u8, param, "showDeletedKeys=true")) {
+                    target.show_deleted = true;
+                } else if (std.mem.startsWith(u8, param, "maxResults=")) {
+                    target.max_results = std.fmt.parseInt(u32, param["maxResults=".len..], 10) catch return error.HttpProtocolError;
+                } else if (std.mem.startsWith(u8, param, "pageToken=")) {
+                    target.page_token = try decode(arena, param["pageToken=".len..]);
+                } else return error.HttpProtocolError;
+            }
+        }
+        return .{ .hmac = target };
     }
     if (std.mem.eql(u8, path, "/storage/v1/b")) return .{ .bucket = try bucketTarget(arena, null, query) };
     if (std.mem.startsWith(u8, path, "/storage/v1/b/")) {

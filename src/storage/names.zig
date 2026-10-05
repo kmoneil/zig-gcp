@@ -375,6 +375,48 @@ pub fn aclResourcePath(arena: Allocator, bucket: []const u8, object: ?[]const u8
     return out.toOwnedSlice();
 }
 
+/// What an HMAC key collection path asks.
+pub const HmacKeysQuery = union(enum) {
+    /// A create, for this account.
+    create: []const u8,
+    list: types.HmacListOptions,
+};
+
+/// `/storage/v1/projects/{project}/hmacKeys` with a create's or a list's
+/// query.
+pub fn hmacKeysPath(arena: Allocator, project: []const u8, request: HmacKeysQuery) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    writeHmacKeys(&out.writer, project, request) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeHmacKeys(w: *Writer, project: []const u8, request: HmacKeysQuery) Writer.Error!void {
+    try w.writeAll("/storage/v1/projects/");
+    try query.writeStrictSegment(w, project);
+    try w.writeAll("/hmacKeys");
+    var params: query.Params = .init(w);
+    switch (request) {
+        .create => |email| try params.add("serviceAccountEmail", email),
+        .list => |options| {
+            try params.addOptional("serviceAccountEmail", options.service_account_email);
+            if (options.show_deleted) try params.add("showDeletedKeys", "true");
+            try params.addNonZero("maxResults", options.page_size);
+            try params.addOptional("pageToken", options.page_token);
+        },
+    }
+}
+
+/// `/storage/v1/projects/{project}/hmacKeys/{accessId}`.
+pub fn hmacKeyPath(arena: Allocator, project: []const u8, access_id: []const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    w.writeAll("/storage/v1/projects/") catch return error.OutOfMemory;
+    query.writeStrictSegment(w, project) catch return error.OutOfMemory;
+    w.writeAll("/hmacKeys/") catch return error.OutOfMemory;
+    query.writeStrictSegment(w, access_id) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
 /// Which list a single-entry path names.
 pub const AclTarget = enum { bucket, default_object, object };
 
@@ -970,6 +1012,21 @@ test "access control list paths: the guarded resource, and each list and entry" 
         "/storage/v1/b/b/o/a%2Fb/acl/user-a%2Bb%40example.com",
         try aclEntryPath(gpa, "b", "a/b", .object, "user-a+b@example.com"),
     );
+}
+
+test "HMAC key paths: a create, a list, and one key" {
+    const gpa = testing.allocator;
+    try expectPath(
+        "/storage/v1/projects/extractctl/hmacKeys?serviceAccountEmail=zig-gcp%40extractctl.iam.gserviceaccount.com",
+        try hmacKeysPath(gpa, "extractctl", .{ .create = "zig-gcp@extractctl.iam.gserviceaccount.com" }),
+    );
+    try expectPath("/storage/v1/projects/extractctl/hmacKeys", try hmacKeysPath(gpa, "extractctl", .{ .list = .{} }));
+    try expectPath(
+        "/storage/v1/projects/p/hmacKeys?serviceAccountEmail=a%40b&showDeletedKeys=true&maxResults=3&pageToken=t%2B",
+        try hmacKeysPath(gpa, "p", .{ .list = .{ .service_account_email = "a@b", .show_deleted = true, .page_size = 3, .page_token = "t+" } }),
+    );
+    // The testbench's access IDs hold `@` and `:`: one segment either way.
+    try expectPath("/storage/v1/projects/p/hmacKeys/sa%40p%3Akey-1", try hmacKeyPath(gpa, "p", "sa@p:key-1"));
 }
 
 test "XML API paths keep the name's slashes and encode the rest" {
