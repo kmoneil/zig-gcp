@@ -77,8 +77,8 @@ it differs from Cloud Storage.
 | `client.listSoftDeletedBuckets(page)`, `bucket.restore(generation)` | Deleted buckets, and one brought back | [Soft delete](buckets.md#versions-and-soft-delete) |
 | `.composeFrom(sources, options)` | Writes this object from up to 32 others in the bucket, server-side | [Compose](writing-objects.md#compose) |
 | `bucket.lockRetentionPolicy(metageneration)` | Makes a bucket's retention policy permanent | [Retention](buckets.md#retention-and-holds) |
-| `.signedUrl(signer, options)`, `bucket.signedUrl(signer, options)` | A V4 signed URL, which lets whoever holds it make one request without credentials until it expires | [Signed URLs](signed-urls.md#signed-urls) |
-| `.postPolicy(signer, options)`, `bucket.postPolicy(signer, options)` | A V4 POST policy, which lets a plain HTML form upload what the policy allows, without credentials, until it expires | [POST policies](signed-urls.md#post-policies-uploads-from-a-plain-html-form) |
+| `.signedUrl(.{ .rsa = signer }, options)`, `bucket.signedUrl(.{ .rsa = signer }, options)` | A V4 signed URL, which lets whoever holds it make one request without credentials until it expires | [Signed URLs](signed-urls.md#signed-urls) |
+| `.postPolicy(.{ .rsa = signer }, options)`, `bucket.postPolicy(.{ .rsa = signer }, options)` | A V4 POST policy, which lets a plain HTML form upload what the policy allows, without credentials, until it expires | [POST policies](signed-urls.md#post-policies-uploads-from-a-plain-html-form) |
 | `.withBillingProject(project)`, `bucket.withBillingProject(project)` | A handle whose every request bills `project`, as a requester pays bucket needs | [Requester pays](buckets.md#requester-pays) |
 | `.withEncryptionKey(&key)` | A handle for an object under a customer-supplied key | [Encryption keys](encryption.md) |
 | `bucket.createNotification(config)`, `.getNotification(id)`, `.listNotifications()`, `.deleteNotification(id)` | Pub/Sub messages for every change to the bucket's objects | [Notifications](notifications.md) |

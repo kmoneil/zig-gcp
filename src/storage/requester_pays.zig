@@ -267,11 +267,11 @@ test "billing: a signed URL signs the project in, as its own userProject would b
     try s.init();
     defer s.deinit();
     const obj = s.client.bucket("b").object("a");
-    var billed = try obj.withBillingProject(project).signedUrl(s.signer.signer(), .{ .expires_in_s = 60 });
+    var billed = try obj.withBillingProject(project).signedUrl(.{ .rsa = s.signer.signer() }, .{ .expires_in_s = 60 });
     defer billed.deinit();
     const billed_message = try testing.allocator.dupe(u8, s.signer.message_buffer[0..s.signer.message_len]);
     defer testing.allocator.free(billed_message);
-    var by_hand = try obj.signedUrl(s.signer.signer(), .{
+    var by_hand = try obj.signedUrl(.{ .rsa = s.signer.signer() }, .{
         .expires_in_s = 60,
         .query = &.{.{ .name = "userProject", .value = project }},
     });
@@ -282,13 +282,13 @@ test "billing: a signed URL signs the project in, as its own userProject would b
 
     // Named twice, once by the handle and once by the caller, is refused,
     // with the reason: the caller named it once.
-    try testing.expectError(error.InvalidSignedUrlOptions, obj.withBillingProject(project).signedUrl(s.signer.signer(), .{
+    try testing.expectError(error.InvalidSignedUrlOptions, obj.withBillingProject(project).signedUrl(.{ .rsa = s.signer.signer() }, .{
         .expires_in_s = 60,
         .query = &.{.{ .name = "userProject", .value = "other" }},
     }));
     try testing.expect(std.mem.indexOf(u8, s.diag.message(), "billing project signs already") != null);
     // A bucket's URL too.
-    var listing = try s.client.bucket("b").withBillingProject(project).signedUrl(s.signer.signer(), .{ .expires_in_s = 60 });
+    var listing = try s.client.bucket("b").withBillingProject(project).signedUrl(.{ .rsa = s.signer.signer() }, .{ .expires_in_s = 60 });
     defer listing.deinit();
     try testing.expect(std.mem.indexOf(u8, listing.value, "userProject=" ++ project) != null);
 }
@@ -297,8 +297,8 @@ test "billing: a POST policy, which a form cannot bill, is refused with one" {
     var s: SigningSetup = undefined;
     try s.init();
     defer s.deinit();
-    try testing.expectError(error.InvalidPostPolicyOptions, s.client.bucket("b").object("a").withBillingProject(project).postPolicy(s.signer.signer(), .{ .expires_in_s = 60 }));
-    try testing.expectError(error.InvalidPostPolicyOptions, s.client.bucket("b").withBillingProject(project).postPolicy(s.signer.signer(), .{
+    try testing.expectError(error.InvalidPostPolicyOptions, s.client.bucket("b").object("a").withBillingProject(project).postPolicy(.{ .rsa = s.signer.signer() }, .{ .expires_in_s = 60 }));
+    try testing.expectError(error.InvalidPostPolicyOptions, s.client.bucket("b").withBillingProject(project).postPolicy(.{ .rsa = s.signer.signer() }, .{
         .expires_in_s = 60,
         .key = .{ .starts_with = "" },
     }));

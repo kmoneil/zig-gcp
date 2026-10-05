@@ -5108,3 +5108,97 @@ test "68. HMAC keys: made, read, listed, deactivated and deleted, each change co
     try testing.expectError(error.NotFound, client.hmacKey("GOOG1ENOSUCHKEYXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX").get());
     try testing.expectError(error.NotFound, client.createHmacKey("zigps-nobody@extractctl.iam.gserviceaccount.com", .{}));
 }
+
+/// Uses `url` as a browser would: no credentials, nothing but `headers` and
+/// the body, its answer in `arena`.
+fn useUnsigned(arena: Allocator, method: std.http.Method, url: []const u8, headers: []const std.http.Header, body: ?[]const u8) !struct { status: u16, body: []const u8 } {
+    var http: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer http.deinit();
+    var request = try http.request(method, try std.Uri.parse(url), .{
+        .redirect_behavior = .unhandled,
+        .keep_alive = false,
+        .headers = .{ .user_agent = .{ .override = Fixture.user_agent }, .accept_encoding = .{ .override = "identity" }, .content_type = .omit },
+        .extra_headers = headers,
+    });
+    defer request.deinit();
+    if (body != null or method.requestHasBody()) {
+        const data = body orelse "";
+        request.transfer_encoding = .{ .content_length = data.len };
+        var buffer: [4096]u8 = undefined;
+        var writer = try request.sendBodyUnflushed(&buffer);
+        try writer.writer.writeAll(data);
+        try writer.end();
+        try request.connection.?.flush();
+    } else {
+        try request.sendBodiless();
+    }
+    var response = try request.receiveHead(&.{});
+    const status: u16 = @backingInt(response.head.status);
+    var transfer: [64]u8 = undefined;
+    return .{ .status = status, .body = try response.reader(&transfer).allocRemaining(arena, .limited(1024 * 1024)) };
+}
+
+test "69. HMAC signing: a fresh key's GET and PUT URLs and POST policy work with no credentials, and a tampered one is refused" {
+    var f: BucketFixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const account = f.env.get("GCP_TEST_HMAC_ACCOUNT") orelse return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var created = f.bucket().create(.{ .location = "us-central1", .soft_delete_retention_s = 0 }) catch |err| return f.report(err);
+    created.deinit();
+    defer f.deleteEveryVersion() catch {};
+    const b = f.bucket();
+    var put_object = b.object("hmac/get.txt").upload("read through an HMAC-signed URL", .{ .content_type = "text/plain" }) catch |err| return f.report(err);
+    put_object.deinit();
+
+    var leftover = f.client.listHmacKeys(.{ .service_account_email = account }) catch |err| return f.report(err);
+    for (leftover.value.keys) |key| f.client.hmacKey(key.access_id).deactivateAndDelete() catch |err| return f.report(err);
+    leftover.deinit();
+    var made = f.client.createHmacKey(account, .{}) catch |err| return f.report(err);
+    defer made.deinit();
+    defer f.client.hmacKey(made.value.info.access_id).deactivateAndDelete() catch {};
+    const signer: storage.UrlSigner = .{ .hmac = .{ .access_id = made.value.info.access_id, .secret = made.value.secret } };
+
+    // A key works at once, measured; a minute's grace all the same.
+    var get_url = b.object("hmac/get.txt").signedUrl(signer, .{ .expires_in_s = 600 }) catch |err| return f.report(err);
+    defer get_url.deinit();
+    try testing.expect(std.mem.indexOf(u8, get_url.value, "X-Goog-Algorithm=GOOG4-HMAC-SHA256") != null);
+    var got = try useUnsigned(a, .GET, get_url.value, &.{}, null);
+    var waited: u32 = 0;
+    while (got.status == 403 and waited < 60) : (waited += 5) {
+        try testing.io.sleep(.fromSeconds(5), .awake);
+        got = try useUnsigned(a, .GET, get_url.value, &.{}, null);
+    }
+    try testing.expectEqual(200, got.status);
+    try testing.expectEqualStrings("read through an HMAC-signed URL", got.body);
+
+    var put_url = b.object("hmac/put.txt").signedUrl(signer, .{ .method = .PUT, .expires_in_s = 600 }) catch |err| return f.report(err);
+    defer put_url.deinit();
+    const put = try useUnsigned(a, .PUT, put_url.value, &.{}, "stored through an HMAC-signed URL");
+    try testing.expectEqual(200, put.status);
+    var stored = b.object("hmac/put.txt").downloadAlloc(1024, .{}) catch |err| return f.report(err);
+    defer stored.deinit();
+    try testing.expectEqualStrings("stored through an HMAC-signed URL", stored.value.data);
+
+    var policy = b.object("hmac/posted.txt").postPolicy(signer, .{ .expires_in_s = 600 }) catch |err| return f.report(err);
+    defer policy.deinit();
+    try testing.expectEqualStrings("GOOG4-HMAC-SHA256", policy.value.field("x-goog-algorithm").?);
+    const boundary = "----zig-gcp-hmac-boundary";
+    var form: std.ArrayList(u8) = .empty;
+    for (policy.value.fields) |field| try form.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"{s}\"\r\n\r\n{s}\r\n", .{ boundary, field.name, field.value });
+    try form.print(a, "--{s}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f\"\r\n\r\nposted under an HMAC-signed policy\r\n--{s}--\r\n", .{ boundary, boundary });
+    const posted = try useUnsigned(a, .POST, policy.value.url, &.{.{ .name = "content-type", .value = "multipart/form-data; boundary=" ++ boundary }}, form.items);
+    try testing.expectEqual(204, posted.status);
+    var form_object = b.object("hmac/posted.txt").downloadAlloc(1024, .{}) catch |err| return f.report(err);
+    defer form_object.deinit();
+    try testing.expectEqualStrings("posted under an HMAC-signed policy", form_object.value.data);
+
+    // One hex digit changed: refused.
+    const tampered = try a.dupe(u8, get_url.value);
+    tampered[tampered.len - 1] = if (tampered[tampered.len - 1] == '0') '1' else '0';
+    const refused = try useUnsigned(a, .GET, tampered, &.{}, null);
+    try testing.expectEqual(403, refused.status);
+    try testing.expect(std.mem.indexOf(u8, refused.body, "SignatureDoesNotMatch") != null);
+}

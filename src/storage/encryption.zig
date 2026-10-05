@@ -431,14 +431,14 @@ test "keys: a signed URL signs the key's headers in, and a POST policy refuses a
     defer s.deinit();
     const a: EncryptionKey = try .fromBase64(key_a_text);
     const obj = s.client.bucket("b").object("a");
-    var keyed = try obj.withEncryptionKey(&a).signedUrl(s.signer.signer(), .{
+    var keyed = try obj.withEncryptionKey(&a).signedUrl(.{ .rsa = s.signer.signer() }, .{
         .expires_in_s = 60,
         .headers = &.{.{ .name = "content-type", .value = "text/plain" }},
     });
     defer keyed.deinit();
     const keyed_message = try testing.allocator.dupe(u8, s.signer.message_buffer[0..s.signer.message_len]);
     defer testing.allocator.free(keyed_message);
-    var by_hand = try obj.signedUrl(s.signer.signer(), .{
+    var by_hand = try obj.signedUrl(.{ .rsa = s.signer.signer() }, .{
         .expires_in_s = 60,
         .headers = &.{
             .{ .name = "content-type", .value = "text/plain" },
@@ -456,7 +456,7 @@ test "keys: a signed URL signs the key's headers in, and a POST policy refuses a
 
     // Named by the caller too, on a keyed handle: refused, naming the header
     // and not its value.
-    try testing.expectError(error.InvalidSignedUrlOptions, obj.withEncryptionKey(&a).signedUrl(s.signer.signer(), .{
+    try testing.expectError(error.InvalidSignedUrlOptions, obj.withEncryptionKey(&a).signedUrl(.{ .rsa = s.signer.signer() }, .{
         .expires_in_s = 60,
         .headers = &.{.{ .name = "X-Goog-Encryption-Key", .value = key_b_text }},
     }));
@@ -464,7 +464,7 @@ test "keys: a signed URL signs the key's headers in, and a POST policy refuses a
     try testing.expectEqual(null, std.mem.indexOf(u8, s.diag.message(), key_b_text));
 
     const calls = s.signer.calls;
-    try testing.expectError(error.InvalidPostPolicyOptions, obj.withEncryptionKey(&a).postPolicy(s.signer.signer(), .{ .expires_in_s = 60 }));
+    try testing.expectError(error.InvalidPostPolicyOptions, obj.withEncryptionKey(&a).postPolicy(.{ .rsa = s.signer.signer() }, .{ .expires_in_s = 60 }));
     try testing.expect(std.mem.indexOf(u8, s.diag.message(), "customer-supplied key") != null);
     try testing.expectEqual(calls, s.signer.calls);
 }

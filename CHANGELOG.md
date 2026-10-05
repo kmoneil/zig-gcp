@@ -48,6 +48,16 @@ including the ones that did not change.
   stale etag and a lost answer once a read finds the key as asked: Cloud
   Storage checks the etag first, so a repeat of a change that landed
   meets its own moved etag. Measured in production on 2026-10-05.
+- storage: **Breaking:** `signedUrl` and `postPolicy`, on `Bucket` and
+  `Object`, take a `UrlSigner`: `.{ .rsa = signer }` for what they took
+  until now, a `core.Signer`, or `.{ .hmac = .{ .access_id, .secret } }`
+  to sign with an HMAC key (`GOOG4-HMAC-SHA256`), which needs no I/O and
+  whose URLs and policies last until they expire or the key is
+  deactivated or deleted. The signing key is derived from the date already
+  in the URL, never a second reading of the clock. Held to Google's 29 URL
+  and 11 POST policy vectors signed again with an HMAC key
+  (`tools/hmac_vectors.py`, Python's standard library), and in production
+  to a fresh key's GET, PUT and POST policy.
 - storage: **Breaking, for an exhaustive switch:** two new errors.
   `error.UniformAccessEnabled` is a list on a bucket with uniform
   bucket-level access, a 400 told apart by its message; and

@@ -42,3 +42,17 @@ on 2026-09-23 with the first 400 untouched. Regenerate with
     tools/post_policy_oracle.py 400 > tests/testdata/post_policy_oracle.json
 
 and read each script's header for what the draw stays clear of, and why.
+
+`hmac_v4_signatures.json` is Google's conformance vectors signed again
+with an HMAC key, since Google publishes none for HMAC.
+`tools/hmac_vectors.py` writes it from `v4_signatures.json` with Python's
+standard library alone: each vector's expected canonical request, or
+decoded policy, changed in the three places an HMAC signature differs
+(the algorithm, the credential's access ID, the signature), and signed by
+the derivation Google documents. That signer was checked against
+production on 2026-10-05, and its derivation against AWS's published
+example. 28 URL vectors, one left out because Google's own canonical
+request for it is wrong, and all 11 POST policy vectors. The key is made
+up, and shaped so no secret scanner takes it for one. Regenerate with
+
+    python3 tools/hmac_vectors.py

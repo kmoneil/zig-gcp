@@ -473,12 +473,12 @@ fn storageLayoutBilled(self: Bucket) Error!types.Owned(types.StorageLayout) {
 /// A V4 signed URL for the bucket itself, through the XML API: a GET lists
 /// its objects as XML, with `prefix` and `delimiter` as signed query
 /// parameters. Everything else is as `Object.signedUrl` says.
-pub fn signedUrl(self: Bucket, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
+pub fn signedUrl(self: Bucket, signer: types.UrlSigner, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
     var client: Client = undefined;
     return (try self.billing(&client)).signedUrlBilled(signer, options);
 }
 
-fn signedUrlBilled(self: Bucket, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
+fn signedUrlBilled(self: Bucket, signer: types.UrlSigner, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     return signing.signUrl(self.client, signer, self.name, null, options);
@@ -489,7 +489,7 @@ fn signedUrlBilled(self: Bucket, signer: core.Signer, options: types.SignedUrlOp
 /// the form may store, one exactly or any under a prefix, and is required:
 /// `.{ .starts_with = "" }` allows any name in the bucket. Everything else
 /// is as `Object.postPolicy` says.
-pub fn postPolicy(self: Bucket, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
+pub fn postPolicy(self: Bucket, signer: types.UrlSigner, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
     var client: Client = undefined;
     const this = try self.billing(&client);
     if (this.billing_project != null) {
@@ -499,7 +499,7 @@ pub fn postPolicy(self: Bucket, signer: core.Signer, options: types.PostPolicyOp
     return this.postPolicyBilled(signer, options);
 }
 
-fn postPolicyBilled(self: Bucket, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
+fn postPolicyBilled(self: Bucket, signer: types.UrlSigner, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.name);
     const key = options.key orelse {

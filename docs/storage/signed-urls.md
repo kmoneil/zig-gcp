@@ -18,7 +18,7 @@ var creds = try auth.findDefault(gpa, io, lookup, .{});
 defer creds.deinit();
 const signer = creds.signer() orelse return error.CannotSign;
 
-var url = try gcs.bucket("photos").object("cats/tom.jpg").signedUrl(signer, .{
+var url = try gcs.bucket("photos").object("cats/tom.jpg").signedUrl(.{ .rsa = signer }, .{
     .expires_in_s = 15 * 60,
     .query = &.{.{ .name = "response-content-disposition", .value = "attachment; filename=\"tom.jpg\"" }},
 });
@@ -28,7 +28,7 @@ defer url.deinit();
 An upload URL can pin what the holder may send:
 
 ```zig
-var put = try object.signedUrl(signer, .{
+var put = try object.signedUrl(.{ .rsa = signer }, .{
     .method = .PUT,
     .expires_in_s = 10 * 60,
     .headers = &.{
@@ -100,7 +100,7 @@ headers a signed PUT pins, and the person at the browser picks the file,
 so its name is not known when the policy is signed.
 
 ```zig
-var policy = try gcs.bucket("photos").postPolicy(signer, .{
+var policy = try gcs.bucket("photos").postPolicy(.{ .rsa = signer }, .{
     .expires_in_s = 15 * 60,
     // Any name under the prefix: the browser chooses the rest.
     .key = .{ .starts_with = "avatars/" },

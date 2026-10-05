@@ -993,7 +993,7 @@ test "signed URLs: PUT, GET, HEAD and DELETE an object, with no credentials" {
         defer body.deinit();
 
         const content_type: std.http.Header = .{ .name = "content-type", .value = "text/plain" };
-        var put = try obj.signedUrl(signer.signer(), .{ .method = .PUT, .expires_in_s = 600, .headers = &.{content_type} });
+        var put = try obj.signedUrl(.{ .rsa = signer.signer() }, .{ .method = .PUT, .expires_in_s = 600, .headers = &.{content_type} });
         defer put.deinit();
         try testing.expect(std.mem.startsWith(u8, put.value, f.client.base_url));
         try testing.expectEqual(.ok, try useUrl(.PUT, put.value, &.{content_type}, data, &body));
@@ -1002,20 +1002,20 @@ test "signed URLs: PUT, GET, HEAD and DELETE an object, with no credentials" {
         try testing.expectEqualStrings("text/plain", info.value.content_type);
         info.deinit();
 
-        var get = try obj.signedUrl(signer.signer(), .{ .expires_in_s = 600 });
+        var get = try obj.signedUrl(.{ .rsa = signer.signer() }, .{ .expires_in_s = 600 });
         defer get.deinit();
         body.clearRetainingCapacity();
         try testing.expectEqual(.ok, try useUrl(.GET, get.value, &.{}, null, &body));
         try testing.expectEqualStrings(data, body.written());
 
-        var head = try obj.signedUrl(signer.signer(), .{ .method = .HEAD, .expires_in_s = 600 });
+        var head = try obj.signedUrl(.{ .rsa = signer.signer() }, .{ .method = .HEAD, .expires_in_s = 600 });
         defer head.deinit();
         body.clearRetainingCapacity();
         try testing.expectEqual(.ok, try useUrl(.HEAD, head.value, &.{}, null, &body));
         try testing.expectEqual(0, body.written().len);
 
         // Cloud Storage answers a DELETE 204; fake-gcs-server says 200.
-        var delete = try obj.signedUrl(signer.signer(), .{ .method = .DELETE, .expires_in_s = 600 });
+        var delete = try obj.signedUrl(.{ .rsa = signer.signer() }, .{ .method = .DELETE, .expires_in_s = 600 });
         defer delete.deinit();
         body.clearRetainingCapacity();
         const status = try useUrl(.DELETE, delete.value, &.{}, null, &body);
@@ -1034,7 +1034,7 @@ test "signed URLs: a bucket-level GET lists the bucket through the XML API" {
     try f.upload("dogs/rex.txt", "woof\n");
     var signer: core.testing.FakeSigner = .{};
 
-    var list = try f.bucket().signedUrl(signer.signer(), .{
+    var list = try f.bucket().signedUrl(.{ .rsa = signer.signer() }, .{
         .expires_in_s = 60,
         .query = &.{.{ .name = "prefix", .value = "cats/" }},
     });

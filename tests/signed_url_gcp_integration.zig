@@ -146,7 +146,7 @@ const Fixture = struct {
 
     /// Signs, printing the server's or the signer's own words on failure.
     fn sign(f: *Fixture, obj: storage.Object, signer: core.Signer, options: storage.SignedUrlOptions) ![]const u8 {
-        var url = obj.signedUrl(signer, options) catch |err| {
+        var url = obj.signedUrl(.{ .rsa = signer }, options) catch |err| {
             std.debug.print("signing failed: {t}: {s} {s}\n", .{ err, f.diag.message(), f.signer_diag.message() });
             return err;
         };
@@ -541,7 +541,7 @@ test "signed URLs, real bucket: a URL is good from 15 minutes before its date, a
             var clock: core.testing.FakeClock = .{ .now_ns = std.Io.Clock.real.now(testing.io).nanoseconds + @as(i96, case.minutes) * 60 * std.time.ns_per_s };
             var ahead: storage.Client = try .init(testing.allocator, clock.io(), .{ .token_provider = f.token.provider() });
             defer ahead.deinit();
-            var url = try ahead.bucket(f.bucket_name).object(obj.name).signedUrl(s.signer, .{ .expires_in_s = 3600 });
+            var url = try ahead.bucket(f.bucket_name).object(obj.name).signedUrl(.{ .rsa = s.signer }, .{ .expires_in_s = 3600 });
             defer url.deinit();
             const got = try useUrl(a, .GET, url.value, &.{}, null);
             if (case.works) {
@@ -701,7 +701,7 @@ test "POST policy, real bucket: a form stores the object, and the policy pins it
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
         const obj = try f.object(try a.print("{s}-form.txt", .{s.name}));
-        var policy = obj.postPolicy(s.signer, .{
+        var policy = obj.postPolicy(.{ .rsa = s.signer }, .{
             .expires_in_s = 600,
             .fields = &.{.{ .name = "content-type", .value = "text/plain" }},
         }) catch |err| return f.report(err);
@@ -751,7 +751,7 @@ test "POST policy, real bucket: success_action_status and success_action_redirec
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
         const created = try f.object(try a.print("{s}-201.txt", .{s.name}));
-        var with_status = created.postPolicy(s.signer, .{
+        var with_status = created.postPolicy(.{ .rsa = s.signer }, .{
             .expires_in_s = 600,
             .fields = &.{.{ .name = "success_action_status", .value = "201" }},
         }) catch |err| return f.report(err);
@@ -766,7 +766,7 @@ test "POST policy, real bucket: success_action_status and success_action_redirec
 
         const sent = try f.object(try a.print("{s}-303.txt", .{s.name}));
         const back = "https://example.com/thanks";
-        var with_redirect = sent.postPolicy(s.signer, .{
+        var with_redirect = sent.postPolicy(.{ .rsa = s.signer }, .{
             .expires_in_s = 600,
             .fields = &.{.{ .name = "success_action_redirect", .value = back }},
         }) catch |err| return f.report(err);
@@ -789,7 +789,7 @@ test "POST policy, real bucket: a prefix key lets the browser name the object" {
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
         const prefix = try a.print("{s}uploads-{s}/", .{ &f.prefix, s.name });
-        var policy = f.bucket().postPolicy(s.signer, .{
+        var policy = f.bucket().postPolicy(.{ .rsa = s.signer }, .{
             .expires_in_s = 600,
             .key = .{ .starts_with = prefix },
         }) catch |err| return f.report(err);
@@ -829,7 +829,7 @@ test "POST policy, real bucket: content-length-range caps the body at both ends"
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
         const obj = try f.object(try a.print("{s}-sized.txt", .{s.name}));
-        var policy = obj.postPolicy(s.signer, .{
+        var policy = obj.postPolicy(.{ .rsa = s.signer }, .{
             .expires_in_s = 600,
             .conditions = &.{.{ .content_length_range = .{ .min = hello.len, .max = hello.len } }},
         }) catch |err| return f.report(err);
@@ -858,7 +858,7 @@ test "POST policy, real bucket: an expired policy and a tampered signature are r
     var buffer: [2]Named = undefined;
     for (f.signers(&buffer)) |s| {
         const obj = try f.object(try a.print("{s}-refused.txt", .{s.name}));
-        var brief = obj.postPolicy(s.signer, .{ .expires_in_s = 1 }) catch |err| return f.report(err);
+        var brief = obj.postPolicy(.{ .rsa = s.signer }, .{ .expires_in_s = 1 }) catch |err| return f.report(err);
         defer brief.deinit();
         try testing.io.sleep(.fromSeconds(3), .awake);
         // Measured 2026-09-23: an expired policy is 400
@@ -868,7 +868,7 @@ test "POST policy, real bucket: an expired policy and a tampered signature are r
         try expectStatus(400, expired, s.name);
         try testing.expectEqualStrings("InvalidPolicyDocument", expired.code());
 
-        var good = obj.postPolicy(s.signer, .{ .expires_in_s = 600 }) catch |err| return f.report(err);
+        var good = obj.postPolicy(.{ .rsa = s.signer }, .{ .expires_in_s = 600 }) catch |err| return f.report(err);
         defer good.deinit();
         const signature = good.value.field("x-goog-signature").?;
         const tampered = try a.dupe(u8, signature);
@@ -938,7 +938,7 @@ test "requester pays, real bucket: a signed URL bills the project it names, and 
     };
 
     // Signed as the account: the URL names the project, signed.
-    var url = try billed.object("signed.txt").signedUrl(iam.signer(), .{ .expires_in_s = 600 });
+    var url = try billed.object("signed.txt").signedUrl(.{ .rsa = iam.signer() }, .{ .expires_in_s = 600 });
     defer url.deinit();
     try testing.expect(std.mem.indexOf(u8, url.value, "userProject=") != null);
     const served = try useUrl(a, .GET, url.value, &.{}, null);
@@ -948,29 +948,29 @@ test "requester pays, real bucket: a signed URL bills the project it names, and 
     // Measured 2026-09-29: a URL that bills nothing is refused as a request
     // with no signature is, and so is one billing a project that does not
     // exist.
-    var unbilled = try plain.object("signed.txt").signedUrl(iam.signer(), .{ .expires_in_s = 600 });
+    var unbilled = try plain.object("signed.txt").signedUrl(.{ .rsa = iam.signer() }, .{ .expires_in_s = 600 });
     defer unbilled.deinit();
     const refused = try useUrl(a, .GET, unbilled.value, &.{}, null);
     try expectStatus(400, refused, "unbilled");
     try testing.expectEqualStrings("UserProjectMissing", refused.code());
-    var nowhere = try plain.withBillingProject("zigps-no-such-project-4d1").object("signed.txt").signedUrl(iam.signer(), .{ .expires_in_s = 600 });
+    var nowhere = try plain.withBillingProject("zigps-no-such-project-4d1").object("signed.txt").signedUrl(.{ .rsa = iam.signer() }, .{ .expires_in_s = 600 });
     defer nowhere.deinit();
     const missing = try useUrl(a, .GET, nowhere.value, &.{}, null);
     try expectStatus(400, missing, "a missing project");
     try testing.expectEqualStrings("UserProjectInvalid", missing.code());
 
     // A form cannot bill a project, so a billed handle's policy is refused.
-    try testing.expectError(error.InvalidPostPolicyOptions, billed.object("form-bare.txt").postPolicy(iam.signer(), .{ .expires_in_s = 600 }));
+    try testing.expectError(error.InvalidPostPolicyOptions, billed.object("form-bare.txt").postPolicy(.{ .rsa = iam.signer() }, .{ .expires_in_s = 600 }));
     // Measured 2026-09-29: unbilled, the account's form is refused as its
     // GET is.
-    var bare = try plain.object("form-bare.txt").postPolicy(iam.signer(), .{ .expires_in_s = 600 });
+    var bare = try plain.object("form-bare.txt").postPolicy(.{ .rsa = iam.signer() }, .{ .expires_in_s = 600 });
     defer bare.deinit();
     const posted = try postForm(a, bare.value, "x.txt", hello);
     try expectStatus(400, posted, "form");
     try testing.expectEqualStrings("UserProjectMissing", posted.code());
     // A policy cannot name the header as a field: "Invalid exact match
     // name: x-goog-user-project".
-    var field = try plain.object("form-field.txt").postPolicy(iam.signer(), .{
+    var field = try plain.object("form-field.txt").postPolicy(.{ .rsa = iam.signer() }, .{
         .expires_in_s = 600,
         .fields = &.{.{ .name = "x-goog-user-project", .value = project }},
     });
@@ -981,7 +981,7 @@ test "requester pays, real bucket: a signed URL bills the project it names, and 
     // Nor can its URL name the parameter: with any query, in either style,
     // the POST is no longer a form's, and is refused as a bucket create,
     // 400 InvalidArgument, "Cannot create buckets using a POST."
-    var vhost = try plain.object("form-query.txt").postPolicy(iam.signer(), .{ .expires_in_s = 600, .style = .virtual_hosted });
+    var vhost = try plain.object("form-query.txt").postPolicy(.{ .rsa = iam.signer() }, .{ .expires_in_s = 600, .style = .virtual_hosted });
     defer vhost.deinit();
     for ([_][]const u8{
         try a.print("{s}?userProject={s}", .{ bare.value.url, project }),

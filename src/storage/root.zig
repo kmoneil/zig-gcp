@@ -118,6 +118,8 @@ pub const decodeEvent = @import("events.zig").decodeEvent;
 pub const DecodeEventOptions = @import("events.zig").DecodeEventOptions;
 pub const DecodeEventError = @import("events.zig").DecodeEventError;
 pub const SignedUrlOptions = @import("types.zig").SignedUrlOptions;
+pub const UrlSigner = @import("types.zig").UrlSigner;
+pub const HmacSigner = @import("types.zig").HmacSigner;
 pub const PostPolicy = @import("types.zig").PostPolicy;
 pub const PostPolicyOptions = @import("types.zig").PostPolicyOptions;
 pub const PostField = @import("types.zig").PostField;
@@ -150,6 +152,7 @@ test {
     _ = @import("acl.zig");
     _ = @import("AclList.zig");
     _ = @import("HmacKey.zig");
+    _ = @import("hmac_signing.zig");
     _ = @import("fake_acl.zig");
     _ = @import("fake_hmac.zig");
     _ = @import("Bucket.zig");

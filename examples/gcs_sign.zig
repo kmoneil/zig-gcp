@@ -102,12 +102,12 @@ pub fn main(init: std.process.Init) !void {
         // names the object, under it.
         const exact = name.len != 0 and name[name.len - 1] != '/';
         const made = if (exact)
-            client.bucket(target.?.bucket).object(name).postPolicy(signer, .{
+            client.bucket(target.?.bucket).object(name).postPolicy(.{ .rsa = signer }, .{
                 .expires_in_s = minutes * 60,
                 .fields = fields,
             })
         else
-            client.bucket(target.?.bucket).postPolicy(signer, .{
+            client.bucket(target.?.bucket).postPolicy(.{ .rsa = signer }, .{
                 .expires_in_s = minutes * 60,
                 .key = .{ .starts_with = name },
                 .fields = fields,
@@ -130,11 +130,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const object = client.bucket(target.?.bucket).object(target.?.name);
-    const url = if (content_type) |media_type| object.signedUrl(signer, .{
+    const url = if (content_type) |media_type| object.signedUrl(.{ .rsa = signer }, .{
         .method = .PUT,
         .expires_in_s = minutes * 60,
         .headers = &.{.{ .name = "content-type", .value = media_type }},
-    }) else object.signedUrl(signer, .{
+    }) else object.signedUrl(.{ .rsa = signer }, .{
         .expires_in_s = minutes * 60,
     });
     var signed = url catch |err| return fail(err, &diag);
