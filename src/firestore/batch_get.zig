@@ -46,8 +46,9 @@ pub fn batchGet(
 
     // A read: asking again is harmless.
     const reply = try rpc.execute(client, response, .{ .method = .POST, .path = url, .body = body });
-    const elements = codec.decodeBatchGet(response.allocator(), reply) catch |err|
-        return rpc.decodeFailed(client, err, "batchGet");
+    var streamed: ?codec.StreamedError = null;
+    const elements = codec.decodeBatchGet(response.allocator(), reply, &streamed) catch |err|
+        return rpc.streamFailed(client, err, streamed, "batchGet");
 
     const documents = try response.allocator().alloc(?types.Snapshot, paths.len);
     const answered = try a.alloc(bool, paths.len);
@@ -153,6 +154,23 @@ test "batchGet: an answer that leaves a document out, or reads wrong, is Invalid
     var bare = try h.client.batchGet(&.{"c/a"}, .{});
     bare.deinit();
     try testing.expectError(error.InvalidResponse, h.client.batchGet(&.{"c/a"}, .{}));
+}
+
+test "regression: an error inside batchGet's answer fails it with that error" {
+    // Until 0.34.0 it was skipped: the documents it cut off read as
+    // InvalidResponse, "said nothing of".
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = test_util.streamed(&.{ found("c/a"), test_util.deadline_element }) } },
+        .{ .respond = .{ .body = test_util.streamed(&.{test_util.deadline_element}) } },
+    }, .{});
+    defer h.deinit();
+    try testing.expectError(error.DeadlineExceeded, h.client.batchGet(&.{ "c/a", "c/b" }, .{}));
+    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.status());
+    try h.expectDiag("The operation exceeded the deadline during execution.");
+    // Document.get reads through batchGet.
+    try testing.expectError(error.DeadlineExceeded, h.client.doc("c/a").get(.{ .read_time = .{ .nanoseconds = 1_791_202_542_000_000_000 } }));
+    try h.expectRequestCount(2);
 }
 
 test "batchGet refuses bad paths and masks before anything is sent" {

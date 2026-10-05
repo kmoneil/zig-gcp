@@ -15,6 +15,7 @@ const errors = @import("errors.zig");
 const names = @import("names.zig");
 const types = @import("types.zig");
 const validate = @import("validate.zig");
+const logging = @import("logging.zig");
 const Error = errors.Error;
 
 /// The OAuth scope the client asks its token provider for: Cloud
@@ -63,6 +64,23 @@ pub fn decodeFailed(client: *Client, err: codec.DecodeError, what: []const u8) E
         if (client.diagnostics) |d| d.print("the {s} response could not be decoded", .{what});
     }
     return err;
+}
+
+/// A streamed answer that could not be decoded, or that held an error of
+/// the server's, which is returned as a failed response's would be, with
+/// its words in `Diagnostics`. It arrived inside a 200 response, past the
+/// engine's retries, and is not retried: a read past its deadline would
+/// likely meet it again.
+pub fn streamFailed(client: *Client, err: codec.StreamDecodeError, streamed: ?codec.StreamedError, what: []const u8) Error {
+    return switch (err) {
+        error.Streamed => {
+            const s = streamed.?;
+            logging.debug("{s} answered {d} {s} inside its stream", .{ what, s.code, s.status });
+            if (client.diagnostics) |d| d.set(s.code, s.status, s.message);
+            return core.errors.fromResponse(s.code, s.status);
+        },
+        else => |e| decodeFailed(client, e, what),
+    };
 }
 
 /// A refusal made here, before anything was sent.

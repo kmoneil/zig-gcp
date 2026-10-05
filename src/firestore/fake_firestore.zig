@@ -73,6 +73,10 @@ pub const FakeFirestore = struct {
     prng: std.Random.DefaultPrng = .init(0x5eed),
     /// The next this many transactional commits answer ABORTED.
     abort_next_commits: u32 = 0,
+    /// The next query answers at most this many of its documents and then,
+    /// inside the same 200, DEADLINE_EXCEEDED, as production does past a
+    /// deadline (measured 2026-10-05).
+    deadline_after: ?u32 = null,
     /// By id.
     transactions: std.StringHashMapUnmanaged(*Txn) = .empty,
     next_transaction: u64 = 1,
@@ -396,11 +400,16 @@ pub const FakeFirestore = struct {
             .txn => |t| t,
             .refused => |r| return r,
         };
-        const hits = try self.evaluate(arena, route, spec);
+        var hits = try self.evaluate(arena, route, spec);
+        const deadline = self.deadline_after;
+        if (deadline) |n| {
+            self.deadline_after = null;
+            hits = hits[0..@min(n, hits.len)];
+        }
         if (txn) |t| for (hits) |hit| try self.noteRead(t, route.database, hit.path);
         var out: Writer.Allocating = .init(arena);
         var jw: Stringify = .{ .writer = &out.writer };
-        writeHits(&jw, arena, route, hits, spec.select, self.now_us) catch return error.OutOfMemory;
+        writeHits(&jw, arena, route, hits, spec.select, self.now_us, deadline != null) catch return error.OutOfMemory;
         return ok(arena, out.written());
     }
 
@@ -1899,10 +1908,10 @@ fn sumOrAverage(hits: []const Hit, path: []const []const u8, average: bool) Fake
     return if (int_ok) .{ .integer = int_sum } else .{ .double = double_sum };
 }
 
-fn writeHits(jw: *Stringify, arena: Allocator, route: FakeFirestore.Route, hits: []const Hit, select: ?[]const []const []const u8, now_us: i64) !void {
+fn writeHits(jw: *Stringify, arena: Allocator, route: FakeFirestore.Route, hits: []const Hit, select: ?[]const []const []const u8, now_us: i64, deadline: bool) !void {
     _ = route;
     try jw.beginArray();
-    if (hits.len == 0) {
+    if (hits.len == 0 and !deadline) {
         // Measured: an empty result is one message, its read time.
         try jw.beginObject();
         try jw.objectField("readTime");
@@ -1918,12 +1927,17 @@ fn writeHits(jw: *Stringify, arena: Allocator, route: FakeFirestore.Route, hits:
         try jw.objectField("readTime");
         try writeTime(jw, now_us);
         // Measured: `done` rides on the last document.
-        if (i == hits.len - 1) {
+        if (i == hits.len - 1 and !deadline) {
             try jw.objectField("done");
             try jw.write(true);
         }
         try jw.endObject();
     }
+    if (deadline) try jw.write(.{ .@"error" = .{
+        .code = 504,
+        .message = "The operation exceeded the deadline during execution.\n\nIf this is a query, try using explain to identify sources of latency within the plan.",
+        .status = "DEADLINE_EXCEEDED",
+    } });
     try jw.endArray();
 }
 
@@ -2695,6 +2709,28 @@ fn putMixed(h: *test_util.FakeHarness) !void {
     }
 }
 
+test "fake: a query past its deadline answers part, then the error, inside a 200" {
+    var h: test_util.FakeHarness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    for ([_][]const u8{ "c/a", "c/b", "c/c" }) |p| _ = try h.client.doc(p).set(&.{.{ .name = "x", .value = .{ .integer = 1 } }}, .{});
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    h.server.deadline_after = 1;
+    const cut = try rawRequest(&h.server, arena.allocator(), .POST, ":runQuery", "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"c\"}]}}");
+    try testing.expectEqual(200, cut.status);
+    try testing.expect(std.mem.indexOf(u8, cut.body, "/documents/c/a\"") != null);
+    try testing.expect(std.mem.indexOf(u8, cut.body, "/documents/c/b\"") == null);
+    // Measured: no `done` before the error.
+    try testing.expect(std.mem.indexOf(u8, cut.body, "\"done\"") == null);
+    try testing.expect(std.mem.endsWith(u8, cut.body, "{\"error\":{\"code\":504,\"message\":\"The operation exceeded the deadline during execution.\\n\\nIf this is a query, try using explain to identify sources of latency within the plan.\",\"status\":\"DEADLINE_EXCEEDED\"}}]"));
+    // Once: the next query answers whole.
+    try expectIds(&h, .{ .from = .{ .collection = "c" } }, &.{ "a", "b", "c" });
+    h.server.deadline_after = 0;
+    try testing.expectError(error.DeadlineExceeded, h.client.runQuery(.{ .from = .{ .collection = "c" } }, .{}));
+    try h.expectDiag("exceeded the deadline");
+}
+
 fn expectIds(h: *test_util.FakeHarness, query: types.Query, expected: []const []const u8) !void {
     var r = try h.client.runQuery(query, .{});
     defer r.deinit();
@@ -3139,7 +3175,7 @@ fn modelProperty(_: void, input: []const u8) !void {
         const path = g.pick([]const u8, &model_paths);
         const doc = h.client.doc(path);
         const existing = model.docs.get(path);
-        switch (g.intRange(u8, 0, 7)) {
+        switch (g.intRange(u8, 0, 8)) {
             0 => { // set, sometimes held to exists == false
                 const fields = try randomFields(&g, a);
                 const must_be_new = g.intRange(u8, 0, 3) == 0;
@@ -3267,6 +3303,26 @@ fn modelProperty(_: void, input: []const u8) !void {
                     if (model.docs.get(p)) |fields| {
                         try expectSameFields(fields, (d orelse return error.TestExpectedDocument).fields);
                     } else try testing.expectEqual(null, d);
+                }
+            },
+            7 => { // a query, sometimes cut off by its deadline: the whole result or the error, never part
+                const cut = g.intRange(u8, 0, 2) == 0;
+                if (cut) h.server.deadline_after = g.intRange(u32, 0, 2);
+                const result = h.client.runQuery(.{ .from = .{ .collection = "c" } }, .{});
+                if (cut) {
+                    try testing.expectError(error.DeadlineExceeded, result);
+                    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.status());
+                } else {
+                    var r = try result;
+                    defer r.deinit();
+                    var expected: usize = 0;
+                    for ([_][]const u8{ "c/a", "c/b" }) |p| if (model.docs.get(p)) |fields| {
+                        try testing.expect(expected < r.value.documents.len);
+                        try testing.expectEqualStrings(p[2..], r.value.documents[expected].id());
+                        try expectSameFields(fields, r.value.documents[expected].fields);
+                        expected += 1;
+                    };
+                    try testing.expectEqual(expected, r.value.documents.len);
                 }
             },
             else => { // a read, checked against the model

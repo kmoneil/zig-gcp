@@ -154,3 +154,16 @@ pub const delete_body = "{\"writeResults\":[{}],\"commitTime\":\"2026-10-04T22:4
 pub inline fn name(comptime path: []const u8) []const u8 {
     return "projects/extractctl/databases/(default)/documents/" ++ path;
 }
+
+/// The error production sent inside a query's 200 answer, after the
+/// documents it had found, when the query ran past its deadline: measured
+/// 2026-10-05 with `X-Server-Timeout`, pretty-printed as sent.
+pub const deadline_element = "{\n  \"error\": {\n    \"code\": 504,\n    \"message\": \"The operation exceeded the deadline during execution.\\n\\nIf this is a query, try using explain to identify sources of latency within the plan.\",\n    \"status\": \"DEADLINE_EXCEEDED\",\n    \"details\": [\n      {\n        \"@type\": \"type.googleapis.com/google.rpc.ErrorInfo\",\n        \"reason\": \"EXECUTION_DEADLINE_EXCEEDED\",\n        \"domain\": \"firestore.googleapis.com\"\n      }\n    ]\n  }\n}";
+
+/// One message of a streamed answer framed as production frames it: the
+/// first right after `[`, each later one after `\n,\r\n`.
+pub inline fn streamed(comptime elements: []const []const u8) []const u8 {
+    comptime var out: []const u8 = "[";
+    inline for (elements, 0..) |e, i| out = out ++ (if (i == 0) "" else "\n,\r\n") ++ e;
+    return out ++ "\n]";
+}

@@ -53,8 +53,9 @@ pub fn run(client: *Client, query: types.Query, options: types.QueryOptions, res
 
     // A read: asking again is harmless.
     const reply = try rpc.execute(client, response, .{ .method = .POST, .path = url, .body = body });
-    return codec.decodeRunQuery(response.allocator(), reply) catch |err|
-        return rpc.decodeFailed(client, err, "runQuery");
+    var streamed: ?codec.StreamedError = null;
+    return codec.decodeRunQuery(response.allocator(), reply, &streamed) catch |err|
+        return rpc.streamFailed(client, err, streamed, "runQuery");
 }
 
 /// Runs `aggregations` over `query`'s results. The call has begun.
@@ -89,8 +90,9 @@ pub fn aggregate(
     const body = try encode(a, unselected, aggregations, options);
 
     const reply = try rpc.execute(client, response, .{ .method = .POST, .path = url, .body = body });
-    return codec.decodeAggregation(response.allocator(), reply, aggregations.len) catch |err|
-        return rpc.decodeFailed(client, err, "runAggregationQuery");
+    var streamed: ?codec.StreamedError = null;
+    return codec.decodeAggregation(response.allocator(), reply, aggregations.len, &streamed) catch |err|
+        return rpc.streamFailed(client, err, streamed, "runAggregationQuery");
 }
 
 /// Checks `query` as the server would, and returns its parent's path.
@@ -604,6 +606,66 @@ test "a streamed error, inside the array, as production sends it" {
     try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.status());
 }
 
+/// A query's document as production streams it, pretty-printed.
+inline fn prettyQueryElement(comptime path: []const u8) []const u8 {
+    return "{\n  \"document\": " ++ test_util.docBody(path, "{}") ++ ",\n  \"readTime\": \"2026-10-05T22:28:44.615753Z\"\n}";
+}
+
+test "regression: an error after a query's documents fails it, rather than answering the documents before it" {
+    // Until 0.34.0 the error was skipped, and the documents before it
+    // came back as the whole result.
+    var h: test_util.Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .body = test_util.streamed(&.{ prettyQueryElement("c/a"), prettyQueryElement("c/b"), test_util.deadline_element }) } }}, .{});
+    defer h.deinit();
+    try testing.expectError(error.DeadlineExceeded, h.client.runQuery(.{ .from = .{ .collection = "c" } }, .{}));
+    try testing.expectEqualStrings("DEADLINE_EXCEEDED", h.diag.status());
+    try h.expectDiag("The operation exceeded the deadline during execution.");
+    try testing.expectEqual(504, h.diag.http_status);
+    // It came inside a 200, past the engine's retries, and is not retried.
+    try h.expectRequestCount(1);
+}
+
+test "an error inside an aggregation's answer, or as a query's only message, fails the call" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = test_util.streamed(&.{test_util.deadline_element}) } },
+        .{ .respond = .{ .body = test_util.streamed(&.{"{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\",\"message\":\"x\"}}"}) } },
+        // Shapes no server sends: an error still ends the answer.
+        .{ .respond = .{ .body = "[{\"error\":\"broken\"}]" } },
+        .{ .respond = .{ .body = "[" ++ queryElement("c/a") ++ ",{\"error\":{\"code\":\"70000\",\"status\":7}}]" } },
+    }, .{});
+    defer h.deinit();
+    const q: types.Query = .{ .from = .{ .collection = "c" } };
+    try testing.expectError(error.DeadlineExceeded, h.client.runAggregationQuery(q, &.{.{ .count = .{} }}, .{}));
+    try testing.expectError(error.Unavailable, h.client.runQuery(q, .{}));
+    try testing.expectEqual(503, h.diag.http_status);
+    try testing.expectError(error.Unknown, h.client.runQuery(q, .{}));
+    try testing.expectEqual(0, h.diag.http_status);
+    try testing.expectEqualStrings("", h.diag.status());
+    try testing.expectError(error.Unknown, h.client.runQuery(q, .{}));
+    try h.expectRequestCount(4);
+}
+
+test "decode: an error inside a streamed answer" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var streamed: ?codec.StreamedError = null;
+    try testing.expectError(error.Streamed, codec.decodeRunQuery(a, test_util.streamed(&.{ prettyQueryElement("c/a"), test_util.deadline_element }), &streamed));
+    try testing.expectEqual(504, streamed.?.code);
+    try testing.expectEqualStrings("DEADLINE_EXCEEDED", streamed.?.status);
+    try testing.expectEqualStrings("The operation exceeded the deadline during execution.\n\nIf this is a query, try using explain to identify sources of latency within the plan.", streamed.?.message);
+    // A null error is no error, as null is absent everywhere.
+    streamed = null;
+    const r = try codec.decodeRunQuery(a, "[" ++ queryElement("c/a") ++ ",{\"error\":null,\"readTime\":\"2026-10-05T12:43:42Z\"}]", &streamed);
+    try testing.expectEqual(1, r.documents.len);
+    try testing.expectEqual(null, streamed);
+    try testing.expectError(error.Streamed, codec.decodeAggregation(a, "[{\"error\":{}}]", 1, &streamed));
+    try testing.expectEqual(0, streamed.?.code);
+    try testing.expectEqualStrings("", streamed.?.status);
+    try testing.expectEqualStrings("", streamed.?.message);
+}
+
 test "golden: aggregations, under aliases of the library's own, answered in order" {
     var h: test_util.Harness = undefined;
     try h.init(&.{.{ .respond = .{ .body =
@@ -631,18 +693,19 @@ test "decode: query and aggregation answers, and the ones that are wrong" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    var streamed: ?codec.StreamedError = null;
     // As the emulator answers an empty result.
-    const empty = try codec.decodeRunQuery(a, "[{\n  \"readTime\": \"2026-10-05T12:43:42.208112Z\",\n  \"done\": true\n}]\n");
+    const empty = try codec.decodeRunQuery(a, "[{\n  \"readTime\": \"2026-10-05T12:43:42.208112Z\",\n  \"done\": true\n}]\n", &streamed);
     try testing.expectEqual(0, empty.documents.len);
     // Progress messages counting what an offset skipped, as production may send.
-    const skipped = try codec.decodeRunQuery(a, "[{\"readTime\":\"2026-10-05T12:43:42Z\",\"skippedResults\":2},{\"readTime\":\"2026-10-05T12:43:43Z\",\"skippedResults\":\"3\"}," ++ queryElement("c/a") ++ "]");
+    const skipped = try codec.decodeRunQuery(a, "[{\"readTime\":\"2026-10-05T12:43:42Z\",\"skippedResults\":2},{\"readTime\":\"2026-10-05T12:43:43Z\",\"skippedResults\":\"3\"}," ++ queryElement("c/a") ++ "]", &streamed);
     try testing.expectEqual(5, skipped.skipped_results);
     try testing.expectEqual(1, skipped.documents.len);
     try testing.expectEqual(1_791_204_222_208_112_000, skipped.read_time.nanoseconds);
     for ([_][]const u8{ "{}", "[]", "[1]", "[{\"document\":{}}]", "[{\"readTime\":\"2026-10-05T12:43:42Z\",\"skippedResults\":-1}]", "[{\"readTime\":\"x\"}]" }) |text| {
-        try testing.expectError(error.InvalidResponse, codec.decodeRunQuery(a, text));
+        try testing.expectError(error.InvalidResponse, codec.decodeRunQuery(a, text, &streamed));
     }
-    const agg = try codec.decodeAggregation(a, "[{\"readTime\":\"2026-10-05T12:43:42Z\"},{\"result\":{\"aggregateFields\":{\"a0\":{\"nullValue\":null}}},\"readTime\":\"2026-10-05T12:43:42Z\",\"done\":true}]", 1);
+    const agg = try codec.decodeAggregation(a, "[{\"readTime\":\"2026-10-05T12:43:42Z\"},{\"result\":{\"aggregateFields\":{\"a0\":{\"nullValue\":null}}},\"readTime\":\"2026-10-05T12:43:42Z\",\"done\":true}]", 1, &streamed);
     try testing.expectEqual(Value.null, agg.values[0]);
     for ([_][]const u8{
         "[]",
@@ -652,7 +715,7 @@ test "decode: query and aggregation answers, and the ones that are wrong" {
         "[{\"result\":{},\"readTime\":\"2026-10-05T12:43:42Z\"}]",
         "[{\"result\":{\"aggregateFields\":{\"a0\":{}}},\"readTime\":\"2026-10-05T12:43:42Z\"}]",
         "[{\"result\":{\"aggregateFields\":{\"a0\":{\"integerValue\":\"1\"}}},\"readTime\":\"2026-10-05T12:43:42Z\"},{\"result\":{\"aggregateFields\":{\"a0\":{\"integerValue\":\"1\"}}}}]",
-    }) |text| try testing.expectError(error.InvalidResponse, codec.decodeAggregation(a, text, 1));
+    }) |text| try testing.expectError(error.InvalidResponse, codec.decodeAggregation(a, text, 1, &streamed));
 }
 
 test "runQuery and runAggregationQuery: every allocation failure is OutOfMemory without leaks" {

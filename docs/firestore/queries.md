@@ -170,6 +170,11 @@ These stay the server's to check, and come back in `Diagnostics` in its
 words. Production sends a query's error inside the stream its answer
 would have taken, `[{"error": ...}]`, and core reads it there.
 
+An error can also come after documents, inside a 200 response: a query
+that runs past its deadline answers the documents it found and then
+`DEADLINE_EXCEEDED`. The call fails with that error, never answering the
+documents before it as the whole result, and is not retried.
+
 - One `not_equal`, `not_in`, `is_not_nan` or `is_not_null` per query.
 - `not_in` beside `in`, `array_contains_any` or OR.
 - One `array_contains` or `array_contains_any` per term of the query's
