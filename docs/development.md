@@ -146,6 +146,25 @@ GCP_TEST_PROJECT=my-project FIRESTORE_TEST_DATABASE=$DB \
 gcloud firestore databases delete --database=$DB
 ```
 
+The emulator suite runs against production too, in the same kind of
+database, when `FIRESTORE_TEST_PRODUCTION=1` is set and
+`FIRESTORE_EMULATOR_HOST` is not. Each test empties the database after
+itself. Two of its queries need composite indexes there, which the
+emulator never asks for; make them before the run, and wait for them to
+be ready:
+
+```sh
+gcloud firestore indexes composite create --database=$DB \
+    --collection-group=items --field-config=field-path=rank,order=descending \
+    --field-config=field-path=__name__,order=ascending
+gcloud firestore indexes composite create --database=$DB \
+    --collection-group=cities --field-config=field-path=state,order=ascending \
+    --field-config=field-path=population,order=ascending
+FIRESTORE_TEST_PRODUCTION=1 GCP_TEST_PROJECT=my-project FIRESTORE_TEST_DATABASE=$DB \
+    GCP_TEST_TOKEN=$(gcloud auth print-access-token) \
+    zig build test-integration -Dtest-filter=firestore_integration
+```
+
 ### Secret Manager and bucket settings
 
 Secret Manager has no emulator, so its tests need a real project. They

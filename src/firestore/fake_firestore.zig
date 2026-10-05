@@ -993,8 +993,17 @@ fn parseUrl(arena: Allocator, url: []const u8) Allocator.Error!?FakeFirestore.Ro
     }
     if (!std.mem.eql(u8, docs, "documents")) return null;
     const segments = try arena.alloc([]const u8, raw.items.len);
-    for (raw.items, segments) |r, *s| s.* = try percentDecode(arena, r);
+    for (raw.items, segments) |r, *s| s.* = try pathDecode(arena, r);
     return .{ .project = project, .database = database, .segments = segments, .verb = verb, .query = query };
+}
+
+/// A path segment, read as production reads it (measured 2026-10-05): a
+/// literal `+` is a space, though the emulator keeps it, so a client that
+/// sends one reaches another document here as it would there.
+fn pathDecode(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    const spaced = try arena.dupe(u8, text);
+    std.mem.replaceScalar(u8, spaced, '+', ' ');
+    return percentDecode(arena, spaced);
 }
 
 fn percentDecode(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
@@ -2448,6 +2457,14 @@ test "fake: ids and field paths that travel encoded, and ids it chooses" {
     var h: test_util.FakeHarness = undefined;
     try h.init(.{});
     defer h.deinit();
+    // A literal `+` in a path is a space, as production reads it.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = try h.client.collection("odd").doc("a b").set(&.{}, .{});
+    const plus = try rawRequest(&h.server, arena.allocator(), .GET, "/odd/a+b", "");
+    try testing.expectEqual(200, plus.status);
+    try testing.expect(std.mem.indexOf(u8, plus.body, "/documents/odd/a b\"") != null);
+    try h.client.collection("odd").doc("a b").delete(.{});
     for ([_][]const u8{ "a b%c+d", "a:b", "été", "x?y#z", "back\\slash" }) |id| {
         _ = try h.client.collection("odd").doc(id).set(&.{.{ .name = "c`d", .value = .{ .map = &.{.{ .name = "e f", .value = .{ .string = id } }} } }}, .{});
         var got = try h.client.collection("odd").doc(id).get(.{ .mask = &.{"`c\\`d`.`e f`"} });
@@ -2460,8 +2477,6 @@ test "fake: ids and field paths that travel encoded, and ids it chooses" {
     try testing.expectEqual(5, page.value.documents.len);
 
     // The library always names the id; a bare POST lets the fake choose.
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
     const made = try h.server.serve(.POST, "https://firestore.googleapis.com/v1/projects/p/databases/(default)/documents/auto", "{\"fields\":{}}", arena.allocator());
     const snapshot = try codec.decodeSnapshot(arena.allocator(), made.body);
     try testing.expectEqual(20, snapshot.id().len);

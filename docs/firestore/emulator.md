@@ -34,6 +34,8 @@ Measured side by side with production, 2026-10-04 to 10-05:
 | A query's error | `{"error": ...}` | `[{"error": ...}]`, inside the answer's stream |
 | A query past its deadline | Not measured | The documents found, then `{"error": ...}` `DEADLINE_EXCEEDED`, all in a 200 |
 | `batchGet`'s order | In no particular order | By name, the missing last |
+| A literal `+` in a request path | Kept: `a+b` names `a+b` | A space: `a+b` names `a b`. The client encodes `+` as `%2B` since 0.34.0 |
+| A query with an equality and a range on different fields, or an order the single-field indexes do not hold | Answered | Needs a composite index: `FAILED_PRECONDITION` with a link that makes it |
 | A request's size | Not measured | 11 MiB (11,534,336 bytes), not the documented 10: "Request payload size exceeds the limit: 11534336 bytes." |
 | An offset | No `skippedResults` | `skippedResults` in a message of its own |
 | `listCollectionIds` below a document id holding `:` | Refused | Answered |
@@ -61,8 +63,11 @@ checks the limits that one of them leaves to the other.
   aggregations per seed against each, which must answer or refuse alike;
   its first runs found eleven rules of the emulator's that the fake now
   follows. CI runs five seeds; `FIRESTORE_DIFF_SEED` replays one.
-- **Production**: `tests/firestore_gcp_integration.zig` runs against a
-  real project, in a named database made for the run, and records what
-  production does where it may differ.
+- **Production**: the emulator suite runs there too, in a named database
+  made for the run, every test but two (one needs a second database,
+  one measures this library's memory). Its first run found the `+` and
+  the two composite indexes above, and nothing else.
+  `tests/firestore_gcp_integration.zig` records the facts production
+  answers differently.
 
 [Development](../development.md#firestore) says how to run each.

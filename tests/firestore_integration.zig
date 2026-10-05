@@ -1,11 +1,27 @@
-//! Integration tests against the Firestore emulator: set
-//! FIRESTORE_EMULATOR_HOST, such as `127.0.0.1:8087`. With it unset, every
-//! test skips.
+//! Integration tests against the Firestore emulator, and against
+//! production on demand.
 //!
+//! The emulator: set FIRESTORE_EMULATOR_HOST, such as `127.0.0.1:8087`.
 //! Each test works in a project of its own, `zigps-` and 8 random hex
 //! digits, which the emulator creates on first use, and empties that
 //! project's databases through the emulator's documented endpoint after
 //! the test, even when the test fails.
+//!
+//! Production: leave FIRESTORE_EMULATOR_HOST unset, and set
+//! FIRESTORE_TEST_PRODUCTION=1 beside GCP_TEST_PROJECT, GCP_TEST_TOKEN and
+//! FIRESTORE_TEST_DATABASE, a named database made for the run and deleted
+//! after it, as `tests/firestore_gcp_integration.zig` takes them. Billed
+//! (a named database beside another gets no free quota), so never in CI.
+//! Each test empties the whole database after itself, documents that
+//! exist only as the parent of a subcollection included, so the next one
+//! starts from nothing, as on the emulator. Where production answers
+//! otherwise, the test says what each side does. A few tests skip there:
+//! they need a second database, or measure this library rather than the
+//! server. Two queries need composite indexes there, made before the run:
+//! `items` by `rank` descending then `__name__`, and `cities` by `state`
+//! then `population` (`docs/development.md` has the commands).
+//!
+//! With neither, every test skips.
 
 const std = @import("std");
 const core = @import("core");
@@ -18,54 +34,157 @@ const Fixture = struct {
     env: std.process.Environ.Map,
     diag: firestore.Diagnostics,
     client: firestore.Client,
-    /// "zigps-" plus 8 random hex digits, unique per test.
-    project: [14]u8,
-    emulator: firestore.Endpoint,
+    /// On the emulator, "zigps-" and 8 random hex digits, unique per test;
+    /// in production, the project named.
+    project: []const u8,
+    project_buf: [14]u8,
+    database: []const u8,
+    /// Null in production.
+    emulator: ?firestore.Endpoint,
+    /// In production, the token every client sends.
+    token: core.StaticToken,
     /// Databases besides `(default)` that the test used, to empty too.
     named: ?[]const u8 = null,
 
-    /// Returns false when no emulator is configured; the test should skip.
+    /// Returns false when no server is configured; the test should skip.
     fn init(f: *Fixture) !bool {
-        return f.initDatabase("(default)");
+        return f.initDatabase(null);
     }
 
-    fn initDatabase(f: *Fixture, database_id: []const u8) !bool {
+    /// `init` with a database of the test's own naming: on the emulator
+    /// only, since production has only the run's.
+    fn initNamed(f: *Fixture, database_id: []const u8) !bool {
+        return f.initDatabase(database_id);
+    }
+
+    fn initDatabase(f: *Fixture, named: ?[]const u8) !bool {
         const gpa = testing.allocator;
         f.env = try testing.environ.createMap(gpa);
         errdefer f.env.deinit();
-        f.emulator = firestore.Endpoint.fromEnv(&f.env) orelse {
-            f.env.deinit();
-            return false;
-        };
         f.diag = .{};
         f.named = null;
-        var random: [4]u8 = undefined;
-        testing.io.random(&random);
-        _ = try std.fmt.bufPrint(&f.project, "zigps-{x}", .{random});
-        f.client = try .init(gpa, testing.io, .{
-            .project_id = &f.project,
-            .database_id = database_id,
-            .endpoint = f.emulator,
-            .diagnostics = &f.diag,
-            .user_agent = "zig-gcp-firestore-integration/0.1",
-        });
-        if (!std.mem.eql(u8, database_id, "(default)")) f.named = database_id;
+        f.emulator = firestore.Endpoint.fromEnv(&f.env);
+        if (f.emulator != null) {
+            var random: [4]u8 = undefined;
+            testing.io.random(&random);
+            f.project = try std.fmt.bufPrint(&f.project_buf, "zigps-{x}", .{random});
+            f.database = named orelse "(default)";
+            f.named = named;
+        } else {
+            const wanted = f.env.get("FIRESTORE_TEST_PRODUCTION") orelse "";
+            const project = f.env.get("GCP_TEST_PROJECT");
+            const token = f.env.get("GCP_TEST_TOKEN");
+            const database = f.env.get("FIRESTORE_TEST_DATABASE");
+            if (!std.mem.eql(u8, wanted, "1") or project == null or token == null or database == null or named != null) {
+                f.env.deinit();
+                return false;
+            }
+            if (std.mem.eql(u8, database.?, "(default)")) return error.RefusedDefaultDatabase;
+            f.project = project.?;
+            f.database = database.?;
+            f.token = .{ .token = std.mem.trim(u8, token.?, &std.ascii.whitespace) };
+        }
+        var with_diag = f.options();
+        with_diag.diagnostics = &f.diag;
+        f.client = try .init(gpa, testing.io, with_diag);
         return true;
     }
 
+    fn production(f: *const Fixture) bool {
+        return f.emulator == null;
+    }
+
+    /// What a client of the test's server and database is made with, for
+    /// tests that need another.
+    fn options(f: *Fixture) firestore.Client.Options {
+        return .{
+            .project_id = f.project,
+            .database_id = f.database,
+            .endpoint = f.emulator,
+            .token_provider = if (f.emulator == null) f.token.provider() else null,
+            .user_agent = "zig-gcp-firestore-integration/0.1",
+        };
+    }
+
     fn deinit(f: *Fixture) void {
-        f.clear("(default)");
-        if (f.named) |db| f.clear(db);
+        if (f.production()) {
+            f.wipe();
+        } else {
+            f.clear("(default)");
+            if (f.named) |db| f.clear(db);
+        }
         f.client.deinit();
         f.env.deinit();
     }
 
-    /// Empties one database of the test's project.
+    /// Empties one database of the test's project on the emulator.
     fn clear(f: *Fixture, database_id: []const u8) void {
         var arena: std.heap.ArenaAllocator = .init(testing.allocator);
         defer arena.deinit();
-        const url = std.fmt.allocPrint(arena.allocator(), "{s}/emulator/v1/projects/{s}/databases/{s}/documents", .{ f.client.base_url, &f.project, database_id }) catch return;
+        const url = std.fmt.allocPrint(arena.allocator(), "{s}/emulator/v1/projects/{s}/databases/{s}/documents", .{ f.client.base_url, f.project, database_id }) catch return;
         _ = f.client.transport.send(.{ .method = .DELETE, .url = url, .timeout_ms = 10_000 }, arena.allocator()) catch {};
+    }
+
+    /// Deletes every document of the production database.
+    fn wipe(f: *Fixture) void {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        f.wipeBelow(arena.allocator(), "") catch |err| std.debug.print("emptying the database failed: {t}\n", .{err});
+    }
+
+    fn wipeBelow(f: *Fixture, a: std.mem.Allocator, parent: []const u8) anyerror!void {
+        var token: ?[]const u8 = null;
+        while (true) {
+            var page = if (parent.len == 0)
+                try f.client.listCollectionIds(.{ .page_token = token })
+            else
+                try f.client.doc(parent).listCollectionIds(.{ .page_token = token });
+            defer page.deinit();
+            for (page.value.collection_ids) |id| {
+                const collection = if (parent.len == 0) try a.dupe(u8, id) else try std.fmt.allocPrint(a, "{s}/{s}", .{ parent, id });
+                try f.wipeCollection(a, collection);
+            }
+            token = if (page.value.next_page_token) |t| try a.dupe(u8, t) else break;
+        }
+    }
+
+    /// Deletes the documents of `collection` and everything below them.
+    /// Listed with `showMissing`, which the client does not send, to find
+    /// the documents that exist only as parents.
+    fn wipeCollection(f: *Fixture, a: std.mem.Allocator, collection: []const u8) anyerror!void {
+        var token: ?[]const u8 = null;
+        while (true) {
+            var url: std.Io.Writer.Allocating = .init(a);
+            try url.writer.print("{s}/v1/projects/{s}/databases/{s}/documents", .{ f.client.base_url, f.project, f.database });
+            var segments = std.mem.splitScalar(u8, collection, '/');
+            while (segments.next()) |segment| {
+                try url.writer.writeByte('/');
+                try core.query.writeSegment(&url.writer, segment);
+            }
+            var params: core.query.Params = .init(&url.writer);
+            try params.add("showMissing", "true");
+            try params.add("mask.fieldPaths", "__name__");
+            try params.add("pageSize", "300");
+            if (token) |t| try params.add("pageToken", t);
+            const reply = try f.client.transport.send(.{ .method = .GET, .url = url.written(), .bearer = f.token.token, .timeout_ms = 30_000 }, a);
+            if (reply.status != 200) {
+                std.debug.print("listing {s} answered {d}: {s}\n", .{ collection, reply.status, reply.body });
+                return error.WipeFailed;
+            }
+            const Page = struct {
+                documents: []const struct { name: []const u8 } = &.{},
+                nextPageToken: ?[]const u8 = null,
+            };
+            const page = try std.json.parseFromSliceLeaky(Page, a, reply.body, .{ .ignore_unknown_fields = true });
+            for (page.documents) |d| {
+                const marker = "/documents/";
+                const at = std.mem.indexOf(u8, d.name, marker) orelse return error.WipeFailed;
+                const path = d.name[at + marker.len ..];
+                try f.wipeBelow(a, path);
+                try f.client.doc(path).delete(.{});
+            }
+            token = page.nextPageToken orelse break;
+        }
     }
 
     fn doc(f: *Fixture, path: []const u8) firestore.Document {
@@ -298,7 +417,10 @@ test "documents: ids that need encoding, subcollections, and odd names" {
     const odd = [_][]const u8{ "a b%c+d", "a:b", "été", "x?y#z", "[brackets]", "back\\slash", "dots.in.id", "...", "~tilde" };
     for (odd) |id| {
         _ = try f.client.collection("odd").doc(id).set(&.{.{ .name = "id", .value = .{ .string = id } }}, .{});
-        var got = try f.client.collection("odd").doc(id).get(.{});
+        var got = f.client.collection("odd").doc(id).get(.{}) catch |err| {
+            std.debug.print("id {s}: {t}\n", .{ id, err });
+            return err;
+        };
         defer got.deinit();
         try testing.expectEqualStrings(id, got.value.id());
         try testing.expectEqualStrings(id, got.value.get("id").?.string);
@@ -382,7 +504,7 @@ test "listing: documents by page and order, collection ids at each level" {
 
 test "named databases: separate from (default), no routing header needed" {
     var f: Fixture = undefined;
-    if (!try f.initDatabase("zigps-named")) return error.SkipZigTest;
+    if (!try f.initNamed("zigps-named")) return error.SkipZigTest;
     defer f.deinit();
     _ = try f.doc("c/x").set(&.{.{ .name = "where", .value = .{ .string = "named" } }}, .{});
     var got = try f.doc("c/x").get(.{});
@@ -391,7 +513,7 @@ test "named databases: separate from (default), no routing header needed" {
 
     // The same path in (default) is another document.
     var default: firestore.Client = try .init(testing.allocator, testing.io, .{
-        .project_id = &f.project,
+        .project_id = f.project,
         .endpoint = f.emulator,
     });
     defer default.deinit();
@@ -724,6 +846,9 @@ test "streaming: a 200 MB answer, read one document at a time in bounded memory"
     var f: Fixture = undefined;
     if (!try f.init()) return error.SkipZigTest;
     defer f.deinit();
+    // This measures the library; production's streaming was measured on
+    // its own, and 200 MB of egress is billed.
+    if (f.production()) return error.SkipZigTest;
     const big = try testing.allocator.alloc(u8, 1_000_000);
     defer testing.allocator.free(big);
     var path_buf: [16]u8 = undefined;
@@ -737,11 +862,7 @@ test "streaming: a 200 MB answer, read one document at a time in bounded memory"
     try testing.expectError(error.ResponseTooLarge, f.client.runQuery(all, .{}));
 
     var peak: Peak = .{ .child = testing.allocator };
-    var client: firestore.Client = try .init(peak.allocator(), testing.io, .{
-        .project_id = &f.project,
-        .endpoint = f.emulator,
-        .user_agent = "zig-gcp-firestore-integration/0.1",
-    });
+    var client: firestore.Client = try .init(peak.allocator(), testing.io, f.options());
     defer client.deinit();
     var tally: Tally = .{};
     const end = try client.runQueryEach(all, .{}, tally.handler());
@@ -830,11 +951,9 @@ test "transactions: concurrent increments never lose one" {
     _ = try f.doc("counters/c").set(&.{.{ .name = "n", .value = .{ .integer = 0 } }}, .{});
     // Three tasks, each with a client of its own, contend for one counter.
     var workers: [3]Incrementer = undefined;
-    for (&workers) |*w| w.* = .{ .client = try .init(testing.allocator, testing.io, .{
-        .project_id = &f.project,
-        .endpoint = f.emulator,
-        .retry = .{ .initial_backoff_ms = 20, .max_backoff_ms = 200 },
-    }) };
+    var quick = f.options();
+    quick.retry = .{ .initial_backoff_ms = 20, .max_backoff_ms = 200 };
+    for (&workers) |*w| w.* = .{ .client = try .init(testing.allocator, testing.io, quick) };
     defer for (&workers) |*w| w.client.deinit();
     const times = 4;
     var futures: [3]std.Io.Future(anyerror!void) = undefined;

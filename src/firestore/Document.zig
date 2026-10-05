@@ -197,7 +197,7 @@ test "get: subcollections, derived handles and odd ids" {
     try h.expectRequest(0, .GET, "https://firestore.googleapis.com/v1/projects/extractctl/databases/zigps-fs-1/documents/cities/LA/landmarks/tower", null);
     var odd = try h.client.collection("c").doc("a b%c+d").get(.{});
     defer odd.deinit();
-    try h.expectRequest(1, .GET, "https://firestore.googleapis.com/v1/projects/extractctl/databases/zigps-fs-1/documents/c/a%20b%25c+d", null);
+    try h.expectRequest(1, .GET, "https://firestore.googleapis.com/v1/projects/extractctl/databases/zigps-fs-1/documents/c/a%20b%25c%2Bd", null);
     try testing.expectEqualStrings("tower", h.client.collection("cities").doc("LA").collection("landmarks").doc("tower").id());
 }
 
