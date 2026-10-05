@@ -546,3 +546,156 @@ test "reads at a past time: get and batchGet see the document as it was" {
     defer batch.deinit();
     try testing.expectEqual(null, batch.value.documents[0]);
 }
+
+fn putCities(f: *Fixture) !void {
+    const cities = [_]struct { []const u8, []const u8, i64, ?f64, []const Value }{
+        .{ "LA", "CA", 3_900_000, 34.05, &.{ .{ .string = "west" }, .{ .string = "coast" } } },
+        .{ "SF", "CA", 870_000, null, &.{ .{ .string = "west" }, .{ .string = "coast" }, .{ .string = "tech" } } },
+        .{ "NY", "NY", 8_300_000, 40.71, &.{ .{ .string = "east" }, .{ .string = "coast" } } },
+        .{ "CHI", "IL", 2_700_000, std.math.nan(f64), &.{.{ .string = "midwest" }} },
+        .{ "AUS", "TX", 960_000, 30.27, &.{ .{ .string = "south" }, .{ .string = "tech" } } },
+    };
+    for (cities) |c| {
+        var path_buf: [16]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "cities/{s}", .{c[0]});
+        _ = try f.doc(path).set(&.{
+            .{ .name = "state", .value = .{ .string = c[1] } },
+            .{ .name = "population", .value = .{ .integer = c[2] } },
+            .{ .name = "lat", .value = if (c[3]) |lat| .{ .double = lat } else .null },
+            .{ .name = "tags", .value = .{ .array = c[4] } },
+        }, .{});
+    }
+}
+
+fn expectQueryIds(f: *Fixture, query: firestore.Query, expected: []const []const u8) !void {
+    var r = try f.client.runQuery(query, .{});
+    defer r.deinit();
+    var same = r.value.documents.len == expected.len;
+    if (same) for (r.value.documents, expected) |d, e| {
+        if (!std.mem.eql(u8, d.id(), e)) same = false;
+    };
+    if (!same) {
+        std.debug.print("expected", .{});
+        for (expected) |e| std.debug.print(" {s}", .{e});
+        std.debug.print("\ngot", .{});
+        for (r.value.documents) |d| std.debug.print(" {s}", .{d.id()});
+        std.debug.print("\n", .{});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "queries: filters, orders, cursors, offsets and limits" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    try putCities(&f);
+    const cities: firestore.Query.From = .{ .collection = "cities" };
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "state", .op = .equal, .value = .{ .string = "CA" } }} }, &.{ "LA", "SF" });
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "population", .op = .greater_than, .value = .{ .integer = 1_000_000 } }} }, &.{ "CHI", "LA", "NY" });
+    try expectQueryIds(&f, .{ .from = cities, .order_by = &.{.{ .field = "population", .direction = .descending }}, .limit = 2 }, &.{ "NY", "LA" });
+    try expectQueryIds(&f, .{ .from = cities, .order_by = &.{.{ .field = "population" }}, .offset = 1, .limit = 2 }, &.{ "AUS", "CHI" });
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "tags", .op = .array_contains, .value = .{ .string = "tech" } }} }, &.{ "AUS", "SF" });
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "tags", .op = .array_contains_any, .value = .{ .array = &.{ .{ .string = "east" }, .{ .string = "south" } } } }} }, &.{ "AUS", "NY" });
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "state", .op = .in, .value = .{ .array = &.{ .{ .string = "NY" }, .{ .string = "TX" } } } }} }, &.{ "AUS", "NY" });
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "state", .op = .not_in, .value = .{ .array = &.{.{ .string = "CA" }} } }} }, &.{ "CHI", "NY", "AUS" });
+    try expectQueryIds(&f, .{
+        .from = cities,
+        .filter = .{
+            .any = &.{
+                .{ .condition = .{ .field = "state", .op = .equal, .value = .{ .string = "TX" } } },
+                .{ .all = &.{
+                    .{ .condition = .{ .field = "state", .op = .equal, .value = .{ .string = "CA" } } },
+                    .{ .condition = .{ .field = "population", .op = .less_than, .value = .{ .integer = 1_000_000 } } },
+                } },
+                // The inequality in one branch orders every result by population.
+            },
+        },
+    }, &.{ "SF", "AUS" });
+    // Cursors, both ends, both ways.
+    const by_pop: []const firestore.Order = &.{.{ .field = "population" }};
+    try expectQueryIds(&f, .{ .from = cities, .order_by = by_pop, .start_at = .{ .values = &.{.{ .integer = 960_000 }} } }, &.{ "AUS", "CHI", "LA", "NY" });
+    try expectQueryIds(&f, .{ .from = cities, .order_by = by_pop, .start_at = .{ .values = &.{.{ .integer = 960_000 }}, .inclusive = false } }, &.{ "CHI", "LA", "NY" });
+    try expectQueryIds(&f, .{ .from = cities, .order_by = by_pop, .end_at = .{ .values = &.{.{ .integer = 2_700_000 }} } }, &.{ "SF", "AUS", "CHI" });
+    try expectQueryIds(&f, .{ .from = cities, .order_by = by_pop, .end_at = .{ .values = &.{.{ .integer = 2_700_000 }}, .inclusive = false } }, &.{ "SF", "AUS" });
+    // A select returns only the fields named.
+    var picked = try f.client.runQuery(.{ .from = cities, .select = &.{"state"}, .where = &.{.{ .field = "state", .op = .equal, .value = .{ .string = "NY" } }} }, .{});
+    defer picked.deinit();
+    try testing.expectEqual(1, picked.value.documents[0].fields.len);
+    try testing.expectEqualStrings("NY", picked.value.documents[0].get("state").?.string);
+}
+
+test "queries: equality with null and NaN finds them, sent as the server's own tests" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    try putCities(&f);
+    const cities: firestore.Query.From = .{ .collection = "cities" };
+    // As field filters these match nothing; the library sends them unary.
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "lat", .op = .equal, .value = .null }} }, &.{"SF"});
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "lat", .op = .equal, .value = .{ .double = std.math.nan(f64) } }} }, &.{"CHI"});
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "lat", .op = .not_equal, .value = .null }} }, &.{ "CHI", "AUS", "LA", "NY" });
+    try expectQueryIds(&f, .{ .from = cities, .where = &.{.{ .field = "lat", .op = .is_not_nan }} }, &.{ "AUS", "LA", "NY" });
+    // The ones that would match nothing are refused before sending.
+    try testing.expectError(error.InvalidArgument, f.client.runQuery(.{ .from = cities, .where = &.{.{ .field = "lat", .op = .less_than, .value = .null }} }, .{}));
+}
+
+test "queries: collection groups below a parent, and the document name" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    for ([_][]const u8{ "cities/LA/landmarks/tower", "cities/LA/landmarks/park", "cities/NY/landmarks/bridge", "landmarks/moon", "cities/LA/other/landmarks" }) |path| {
+        _ = try f.doc(path).set(&.{.{ .name = "path", .value = .{ .string = path } }}, .{});
+    }
+    try expectQueryIds(&f, .{ .from = .{ .group = "landmarks" } }, &.{ "park", "tower", "bridge", "moon" });
+    try expectQueryIds(&f, .{ .from = .{ .group = "landmarks" }, .parent = "cities/LA" }, &.{ "park", "tower" });
+    try expectQueryIds(&f, .{ .from = .{ .collection = "landmarks" }, .parent = "cities/NY" }, &.{"bridge"});
+    const tower = try f.client.documentName(testing.allocator, "cities/LA/landmarks/tower");
+    defer testing.allocator.free(tower);
+    try expectQueryIds(&f, .{ .from = .{ .group = "landmarks" }, .where = &.{.{ .field = "__name__", .op = .equal, .value = .{ .reference = tower } }} }, &.{"tower"});
+    // Names order segment by segment: landmarks/moon after every cities/...
+    try expectQueryIds(&f, .{ .from = .{ .group = "landmarks" }, .order_by = &.{.{ .field = "__name__" }}, .start_at = .{ .values = &.{.{ .reference = tower }}, .inclusive = false } }, &.{ "bridge", "moon" });
+}
+
+test "aggregations: count, sum and average, and the documents they see" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    try putCities(&f);
+    _ = try f.doc("cities/NOWHERE").set(&.{.{ .name = "state", .value = .{ .string = "??" } }}, .{});
+    const cities: firestore.Query = .{ .from = .{ .collection = "cities" } };
+    var count = try f.client.runAggregationQuery(cities, &.{ .{ .count = .{} }, .{ .count = .{ .up_to = 2 } } }, .{});
+    defer count.deinit();
+    try testing.expectEqual(6, count.value.values[0].integer);
+    try testing.expectEqual(2, count.value.values[1].integer);
+    // Measured on the emulator: with a sum among them, the count sees only
+    // the documents that have the summed field.
+    var sums = try f.client.runAggregationQuery(cities, &.{ .{ .sum = "population" }, .{ .avg = "population" }, .{ .count = .{} } }, .{});
+    defer sums.deinit();
+    try testing.expectEqual(16_730_000, sums.value.values[0].integer);
+    try testing.expectEqual(3_346_000.0, sums.value.values[1].double);
+    try testing.expectEqual(5, sums.value.values[2].integer);
+    var west = try f.client.runAggregationQuery(.{ .from = .{ .collection = "cities" }, .where = &.{.{ .field = "state", .op = .equal, .value = .{ .string = "CA" } }} }, &.{.{ .count = .{} }}, .{});
+    defer west.deinit();
+    try testing.expectEqual(2, west.value.values[0].integer);
+    var nothing = try f.client.runAggregationQuery(.{ .from = .{ .collection = "none" } }, &.{ .{ .sum = "x" }, .{ .avg = "x" } }, .{});
+    defer nothing.deinit();
+    try testing.expectEqual(0, nothing.value.values[0].integer);
+    try testing.expectEqual(Value.null, nothing.value.values[1]);
+}
+
+test "queries at a past time see the documents as they were" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const first = try f.doc("c/a").set(&.{.{ .name = "v", .value = .{ .integer = 1 } }}, .{});
+    _ = try f.doc("c/b").set(&.{.{ .name = "v", .value = .{ .integer = 2 } }}, .{});
+    _ = try f.doc("c/a").set(&.{.{ .name = "v", .value = .{ .integer = 3 } }}, .{});
+    var then = try f.client.runQuery(.{ .from = .{ .collection = "c" } }, .{ .read_time = first.update_time });
+    defer then.deinit();
+    try testing.expectEqual(1, then.value.documents.len);
+    try testing.expectEqual(1, then.value.documents[0].get("v").?.integer);
+    try testing.expectEqual(first.update_time, then.value.read_time);
+    var sum_then = try f.client.runAggregationQuery(.{ .from = .{ .collection = "c" } }, &.{.{ .sum = "v" }}, .{ .read_time = first.update_time });
+    defer sum_then.deinit();
+    try testing.expectEqual(1, sum_then.value.values[0].integer);
+}

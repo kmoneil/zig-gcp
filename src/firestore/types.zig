@@ -246,6 +246,131 @@ pub const CommitResult = struct {
     commit_time: std.Io.Timestamp,
 };
 
+/// A query over one collection, or over every collection of one id at any
+/// depth (a collection group), read with `Client.runQuery`.
+pub const Query = struct {
+    from: From,
+    /// The document below which to look, such as `cities/LA`; empty for
+    /// the whole database. A collection query reads the collection
+    /// directly below it, a group query every collection of that id
+    /// anywhere below it.
+    parent: []const u8 = "",
+    /// Conditions that must all hold. For OR, or AND nested in it, use
+    /// `filter` instead; the two cannot be set together.
+    where: []const Condition = &.{},
+    filter: ?Filter = null,
+    /// A document without a field ordered by is left out. After these,
+    /// the server orders by the fields of any inequality not ordered by
+    /// already, then by name, in the last order's direction; ties break
+    /// the same way.
+    order_by: []const Order = &.{},
+    /// Field paths to return; null returns whole documents, and an empty
+    /// list only their names.
+    select: ?[]const []const u8 = null,
+    /// Where the results begin and end, in `order_by`'s terms.
+    start_at: ?Cursor = null,
+    end_at: ?Cursor = null,
+    /// Results to skip.
+    offset: u32 = 0,
+    /// Null for no limit.
+    limit: ?u32 = null,
+
+    pub const From = union(enum) {
+        /// A collection id, such as `cities`.
+        collection: []const u8,
+        /// A collection id, such as `landmarks`: every collection so named.
+        group: []const u8,
+    };
+};
+
+pub const Operator = enum {
+    less_than,
+    less_than_or_equal,
+    greater_than,
+    greater_than_or_equal,
+    /// Against null or NaN, sent as the server's own test for them: an
+    /// equality with either never matches on the wire.
+    equal,
+    /// Against null or NaN, likewise. Leaves out documents whose field is
+    /// null or missing.
+    not_equal,
+    array_contains,
+    /// The value is an array of at most 30 values to match any of.
+    in,
+    /// The value is an array of at most 30 values, any of which the
+    /// field's array holds.
+    array_contains_any,
+    /// The value is an array of at most 10 values to match none of. Leaves
+    /// out documents whose field is null or missing.
+    not_in,
+    is_null,
+    is_nan,
+    is_not_null,
+    /// Leaves out null too.
+    is_not_nan,
+};
+
+/// One test of one field. A range only matches values of its operand's
+/// kind: `greater_than` 1 matches numbers, never strings.
+pub const Condition = struct {
+    /// A field path, or `__name__`, whose values are references, which
+    /// `Client.documentName` builds.
+    field: []const u8,
+    op: Operator,
+    /// Unused by the four `is_*` operators.
+    value: Value = .null,
+};
+
+/// A tree of conditions.
+pub const Filter = union(enum) {
+    condition: Condition,
+    /// Every one holds; at least one.
+    all: []const Filter,
+    /// Any one holds; at least one.
+    any: []const Filter,
+};
+
+/// A position in a query's order: one value per `order_by` entry, at most
+/// as many as there are. A `__name__` position is a reference.
+pub const Cursor = struct {
+    values: []const Value,
+    /// For `start_at`, whether documents at the position are included or
+    /// the results start after them; for `end_at`, whether they are
+    /// included or the results end before them.
+    inclusive: bool = true,
+};
+
+pub const QueryOptions = struct {
+    /// Read as of then; see `GetOptions.read_time`.
+    read_time: ?std.Io.Timestamp = null,
+};
+
+pub const QueryResult = struct {
+    documents: []const Snapshot,
+    /// When the results were read.
+    read_time: std.Io.Timestamp,
+    /// How many results the offset skipped, where the server says.
+    skipped_results: u64 = 0,
+};
+
+/// One figure over a query's results; at most five per query.
+pub const Aggregation = union(enum) {
+    /// How many documents; with `up_to`, counting stops there.
+    count: struct { up_to: ?u63 = null },
+    /// The sum of a field's numbers, other values left out: an integer
+    /// while every number is one and the sum fits, a double otherwise.
+    sum: []const u8,
+    /// The mean of a field's numbers as a double, null when there are
+    /// none.
+    avg: []const u8,
+};
+
+pub const AggregationResult = struct {
+    /// One per aggregation, in the order asked.
+    values: []const Value,
+    read_time: std.Io.Timestamp,
+};
+
 pub const BatchGetOptions = struct {
     /// As `GetOptions.mask`, for every document.
     mask: ?[]const []const u8 = null,
