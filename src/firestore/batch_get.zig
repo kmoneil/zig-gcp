@@ -25,6 +25,7 @@ pub fn batchGet(
 ) Error!types.BatchGetResult {
     if (options.mask) |m| try rpc.checkMask(client, m, "read mask");
     if (options.read_time) |t| try rpc.checkTime(client, t, "read time");
+    try rpc.checkTransaction(client, options.transaction, options.read_time);
     if (paths.len == 0) return .{ .documents = &.{}, .read_time = null };
 
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
@@ -41,7 +42,7 @@ pub fn batchGet(
         if (!entry.found_existing) entry.value_ptr.* = i;
     }
     const url = writeUrl(a, client) catch return error.OutOfMemory;
-    const body = try codec.encodeBatchGet(a, full_names, options.mask, options.read_time);
+    const body = try codec.encodeBatchGet(a, full_names, options);
 
     // A read: asking again is harmless.
     const reply = try rpc.execute(client, response, .{ .method = .POST, .path = url, .body = body });

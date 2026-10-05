@@ -46,15 +46,18 @@ pub fn get(self: Document, options: types.GetOptions) Error!types.Owned(types.Sn
     const path = try rpc.checkedPath(client, a, self.path, .document);
     if (options.mask) |m| try rpc.checkMask(client, m, "read mask");
 
+    try rpc.checkTransaction(client, options.transaction, options.read_time);
+
     var result: types.Owned(types.Snapshot) = try .init(client.gpa);
     errdefer result.deinit();
-    if (options.read_time) |t| {
+    if (options.read_time != null or options.transaction != null) {
         // Measured: the emulator refuses a read time as a query parameter,
-        // "Only timestamps past epoch are supported.", and takes it in
-        // batchGet's body.
-        const batch = try batch_get.batchGet(client, &.{path}, .{ .mask = options.mask, .read_time = t }, result.arena);
-        result.value = batch.documents[0] orelse
-            return rpc.refuse(client, error.NotFound, "the document did not exist at the read time", .{});
+        // "Only timestamps past epoch are supported.", and hangs on a
+        // transaction there; batchGet takes either in its body.
+        const batch = try batch_get.batchGet(client, &.{path}, .{ .mask = options.mask, .read_time = options.read_time, .transaction = options.transaction }, result.arena);
+        result.value = batch.documents[0] orelse return rpc.refuse(client, error.NotFound, "{s}", .{
+            if (options.read_time != null) "the document did not exist at the read time" else "the document does not exist",
+        });
         return result;
     }
     const url = writeUrl(a, client, path, options.mask) catch return error.OutOfMemory;
@@ -99,18 +102,7 @@ pub fn update(self: Document, fields: []const types.Field, options: types.Update
     defer scratch.deinit();
     const a = scratch.allocator();
     const path = try rpc.checkedPath(client, a, self.path, .document);
-    try rpc.checkFields(client, fields);
-    const mask = options.mask orelse try defaultMask(a, fields);
-    if (mask.len == 0 and options.transforms.len == 0) {
-        return rpc.refuse(client, error.InvalidArgument, "an update needs a field, a mask path or a transform: this one would change nothing", .{});
-    }
-    return writeOne(client, .{ .update = .{
-        .path = path,
-        .fields = fields,
-        .mask = mask,
-        .transforms = options.transforms,
-        .precondition = options.precondition,
-    } });
+    return writeOne(client, try writes.updateWrite(client, a, path, fields, options));
 }
 
 /// Deletes the document. Deleting a missing one succeeds unless
@@ -142,7 +134,7 @@ pub fn listCollectionIds(self: Document, options: types.ListCollectionIdsOptions
 fn writeOne(client: *Client, write: types.Write) Error!types.WriteResult {
     var response: std.heap.ArenaAllocator = .init(client.gpa);
     defer response.deinit();
-    const result = try writes.commit(client, &.{write}, &response);
+    const result = try writes.commit(client, &.{write}, null, &response);
     return .{ .update_time = result.writes[0].update_time orelse result.commit_time };
 }
 
@@ -154,13 +146,6 @@ fn writeUrl(a: Allocator, client: *const Client, path: []const u8, mask: ?[]cons
     var params: Params = .init(w);
     if (mask) |m| try rpc.addMask(&params, "mask.fieldPaths", m);
     return out.written();
-}
-
-/// The top-level names of `fields`, each as a field path.
-fn defaultMask(a: Allocator, fields: []const types.Field) Allocator.Error![]const []const u8 {
-    const mask = try a.alloc([]const u8, fields.len);
-    for (fields, mask) |f, *m| m.* = try names.fieldPathOf(a, f.name);
-    return mask;
 }
 
 const testing = std.testing;

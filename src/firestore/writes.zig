@@ -24,10 +24,11 @@ const types = @import("types.zig");
 const validate = @import("validate.zig");
 const Error = errors.Error;
 
-/// Commits `writes`, in order and atomically, and returns what each did,
-/// decoded into `response`. The call has begun.
-pub fn commit(client: *Client, writes: []const types.Write, response: *std.heap.ArenaAllocator) Error!types.CommitResult {
-    if (writes.len == 0) return rpc.refuse(client, error.InvalidArgument, "a commit needs at least one write", .{});
+/// Commits `writes`, in order and atomically, in `transaction` when set,
+/// and returns what each did, decoded into `response`. The call has begun.
+pub fn commit(client: *Client, writes: []const types.Write, transaction: ?[]const u8, response: *std.heap.ArenaAllocator) Error!types.CommitResult {
+    if (writes.len == 0) return rpc.refuse(client, error.InvalidArgument, "a commit needs at least one write: a transaction without any ends with rollback", .{});
+    try rpc.checkTransaction(client, transaction, null);
     var scratch: std.heap.ArenaAllocator = .init(client.gpa);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -40,12 +41,16 @@ pub fn commit(client: *Client, writes: []const types.Write, response: *std.heap.
     }
     try checkTransformCounts(client, a, wire);
     const url = rpc.commitPath(a, client) catch return error.OutOfMemory;
-    const body = try codec.encodeCommit(a, wire);
-    const retried = client.retry_unconditional_writes or for (wire) |w| {
+    const body = try codec.encodeCommit(a, wire, transaction);
+    // A transaction's commit is sent once: a repeat of one that landed
+    // answers ABORTED, which would run the transaction again.
+    const retried = transaction == null and (client.retry_unconditional_writes or for (wire) |w| {
         if (!safeToRepeat(w)) break false;
-    } else true;
+    } else true);
     const reply = rpc.execute(client, response, .{ .method = .POST, .path = url, .body = body, .retry = retried }) catch |err| {
-        noteFailure(client, err, wire, retried);
+        if (transaction != null) {
+            if (client.retry.max_attempts > 1 and core.isRetryable(err)) rpc.appendNote(client, "; a transaction's commit is sent once: it may or may not have committed, so read to see");
+        } else noteFailure(client, err, wire, retried);
         return err;
     };
     const result = codec.decodeCommit(response.allocator(), reply) catch |err|
@@ -56,6 +61,92 @@ pub fn commit(client: *Client, writes: []const types.Write, response: *std.heap.
     }
     // A commit of writes always carries its time; decodeCommit says so.
     return .{ .writes = result.writes, .commit_time = result.commit_time.? };
+}
+
+/// The write `Document.update` sends: the mask given, or the top-level
+/// names of `fields`; refused when it would change nothing.
+pub fn updateWrite(client: *Client, a: Allocator, path: []const u8, fields: []const types.Field, options: types.UpdateOptions) Error!types.Write {
+    try rpc.checkFields(client, fields);
+    const mask = options.mask orelse try defaultMask(a, fields);
+    if (mask.len == 0 and options.transforms.len == 0) {
+        return rpc.refuse(client, error.InvalidArgument, "an update needs a field, a mask path or a transform: this one would change nothing", .{});
+    }
+    return .{ .update = .{
+        .path = path,
+        .fields = fields,
+        .mask = mask,
+        .transforms = options.transforms,
+        .precondition = options.precondition,
+    } };
+}
+
+/// The top-level names of `fields`, each as a field path.
+fn defaultMask(a: Allocator, fields: []const types.Field) Allocator.Error![]const []const u8 {
+    const mask = try a.alloc([]const u8, fields.len);
+    for (fields, mask) |f, *m| m.* = try names.fieldPathOf(a, f.name);
+    return mask;
+}
+
+/// Checks a write as `commit` would, without sending it.
+pub fn check(client: *Client, a: Allocator, w: types.Write) Error!void {
+    _ = try resolve(client, a, w);
+}
+
+/// `w` with everything it points to copied into `a`, for a write kept
+/// past the call that made it, as a transaction keeps its writes.
+pub fn copyWrite(a: Allocator, w: types.Write) Allocator.Error!types.Write {
+    return switch (w) {
+        .update => |u| .{ .update = .{
+            .path = try a.dupe(u8, u.path),
+            .fields = try copyFields(a, u.fields),
+            .mask = if (u.mask) |m| try copyStrings(a, m) else null,
+            .transforms = try copyTransforms(a, u.transforms),
+            .precondition = u.precondition,
+        } },
+        .delete => |d| .{ .delete = .{ .path = try a.dupe(u8, d.path), .precondition = d.precondition } },
+    };
+}
+
+fn copyStrings(a: Allocator, strings: []const []const u8) Allocator.Error![]const []const u8 {
+    const out = try a.alloc([]const u8, strings.len);
+    for (strings, out) |s, *o| o.* = try a.dupe(u8, s);
+    return out;
+}
+
+fn copyFields(a: Allocator, fields: []const types.Field) Allocator.Error![]const types.Field {
+    const out = try a.alloc(types.Field, fields.len);
+    for (fields, out) |f, *o| o.* = .{ .name = try a.dupe(u8, f.name), .value = try copyValue(a, f.value) };
+    return out;
+}
+
+fn copyValues(a: Allocator, values: []const types.Value) Allocator.Error![]const types.Value {
+    const out = try a.alloc(types.Value, values.len);
+    for (values, out) |v, *o| o.* = try copyValue(a, v);
+    return out;
+}
+
+fn copyValue(a: Allocator, v: types.Value) Allocator.Error!types.Value {
+    return switch (v) {
+        .string => |s| .{ .string = try a.dupe(u8, s) },
+        .bytes => |b| .{ .bytes = try a.dupe(u8, b) },
+        .reference => |r| .{ .reference = try a.dupe(u8, r) },
+        .array => |items| .{ .array = try copyValues(a, items) },
+        .map => |fields| .{ .map = try copyFields(a, fields) },
+        .null, .boolean, .integer, .double, .timestamp, .geo_point => v,
+    };
+}
+
+fn copyTransforms(a: Allocator, transforms: []const types.Transform) Allocator.Error![]const types.Transform {
+    const out = try a.alloc(types.Transform, transforms.len);
+    for (transforms, out) |t, *o| o.* = .{
+        .field_path = try a.dupe(u8, t.field_path),
+        .op = switch (t.op) {
+            .append_missing => |values| .{ .append_missing = try copyValues(a, values) },
+            .remove_all => |values| .{ .remove_all = try copyValues(a, values) },
+            else => t.op,
+        },
+    };
+    return out;
 }
 
 /// Whether sending `w` again after a lost answer is safe; see the top of
@@ -457,4 +548,84 @@ test "commit: every allocation failure is OutOfMemory without leaks" {
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+}
+
+/// The commit body of `w` alone, for comparing writes.
+fn encodeOne(a: Allocator, w: types.Write) ![]u8 {
+    const wire: codec.Write = switch (w) {
+        .update => |u| .{ .name = u.path, .op = .{ .update = .{ .fields = u.fields, .mask = u.mask, .transforms = u.transforms } }, .precondition = u.precondition },
+        .delete => |d| .{ .name = d.path, .op = .delete, .precondition = d.precondition },
+    };
+    return codec.encodeCommit(a, &.{wire}, null);
+}
+
+test "copyWrite: the copy says exactly what the original said, and outlives it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Every value kind, transforms with values, a mask, in borrowed memory
+    // that is overwritten once copied.
+    const scratch = try testing.allocator.alloc(u8, 64);
+    defer testing.allocator.free(scratch);
+    @memcpy(scratch[0..20], "c/xbytesrefnamemaskv");
+    const original: types.Write = .{ .update = .{
+        .path = scratch[0..3],
+        .fields = &.{
+            .{ .name = scratch[15..19], .value = .{ .map = &.{
+                .{ .name = "s", .value = .{ .string = scratch[3..8] } },
+                .{ .name = "b", .value = .{ .bytes = scratch[3..8] } },
+                .{ .name = "r", .value = .{ .reference = "projects/p/databases/(default)/documents/c/y" } },
+                .{ .name = "a", .value = .{ .array = &.{ .{ .integer = 1 }, .{ .double = 1.5 }, .null, .{ .boolean = true } } } },
+                .{ .name = "t", .value = .{ .timestamp = .{ .nanoseconds = 1_791_158_400_000_000_000 } } },
+                .{ .name = "g", .value = .{ .geo_point = .{ .latitude = 1, .longitude = 2 } } },
+            } } },
+        },
+        .mask = &.{scratch[15..19]},
+        .transforms = &.{
+            .{ .field_path = "n", .op = .{ .increment = .{ .integer = 1 } } },
+            .{ .field_path = "tags", .op = .{ .append_missing = &.{.{ .string = scratch[3..8] }} } },
+            .{ .field_path = "old", .op = .{ .remove_all = &.{.{ .map = &.{.{ .name = "k", .value = .null }} }} } },
+            .{ .field_path = "at", .op = .server_time },
+        },
+        .precondition = .{ .exists = true },
+    } };
+    const before = try encodeOne(a, original);
+    const copy = try copyWrite(a, original);
+    @memset(scratch, 'Z');
+    try testing.expectEqualStrings(before, try encodeOne(a, copy));
+
+    @memcpy(scratch[0..3], "c/x");
+    const delete: types.Write = .{ .delete = .{ .path = scratch[0..3], .precondition = .{ .update_time = .{ .nanoseconds = 1_000 } } } };
+    const delete_before = try encodeOne(a, delete);
+    const delete_copy = try copyWrite(a, delete);
+    @memset(scratch, 'Z');
+    try testing.expectEqualStrings(delete_before, try encodeOne(a, delete_copy));
+}
+
+fn copyProperty(_: void, input: []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var g: test_util.ByteGen = .init(input);
+    const fields = try a.alloc(types.Field, g.intRange(u8, 0, 3));
+    for (fields, 0..) |*f, i| f.* = .{ .name = try std.fmt.allocPrint(a, "f{d}", .{i}), .value = try codec.randomValue(&g, a, 3, false) };
+    const values = try a.alloc(types.Value, g.intRange(u8, 0, 2));
+    for (values) |*v| v.* = try codec.randomValue(&g, a, 2, true);
+    const w: types.Write = if (g.intRange(u8, 0, 4) == 0)
+        .{ .delete = .{ .path = "c/x" } }
+    else
+        .{ .update = .{
+            .path = "c/x",
+            .fields = fields,
+            .mask = if (g.boolean()) &.{"f0"} else null,
+            .transforms = if (g.boolean()) &.{.{ .field_path = "z", .op = .{ .append_missing = values } }} else &.{},
+        } };
+    var copy_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer copy_arena.deinit();
+    const copy = try copyWrite(copy_arena.allocator(), w);
+    try testing.expectEqualStrings(try encodeOne(a, w), try encodeOne(a, copy));
+}
+
+test "fuzz copyWrite: any write's copy encodes as the original" {
+    try test_util.fuzzBytes({}, copyProperty, .{ .corpus = &.{ "", "\x01\x0a\x03\x09\x02", "\x03\x0a\x0a\x0a\x01\x01\x01" } });
 }

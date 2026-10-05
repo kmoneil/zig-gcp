@@ -8,6 +8,7 @@
 //!     ... -- getall cities/LA cities/SF
 //!     ... -- query cities population '>' 1000000 --order population:desc --limit 2
 //!     ... -- count cities state == CA
+//!     ... -- transfer accounts/alice accounts/bob balance 25
 //!     ... -- ls cities
 //!     ... -- collections [cities/LA]
 //!     ... -- rm cities/LA
@@ -20,7 +21,10 @@
 //! `getall` reads several documents in one request. `query` and `count`
 //! take conditions as FIELD OP VALUE triples, OP one of `==`, `!=`, `<`,
 //! `<=`, `>`, `>=` and `contains` (an array holding the value), and
-//! `--group` reads every collection of that id at any depth.
+//! `--group` reads every collection of that id at any depth. `transfer`
+//! moves an amount from one document's field to another's in a
+//! transaction: both read, both written, or neither, and refused when the
+//! first holds too little; contention runs it again.
 //! `--project` names the project, by default GOOGLE_CLOUD_PROJECT, or
 //! `test` against the emulator; `--database` a named database.
 //!
@@ -44,6 +48,7 @@ const usage =
     \\       firestore getall DOC_PATH...
     \\       firestore query COLLECTION [FIELD OP VALUE]... [--order FIELD[:desc]] [--limit N] [--group]
     \\       firestore count COLLECTION [FIELD OP VALUE]... [--group]
+    \\       firestore transfer FROM_DOC TO_DOC FIELD AMOUNT
     \\       firestore ls COLLECTION_PATH
     \\       firestore collections [DOC_PATH]
     \\       firestore rm DOC_PATH
@@ -179,6 +184,22 @@ pub fn main(init: std.process.Init) !void {
             defer r.deinit();
             for (r.value.documents) |d| try printDoc(out, d);
         }
+    } else if (std.mem.eql(u8, command, "transfer")) {
+        if (p.len != 5) return badUsage(out);
+        var transfer: Transfer = .{
+            .from = p[1],
+            .to = p[2],
+            .field = p[3],
+            .amount = std.fmt.parseInt(i64, p[4], 10) catch return badUsage(out),
+        };
+        client.runTransaction(transfer.handler(), .{}) catch |err| {
+            if (err == error.InsufficientFunds) {
+                std.debug.print("error: {s} holds {d}, less than {d}\n", .{ transfer.from, transfer.balance, transfer.amount });
+                return err;
+            }
+            return fail(err, &diag);
+        };
+        try out.print("moved {d}: {s} now holds {d}, {s} {d}\n", .{ transfer.amount, transfer.from, transfer.balance - transfer.amount, transfer.to, transfer.received + transfer.amount });
     } else if (std.mem.eql(u8, command, "get")) {
         if (p.len != 2) return badUsage(out);
         var got = client.doc(p[1]).get(.{}) catch |err| return fail(err, &diag);
@@ -223,6 +244,41 @@ fn parseFields(arena: std.mem.Allocator, pairs: []const []const u8) ![]const fir
     }
     return fields;
 }
+
+/// Moves `amount` of `field` from one document to another, as a
+/// transaction's handler: run again from the start whenever the server
+/// aborts the transaction, so it only reads and writes through `txn`.
+const Transfer = struct {
+    from: []const u8,
+    to: []const u8,
+    field: []const u8,
+    amount: i64,
+    /// What the documents held when last read.
+    balance: i64 = 0,
+    received: i64 = 0,
+
+    fn handler(self: *Transfer) firestore.TransactionHandler {
+        return .{ .ptr = self, .vtable = &.{ .run = run } };
+    }
+
+    fn run(ptr: *anyopaque, txn: *firestore.Transaction) anyerror!void {
+        const self: *Transfer = @ptrCast(@alignCast(ptr));
+        var both = try txn.batchGet(&.{ self.from, self.to }, .{});
+        defer both.deinit();
+        self.balance = number(both.value.documents[0], self.field);
+        self.received = number(both.value.documents[1], self.field);
+        if (self.balance < self.amount) return error.InsufficientFunds;
+        try txn.set(self.from, &.{.{ .name = self.field, .value = .{ .integer = self.balance - self.amount } }}, .{});
+        try txn.set(self.to, &.{.{ .name = self.field, .value = .{ .integer = self.received + self.amount } }}, .{});
+    }
+
+    /// The document's integer `field`, 0 when it or the field is missing.
+    fn number(doc: ?firestore.Snapshot, field: []const u8) i64 {
+        const d = doc orelse return 0;
+        const v = d.get(field) orelse return 0;
+        return if (v == .integer) v.integer else 0;
+    }
+};
 
 fn parseOp(text: []const u8) ?firestore.Operator {
     const ops = std.StaticStringMap(firestore.Operator).initComptime(.{

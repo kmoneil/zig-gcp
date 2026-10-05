@@ -75,20 +75,74 @@ pub const Write = struct {
 /// (2026-10-04), `currentDocument.updateTime` in RFC 3339 as a query
 /// parameter reads as 0, which demands that the document not exist, and
 /// in the body it is honored. Google's clients send every write this way.
-pub fn encodeCommit(arena: Allocator, writes: []const Write) Allocator.Error![]u8 {
+pub fn encodeCommit(arena: Allocator, writes: []const Write, transaction: ?[]const u8) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
     var jw: Stringify = .{ .writer = &out.writer };
-    writeCommit(&jw, writes) catch return error.OutOfMemory;
+    writeCommit(&jw, writes, transaction) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn writeCommit(jw: *Stringify, writes: []const Write) Stringify.Error!void {
+fn writeCommit(jw: *Stringify, writes: []const Write, transaction: ?[]const u8) Stringify.Error!void {
     try jw.beginObject();
     try jw.objectField("writes");
     try jw.beginArray();
     for (writes) |w| try writeWrite(jw, w);
     try jw.endArray();
+    if (transaction) |t| {
+        try jw.objectField("transaction");
+        try jw.write(t);
+    }
     try jw.endObject();
+}
+
+/// The `beginTransaction` body: read-write, again after `retry` when set,
+/// or read-only, as of a time when set.
+pub fn encodeBeginTransaction(arena: Allocator, options: types.TransactionOptions, retry: ?[]const u8) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeBeginTransaction(&jw, options, retry) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeBeginTransaction(jw: *Stringify, options: types.TransactionOptions, retry: ?[]const u8) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("options");
+    try jw.beginObject();
+    switch (options) {
+        .read_write => {
+            try jw.objectField("readWrite");
+            try jw.beginObject();
+            if (retry) |r| {
+                try jw.objectField("retryTransaction");
+                try jw.write(r);
+            }
+            try jw.endObject();
+        },
+        .read_only => |ro| {
+            try jw.objectField("readOnly");
+            try jw.beginObject();
+            if (ro.read_time) |t| {
+                try jw.objectField("readTime");
+                try writeTimestamp(jw, t);
+            }
+            try jw.endObject();
+        },
+    }
+    try jw.endObject();
+    try jw.endObject();
+}
+
+/// `{"transaction": id}`: the `rollback` body.
+pub fn encodeRollback(arena: Allocator, transaction: []const u8) Allocator.Error![]u8 {
+    return Stringify.valueAlloc(arena, .{ .transaction = transaction }, .{});
+}
+
+/// The id `beginTransaction` answers, as the base64 text it travels as.
+pub fn decodeBeginTransaction(arena: Allocator, body: []const u8) DecodeError![]const u8 {
+    const obj = objectOf(try parseTree(arena, body)) orelse return error.InvalidResponse;
+    const t = present(obj, "transaction") orelse return error.InvalidResponse;
+    if (t != .string or t.string.len == 0) return error.InvalidResponse;
+    return t.string;
 }
 
 fn writeWrite(jw: *Stringify, w: Write) Stringify.Error!void {
@@ -181,14 +235,16 @@ fn writeValues(jw: *Stringify, field: []const u8, values: []const Value) Stringi
 
 /// `{"documents": [...], "mask": ..., "readTime": ...}`: the `batchGet`
 /// body, with full names.
-pub fn encodeBatchGet(arena: Allocator, document_names: []const []const u8, mask: ?[]const []const u8, read_time: ?std.Io.Timestamp) Allocator.Error![]u8 {
+pub fn encodeBatchGet(arena: Allocator, document_names: []const []const u8, options: types.BatchGetOptions) Allocator.Error![]u8 {
     var out: Writer.Allocating = .init(arena);
     var jw: Stringify = .{ .writer = &out.writer };
-    writeBatchGet(&jw, document_names, mask, read_time) catch return error.OutOfMemory;
+    writeBatchGet(&jw, document_names, options) catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
 
-fn writeBatchGet(jw: *Stringify, document_names: []const []const u8, mask: ?[]const []const u8, read_time: ?std.Io.Timestamp) Stringify.Error!void {
+fn writeBatchGet(jw: *Stringify, document_names: []const []const u8, options: types.BatchGetOptions) Stringify.Error!void {
+    const mask = options.mask;
+    const read_time = options.read_time;
     try jw.beginObject();
     try jw.objectField("documents");
     try jw.write(document_names);
@@ -202,6 +258,10 @@ fn writeBatchGet(jw: *Stringify, document_names: []const []const u8, mask: ?[]co
     if (read_time) |t| {
         try jw.objectField("readTime");
         try writeTimestamp(jw, t);
+    }
+    if (options.transaction) |t| {
+        try jw.objectField("transaction");
+        try jw.write(t);
     }
     try jw.endObject();
 }
@@ -903,15 +963,25 @@ test "golden: commit bodies, and what commit answers" {
             .name = name,
             .op = .{ .update = .{ .fields = &.{.{ .name = "v", .value = .{ .integer = 4 } }}, .mask = &.{ "v", "`a-b`" } } },
             .precondition = .{ .update_time = .{ .nanoseconds = 1_791_154_635_556_285_000 } },
-        }}),
+        }}, null),
     );
     try testing.expectEqualStrings(
-        "{\"writes\":[{\"update\":{\"name\":\"projects/p/databases/(default)/documents/c/u2\",\"fields\":{}}},{\"delete\":\"projects/p/databases/(default)/documents/c/u2\",\"currentDocument\":{\"exists\":true}}]}",
+        "{\"writes\":[{\"update\":{\"name\":\"projects/p/databases/(default)/documents/c/u2\",\"fields\":{}}},{\"delete\":\"projects/p/databases/(default)/documents/c/u2\",\"currentDocument\":{\"exists\":true}}],\"transaction\":\"EQIAAAAAAAAA\"}",
         try encodeCommit(a, &.{
             .{ .name = name, .op = .{ .update = .{ .fields = &.{} } } },
             .{ .name = name, .op = .delete, .precondition = .{ .exists = true } },
-        }),
+        }, "EQIAAAAAAAAA"),
     );
+    // The transaction bodies, in the emulator's ids.
+    try testing.expectEqualStrings("{\"options\":{\"readWrite\":{}}}", try encodeBeginTransaction(a, .read_write, null));
+    try testing.expectEqualStrings("{\"options\":{\"readWrite\":{\"retryTransaction\":\"EQIAAAAAAAAA\"}}}", try encodeBeginTransaction(a, .read_write, "EQIAAAAAAAAA"));
+    try testing.expectEqualStrings("{\"options\":{\"readOnly\":{}}}", try encodeBeginTransaction(a, .{ .read_only = .{} }, null));
+    try testing.expectEqualStrings("{\"options\":{\"readOnly\":{\"readTime\":\"2026-10-05T00:00:00Z\"}}}", try encodeBeginTransaction(a, .{ .read_only = .{ .read_time = .{ .nanoseconds = 1_791_158_400_000_000_000 } } }, null));
+    try testing.expectEqualStrings("{\"transaction\":\"EQIAAAAAAAAA\"}", try encodeRollback(a, "EQIAAAAAAAAA"));
+    try testing.expectEqualStrings("EQIAAAAAAAAA", try decodeBeginTransaction(a, "{\n  \"transaction\": \"EQIAAAAAAAAA\"\n}\n"));
+    for ([_][]const u8{ "{}", "{\"transaction\":\"\"}", "{\"transaction\":1}", "[]" }) |text| {
+        try testing.expectError(error.InvalidResponse, decodeBeginTransaction(a, text));
+    }
 
     // As the emulator answered, 2026-10-04.
     const r = try decodeCommit(a, "{ \"writeResults\": [{ \"updateTime\": \"2026-10-04T22:57:15.592244Z\" }, { }], \"commitTime\": \"2026-10-04T22:57:15.592244Z\"}");

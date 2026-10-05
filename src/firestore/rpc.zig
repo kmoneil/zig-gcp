@@ -104,6 +104,14 @@ pub fn checkFields(client: *Client, fields: []const types.Field) Error!void {
     }
 }
 
+/// Checks a transaction's id, and that a read does not also ask for a
+/// read time: a transaction reads at its own.
+pub fn checkTransaction(client: *Client, transaction: ?[]const u8, read_time: ?std.Io.Timestamp) Error!void {
+    const t = transaction orelse return;
+    if (!validate.isTransactionId(t)) return refuse(client, error.InvalidArgument, "invalid transaction id: expected the base64 text beginTransaction returned", .{});
+    if (read_time != null) return refuse(client, error.InvalidArgument, "a read takes a transaction or a read time, not both", .{});
+}
+
 /// Checks a timestamp before it is written into a request.
 pub fn checkTime(client: *Client, ts: std.Io.Timestamp, what: []const u8) Error!void {
     if (!core.timestamp.inRange(ts)) {

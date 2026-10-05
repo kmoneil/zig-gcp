@@ -30,11 +30,20 @@
 //!   write of a commit takes the commit's time.
 //! - Faults: `refuse_next` answers the next requests 503 untouched;
 //!   `lose_answers` lets the next writes land and then answers them 503,
-//!   as a lost answer.
+//!   as a lost answer; `abort_next_commits` answers the next transactions'
+//!   commits ABORTED.
+//! - Transactions: begun read-write or read-only, they record what they
+//!   read; a commit aborts ("Transaction lock timeout.", as the emulator's
+//!   lock waits end) when anything read has been written since, rather
+//!   than wait for a lock. One committed, rolled back or aborted answers
+//!   ABORTED "The referenced transaction has expired or is no longer
+//!   valid."; an unknown one "Invalid transaction."; a read-only one with
+//!   writes "Cannot modify entities in a read-only transaction.".
 //!
-//! Not modelled: ordering a list by a field, read times, transactions,
-//! transforms, queries, `showMissing`, and the `updateTime` query
-//! parameters, which the emulator misreads.
+//! Not modelled: ordering a list by a field, read times, locks that make
+//! writes wait, a transaction's own expiry, `newTransaction`,
+//! `showMissing`, and the `updateTime` query parameters, which the
+//! emulator misreads.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -62,6 +71,23 @@ pub const FakeFirestore = struct {
     lose_answers: u32 = 0,
     /// For the ids `createDocument` chooses.
     prng: std.Random.DefaultPrng = .init(0x5eed),
+    /// The next this many transactional commits answer ABORTED.
+    abort_next_commits: u32 = 0,
+    /// By id.
+    transactions: std.StringHashMapUnmanaged(*Txn) = .empty,
+    next_transaction: u64 = 1,
+    /// Transactions begun and committed, and rollbacks asked for, for tests
+    /// to count.
+    begun: u32 = 0,
+    commits: u32 = 0,
+    rolled_back: u32 = 0,
+
+    pub const Txn = struct {
+        read_only: bool,
+        state: enum { active, ended } = .active,
+        /// Each path read, with its update time then; 0 when missing.
+        reads: std.StringArrayHashMapUnmanaged(i64) = .empty,
+    };
 
     pub const Reply = struct { status: u16, body: []const u8 };
 
@@ -97,6 +123,7 @@ pub const FakeFirestore = struct {
 
     pub fn deinit(self: *FakeFirestore) void {
         self.docs.deinit(self.gpa);
+        self.transactions.deinit(self.gpa);
         self.store.deinit();
         self.* = undefined;
     }
@@ -145,6 +172,8 @@ pub const FakeFirestore = struct {
         const route = (try parseUrl(arena, url)) orelse return fail(arena, 404, "NOT_FOUND", "fake: no such route");
         if (route.verb) |verb| {
             if (method == .POST and std.mem.eql(u8, verb, "commit") and route.segments.len == 0) return self.commit(arena, route, body);
+            if (method == .POST and std.mem.eql(u8, verb, "beginTransaction") and route.segments.len == 0) return self.beginTransaction(arena, body);
+            if (method == .POST and std.mem.eql(u8, verb, "rollback") and route.segments.len == 0) return self.rollbackTransaction(arena, body);
             if (method == .POST and std.mem.eql(u8, verb, "listCollectionIds") and route.segments.len % 2 == 0) return self.listCollectionIds(arena, route, body);
             if (method == .POST and std.mem.eql(u8, verb, "batchGet") and route.segments.len == 0) return self.batchGet(arena, route, body);
             if (method == .POST and std.mem.eql(u8, verb, "runQuery") and route.segments.len % 2 == 0) return self.runQuery(arena, route, body);
@@ -284,9 +313,14 @@ pub const FakeFirestore = struct {
     fn batchGet(self: *FakeFirestore, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
         const tree = parseJson(arena, body) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
         if (tree != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
-        if (tree.object.get("readTime") != null or tree.object.get("transaction") != null or tree.object.get("newTransaction") != null) {
-            return fail(arena, 400, "INVALID_ARGUMENT", "fake: read times and transactions are not modelled");
+        if (tree.object.get("readTime") != null or tree.object.get("newTransaction") != null) {
+            return fail(arena, 400, "INVALID_ARGUMENT", "fake: read times and new transactions are not modelled");
         }
+        const txn: ?*Txn = switch (try self.joinTransaction(arena, tree)) {
+            .none => null,
+            .txn => |t| t,
+            .refused => |r| return r,
+        };
         var masks: ?[]const []const []const u8 = null;
         if (tree.object.get("mask")) |m| {
             var texts: std.ArrayList([]const u8) = .empty;
@@ -326,6 +360,7 @@ pub const FakeFirestore = struct {
                 while (it.next()) |_| n += 1;
                 if (n % 2 != 0) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Document name \"{s}\" lacks \"/\".", .{name}));
                 d = self.docs.get(try std.fmt.allocPrint(arena, "{s}|{s}", .{ route.database, path }));
+                if (txn) |t| try self.noteRead(t, route.database, path);
             }
             writeBatchElement(&jw, arena, name, d, masks, self.now_us) catch return error.OutOfMemory;
         }
@@ -356,7 +391,13 @@ pub const FakeFirestore = struct {
             .refused => |r| return r,
             .spec => |spec| spec,
         };
+        const txn: ?*Txn = switch (try self.joinTransaction(arena, tree)) {
+            .none => null,
+            .txn => |t| t,
+            .refused => |r| return r,
+        };
         const hits = try self.evaluate(arena, route, spec);
+        if (txn) |t| for (hits) |hit| try self.noteRead(t, route.database, hit.path);
         var out: Writer.Allocating = .init(arena);
         var jw: Stringify = .{ .writer = &out.writer };
         writeHits(&jw, arena, route, hits, spec.select, self.now_us) catch return error.OutOfMemory;
@@ -397,6 +438,10 @@ pub const FakeFirestore = struct {
                 return fail(arena, 400, "INVALID_ARGUMENT", "Aggregation over non-key properties is not supported for base query that only returns keys.");
             }
         };
+        switch (try self.joinTransaction(arena, tree)) {
+            .none, .txn => {},
+            .refused => |r| return r,
+        }
         const hits = try self.evaluate(arena, route, spec);
 
         var out: Writer.Allocating = .init(arena);
@@ -499,6 +544,66 @@ pub const FakeFirestore = struct {
         return hits.items[start..end];
     }
 
+    fn beginTransaction(self: *FakeFirestore, arena: Allocator, body: []const u8) Allocator.Error!Reply {
+        const tree = parseJson(arena, body) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (tree != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        var read_only = false;
+        if (tree.object.get("options")) |o| {
+            if (o != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+            if (o.object.get("readOnly")) |ro| {
+                read_only = true;
+                if (ro == .object and ro.object.get("readTime") != null) return fail(arena, 400, "INVALID_ARGUMENT", "fake: read times are not modelled");
+            }
+            if (o.object.get("readWrite")) |rw| if (rw == .object) if (rw.object.get("retryTransaction")) |retry| {
+                if (retry != .string or self.transactions.get(retry.string) == null) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid transaction.");
+            };
+        }
+        const a = self.store.allocator();
+        var id_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id_bytes, self.next_transaction, .little);
+        self.next_transaction += 1;
+        var id_buf: [12]u8 = undefined;
+        const id = try a.dupe(u8, std.base64.standard.Encoder.encode(&id_buf, &id_bytes));
+        const txn = try a.create(Txn);
+        txn.* = .{ .read_only = read_only };
+        try self.transactions.put(self.gpa, id, txn);
+        self.begun += 1;
+        return ok(arena, try Stringify.valueAlloc(arena, .{ .transaction = id }, .{}));
+    }
+
+    fn rollbackTransaction(self: *FakeFirestore, arena: Allocator, body: []const u8) Allocator.Error!Reply {
+        const tree = parseJson(arena, body) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        const t = if (tree == .object) tree.object.get("transaction") else null;
+        const id = if (t) |v| (if (v == .string) v.string else "") else "";
+        const txn = self.transactions.get(id) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid transaction.");
+        // Measured: rolling back one already ended succeeds.
+        self.rolled_back += 1;
+        txn.state = .ended;
+        return ok(arena, "{}");
+    }
+
+    /// The transaction a request names, if any, or the refusal of one that
+    /// is unknown or over.
+    const Joined = union(enum) { none, txn: *Txn, refused: Reply };
+
+    fn joinTransaction(self: *FakeFirestore, arena: Allocator, tree: std.json.Value) Allocator.Error!Joined {
+        const t = tree.object.get("transaction") orelse return .none;
+        if (t != .string) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.") };
+        const txn = self.transactions.get(t.string) orelse return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid transaction.") };
+        if (txn.state != .active) return .{ .refused = try fail(arena, 409, "ABORTED", "The referenced transaction has expired or is no longer valid.") };
+        return .{ .txn = txn };
+    }
+
+    /// Notes that `txn` read the document at `path`, in `database`.
+    fn noteRead(self: *FakeFirestore, txn: *Txn, database: []const u8, path: []const u8) Allocator.Error!void {
+        const a = self.store.allocator();
+        var key_buf: [8192]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}|{s}", .{ database, path }) catch return;
+        const version: i64 = if (self.docs.get(key)) |d| d.update_us else 0;
+        const entry = try txn.reads.getOrPut(a, try a.dupe(u8, key));
+        if (!entry.found_existing) entry.value_ptr.* = version;
+    }
+
     fn create(self: *FakeFirestore, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
         const collection = try join(arena, route.segments);
         var id_buf: [20]u8 = undefined;
@@ -523,8 +628,34 @@ pub const FakeFirestore = struct {
     fn commit(self: *FakeFirestore, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
         const tree = parseJson(arena, body) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
         if (tree != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
-        const writes = tree.object.get("writes") orelse return self.committed(arena, &.{});
+        const txn: ?*Txn = switch (try self.joinTransaction(arena, tree)) {
+            .none => null,
+            .txn => |t| t,
+            .refused => |r| return r,
+        };
+        const writes = tree.object.get("writes") orelse std.json.Value{ .array = .init(arena) };
         if (writes != .array) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (txn) |t| {
+            if (t.read_only and writes.array.items.len > 0) return fail(arena, 400, "INVALID_ARGUMENT", "Cannot modify entities in a read-only transaction.");
+            // Contention, as the emulator's lock waits end it: something
+            // read has been written since.
+            var aborted = self.abort_next_commits > 0;
+            if (aborted) self.abort_next_commits -= 1;
+            var it = t.reads.iterator();
+            while (it.next()) |read| {
+                const now: i64 = if (self.docs.get(read.key_ptr.*)) |d| d.update_us else 0;
+                if (now != read.value_ptr.*) aborted = true;
+            }
+            if (aborted) {
+                t.state = .ended;
+                return fail(arena, 409, "ABORTED", "Transaction lock timeout.");
+            }
+            if (writes.array.items.len == 0) {
+                t.state = .ended;
+                self.commits += 1;
+                return ok(arena, "{}");
+            }
+        }
 
         // Every write is applied to a staging copy; one refusal and none
         // of them land.
@@ -536,6 +667,10 @@ pub const FakeFirestore = struct {
             if (try self.stage(arena, route, w, commit_us, &staged, outcome)) |refusal| return refusal;
         }
         self.now_us = commit_us;
+        if (txn) |t| {
+            t.state = .ended;
+            self.commits += 1;
+        }
         var it = staged.iterator();
         while (it.next()) |entry| {
             const key = try self.store.allocator().dupe(u8, entry.key_ptr.*);
@@ -809,7 +944,7 @@ fn parseUrl(arena: Allocator, url: []const u8) Allocator.Error!?FakeFirestore.Ro
         var segs = std.mem.splitScalar(u8, remaining, '/');
         while (segs.next()) |s| try raw.append(arena, s);
         const last = raw.items[raw.items.len - 1];
-        for ([_][]const u8{ ":listCollectionIds", ":commit", ":batchGet", ":runQuery", ":runAggregationQuery" }) |v| if (std.mem.endsWith(u8, last, v)) {
+        for ([_][]const u8{ ":listCollectionIds", ":commit", ":batchGet", ":runQuery", ":runAggregationQuery", ":beginTransaction", ":rollback" }) |v| if (std.mem.endsWith(u8, last, v)) {
             verb = v[1..];
             raw.items[raw.items.len - 1] = last[0 .. last.len - v.len];
         };
@@ -1234,8 +1369,8 @@ const QuerySpec = struct {
 const ParsedQuery = union(enum) { spec: QuerySpec, refused: FakeFirestore.Reply };
 
 fn notModelled(arena: Allocator, tree: std.json.Value) Allocator.Error!?FakeFirestore.Reply {
-    if (tree.object.get("readTime") != null or tree.object.get("transaction") != null or tree.object.get("newTransaction") != null) {
-        return try fail(arena, 400, "INVALID_ARGUMENT", "fake: read times and transactions are not modelled");
+    if (tree.object.get("readTime") != null or tree.object.get("newTransaction") != null) {
+        return try fail(arena, 400, "INVALID_ARGUMENT", "fake: read times and new transactions are not modelled");
     }
     return null;
 }
