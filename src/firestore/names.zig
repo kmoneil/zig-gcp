@@ -4,9 +4,11 @@
 //! A path here is relative to a database's documents, such as `cities/LA`
 //! or `cities/LA/landmarks`. Its segments alternate collection and document
 //! ids, so a document's path has an even number of them and a collection's
-//! an odd one. Every segment travels percent-encoded, minimally, as core's
-//! `writeSegment` does: measured on the emulator (2026-10-04), `a%20b%25c+d`
-//! names the document `a b%c+d`, and a literal `:` stays part of the id.
+//! an odd one. Every segment travels percent-encoded strictly, everything
+//! outside the unreserved characters as `%XX`, as Google's own REST clients
+//! encode path parameters: measured in production (2026-10-05), a literal
+//! `+` in a path reads as a space, so `a%20b%25c+d` named the document
+//! `a b%c d`, another document, though the emulator read it as `a b%c+d`.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -127,7 +129,7 @@ pub fn writeDocumentsPath(w: *Writer, project_id: []const u8, database_id: []con
     var it = std.mem.splitScalar(u8, path, '/');
     while (it.next()) |segment| {
         try w.writeByte('/');
-        try core.query.writeSegment(w, segment);
+        try core.query.writeStrictSegment(w, segment);
     }
 }
 
@@ -385,11 +387,16 @@ test "pathProblem: parity, ids, depth" {
     try testing.expect(pathProblem(deep[0 .. 102 * 2 - 1], .document) != null);
 }
 
-test "writeDocumentsPath: segments encoded minimally, (default) kept" {
+test "regression: writeDocumentsPath encodes every segment strictly, `+` and `:` included; (default) kept" {
+    // Until 0.34.0 a `+` went literal, which production reads as a space:
+    // a read of `a b%c+d` asked for `a b%c d`.
     var buf: [256]u8 = undefined;
     var w: Writer = .fixed(&buf);
     try writeDocumentsPath(&w, "p", "(default)", "c/a b%c+d/sub/a:b");
-    try testing.expectEqualStrings("/v1/projects/p/databases/(default)/documents/c/a%20b%25c+d/sub/a:b", w.buffered());
+    try testing.expectEqualStrings("/v1/projects/p/databases/(default)/documents/c/a%20b%25c%2Bd/sub/a%3Ab", w.buffered());
+    w = .fixed(&buf);
+    try writeDocumentsPath(&w, "p", "(default)", "c/x?y#z/s/[b]~é");
+    try testing.expectEqualStrings("/v1/projects/p/databases/(default)/documents/c/x%3Fy%23z/s/%5Bb%5D~%C3%A9", w.buffered());
     w = .fixed(&buf);
     try writeDocumentsPath(&w, "p", "zigps-fs-1", "");
     try testing.expectEqualStrings("/v1/projects/p/databases/zigps-fs-1/documents", w.buffered());

@@ -18,6 +18,14 @@ including the ones that did not change.
   and code in `Diagnostics`. It is not retried: it arrived in a success
   response, and a read that ran past its deadline would likely do so
   again.
+- firestore: **Fixed:** a document id holding `+` reached another
+  document. Request paths left `+` literal, which production reads as a
+  space, so `get`, `list`, `listCollectionIds` and `createDocument` for
+  `a+b` asked for `a b`; the emulator, which keeps `+`, never showed it.
+  Every path segment is now encoded strictly, everything but letters,
+  digits and `-._~` as `%XX`, as Google's own REST clients encode them.
+  Found by running the emulator suite against production, which it now
+  can (`docs/development.md`).
 - firestore: streamed reads. `Client.runQueryEach(query, options,
   handler)` and `Client.batchGetEach(paths, options, handler)` hand each
   document to a `DocumentHandler` or `BatchGetHandler` as it arrives,
