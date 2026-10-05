@@ -3291,7 +3291,7 @@ fn modelProperty(_: void, input: []const u8) !void {
     }
 }
 
-test "fuzz fake: random writes agree with a model of the rules" {
+test "heavy property writes, transforms and batch reads: the fake agrees with a model of the rules" {
     try test_util.fuzzBytes({}, modelProperty, .{ .corpus = &.{
         "\x00\x00\x02\x05\x01\x00\x01\x01\x04",
         "\x01\x01\x03\x02\x00\x01\x01\x01\x00\x02\x00\x04",

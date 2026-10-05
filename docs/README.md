@@ -48,6 +48,16 @@ Google, not only what Google documents, and where the emulators differ.
 | [Notifications and rotation](secret-manager/notifications.md) | Topics, the service agent, every event and how late it comes, and rotating on schedule |
 | [Encryption keys](secret-manager/encryption.md) | Cloud KMS keys for automatic, user-managed and regional secrets, and what a key that goes away does |
 
+## 🔥 Firestore
+
+| Guide | What's in it |
+| --- | --- |
+| [Overview](firestore/README.md) | A first program, values and documents, paths and handles, every call, errors and retries, and the limits checked before sending |
+| [Writing documents](firestore/writing.md) | Set, update and delete; masks and preconditions; creating documents; transforms; several writes in one commit; which writes are retried |
+| [Queries and aggregations](firestore/queries.md) | Conditions, null and NaN, the order of values, cursors and paging, collection groups, count, sum and average |
+| [Transactions](firestore/transactions.md) | A handler run again on contention, read-only transactions, and transactions by hand |
+| [The emulator](firestore/emulator.md) | What the emulator does differently from production, and how the tests hold the fake to both |
+
 ## 🛠️ Working on zig-gcp
 
 | Guide | What's in it |

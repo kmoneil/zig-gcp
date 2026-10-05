@@ -40,6 +40,7 @@ means production, when it is unset:
 | --- | --- | --- |
 | `pubsub` | `PUBSUB_EMULATOR_HOST` | `gcloud beta emulators pubsub start` |
 | `storage` | `STORAGE_EMULATOR_HOST` | [fake-gcs-server](https://github.com/fsouza/fake-gcs-server) |
+| `firestore` | `FIRESTORE_EMULATOR_HOST` | `gcloud emulators firestore start`; see [the emulator](firestore/emulator.md) |
 
 Secret Manager has no emulator, so its client always needs credentials.
 
@@ -68,7 +69,7 @@ when it is released.
 ## Errors and diagnostics
 
 Every call returns its module's error set: `pubsub.Error`,
-`storage.Error` or `secret_manager.Error`. Each is closed: one error per
+`storage.Error`, `secret_manager.Error` or `firestore.Error`. Each is closed: one error per
 API status (`error.NotFound`, `error.AlreadyExists`, ...), the
 transport's errors (`error.ConnectionRefused`, `error.TlsFailure`, ...),
 the token provider's (`error.RefreshTokenInvalid`,
@@ -167,7 +168,8 @@ while (select.cancel()) |other| switch (other) {
 ## Logging
 
 Each module logs through `std.log` under a scope of its own:
-`.gcp_pubsub`, `.gcp_storage`, `.gcp_secret_manager` and `.gcp_auth`.
+`.gcp_pubsub`, `.gcp_storage`, `.gcp_secret_manager`, `.gcp_firestore`
+and `.gcp_auth`.
 Each request goes to `debug` (method, path, status, attempt, time) and
 each retry to `warn`. Nothing sensitive is logged: no token, no message
 data or attribute value, no secret or even its length, no signed URL or
