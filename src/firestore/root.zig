@@ -36,6 +36,14 @@ pub const UpdateOptions = @import("types.zig").UpdateOptions;
 pub const DeleteOptions = @import("types.zig").DeleteOptions;
 pub const CreateOptions = @import("types.zig").CreateOptions;
 pub const WriteResult = @import("types.zig").WriteResult;
+pub const Numeric = @import("types.zig").Numeric;
+pub const Transform = @import("types.zig").Transform;
+pub const Write = @import("types.zig").Write;
+pub const CommitOptions = @import("types.zig").CommitOptions;
+pub const CommittedWrite = @import("types.zig").CommittedWrite;
+pub const CommitResult = @import("types.zig").CommitResult;
+pub const BatchGetOptions = @import("types.zig").BatchGetOptions;
+pub const BatchGetResult = @import("types.zig").BatchGetResult;
 pub const Direction = @import("types.zig").Direction;
 pub const Order = @import("types.zig").Order;
 pub const ListOptions = @import("types.zig").ListOptions;
@@ -66,6 +74,7 @@ test {
     _ = @import("Collection.zig");
     _ = @import("Document.zig");
     _ = @import("Endpoint.zig");
+    _ = @import("batch_get.zig");
     _ = @import("codec.zig");
     _ = @import("errors.zig");
     _ = @import("fake_firestore.zig");
@@ -75,6 +84,7 @@ test {
     _ = @import("test_util.zig");
     _ = @import("types.zig");
     _ = @import("validate.zig");
+    _ = @import("writes.zig");
 }
 
 test "every public declaration of types.zig is public here too" {

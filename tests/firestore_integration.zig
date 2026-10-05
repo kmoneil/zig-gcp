@@ -408,3 +408,141 @@ test "references: a full name built by the client goes in and comes back" {
     defer got.deinit();
     try testing.expectEqualStrings(name, got.value.get("city").?.reference);
 }
+
+test "transforms: each kind, and what the emulator answers for it" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const nan = std.math.nan(f64);
+    const cases = [_]struct { ?Value, firestore.Transform.Op, Value }{
+        .{ .{ .integer = 5 }, .{ .increment = .{ .integer = 1 } }, .{ .integer = 6 } },
+        .{ .{ .integer = std.math.maxInt(i64) }, .{ .increment = .{ .integer = 1 } }, .{ .integer = std.math.maxInt(i64) } },
+        .{ .{ .integer = 5 }, .{ .increment = .{ .double = 0.5 } }, .{ .double = 5.5 } },
+        .{ null, .{ .increment = .{ .integer = 3 } }, .{ .integer = 3 } },
+        .{ .{ .string = "a" }, .{ .increment = .{ .integer = 2 } }, .{ .integer = 2 } },
+        .{ .{ .integer = 3 }, .{ .maximum = .{ .double = 3.0 } }, .{ .integer = 3 } },
+        .{ .{ .integer = 5 }, .{ .maximum = .{ .double = 7.5 } }, .{ .double = 7.5 } },
+        .{ .{ .double = 1.5 }, .{ .minimum = .{ .integer = 1 } }, .{ .integer = 1 } },
+        .{ .{ .integer = 0 }, .{ .maximum = .{ .double = nan } }, .{ .double = nan } },
+    };
+    for (cases, 0..) |case, i| {
+        var id_buf: [8]u8 = undefined;
+        const path = try std.fmt.bufPrint(&id_buf, "t/{d}", .{i});
+        if (case[0]) |v| _ = try f.doc(path).set(&.{.{ .name = "x", .value = v }}, .{});
+        var r = try f.client.commit(&.{.{ .update = .{ .path = path, .mask = &.{}, .transforms = &.{.{ .field_path = "x", .op = case[1] }}, .precondition = .{ .exists = case[0] != null } } }}, .{});
+        defer r.deinit();
+        expectValueEqual(case[2], r.value.writes[0].transform_results[0]) catch |err| {
+            std.debug.print("case {d}: got {any}\n", .{ i, r.value.writes[0].transform_results[0] });
+            return err;
+        };
+    }
+
+    // Array transforms, and server time in several fields of one commit.
+    _ = try f.doc("t/arr").set(&.{.{ .name = "a", .value = .{ .array = &.{ .{ .integer = 3 }, .{ .double = nan }, .null } } }}, .{});
+    var r = try f.client.commit(&.{.{ .update = .{ .path = "t/arr", .mask = &.{}, .transforms = &.{
+        .{ .field_path = "a", .op = .{ .append_missing = &.{ .{ .double = 3.0 }, .{ .integer = 4 }, .{ .integer = 4 } } } },
+        .{ .field_path = "a", .op = .{ .remove_all = &.{.{ .double = nan }} } },
+        .{ .field_path = "at", .op = .server_time },
+        .{ .field_path = "nested.at", .op = .server_time },
+    } } }}, .{});
+    defer r.deinit();
+    const results = r.value.writes[0].transform_results;
+    try testing.expectEqual(Value.null, results[0]);
+    try testing.expectEqual(results[2].timestamp, results[3].timestamp);
+    try testing.expectEqual(0, @mod(results[2].timestamp.nanoseconds, std.time.ns_per_ms));
+    var got = try f.doc("t/arr").get(.{});
+    defer got.deinit();
+    try expectValueEqual(.{ .array = &.{ .{ .integer = 3 }, .null, .{ .integer = 4 } } }, got.value.get("a").?);
+    try testing.expectEqual(results[2].timestamp, got.value.get("nested").?.get("at").?.timestamp);
+
+    // Through Document.update: transforms beside fields, the rest kept.
+    _ = try f.doc("t/arr").update(&.{.{ .name = "label", .value = .{ .string = "x" } }}, .{ .transforms = &.{.{ .field_path = "count", .op = .{ .increment = .{ .integer = 2 } } }} });
+    var updated = try f.doc("t/arr").get(.{});
+    defer updated.deinit();
+    try testing.expectEqual(2, updated.value.get("count").?.integer);
+    try testing.expectEqualStrings("x", updated.value.get("label").?.string);
+    try testing.expect(updated.value.get("a") != null);
+}
+
+test "commit: several writes land together or not at all" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    _ = try f.doc("c/exists").set(&.{}, .{});
+    // The third write's precondition fails, so neither of the first two lands.
+    try testing.expectError(error.NotFound, f.client.commit(&.{
+        .{ .update = .{ .path = "c/new", .fields = &.{.{ .name = "v", .value = .{ .integer = 1 } }} } },
+        .{ .delete = .{ .path = "c/exists" } },
+        .{ .update = .{ .path = "c/missing", .fields = &.{}, .precondition = .{ .exists = true } } },
+    }, .{}));
+    try testing.expectError(error.NotFound, f.doc("c/new").get(.{}));
+    var still = try f.doc("c/exists").get(.{});
+    still.deinit();
+
+    // Measured: a precondition sees the commit's earlier writes. Deleted by
+    // the first write, the document does not exist for the second.
+    var recreated = try f.client.commit(&.{
+        .{ .delete = .{ .path = "c/exists" } },
+        .{ .update = .{ .path = "c/exists", .fields = &.{.{ .name = "again", .value = .{ .boolean = true } }}, .precondition = .{ .exists = false } } },
+    }, .{});
+    recreated.deinit();
+    var again = try f.doc("c/exists").get(.{});
+    defer again.deinit();
+    try testing.expect(again.value.get("again").?.boolean);
+
+    // A document written twice in one commit, each write seeing the last.
+    var r = try f.client.commit(&.{
+        .{ .update = .{ .path = "c/twice", .fields = &.{.{ .name = "a", .value = .{ .integer = 1 } }} } },
+        .{ .update = .{ .path = "c/twice", .fields = &.{.{ .name = "b", .value = .{ .integer = 2 } }}, .mask = &.{"b"} } },
+        .{ .delete = .{ .path = "c/exists", .precondition = .{ .exists = true } } },
+    }, .{});
+    defer r.deinit();
+    try testing.expectEqual(3, r.value.writes.len);
+    try testing.expectEqual(r.value.commit_time, r.value.writes[0].update_time.?);
+    try testing.expectEqual(null, r.value.writes[2].update_time);
+    var twice = try f.doc("c/twice").get(.{});
+    defer twice.deinit();
+    try testing.expectEqual(2, twice.value.fields.len);
+    try testing.expectError(error.NotFound, f.doc("c/exists").get(.{}));
+}
+
+test "batchGet: in the order asked, duplicates and missing included" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    _ = try f.doc("c/b").set(&.{ .{ .name = "v", .value = .{ .integer = 2 } }, .{ .name = "w", .value = .null } }, .{});
+    _ = try f.doc("c/a").set(&.{.{ .name = "v", .value = .{ .integer = 1 } }}, .{});
+    _ = try f.doc("c/a b%c").set(&.{.{ .name = "v", .value = .{ .integer = 3 } }}, .{});
+    var r = try f.client.batchGet(&.{ "c/b", "c/none", "c/a", "c/b", "c/a b%c" }, .{ .mask = &.{"v"} });
+    defer r.deinit();
+    const docs = r.value.documents;
+    try testing.expectEqual(5, docs.len);
+    try testing.expectEqual(2, docs[0].?.get("v").?.integer);
+    try testing.expectEqual(1, docs[0].?.fields.len);
+    try testing.expectEqual(null, docs[1]);
+    try testing.expectEqual(1, docs[2].?.get("v").?.integer);
+    try testing.expectEqual(2, docs[3].?.get("v").?.integer);
+    try testing.expectEqual(3, docs[4].?.get("v").?.integer);
+    try testing.expect(r.value.read_time != null);
+}
+
+test "reads at a past time: get and batchGet see the document as it was" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const first = try f.doc("c/x").set(&.{.{ .name = "v", .value = .{ .integer = 1 } }}, .{});
+    _ = try f.doc("c/x").set(&.{.{ .name = "v", .value = .{ .integer = 2 } }}, .{});
+    var then = try f.doc("c/x").get(.{ .read_time = first.update_time });
+    defer then.deinit();
+    try testing.expectEqual(1, then.value.get("v").?.integer);
+    var now = try f.doc("c/x").get(.{});
+    defer now.deinit();
+    try testing.expectEqual(2, now.value.get("v").?.integer);
+    // Before the document existed: NotFound from get, null from batchGet.
+    const before: std.Io.Timestamp = .{ .nanoseconds = first.update_time.nanoseconds - std.time.ns_per_us };
+    try testing.expectError(error.NotFound, f.doc("c/x").get(.{ .read_time = before }));
+    try expectDiag(&f, "did not exist at the read time");
+    var batch = try f.client.batchGet(&.{"c/x"}, .{ .read_time = before });
+    defer batch.deinit();
+    try testing.expectEqual(null, batch.value.documents[0]);
+}

@@ -31,6 +31,9 @@ pub const max_value_bytes = 1_048_487;
 /// Most maps and arrays nested in one field's value. The emulator takes
 /// 20 and refuses 21: "Property f contains an invalid nested entity."
 pub const max_value_depth = 20;
+/// Most field transforms on one document in one commit, as documented.
+/// The emulator took 501.
+pub const max_transforms_per_document = 500;
 
 /// Why `id` is not a collection or document id, or null when it is: valid
 /// UTF-8 of 1 to 1,500 bytes, no `/`, not `.` or `..`, and no reserved
@@ -102,6 +105,18 @@ pub const Problem = struct {
 pub fn fieldsProblem(fields: []const Field, where_buf: []u8) ?Problem {
     var checker: Checker = .{ .where = .fixed(where_buf) };
     if (checker.fields(fields, 0)) |what| return .{ .where = checker.whereText(), .what = what };
+    return null;
+}
+
+/// Checks the values an array transform adds or removes, as elements of
+/// an array: none an array itself (the emulator took one, which no stored
+/// array may hold), and each as `fieldsProblem` checks a value.
+pub fn arrayElementsProblem(values: []const Value, where_buf: []u8) ?Problem {
+    var checker: Checker = .{ .where = .fixed(where_buf) };
+    for (values) |v| {
+        if (v == .array) return .{ .where = "", .what = "an array transform's value is an array, which no array may hold" };
+        if (checker.value(v, 1)) |what| return .{ .where = checker.whereText(), .what = what };
+    }
     return null;
 }
 
@@ -275,6 +290,14 @@ test "fieldsProblem: the server's refusals, with where they are" {
     try expectProblem(&.{.{ .name = "s", .value = .{ .string = big } }}, "s", "1,048,487");
     try expectProblem(&.{.{ .name = "b", .value = .{ .bytes = big } }}, "b", "1,048,487");
     try testing.expectEqual(null, fieldsProblem(&.{.{ .name = "s", .value = .{ .string = big[0..max_value_bytes] } }}, &buf));
+}
+
+test "arrayElementsProblem: what an array may hold" {
+    var buf: [64]u8 = undefined;
+    try testing.expectEqual(null, arrayElementsProblem(&.{ .null, .{ .integer = 3 }, .{ .map = &.{.{ .name = "a", .value = .{ .array = &.{} } }} } }, &buf));
+    try testing.expect(std.mem.indexOf(u8, arrayElementsProblem(&.{.{ .array = &.{} }}, &buf).?.what, "array") != null);
+    try testing.expect(arrayElementsProblem(&.{.{ .string = "\xff" }}, &buf) != null);
+    try testing.expect(arrayElementsProblem(&.{.{ .map = &.{.{ .name = "__x__", .value = .null }} }}, &buf) != null);
 }
 
 test "fieldsProblem: a long path is shortened, never overflows" {

@@ -28,7 +28,16 @@ including the ones that did not change.
   Paths, ids, field paths, masks and values are checked against the
   limits the emulator enforced before anything is sent. Writes travel
   through `commit`, as Google's clients send them: the emulator misreads
-  a precondition's time as a query parameter.
+  a precondition's time as a query parameter. `Client.commit` applies
+  several writes atomically, each with field transforms (server time,
+  increment, maximum, minimum, and the two array transforms), and returns
+  their results; `set` and `update` take transforms too. A write with
+  transforms is sent again after a lost answer only under a precondition
+  a repeat fails, since an increment sent twice counts twice, unless
+  `retry_unconditional_writes` says otherwise. `Client.batchGet` reads
+  many documents in one request and lays the answer out in the order
+  asked, `null` for a missing one; `get` and `batchGet` read as of a past
+  time.
 - core: `core.timestamp.format` writes an RFC 3339 timestamp as Google's
   servers do, in UTC with no fractional digits or 3, 6 or 9 of them.
   `core.timestamp.min`, `max` and `inRange` give the range it writes,

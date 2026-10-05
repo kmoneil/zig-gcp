@@ -52,10 +52,22 @@ pub const Write = struct {
 
     pub const Op = union(enum) {
         /// The fields, and the mask of those to change; without a mask the
-        /// fields replace the document's.
-        update: struct { fields: []const Field, mask: ?[]const []const u8 = null },
+        /// fields replace the document's. The transforms follow.
+        update: struct {
+            fields: []const Field,
+            mask: ?[]const []const u8 = null,
+            transforms: []const types.Transform = &.{},
+        },
         delete,
     };
+
+    /// How many transforms this write carries.
+    pub fn transformCount(self: Write) usize {
+        return switch (self.op) {
+            .update => |u| u.transforms.len,
+            .delete => 0,
+        };
+    }
 };
 
 /// `{"writes": [...]}`: the `commit` body. Preconditions travel here, in
@@ -90,6 +102,8 @@ fn writeWrite(jw: *Stringify, w: Write) Stringify.Error!void {
             try jw.objectField("fields");
             try writeFields(jw, u.fields);
             try jw.endObject();
+            // An empty mask is sent too: without one, a write of transforms
+            // alone would first replace the document with no fields.
             if (u.mask) |mask| {
                 try jw.objectField("updateMask");
                 try jw.beginObject();
@@ -98,6 +112,12 @@ fn writeWrite(jw: *Stringify, w: Write) Stringify.Error!void {
                 for (mask) |p| try jw.write(p);
                 try jw.endArray();
                 try jw.endObject();
+            }
+            if (u.transforms.len > 0) {
+                try jw.objectField("updateTransforms");
+                try jw.beginArray();
+                for (u.transforms) |t| try writeTransform(jw, t);
+                try jw.endArray();
             }
         },
         .delete => {
@@ -119,6 +139,69 @@ fn writeWrite(jw: *Stringify, w: Write) Stringify.Error!void {
             },
         }
         try jw.endObject();
+    }
+    try jw.endObject();
+}
+
+fn writeTransform(jw: *Stringify, t: types.Transform) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("fieldPath");
+    try jw.write(t.field_path);
+    switch (t.op) {
+        .server_time => {
+            try jw.objectField("setToServerValue");
+            try jw.write("REQUEST_TIME");
+        },
+        .increment => |n| try writeNumeric(jw, "increment", n),
+        .maximum => |n| try writeNumeric(jw, "maximum", n),
+        .minimum => |n| try writeNumeric(jw, "minimum", n),
+        .append_missing => |values| try writeValues(jw, "appendMissingElements", values),
+        .remove_all => |values| try writeValues(jw, "removeAllFromArray", values),
+    }
+    try jw.endObject();
+}
+
+fn writeNumeric(jw: *Stringify, field: []const u8, n: types.Numeric) Stringify.Error!void {
+    try jw.objectField(field);
+    try writeValue(jw, switch (n) {
+        .integer => |i| .{ .integer = i },
+        .double => |d| .{ .double = d },
+    });
+}
+
+fn writeValues(jw: *Stringify, field: []const u8, values: []const Value) Stringify.Error!void {
+    try jw.objectField(field);
+    try jw.beginObject();
+    try jw.objectField("values");
+    try jw.beginArray();
+    for (values) |v| try writeValue(jw, v);
+    try jw.endArray();
+    try jw.endObject();
+}
+
+/// `{"documents": [...], "mask": ..., "readTime": ...}`: the `batchGet`
+/// body, with full names.
+pub fn encodeBatchGet(arena: Allocator, document_names: []const []const u8, mask: ?[]const []const u8, read_time: ?std.Io.Timestamp) Allocator.Error![]u8 {
+    var out: Writer.Allocating = .init(arena);
+    var jw: Stringify = .{ .writer = &out.writer };
+    writeBatchGet(&jw, document_names, mask, read_time) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeBatchGet(jw: *Stringify, document_names: []const []const u8, mask: ?[]const []const u8, read_time: ?std.Io.Timestamp) Stringify.Error!void {
+    try jw.beginObject();
+    try jw.objectField("documents");
+    try jw.write(document_names);
+    if (mask) |m| {
+        try jw.objectField("mask");
+        try jw.beginObject();
+        try jw.objectField("fieldPaths");
+        try jw.write(m);
+        try jw.endObject();
+    }
+    if (read_time) |t| {
+        try jw.objectField("readTime");
+        try writeTimestamp(jw, t);
     }
     try jw.endObject();
 }
@@ -227,25 +310,63 @@ pub fn decodeSnapshot(arena: Allocator, body: []const u8) DecodeError!types.Snap
 }
 
 /// What a commit returns: each write's update time, absent for a delete,
-/// and the commit's own time.
+/// and transform results, and the commit's own time, which the emulator
+/// leaves out of the answer to a commit of no writes.
 pub const CommitResult = struct {
-    update_times: []const ?std.Io.Timestamp,
-    commit_time: std.Io.Timestamp,
+    writes: []const types.CommittedWrite,
+    commit_time: ?std.Io.Timestamp,
 };
 
 pub fn decodeCommit(arena: Allocator, body: []const u8) DecodeError!CommitResult {
     const obj = objectOf(try parseTree(arena, body)) orelse return error.InvalidResponse;
-    var times: []?std.Io.Timestamp = &.{};
+    var writes: []types.CommittedWrite = &.{};
     if (present(obj, "writeResults")) |results| {
         if (results != .array) return error.InvalidResponse;
-        times = try arena.alloc(?std.Io.Timestamp, results.array.items.len);
-        for (results.array.items, times) |r, *t| {
+        writes = try arena.alloc(types.CommittedWrite, results.array.items.len);
+        for (results.array.items, writes) |r, *w| {
             const result = objectOf(r) orelse return error.InvalidResponse;
             // Measured: a delete's result is `{}`.
-            t.* = if (present(result, "updateTime")) |_| try requiredTime(result, "updateTime") else null;
+            w.* = .{ .update_time = if (present(result, "updateTime")) |_| try requiredTime(result, "updateTime") else null };
+            if (present(result, "transformResults")) |values| {
+                if (values != .array) return error.InvalidResponse;
+                const out = try arena.alloc(Value, values.array.items.len);
+                for (values.array.items, out) |v, *o| o.* = try valueFrom(arena, v, 0);
+                w.transform_results = out;
+            }
         }
     }
-    return .{ .update_times = times, .commit_time = try requiredTime(obj, "commitTime") };
+    const commit_time: ?std.Io.Timestamp = if (present(obj, "commitTime")) |_| try requiredTime(obj, "commitTime") else null;
+    if (commit_time == null and writes.len > 0) return error.InvalidResponse;
+    return .{ .writes = writes, .commit_time = commit_time };
+}
+
+/// One message of a `batchGet` answer: a document found, a name missing,
+/// or neither, and the time it was read.
+pub const BatchGetElement = struct {
+    found: ?types.Snapshot = null,
+    missing: ?[]const u8 = null,
+    read_time: ?std.Io.Timestamp = null,
+};
+
+/// The `batchGet` answer: one JSON array of stream messages, measured on
+/// the emulator, in no particular order and with a name asked twice
+/// answered once.
+pub fn decodeBatchGet(arena: Allocator, body: []const u8) DecodeError![]const BatchGetElement {
+    const tree = try parseTree(arena, body);
+    if (tree != .array) return error.InvalidResponse;
+    const out = try arena.alloc(BatchGetElement, tree.array.items.len);
+    for (tree.array.items, out) |item, *e| {
+        const obj = objectOf(item) orelse return error.InvalidResponse;
+        e.* = .{};
+        if (present(obj, "found")) |f| e.found = try snapshotFrom(arena, f);
+        if (present(obj, "missing")) |m| {
+            if (m != .string or m.string.len == 0) return error.InvalidResponse;
+            e.missing = m.string;
+        }
+        if (e.found != null and e.missing != null) return error.InvalidResponse;
+        if (present(obj, "readTime")) |_| e.read_time = try requiredTime(obj, "readTime");
+    }
+    return out;
 }
 
 /// One page of `listDocuments`.
@@ -741,14 +862,26 @@ test "golden: commit bodies, and what commit answers" {
 
     // As the emulator answered, 2026-10-04.
     const r = try decodeCommit(a, "{ \"writeResults\": [{ \"updateTime\": \"2026-10-04T22:57:15.592244Z\" }, { }], \"commitTime\": \"2026-10-04T22:57:15.592244Z\"}");
-    try testing.expectEqual(2, r.update_times.len);
-    try testing.expectEqual(1_791_154_635_592_244_000, r.update_times[0].?.nanoseconds);
-    try testing.expectEqual(null, r.update_times[1]);
-    try testing.expectEqual(1_791_154_635_592_244_000, r.commit_time.nanoseconds);
-    try testing.expectEqual(0, (try decodeCommit(a, "{\"commitTime\":\"2026-10-04T22:57:15Z\"}")).update_times.len);
+    try testing.expectEqual(2, r.writes.len);
+    try testing.expectEqual(1_791_154_635_592_244_000, r.writes[0].update_time.?.nanoseconds);
+    try testing.expectEqual(null, r.writes[1].update_time);
+    try testing.expectEqual(0, r.writes[1].transform_results.len);
+    try testing.expectEqual(1_791_154_635_592_244_000, r.commit_time.?.nanoseconds);
+    try testing.expectEqual(0, (try decodeCommit(a, "{\"commitTime\":\"2026-10-04T22:57:15Z\"}")).writes.len);
+    // Measured: the emulator answers a commit of no writes with `{}`.
+    try testing.expectEqual(null, (try decodeCommit(a, "{}")).commit_time);
+    // Transform results, as the emulator answered them, 2026-10-05.
+    const t = try decodeCommit(a,
+        \\{"writeResults": [{"updateTime": "2026-10-05T12:15:13.233173Z", "transformResults": [{"timestampValue": "2026-10-05T12:15:13.232Z"}, {"doubleValue": 5.5}, {"nullValue": null}]}], "commitTime": "2026-10-05T12:15:13.233173Z"}
+    );
+    try testing.expectEqual(3, t.writes[0].transform_results.len);
+    try testing.expectEqual(1_791_202_513_232_000_000, t.writes[0].transform_results[0].timestamp.nanoseconds);
+    try testing.expectEqual(5.5, t.writes[0].transform_results[1].double);
+    try testing.expectEqual(Value.null, t.writes[0].transform_results[2]);
     for ([_][]const u8{
-        "{}",
-        "{\"writeResults\":[]}",
+        "{\"writeResults\":[{}]}",
+        "{\"writeResults\":[{\"transformResults\":{}}],\"commitTime\":\"2026-10-04T22:57:15Z\"}",
+        "{\"writeResults\":[{\"transformResults\":[{}]}],\"commitTime\":\"2026-10-04T22:57:15Z\"}",
         "{\"writeResults\":{},\"commitTime\":\"2026-10-04T22:57:15Z\"}",
         "{\"writeResults\":[1],\"commitTime\":\"2026-10-04T22:57:15Z\"}",
         "{\"writeResults\":[{\"updateTime\":\"x\"}],\"commitTime\":\"2026-10-04T22:57:15Z\"}",

@@ -112,10 +112,20 @@ pub const GetOptions = struct {
     /// Field paths to return, such as `name` or `address.city`; null
     /// returns every field. `__name__` alone returns none.
     mask: ?[]const []const u8 = null,
+    /// Read the document as it was then, to the microsecond, within the
+    /// last hour (or a whole minute within the last 7 days where
+    /// point-in-time recovery is on). A document missing then is
+    /// `error.NotFound`. The read goes through `batchGet`, which takes
+    /// the time in its body.
+    read_time: ?std.Io.Timestamp = null,
 };
 
 pub const SetOptions = struct {
     precondition: ?Precondition = null,
+    /// Applied after the fields are written, in order; see `Transform`.
+    /// With any, the write is retried after a lost answer only under a
+    /// precondition a repeat fails, or `retry_unconditional_writes`.
+    transforms: []const Transform = &.{},
 };
 
 pub const UpdateOptions = struct {
@@ -128,6 +138,9 @@ pub const UpdateOptions = struct {
     /// By default the document must exist, as Google's clients have it.
     /// Null writes it either way, creating it when missing.
     precondition: ?Precondition = .{ .exists = true },
+    /// As `SetOptions.transforms`. With transforms, the fields and mask
+    /// may be empty: the update then changes only what the transforms do.
+    transforms: []const Transform = &.{},
 };
 
 pub const DeleteOptions = struct {
@@ -145,6 +158,107 @@ pub const CreateOptions = struct {
 pub const WriteResult = struct {
     /// The document's new update time, for the next write's precondition.
     update_time: std.Io.Timestamp,
+};
+
+/// A number a transform takes. Integer arithmetic stays integer; a double
+/// on either side makes the result a double.
+pub const Numeric = union(enum) {
+    integer: i64,
+    double: f64,
+};
+
+/// A change the server makes to a field from its current value, after a
+/// write's fields are written, so concurrent writers cannot lose each
+/// other's changes. A document takes at most 500 per commit.
+pub const Transform = struct {
+    /// The field to change, such as `visits` or `stats.views`; maps on
+    /// the way are made as needed. Two transforms may name one field,
+    /// applied in turn, but not a field and one inside it.
+    field_path: []const u8,
+    op: Op,
+
+    pub const Op = union(enum) {
+        /// The time the server takes the write, to the millisecond, the
+        /// same for every such field of one commit.
+        server_time,
+        /// Adds to the field's number; a field that is missing or no
+        /// number is set to the operand. Integers saturate at the ends of
+        /// `i64` rather than wrap.
+        increment: Numeric,
+        /// Keeps the larger of the field and the operand, setting a
+        /// missing or non-numeric field to it. `3` and `3.0` count as
+        /// equal and leave the field as it was; NaN wins.
+        maximum: Numeric,
+        /// As `maximum`, keeping the smaller.
+        minimum: Numeric,
+        /// Appends each value the array does not hold yet, in order; a
+        /// field that is missing or no array becomes one. Numbers compare
+        /// across integer and double, NaN equals NaN, and maps compare
+        /// field by field. No value may itself be an array.
+        append_missing: []const Value,
+        /// Removes every element equal to any value, comparing as
+        /// `append_missing` does; a field that is missing or no array
+        /// becomes an empty one.
+        remove_all: []const Value,
+    };
+};
+
+/// One write in a commit.
+pub const Write = union(enum) {
+    update: Update,
+    delete: Delete,
+
+    pub const Update = struct {
+        /// A document path, such as `cities/LA`.
+        path: []const u8,
+        fields: []const Field = &.{},
+        /// Null replaces the whole document with `fields`, as
+        /// `Document.set` does. A mask changes only the paths it names, as
+        /// `UpdateOptions.mask` describes; an empty one, with transforms,
+        /// changes only what they change.
+        mask: ?[]const []const u8 = null,
+        transforms: []const Transform = &.{},
+        /// None by default: a missing document is created.
+        precondition: ?Precondition = null,
+    };
+
+    pub const Delete = struct {
+        path: []const u8,
+        precondition: ?Precondition = null,
+    };
+};
+
+pub const CommitOptions = struct {};
+
+/// What one write of a commit did.
+pub const CommittedWrite = struct {
+    /// The document's new update time; null for a delete.
+    update_time: ?std.Io.Timestamp,
+    /// One per transform, in order: the field's new value for
+    /// `server_time`, `increment`, `maximum` and `minimum`, and null for
+    /// the array transforms.
+    transform_results: []const Value = &.{},
+};
+
+pub const CommitResult = struct {
+    /// One per write, in the order given.
+    writes: []const CommittedWrite,
+    commit_time: std.Io.Timestamp,
+};
+
+pub const BatchGetOptions = struct {
+    /// As `GetOptions.mask`, for every document.
+    mask: ?[]const []const u8 = null,
+    /// As `GetOptions.read_time`.
+    read_time: ?std.Io.Timestamp = null,
+};
+
+pub const BatchGetResult = struct {
+    /// One per path asked for, in the order asked, a path asked twice
+    /// included twice: the document, or null where it does not exist.
+    documents: []const ?Snapshot,
+    /// When the documents were read; null only when none were asked for.
+    read_time: ?std.Io.Timestamp,
 };
 
 pub const Direction = enum { ascending, descending };

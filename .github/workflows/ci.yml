@@ -214,6 +214,13 @@ jobs:
             exit 1
           fi
           zig build example-firestore -- collections cities/LA | grep -qx landmarks
+          # A counter: an increment on the server, twice, and a read of two
+          # documents at once, one of them missing.
+          zig build example-firestore -- incr cities/LA visits 2
+          zig build example-firestore -- incr cities/LA visits 3 | grep -qx "visits is now 5"
+          zig build example-firestore -- getall cities/LA cities/NOPE | tee "$RUNNER_TEMP/getall.log"
+          grep -q "visits: 5" "$RUNNER_TEMP/getall.log"
+          grep -qx "cities/NOPE: missing" "$RUNNER_TEMP/getall.log"
           zig build example-firestore -- rm cities/LA
           if zig build example-firestore -- get cities/LA; then
             echo "rm left the document"

@@ -314,6 +314,19 @@ pub fn fieldPathsOverlap(a: []const u8, b: []const u8) bool {
     }
 }
 
+/// Whether two valid field paths name the same field, however quoted:
+/// `a.b` and `` `a`.b ``.
+pub fn fieldPathsEqual(a: []const u8, b: []const u8) bool {
+    var ia: FieldPathIterator = .init(a);
+    var ib: FieldPathIterator = .init(b);
+    var buf: [validate.max_field_path_bytes]u8 = undefined;
+    while (true) {
+        const sa = (ia.next() catch return false) orelse return (ib.next() catch return false) == null;
+        const sb = (ib.next() catch return false) orelse return false;
+        if (!sb.eql(sa.name(&buf))) return false;
+    }
+}
+
 /// The first segment of a valid field path, unquoted, into `buf`.
 pub fn firstFieldName(path: []const u8, buf: []u8) []const u8 {
     var it: FieldPathIterator = .init(path);
@@ -466,6 +479,16 @@ test "writeFieldSegment quotes what is not simple" {
         try writeFieldSegment(&w, pair[0]);
         try testing.expectEqualStrings(pair[1], w.buffered());
     }
+}
+
+test "fieldPathsEqual: one field however quoted" {
+    try testing.expect(fieldPathsEqual("a.b", "a.b"));
+    try testing.expect(fieldPathsEqual("a.b", "`a`.`b`"));
+    try testing.expect(fieldPathsEqual("`c\\`d`", "`c\\`d`"));
+    try testing.expect(!fieldPathsEqual("a", "a.b"));
+    try testing.expect(!fieldPathsEqual("a.b", "a"));
+    try testing.expect(!fieldPathsEqual("a.b", "a.c"));
+    try testing.expect(!fieldPathsEqual("`a.b`", "a.b"));
 }
 
 test "fieldPathsOverlap: a path and the fields inside it" {
