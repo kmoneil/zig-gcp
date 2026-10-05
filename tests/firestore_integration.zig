@@ -177,8 +177,9 @@ test "values: the server's own limits, past the client's checks" {
     // A 1,500-byte name is the limit, and the emulator takes it.
     const long = core.testing.repeat("k", 1500);
     _ = try f.doc("limits/name").set(&.{.{ .name = long, .value = .null }}, .{});
-    // But a mask of the same 1,500 bytes is one past what it takes.
-    try testing.expectError(error.InvalidArgument, f.doc("limits/name").update(&.{.{ .name = long, .value = .{ .integer = 1 } }}, .{}));
+    // But a mask of the same 1,500 bytes is one past what the server takes,
+    // which the client now refuses itself.
+    try testing.expectError(error.InvalidResourceId, f.doc("limits/name").update(&.{.{ .name = long, .value = .{ .integer = 1 } }}, .{}));
     try expectDiag(&f, "longer than 1500 bytes");
     // A reference to a collection: refused by the client already.
     try testing.expectError(error.InvalidArgument, f.doc("limits/ref").set(&.{.{ .name = "r", .value = .{ .reference = "projects/p/databases/(default)/documents/c" } }}, .{}));

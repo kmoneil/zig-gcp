@@ -284,7 +284,7 @@ pub fn build(b: *std.Build) void {
     // examples, so they cannot rot between runs.
     const gcp_step = b.step(
         "test-integration-gcp",
-        "Run the Secret Manager, Cloud Storage and signed URL tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET",
+        "Run the Secret Manager, Cloud Storage, signed URL and Firestore tests against Google: GCP_TEST_PROJECT, GCP_TEST_BUCKET, FIRESTORE_TEST_DATABASE",
     );
     // Secret Manager has no emulator, so its tests need GCP_TEST_PROJECT
     // and GCP_TEST_TOKEN.
@@ -340,6 +340,24 @@ pub fn build(b: *std.Build) void {
     });
     gcp_step.dependOn(&streamed(b, notifications_gcp_tests).step);
     test_step.dependOn(&notifications_gcp_tests.step);
+    // Firestore against a real project, in a named database made for the
+    // run: GCP_TEST_PROJECT, GCP_TEST_TOKEN and FIRESTORE_TEST_DATABASE.
+    const firestore_gcp_tests = b.addTest(.{
+        .name = "firestore-gcp-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/firestore_gcp_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "firestore", .module = firestore },
+                .{ .name = "core", .module = core },
+            },
+        }),
+        .filters = test_filters,
+        .test_runner = test_runner,
+    });
+    gcp_step.dependOn(&streamed(b, firestore_gcp_tests).step);
+    test_step.dependOn(&firestore_gcp_tests.step);
     // Signed URLs against a real bucket, which is the only place a
     // signature is checked: GCP_TEST_BUCKET, GCP_TEST_TOKEN, and a signer,
     // GCP_TEST_SIGNER_KEY or GCP_TEST_SIGNER_EMAIL.
