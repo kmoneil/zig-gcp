@@ -19,6 +19,11 @@
 //! signs them with. A user's own login is no service account and cannot
 //! sign at all, which `auth.Credentials.signer` reports by returning null.
 //!
+//! With `GCS_HMAC_ACCESS_ID` and `GCS_HMAC_SECRET` set, it signs with that
+//! HMAC key instead (`GOOG4-HMAC-SHA256`), and needs no credentials at
+//! all: signing sends nothing. The secret comes from the environment, never
+//! the command line, where other users could read it.
+//!
 //! The URL is a bearer credential until it expires: whoever holds it can
 //! make that request, so pass it around no more freely than a password.
 
@@ -75,23 +80,39 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var diag: storage.Diagnostics = .{};
-    var lookup = try auth.Lookup.fromEnv(init.environ_map, arena);
-    lookup.diagnostics = &diag;
-    var creds = auth.findDefault(init.gpa, init.io, lookup, .{}) catch |err| return fail(err, &diag);
-    defer creds.deinit();
-    const signer = creds.signer() orelse {
-        try out.print("cannot sign: {s} names no service account\n", .{creds.source.description()});
+    const hmac_id = init.environ_map.get("GCS_HMAC_ACCESS_ID");
+    const hmac_secret = init.environ_map.get("GCS_HMAC_SECRET");
+    if ((hmac_id == null) != (hmac_secret == null)) {
+        try out.writeAll("an HMAC key needs both GCS_HMAC_ACCESS_ID and GCS_HMAC_SECRET\n");
         return out.flush();
+    }
+    var creds: ?auth.Credentials = null;
+    defer if (creds) |*c| c.deinit();
+    // Signing with an HMAC key sends nothing; a client on Google's
+    // endpoint wants a token provider all the same, and this one's token
+    // never leaves the process.
+    var unused: storage.StaticToken = .{ .token = "unused: signing sends nothing" };
+    const signer: storage.UrlSigner = if (hmac_id) |id| .{ .hmac = .{ .access_id = id, .secret = hmac_secret.? } } else blk: {
+        var lookup = try auth.Lookup.fromEnv(init.environ_map, arena);
+        lookup.diagnostics = &diag;
+        creds = auth.findDefault(init.gpa, init.io, lookup, .{}) catch |err| return fail(err, &diag);
+        break :blk .{ .rsa = creds.?.signer() orelse {
+            try out.print("cannot sign: {s} names no service account\n", .{creds.?.source.description()});
+            return out.flush();
+        } };
     };
 
     var client = storage.Client.init(init.gpa, init.io, .{
         .endpoint = storage.Endpoint.fromEnv(init.environ_map),
-        .token_provider = creds.provider(),
+        .token_provider = if (creds) |c| c.provider() else unused.provider(),
         .diagnostics = &diag,
     }) catch |err| return fail(err, &diag);
     defer client.deinit();
 
-    const account = signer.email(init.io, arena) catch |err| return fail(err, &diag);
+    const account = switch (signer) {
+        .rsa => |s| s.email(init.io, arena) catch |err| return fail(err, &diag),
+        .hmac => |h| try std.fmt.allocPrint(arena, "HMAC key {s}", .{h.access_id}),
+    };
     if (post_policy) {
         const fields: []const storage.PostField = if (content_type) |media_type|
             &.{.{ .name = "content-type", .value = media_type }}
@@ -102,12 +123,12 @@ pub fn main(init: std.process.Init) !void {
         // names the object, under it.
         const exact = name.len != 0 and name[name.len - 1] != '/';
         const made = if (exact)
-            client.bucket(target.?.bucket).object(name).postPolicy(.{ .rsa = signer }, .{
+            client.bucket(target.?.bucket).object(name).postPolicy(signer, .{
                 .expires_in_s = minutes * 60,
                 .fields = fields,
             })
         else
-            client.bucket(target.?.bucket).postPolicy(.{ .rsa = signer }, .{
+            client.bucket(target.?.bucket).postPolicy(signer, .{
                 .expires_in_s = minutes * 60,
                 .key = .{ .starts_with = name },
                 .fields = fields,
@@ -130,11 +151,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const object = client.bucket(target.?.bucket).object(target.?.name);
-    const url = if (content_type) |media_type| object.signedUrl(.{ .rsa = signer }, .{
+    const url = if (content_type) |media_type| object.signedUrl(signer, .{
         .method = .PUT,
         .expires_in_s = minutes * 60,
         .headers = &.{.{ .name = "content-type", .value = media_type }},
-    }) else object.signedUrl(.{ .rsa = signer }, .{
+    }) else object.signedUrl(signer, .{
         .expires_in_s = minutes * 60,
     });
     var signed = url catch |err| return fail(err, &diag);

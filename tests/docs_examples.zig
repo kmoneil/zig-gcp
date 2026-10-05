@@ -187,3 +187,88 @@ test "the Firestore guides' code, against a fake" {
     try std.testing.expect(std.mem.indexOf(u8, (try fake.request(4)).body.?, "\"updateMask\":{\"fieldPaths\":[]}") != null);
     try std.testing.expectEqual(1, try everyCity(&client, std.testing.allocator));
 }
+
+const storage = @import("storage");
+
+// snippet: storage-acl-grant
+/// Lets a team's group read one report and takes a former colleague's
+/// access away: each a read of the list, a change, and a write guarded by
+/// what was read, run again when another change came in between.
+fn shareReport(gcs: *storage.Client) !void {
+    const acl = gcs.bucket("reports").object("2026/q3.pdf").acl();
+    var shared = try acl.grant(.{ .group = "finance@example.com" }, .reader);
+    defer shared.deinit();
+    var revoked = try acl.revoke(.{ .user = "former@example.com" });
+    defer revoked.deinit();
+}
+// end snippet
+
+// snippet: storage-hmac
+/// Makes an HMAC key for a service account, signs a download URL with it,
+/// and returns the URL in `gpa`'s memory. The secret is shown this once: a
+/// real program stores it, as a credential, before `deinit` zeroes it.
+fn signWithNewKey(gcs: *storage.Client, gpa: std.mem.Allocator, account: []const u8) ![]u8 {
+    var key = try gcs.createHmacKey(account, .{});
+    defer key.deinit();
+    const signer: storage.UrlSigner = .{ .hmac = .{
+        .access_id = key.value.info.access_id,
+        .secret = key.value.secret,
+    } };
+    var url = try gcs.bucket("photos").object("cats/tom.jpg").signedUrl(signer, .{ .expires_in_s = 15 * 60 });
+    defer url.deinit();
+    return gpa.dupe(u8, url.value);
+}
+
+/// Retires a key: deactivated, then deleted. URLs it signed stop working
+/// within minutes.
+fn retireKey(gcs: *storage.Client, access_id: []const u8) !void {
+    try gcs.hmacKey(access_id).deactivateAndDelete();
+}
+// end snippet
+
+test "the Cloud Storage guides' code, against a scripted transport" {
+    const object_list =
+        \\{"name":"2026/q3.pdf","generation":"7","metageneration":"2","owner":{"entity":"user-w@example.com"},
+        \\ "acl":[{"entity":"user-w@example.com","role":"OWNER"},{"entity":"user-former@example.com","role":"READER"}]}
+    ;
+    const with_group =
+        \\{"name":"2026/q3.pdf","generation":"7","metageneration":"3","owner":{"entity":"user-w@example.com"},
+        \\ "acl":[{"entity":"user-w@example.com","role":"OWNER"},{"entity":"user-former@example.com","role":"READER"},
+        \\  {"entity":"group-finance@example.com","role":"READER"}]}
+    ;
+    // Made up, and shaped so no secret scanner takes it for a key.
+    const created =
+        \\{"kind":"storage#hmacKey","metadata":{"accessId":"GOOG1E-TEST-ONLY-NOT-A-REAL-ACCESS-ID","state":"ACTIVE","etag":"MQ=="},
+        \\ "secret":"TEST_ONLY_not_a_real_secret_000000000000"}
+    ;
+    var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{
+        .{ .respond = .{ .body = object_list } },
+        .{ .respond = .{ .body = with_group } },
+        .{ .respond = .{ .body = with_group } },
+        .{ .respond = .{ .body = with_group } },
+        .{ .respond = .{ .body = created } },
+        .{ .respond = .{ .body = "{\"accessId\":\"GOOG1E-TEST-ONLY-NOT-A-REAL-ACCESS-ID\",\"state\":\"INACTIVE\",\"etag\":\"Mg==\"}" } },
+        .{ .respond = .{ .status = 204, .body = "" } },
+    });
+    defer fake.deinit();
+    var tokens: core.testing.FakeTokenProvider = .{};
+    var gcs = try storage.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = tokens.provider(),
+        .transport = fake.transport(),
+    });
+    defer gcs.deinit();
+
+    try shareReport(&gcs);
+    // The grant wrote the whole list under the metageneration it read.
+    try std.testing.expectEqualStrings(
+        "https://storage.googleapis.com/storage/v1/b/reports/o/2026%2Fq3.pdf?projection=full&ifGenerationMatch=7&ifMetagenerationMatch=2",
+        (try fake.request(1)).url,
+    );
+
+    const url = try signWithNewKey(&gcs, std.testing.allocator, "signer@my-project.iam.gserviceaccount.com");
+    defer std.testing.allocator.free(url);
+    try std.testing.expect(std.mem.indexOf(u8, url, "X-Goog-Algorithm=GOOG4-HMAC-SHA256&X-Goog-Credential=GOOG1E-TEST-ONLY-NOT-A-REAL-ACCESS-ID%2F") != null);
+    try retireKey(&gcs, "GOOG1E-TEST-ONLY-NOT-A-REAL-ACCESS-ID");
+    try std.testing.expectEqual(7, fake.requests.items.len);
+}

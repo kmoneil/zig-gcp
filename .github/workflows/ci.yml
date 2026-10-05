@@ -202,6 +202,14 @@ jobs:
             echo "--encryption-key-file took a file that holds no key"
             exit 1
           fi
+          # An HMAC key signs with no credentials at all. The emulator
+          # checks no signature, so this checks the URL is made, names the
+          # HMAC algorithm, and fetches the object. The key is made up.
+          url=$(GCS_HMAC_ACCESS_ID=GOOG1E-TEST-ONLY GCS_HMAC_SECRET=TEST_ONLY_not_a_real_secret_000000000000 \
+            zig build example-gcs_sign -- gs://zigps-examples/dir/copy.bin | sed -n "s/^curl '\(.*\)'$/\1/p")
+          case "$url" in *X-Goog-Algorithm=GOOG4-HMAC-SHA256*) ;; *) echo "gcs_sign made no HMAC-signed URL"; exit 1 ;; esac
+          curl -sf "$url" -o "$RUNNER_TEMP/hmac.bin"
+          cmp "$RUNNER_TEMP/src.bin" "$RUNNER_TEMP/hmac.bin"
           # A bucket's notifications: gcs_notify sets them up, an upload
           # under the prefix reaches the Pub/Sub emulator through
           # fake-gcs-server, and gcs_notify watch prints it, decoded.
