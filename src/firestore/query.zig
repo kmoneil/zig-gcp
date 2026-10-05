@@ -586,6 +586,24 @@ test "queries the server would refuse, or that match nothing, are refused before
     try h.expectRequestCount(0);
 }
 
+test "a streamed error, inside the array, as production sends it" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .status = 400, .body =
+        \\[{
+        \\  "error": {
+        \\    "code": 400,
+        \\    "message": "The query requires an index. You can create it here: https://console.firebase.google.com/v1/r/project/extractctl/firestore/databases/d/indexes?create_composite=x",
+        \\    "status": "FAILED_PRECONDITION"
+        \\  }
+        \\}
+        \\]
+    } }}, .{});
+    defer h.deinit();
+    try testing.expectError(error.FailedPrecondition, h.client.runQuery(.{ .from = .{ .collection = "c" }, .order_by = &.{.{ .field = "__name__", .direction = .descending }} }, .{}));
+    try h.expectDiag("The query requires an index.");
+    try testing.expectEqualStrings("FAILED_PRECONDITION", h.diag.status());
+}
+
 test "golden: aggregations, under aliases of the library's own, answered in order" {
     var h: test_util.Harness = undefined;
     try h.init(&.{.{ .respond = .{ .body =

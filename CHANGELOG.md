@@ -53,7 +53,14 @@ including the ones that did not change.
   failure rolled back. A transaction's commit is sent once, since a
   repeat of one that landed would answer ABORTED and run it twice.
   `beginTransaction`, `rollback` and a `transaction` option on reads and
-  `commit` are there for driving one by hand.
+  `commit` are there for driving one by hand. The module has been run
+  against production Firestore, in a named database, and a field path of
+  1,500 bytes, which production refuses though the documentation allows
+  it, is now refused before sending.
+- core: `decodeErrorBody` and `decodeErrorInfos` read an error sent inside
+  the JSON array a streamed REST answer travels in, `[{"error": ...}]`,
+  as Firestore's runQuery sends one in production; the status there
+  decides the error, where the HTTP status alone named the wrong one.
 - core: `core.timestamp.format` writes an RFC 3339 timestamp as Google's
   servers do, in UTC with no fractional digits or 3, 6 or 9 of them.
   `core.timestamp.min`, `max` and `inRange` give the range it writes,

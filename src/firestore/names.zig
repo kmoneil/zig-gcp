@@ -281,13 +281,12 @@ pub const FieldPathIterator = struct {
 };
 
 /// Why `path` is not a field path a request may carry, or null when it is:
-/// the grammar, at most 1,500 bytes, and no reserved `__x__` name but a
-/// lone `__name__`. The emulator also refuses a path of exactly 1,500
-/// bytes; the documented limit is checked here, and the server has the
-/// last word.
+/// the grammar, at most 1,499 bytes (production refuses 1,500, though the
+/// documentation allows it), and no reserved `__x__` name but a lone
+/// `__name__`.
 pub fn fieldPathProblem(path: []const u8) ?[]const u8 {
     if (path.len == 0) return "a field path is empty";
-    if (path.len > validate.max_field_path_bytes) return "a field path is over 1,500 bytes";
+    if (path.len > validate.max_field_path_bytes) return "a field path is 1,500 bytes or longer: \"property path is longer than 1500 bytes.\"";
     if (std.mem.eql(u8, path, "__name__")) return null;
     var it: FieldPathIterator = .init(path);
     while (it.next() catch return "a field path breaks the grammar: segments are letters, digits and _ not starting with a digit, or quoted in backticks, separated by dots") |segment| {
@@ -458,8 +457,9 @@ test "fieldPathProblem: grammar, reserved names, size" {
     try testing.expect(fieldPathProblem("`__x__`") != null);
     try testing.expect(fieldPathProblem("a.__name__") != null);
     try testing.expect(fieldPathProblem("a-b") != null);
-    try testing.expectEqual(null, fieldPathProblem(test_util.repeat("k", 1500)));
-    try testing.expect(fieldPathProblem(test_util.repeat("k", 1501)) != null);
+    // Production and the emulator take 1,499 bytes and refuse 1,500.
+    try testing.expectEqual(null, fieldPathProblem(test_util.repeat("k", 1499)));
+    try testing.expect(fieldPathProblem(test_util.repeat("k", 1500)) != null);
 }
 
 test "writeFieldSegment quotes what is not simple" {

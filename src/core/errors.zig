@@ -136,27 +136,44 @@ const WireErrorBody = struct {
     } = null,
 };
 
+/// Parses `body` as `T`, or as a JSON array of `T` and takes the first
+/// element: a streamed REST answer, such as Firestore's runQuery, sends
+/// its error inside the array its messages travel in, `[{"error": ...}]`,
+/// as production does (measured 2026-10-05). Null when it is neither.
+fn parseMaybeStreamed(comptime T: type, arena: Allocator, body: []const u8) Allocator.Error!?T {
+    const options: std.json.ParseOptions = .{
+        .ignore_unknown_fields = true,
+        // Proto3 JSON parsers keep the last duplicate rather than failing.
+        .duplicate_field_behavior = .use_last,
+        .allocate = .alloc_if_needed,
+    };
+    if (std.json.parseFromSliceLeaky(T, arena, body, options)) |wire| {
+        return wire;
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    }
+    const list = std.json.parseFromSliceLeaky([]const T, arena, body, options) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return if (list.len > 0) list[0] else null;
+}
+
 /// The standard Google error body, `{"error": {"status": ..., "message":
-/// ...}}`, or null when `body` is not one (a proxy's HTML page, say), in
-/// which case the caller falls back to the HTTP status. Running out of
-/// memory is an error, not a body that failed to decode: the fallback could
-/// report the wrong error, since statuses share HTTP codes. The strings may
-/// point into `body`.
+/// ...}}`, also inside the array a streamed answer travels in, or null
+/// when `body` is not one (a proxy's HTML page, say), in which case the
+/// caller falls back to the HTTP status. Running out of memory is an
+/// error, not a body that failed to decode: the fallback could report the
+/// wrong error, since statuses share HTTP codes. The strings may point
+/// into `body`.
 ///
 /// Cloud Storage sends an older shape with no `status`; there the first
 /// error's `reason`, such as "notFound", stands in as the status. No reason
 /// is a canonical status name, so mapping still falls back to the HTTP code
 /// while diagnostics keep the server's word.
 pub fn decodeErrorBody(arena: Allocator, body: []const u8) Allocator.Error!?ErrorBody {
-    const wire = std.json.parseFromSliceLeaky(WireErrorBody, arena, body, .{
-        .ignore_unknown_fields = true,
-        // Proto3 JSON parsers keep the last duplicate rather than failing.
-        .duplicate_field_behavior = .use_last,
-        .allocate = .alloc_if_needed,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
+    const wire = (try parseMaybeStreamed(WireErrorBody, arena, body)) orelse return null;
     const e = wire.@"error" orelse return null;
     const reason: ?[]const u8 = if (e.errors) |list|
         if (list.len > 0) list[0].reason else null
@@ -191,19 +208,12 @@ const WireDetails = struct {
 };
 
 /// Every `google.rpc.ErrorInfo` in an error body's `details`, in order,
-/// skipping every other kind of detail. Empty when there is none, or when
-/// `body` is not Google's JSON error shape. Running out of memory is an
-/// error, as it is for `decodeErrorBody`.
+/// skipping every other kind of detail; a streamed answer's error too, as
+/// `decodeErrorBody` reads it. Empty when there is none, or when `body` is
+/// not Google's JSON error shape. Running out of memory is an error, as it
+/// is for `decodeErrorBody`.
 pub fn decodeErrorInfos(arena: Allocator, body: []const u8) Allocator.Error![]const ErrorInfo {
-    const wire = std.json.parseFromSliceLeaky(WireDetails, arena, body, .{
-        .ignore_unknown_fields = true,
-        // Proto3 JSON parsers keep the last duplicate rather than failing.
-        .duplicate_field_behavior = .use_last,
-        .allocate = .alloc_if_needed,
-    }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return &.{},
-    };
+    const wire = (try parseMaybeStreamed(WireDetails, arena, body)) orelse return &.{};
     const e = wire.@"error" orelse return &.{};
     const details = e.details orelse return &.{};
     var infos: std.ArrayList(ErrorInfo) = .empty;
@@ -507,6 +517,33 @@ test "decode error bodies" {
     try testing.expectEqual(null, try decodeErrorBody(a, "{\"error\":\"string\"}"));
     const partial = try decodeErrorBody(a, "{\"error\":{\"code\":\"weird\"}}");
     try testing.expectEqualStrings("", partial.?.status);
+}
+
+test "decode an error inside the array a streamed answer travels in" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // As Firestore's runQuery answered in production, 2026-10-05, with HTTP 400.
+    const streamed = (try decodeErrorBody(a,
+        \\[{
+        \\  "error": {
+        \\    "code": 400,
+        \\    "message": "The query requires an index. You can create it here: https://console.firebase.google.com/v1/r/project/p/firestore/databases/d/indexes?create_composite=x",
+        \\    "status": "FAILED_PRECONDITION"
+        \\  }
+        \\}
+        \\]
+    )).?;
+    try testing.expectEqualStrings("FAILED_PRECONDITION", streamed.status);
+    try testing.expect(std.mem.startsWith(u8, streamed.message, "The query requires an index."));
+    // The status decides, not the HTTP 400 it came with.
+    try testing.expectEqual(error.FailedPrecondition, fromResponse(400, streamed.status));
+    try testing.expectEqual(null, try decodeErrorBody(a, "[]"));
+    try testing.expectEqual(null, try decodeErrorBody(a, "[1]"));
+    try testing.expectEqual(null, try decodeErrorBody(a, "[{\"document\":{}}]"));
+    const infos = try decodeErrorInfos(a, "[{\"error\":{\"details\":[{\"@type\":\"type.googleapis.com/google.rpc.ErrorInfo\",\"reason\":\"R\"}]}}]");
+    try testing.expectEqual(1, infos.len);
+    try testing.expectEqualStrings("R", infos[0].reason);
 }
 
 test "decodeErrorBody reports running out of memory, not an unreadable body" {

@@ -22,9 +22,10 @@ pub const max_name_bytes = 6 * 1024;
 /// bytes." A nested name counts against the longer path it ends, which
 /// the server checks.
 pub const max_field_name_bytes = 1500;
-/// Longest field path, in bytes, as documented. The emulator refuses one
-/// of exactly 1,500 bytes too: "property path is longer than 1500 bytes."
-pub const max_field_path_bytes = 1500;
+/// Longest field path, in bytes. The documentation says 1,500, but
+/// production and the emulator both refuse a path of exactly 1,500 bytes,
+/// "property path is longer than 1500 bytes." (measured 2026-10-05).
+pub const max_field_path_bytes = 1499;
 /// Longest string or bytes value: 1 MiB less 89 bytes. "The value of
 /// property \"s\" is longer than 1048487 bytes."
 pub const max_value_bytes = 1_048_487;
