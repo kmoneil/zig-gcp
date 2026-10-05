@@ -37,7 +37,15 @@ including the ones that did not change.
   `retry_unconditional_writes` says otherwise. `Client.batchGet` reads
   many documents in one request and lays the answer out in the order
   asked, `null` for a missing one; `get` and `batchGet` read as of a past
-  time.
+  time. `Client.runQuery` runs structured queries over a collection or a
+  collection group below any document: conditions ANDed or a tree of
+  AND and OR, orders, cursors at either end, offset, limit and select.
+  Equality with null or NaN is sent as the server's own test for them,
+  as Google's clients send it, since the plain form matches nothing;
+  ranges and `array_contains` against null or NaN, which match nothing
+  either, are refused, as are lists past the server's sizes.
+  `Client.runAggregationQuery` counts, sums and averages a query's
+  results on the server, at most five at a time.
 - core: `core.timestamp.format` writes an RFC 3339 timestamp as Google's
   servers do, in UTC with no fractional digits or 3, 6 or 9 of them.
   `core.timestamp.min`, `max` and `inRange` give the range it writes,

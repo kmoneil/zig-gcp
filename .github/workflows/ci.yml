@@ -109,6 +109,16 @@ jobs:
           FIRESTORE_EMULATOR_HOST: 127.0.0.1:8087
         run: zig build test-integration --summary all
 
+      # FakeFirestore, which the unit tests run against, held to the
+      # emulator: hundreds of random queries and aggregations, answered
+      # alike or refused alike. A failure prints its seed;
+      # FIRESTORE_DIFF_SEED replays it.
+      - name: Firestore fake against the emulator
+        timeout-minutes: 10
+        env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8087
+        run: zig build test -Dmodule=firestore "-Dtest-filter=emulator differential" --summary all
+
       - name: Examples
         timeout-minutes: 10
         env:
@@ -221,6 +231,14 @@ jobs:
           zig build example-firestore -- getall cities/LA cities/NOPE | tee "$RUNNER_TEMP/getall.log"
           grep -q "visits: 5" "$RUNNER_TEMP/getall.log"
           grep -qx "cities/NOPE: missing" "$RUNNER_TEMP/getall.log"
+          # Queries: the biggest two of three cities, and a count by state.
+          zig build example-firestore -- set cities/SF state=CA population=870000
+          zig build example-firestore -- set cities/NY state=NY population=8300000
+          zig build example-firestore -- update cities/LA state=CA
+          zig build example-firestore -- query cities population '>' 0 --order population:desc --limit 2 | tee "$RUNNER_TEMP/query.log"
+          test "$(grep -c '^cities/' "$RUNNER_TEMP/query.log")" = 2
+          head -1 "$RUNNER_TEMP/query.log" | grep -qx "cities/NY"
+          zig build example-firestore -- count cities state == CA | grep -qx 2
           zig build example-firestore -- rm cities/LA
           if zig build example-firestore -- get cities/LA; then
             echo "rm left the document"

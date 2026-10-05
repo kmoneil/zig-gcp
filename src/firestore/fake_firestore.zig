@@ -147,6 +147,8 @@ pub const FakeFirestore = struct {
             if (method == .POST and std.mem.eql(u8, verb, "commit") and route.segments.len == 0) return self.commit(arena, route, body);
             if (method == .POST and std.mem.eql(u8, verb, "listCollectionIds") and route.segments.len % 2 == 0) return self.listCollectionIds(arena, route, body);
             if (method == .POST and std.mem.eql(u8, verb, "batchGet") and route.segments.len == 0) return self.batchGet(arena, route, body);
+            if (method == .POST and std.mem.eql(u8, verb, "runQuery") and route.segments.len % 2 == 0) return self.runQuery(arena, route, body);
+            if (method == .POST and std.mem.eql(u8, verb, "runAggregationQuery") and route.segments.len % 2 == 0) return self.runAggregation(arena, route, body);
             return fail(arena, 400, "INVALID_ARGUMENT", "fake: verb not modelled");
         }
         if (route.segments.len == 0) return fail(arena, 404, "NOT_FOUND", "fake: no such route");
@@ -343,6 +345,158 @@ pub const FakeFirestore = struct {
         try jw.objectField("readTime");
         try writeTime(jw, now_us);
         try jw.endObject();
+    }
+
+    fn runQuery(self: *FakeFirestore, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const tree = parseJson(arena, body) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (tree != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (try notModelled(arena, tree)) |r| return r;
+        const sq = tree.object.get("structuredQuery") orelse return fail(arena, 400, "INVALID_ARGUMENT", "fake: no structuredQuery");
+        const spec = switch (try parseQuery(arena, route, sq, &.{})) {
+            .refused => |r| return r,
+            .spec => |spec| spec,
+        };
+        const hits = try self.evaluate(arena, route, spec);
+        var out: Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        writeHits(&jw, arena, route, hits, spec.select, self.now_us) catch return error.OutOfMemory;
+        return ok(arena, out.written());
+    }
+
+    fn runAggregation(self: *FakeFirestore, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
+        const tree = parseJson(arena, body) orelse return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (tree != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (try notModelled(arena, tree)) |r| return r;
+        const saq = tree.object.get("structuredAggregationQuery") orelse return fail(arena, 400, "INVALID_ARGUMENT", "fake: no structuredAggregationQuery");
+        if (saq != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        const sq = saq.object.get("structuredQuery") orelse return fail(arena, 400, "INVALID_ARGUMENT", "fake: no structuredQuery");
+        const aggs_json = saq.object.get("aggregations") orelse return fail(arena, 400, "INVALID_ARGUMENT", "fake: no aggregations");
+        if (aggs_json != .array) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        const aggs = aggs_json.array.items;
+        // Measured: with a sum or an average among them, every aggregation,
+        // a count included, sees only the documents holding each field
+        // summed or averaged, whatever its value: the fields are ordered by
+        // as an inequality's would be, and a document without a field
+        // ordered by is left out, before the cursors, offset and limit.
+        var required: std.ArrayList([]const []const u8) = .empty;
+        for (aggs) |agg| {
+            if (agg != .object) continue;
+            inline for (.{ "sum", "avg" }) |kind| if (agg.object.get(kind)) |op| {
+                if (try aggregatePath(arena, op)) |path| try required.append(arena, path);
+            };
+        }
+        const spec = switch (try parseQuery(arena, route, sq, required.items)) {
+            .refused => |r| return r,
+            .spec => |spec| spec,
+        };
+        if (aggs.len > 5) return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The maximum number of aggregations allowed in an aggregation query is 5. Received: {d}", .{aggs.len}));
+        // Measured: "Aggregation over non-key properties is not supported
+        // for base query that only returns keys."
+        if (spec.select) |sel| if (sel.len == 0) for (aggs) |agg| {
+            if (agg == .object and (agg.object.get("sum") != null or agg.object.get("avg") != null)) {
+                return fail(arena, 400, "INVALID_ARGUMENT", "Aggregation over non-key properties is not supported for base query that only returns keys.");
+            }
+        };
+        const hits = try self.evaluate(arena, route, spec);
+
+        var out: Writer.Allocating = .init(arena);
+        var jw: Stringify = .{ .writer = &out.writer };
+        var aliases: std.StringArrayHashMapUnmanaged(void) = .empty;
+        const results = try arena.alloc(Val, aggs.len);
+        for (aggs, results, 0..) |agg, *result, i| {
+            if (agg != .object) return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+            const alias = if (agg.object.get("alias")) |al| (if (al == .string) al.string else return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.")) else try std.fmt.allocPrint(arena, "field_{d}", .{i + 1});
+            if (alias.len >= 5 and std.mem.startsWith(u8, alias, "__") and std.mem.endsWith(u8, alias, "__")) {
+                return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "The property.name \"{s}\" is reserved.", .{alias}));
+            }
+            if ((try aliases.getOrPut(arena, alias)).found_existing) {
+                return fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "Aggregation aliases contain duplicate alias: {s}.", .{alias}));
+            }
+            if (agg.object.get("count")) |c| {
+                var up_to: ?u64 = null;
+                if (c == .object) if (c.object.get("upTo")) |u| {
+                    const n = std.fmt.parseInt(i64, numberText(u) orelse "x", 10) catch return fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+                    if (n < 0) return fail(arena, 400, "INVALID_ARGUMENT", "The `up_to` value in a COUNT aggregation must be greater than or equal to zero.");
+                    up_to = @intCast(n);
+                };
+                result.* = .{ .integer = @intCast(@min(hits.len, up_to orelse hits.len)) };
+                continue;
+            }
+            const sum_op = agg.object.get("sum");
+            const op = sum_op orelse agg.object.get("avg") orelse return fail(arena, 400, "INVALID_ARGUMENT", "fake: aggregation not modelled");
+            const path = (try aggregatePath(arena, op)) orelse return try badPath(arena, &.{"?"});
+            result.* = sumOrAverage(hits, path, sum_op == null);
+        }
+        writeAggregationResult(&jw, aliases.keys(), results, self.now_us) catch return error.OutOfMemory;
+        return ok(arena, out.written());
+    }
+
+    fn writeAggregationResult(jw: *Stringify, aliases: []const []const u8, results: []const Val, now_us: i64) !void {
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("result");
+        try jw.beginObject();
+        try jw.objectField("aggregateFields");
+        try jw.beginObject();
+        for (aliases, results) |alias, v| {
+            try jw.objectField(alias);
+            try writeVal(jw, v);
+        }
+        try jw.endObject();
+        try jw.endObject();
+        try jw.objectField("readTime");
+        try writeTime(jw, now_us);
+        try jw.objectField("done");
+        try jw.write(true);
+        try jw.endObject();
+        try jw.endArray();
+    }
+
+    /// The documents a query matches, ordered, cut by cursors, offset and
+    /// limit.
+    fn evaluate(self: *FakeFirestore, arena: Allocator, route: Route, spec: QuerySpec) Allocator.Error![]const Hit {
+        const parent = try join(arena, route.segments);
+        var hits: std.ArrayList(Hit) = .empty;
+        const db_prefix = try std.fmt.allocPrint(arena, "{s}|", .{route.database});
+        for (self.docs.keys(), self.docs.values()) |key, d| {
+            if (!std.mem.startsWith(u8, key, db_prefix)) continue;
+            const path = key[db_prefix.len..];
+            const last_slash = std.mem.lastIndexOfScalar(u8, path, '/').?;
+            const collection_path = path[0..last_slash];
+            const collection_slash = std.mem.lastIndexOfScalar(u8, collection_path, '/');
+            const collection_id = if (collection_slash) |c| collection_path[c + 1 ..] else collection_path;
+            const collection_parent = if (collection_slash) |c| collection_path[0..c] else "";
+            if (!std.mem.eql(u8, collection_id, spec.collection)) continue;
+            if (spec.group) {
+                if (parent.len > 0 and !(std.mem.startsWith(u8, collection_parent, parent) and
+                    (collection_parent.len == parent.len or collection_parent[parent.len] == '/'))) continue;
+            } else if (!std.mem.eql(u8, collection_parent, parent)) continue;
+            const hit: Hit = .{ .path = path, .doc = d, .name = try fullName(arena, route, path) };
+            if (spec.filter) |f| if (!matches(f, hit)) continue;
+            // A document without a field ordered by is left out.
+            const keys = try arena.alloc(Val, spec.orders.len);
+            var complete = true;
+            for (spec.orders, keys) |o, *k| k.* = hit.orderValue(o.path) orelse {
+                complete = false;
+                break;
+            };
+            if (!complete) continue;
+            var with_keys = hit;
+            with_keys.keys = keys;
+            try hits.append(arena, with_keys);
+        }
+        std.mem.sort(Hit, hits.items, spec.orders, Hit.lessThan);
+        var start: usize = 0;
+        var end: usize = hits.items.len;
+        if (spec.start) |c| {
+            while (start < end and !c.admitsAsStart(spec.orders, hits.items[start].keys)) start += 1;
+        }
+        if (spec.end) |c| {
+            while (end > start and !c.admitsAsEnd(spec.orders, hits.items[end - 1].keys)) end -= 1;
+        }
+        start = @min(end, start + spec.offset);
+        if (spec.limit) |l| end = @min(end, start + l);
+        return hits.items[start..end];
     }
 
     fn create(self: *FakeFirestore, arena: Allocator, route: Route, body: []const u8) Allocator.Error!Reply {
@@ -655,7 +809,7 @@ fn parseUrl(arena: Allocator, url: []const u8) Allocator.Error!?FakeFirestore.Ro
         var segs = std.mem.splitScalar(u8, remaining, '/');
         while (segs.next()) |s| try raw.append(arena, s);
         const last = raw.items[raw.items.len - 1];
-        for ([_][]const u8{ ":listCollectionIds", ":commit", ":batchGet" }) |v| if (std.mem.endsWith(u8, last, v)) {
+        for ([_][]const u8{ ":listCollectionIds", ":commit", ":batchGet", ":runQuery", ":runAggregationQuery" }) |v| if (std.mem.endsWith(u8, last, v)) {
             verb = v[1..];
             raw.items[raw.items.len - 1] = last[0 .. last.len - v.len];
         };
@@ -794,6 +948,8 @@ fn parseMasks(arena: Allocator, texts: []const []const u8) Allocator.Error!?[]co
 
 const ValueParser = struct {
     arena: Allocator,
+    /// A query's operand, not stored: arrays may hold arrays, measured.
+    query: bool = false,
     status: []const u8 = "INVALID_ARGUMENT",
     message: []const u8 = "Payload isn't valid for request.",
 
@@ -880,7 +1036,7 @@ const ValueParser = struct {
             return .{ .geo = .{ lat, lon } };
         }
         if (eq(u8, kind, "arrayValue")) {
-            if (in_array) {
+            if (in_array and !p.query) {
                 p.message = "Nested arrays are not allowed";
                 return null;
             }
@@ -998,6 +1154,642 @@ fn copyVal(a: Allocator, v: FakeFirestore.Val) Allocator.Error!FakeFirestore.Val
         .map => |m| .{ .map = try deepCopy(a, m) },
         else => v,
     };
+}
+
+// Queries
+
+/// One document a query considers, with its values for the query's
+/// orders once they are known.
+const Hit = struct {
+    path: []const u8,
+    name: []const u8,
+    doc: *const FakeFirestore.Doc,
+    keys: []const FakeFirestore.Val = &.{},
+
+    /// The value at `path`, or the document's name for `__name__`.
+    fn orderValue(self: Hit, path: []const []const u8) ?FakeFirestore.Val {
+        if (path.len == 1 and std.mem.eql(u8, path[0], "__name__")) return .{ .reference = self.name };
+        return lookup(self.doc.fields, path);
+    }
+
+    fn lessThan(orders: []const QueryOrder, a: Hit, b: Hit) bool {
+        return compareKeys(orders, a.keys, b.keys) == .lt;
+    }
+};
+
+const QueryOrder = struct { path: []const []const u8, descending: bool };
+
+/// Compares two documents' values for the orders, each in its direction.
+fn compareKeys(orders: []const QueryOrder, a: []const FakeFirestore.Val, b: []const FakeFirestore.Val) std.math.Order {
+    for (orders[0..@min(a.len, b.len)], a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |o, x, y| {
+        const order = compareVals(x, y);
+        if (order != .eq) return if (o.descending) order.invert() else order;
+    }
+    return .eq;
+}
+
+const QueryCursor = struct {
+    values: []const FakeFirestore.Val,
+    before: bool,
+
+    fn compare(self: QueryCursor, orders: []const QueryOrder, keys: []const FakeFirestore.Val) std.math.Order {
+        return compareKeys(orders[0..self.values.len], keys[0..self.values.len], self.values);
+    }
+
+    /// startAt: at the position when `before`, after it otherwise.
+    fn admitsAsStart(self: QueryCursor, orders: []const QueryOrder, keys: []const FakeFirestore.Val) bool {
+        const order = self.compare(orders, keys);
+        return if (self.before) order != .lt else order == .gt;
+    }
+
+    /// endAt: before the position when `before`, at it otherwise.
+    fn admitsAsEnd(self: QueryCursor, orders: []const QueryOrder, keys: []const FakeFirestore.Val) bool {
+        const order = self.compare(orders, keys);
+        return if (self.before) order == .lt else order != .gt;
+    }
+};
+
+const FilterNode = union(enum) {
+    field: struct { path: []const []const u8, op: FieldOp, value: FakeFirestore.Val },
+    unary: struct { path: []const []const u8, op: UnaryOp },
+    composite: struct { all: bool, children: []const FilterNode },
+};
+
+const FieldOp = enum { LESS_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN, GREATER_THAN_OR_EQUAL, EQUAL, NOT_EQUAL, ARRAY_CONTAINS, IN, ARRAY_CONTAINS_ANY, NOT_IN };
+const UnaryOp = enum { IS_NULL, IS_NAN, IS_NOT_NULL, IS_NOT_NAN };
+
+const QuerySpec = struct {
+    collection: []const u8,
+    group: bool,
+    filter: ?FilterNode,
+    /// The explicit orders, then the implicit ones.
+    orders: []const QueryOrder,
+    select: ?[]const []const []const u8,
+    start: ?QueryCursor,
+    end: ?QueryCursor,
+    offset: usize,
+    limit: ?usize,
+};
+
+const ParsedQuery = union(enum) { spec: QuerySpec, refused: FakeFirestore.Reply };
+
+fn notModelled(arena: Allocator, tree: std.json.Value) Allocator.Error!?FakeFirestore.Reply {
+    if (tree.object.get("readTime") != null or tree.object.get("transaction") != null or tree.object.get("newTransaction") != null) {
+        return try fail(arena, 400, "INVALID_ARGUMENT", "fake: read times and transactions are not modelled");
+    }
+    return null;
+}
+
+fn queryRefusal(arena: Allocator, status: []const u8, message: []const u8) Allocator.Error!ParsedQuery {
+    return .{ .refused = try fail(arena, 400, status, message) };
+}
+
+fn fieldReferencePath(arena: Allocator, v: ?std.json.Value) Allocator.Error!?[]const []const u8 {
+    const ref = v orelse return null;
+    if (ref != .object) return null;
+    const p = ref.object.get("fieldPath") orelse return null;
+    if (p != .string) return null;
+    const segments = (try parseMasks(arena, &.{p.string})) orelse return null;
+    return segments[0];
+}
+
+fn aggregatePath(arena: Allocator, op: std.json.Value) Allocator.Error!?[]const []const u8 {
+    if (op != .object) return null;
+    return fieldReferencePath(arena, op.object.get("field"));
+}
+
+fn parseQuery(arena: Allocator, route: FakeFirestore.Route, sq: std.json.Value, required: []const []const []const u8) Allocator.Error!ParsedQuery {
+    _ = route;
+    if (sq != .object) return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+    const o = sq.object;
+    const from = o.get("from") orelse return queryRefusal(arena, "INVALID_ARGUMENT", "fake: a query without from is not modelled");
+    if (from != .array or from.array.items.len == 0) return queryRefusal(arena, "INVALID_ARGUMENT", "fake: a query without from is not modelled");
+    if (from.array.items.len > 1) return queryRefusal(arena, "INVALID_ARGUMENT", "StructuredQuery.from cannot have more than one collection selector.");
+    const selector = from.array.items[0];
+    if (selector != .object) return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+    const id = selector.object.get("collectionId") orelse return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+    if (id != .string) return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+    const group = if (selector.object.get("allDescendants")) |g| g == .bool and g.bool else false;
+
+    var seen: FilterSeen = .{};
+    const filter: ?FilterNode = if (o.get("where")) |w| switch (try parseFilter(arena, w, &seen)) {
+        .node => |n| n,
+        .refused => |r| return .{ .refused = r },
+    } else null;
+    if (seen.negations > 1) return queryRefusal(arena, "INVALID_ARGUMENT", "Only a single 'NOT_EQUAL', 'NOT_IN', 'IS_NOT_NAN', or 'IS_NOT_NULL' filter allowed per query.");
+    if (seen.not_in and (seen.in or seen.@"or")) return queryRefusal(arena, "INVALID_ARGUMENT", "'NOT_IN' cannot be used in the same query with 'IN', 'ARRAY_CONTAINS_ANY' or 'OR'.");
+    // Measured: one array-contains, or array-contains-any, per term of the
+    // filter's disjunction; OR branches may each hold one.
+    if (filter) |f| if (arrayContainsPerTerm(f) > 1) return queryRefusal(arena, "FAILED_PRECONDITION", "Only a single array-contains clause is allowed in a query");
+    if (seen.name_equality) {
+        var other = false;
+        var name_inequality = false;
+        for (seen.inequalities.items) |path| {
+            if (isName(path)) name_inequality = true else other = true;
+        }
+        if (other and !name_inequality) return queryRefusal(arena, "INVALID_ARGUMENT", "Equality on key is not allowed if there are other inequality fields and key does not appear in inequalities.");
+    }
+    const inequalities = &seen.inequalities;
+
+    var orders: std.ArrayList(QueryOrder) = .empty;
+    if (o.get("orderBy")) |ob| {
+        if (ob != .array) return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        for (ob.array.items) |item| {
+            if (item != .object) return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+            const path = (try fieldReferencePath(arena, item.object.get("field"))) orelse return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+            const dir = item.object.get("direction");
+            const descending = dir != null and dir.? == .string and std.mem.eql(u8, dir.?.string, "DESCENDING");
+            try orders.append(arena, .{ .path = path, .descending = descending });
+        }
+    }
+    const explicit = orders.items.len;
+    // Once the name is ordered by, explicitly or as an inequality's field,
+    // nothing may follow it.
+    var name_ordered = for (orders.items) |o_| {
+        if (isName(o_.path)) break true;
+    } else false;
+    // Measured, in this order: no other field may follow the name; a query
+    // filtering on nothing but the name, ordered first by name descending,
+    // is a descending key scan, which the emulator alone refuses; and no
+    // field may be ordered by twice.
+    for (orders.items[0..explicit], 0..) |o_, i| {
+        if (!isName(o_.path)) continue;
+        for (orders.items[i + 1 .. explicit]) |later| {
+            // The name again the other way counts as another field.
+            if (!isName(later.path) or later.descending != o_.descending) return queryRefusal(arena, "INVALID_ARGUMENT", "order by clause cannot contain more fields after the key");
+        }
+    }
+    const key_scan = if (filter) |f| onlyName(f) else true;
+    if (key_scan and explicit > 0 and isName(orders.items[0].path) and orders.items[0].descending) {
+        return queryRefusal(arena, "FAILED_PRECONDITION", "Firestore does not support descending key scans");
+    }
+    for (orders.items[0..explicit], 0..) |o_, i| for (orders.items[0..i]) |earlier| {
+        if (samePath(earlier.path, o_.path)) return queryRefusal(arena, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "order by clause cannot contain duplicate fields {s}", .{try dotted(arena, o_.path)}));
+    };
+    // Then each inequality's field, in field path order, the name last
+    // among them (measured), then the fields aggregations sum or average,
+    // and the name, all in the last order's direction.
+    std.mem.sort([]const []const u8, inequalities.items, {}, lessPath);
+    const last_descending = explicit > 0 and orders.items[explicit - 1].descending;
+    var name_inequality = false;
+    for (inequalities.items) |path| {
+        if (isName(path)) {
+            name_inequality = true;
+            continue;
+        }
+        for (orders.items) |existing| {
+            if (samePath(existing.path, path)) break;
+        } else {
+            if (name_ordered) return queryRefusal(arena, "INVALID_ARGUMENT", "order by clause cannot contain more fields after the key");
+            try orders.append(arena, .{ .path = path, .descending = last_descending });
+        }
+    }
+    // Measured: a name matched against a list orders by the name too.
+    if ((name_inequality or seen.name_equality) and !name_ordered) {
+        const name = try arena.alloc([]const u8, 1);
+        name[0] = "__name__";
+        try orders.append(arena, .{ .path = name, .descending = last_descending });
+        name_ordered = true;
+    }
+    // Fields an aggregation sums or averages, likewise.
+    var missing_orders: std.ArrayList(u8) = .empty;
+    const sorted_required = try arena.dupe([]const []const u8, required);
+    std.mem.sort([]const []const u8, sorted_required, {}, lessPath);
+    for (sorted_required) |path| {
+        for (orders.items) |existing| {
+            if (samePath(existing.path, path)) break;
+        } else {
+            if (name_ordered) {
+                if (missing_orders.items.len > 0) try missing_orders.appendSlice(arena, ", ");
+                for (path, 0..) |segment, k| {
+                    if (k > 0) try missing_orders.append(arena, '.');
+                    try missing_orders.appendSlice(arena, segment);
+                }
+                continue;
+            }
+            try orders.append(arena, .{ .path = path, .descending = last_descending });
+        }
+    }
+    if (missing_orders.items.len > 0) return queryRefusal(arena, "INVALID_ARGUMENT", try std.fmt.allocPrint(
+        arena,
+        "This query requires an index that has fields [{s}] after __name__ and Firestore does not currently support such an index. Please try the query again with additional ordering on those fields.",
+        .{missing_orders.items},
+    ));
+    for (orders.items) |existing| {
+        if (isName(existing.path)) break;
+    } else {
+        const name = try arena.alloc([]const u8, 1);
+        name[0] = "__name__";
+        try orders.append(arena, .{ .path = name, .descending = last_descending });
+    }
+
+    var select: ?[]const []const []const u8 = null;
+    if (o.get("select")) |sel| {
+        if (sel != .object) return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        var fields: std.ArrayList([]const []const u8) = .empty;
+        if (sel.object.get("fields")) |fs| {
+            if (fs != .array) return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+            for (fs.array.items) |f| try fields.append(arena, (try fieldReferencePath(arena, f)) orelse return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received."));
+        }
+        select = fields.items;
+    }
+
+    var cursors: [2]?QueryCursor = .{ null, null };
+    for ([_][]const u8{ "startAt", "endAt" }, &cursors) |key, *cursor| {
+        const c = o.get(key) orelse continue;
+        if (c != .object) return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        const values_json = c.object.get("values") orelse return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (values_json != .array) return queryRefusal(arena, "INVALID_ARGUMENT", "Invalid JSON payload received.");
+        if (values_json.array.items.len > explicit) return queryRefusal(arena, "INVALID_ARGUMENT", "Cursor has too many values.");
+        const values = try arena.alloc(FakeFirestore.Val, values_json.array.items.len);
+        var parser: ValueParser = .{ .arena = arena, .query = true };
+        for (values_json.array.items, values, 0..) |vj, *v, i| {
+            v.* = parser.value(vj, "cursor", 0, false) orelse return .{ .refused = try parser.refusal() };
+            if (isName(orders.items[i].path) and v.* != .reference) return queryRefusal(arena, "INVALID_ARGUMENT", "Cursor __key__ value is not a document reference.");
+        }
+        const before = if (c.object.get("before")) |b| b == .bool and b.bool else false;
+        cursor.* = .{ .values = values, .before = before };
+    }
+
+    var offset: usize = 0;
+    if (o.get("offset")) |off| offset = std.fmt.parseInt(usize, numberText(off) orelse return queryRefusal(arena, "INVALID_ARGUMENT", "Payload isn't valid for request."), 10) catch
+        return queryRefusal(arena, "INVALID_ARGUMENT", "offset is negative");
+    var limit: ?usize = null;
+    if (o.get("limit")) |l| {
+        const n = std.fmt.parseInt(i64, numberText(l) orelse return queryRefusal(arena, "INVALID_ARGUMENT", "Payload isn't valid for request."), 10) catch
+            return queryRefusal(arena, "INVALID_ARGUMENT", "Payload isn't valid for request.");
+        if (n < 0) return queryRefusal(arena, "INVALID_ARGUMENT", "limit is negative");
+        limit = @intCast(n);
+    }
+    return .{ .spec = .{
+        .collection = id.string,
+        .group = group,
+        .filter = filter,
+        .orders = orders.items,
+        .select = select,
+        .start = cursors[0],
+        .end = cursors[1],
+        .offset = offset,
+        .limit = limit,
+    } };
+}
+
+fn dotted(arena: Allocator, path: []const []const u8) Allocator.Error![]const u8 {
+    return std.mem.join(arena, ".", path);
+}
+
+fn isName(path: []const []const u8) bool {
+    return path.len == 1 and std.mem.eql(u8, path[0], "__name__");
+}
+
+fn samePath(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
+fn lessPath(_: void, a: []const []const u8, b: []const []const u8) bool {
+    for (a[0..@min(a.len, b.len)], b[0..@min(a.len, b.len)]) |x, y| {
+        switch (std.mem.order(u8, x, y)) {
+            .lt => return true,
+            .gt => return false,
+            .eq => {},
+        }
+    }
+    return a.len < b.len;
+}
+
+const ParsedFilter = union(enum) { node: FilterNode, refused: FakeFirestore.Reply };
+
+/// What a filter tree holds, for the rules that span it.
+const FilterSeen = struct {
+    negations: usize = 0,
+    inequalities: std.ArrayList([]const []const u8) = .empty,
+    not_in: bool = false,
+    /// `IN` or `ARRAY_CONTAINS_ANY`.
+    in: bool = false,
+    @"or": bool = false,
+    /// An equality or `IN` on the name.
+    name_equality: bool = false,
+};
+
+fn parseFilter(arena: Allocator, f: std.json.Value, seen: *FilterSeen) Allocator.Error!ParsedFilter {
+    const bad = ParsedFilter{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "Invalid JSON payload received.") };
+    if (f != .object) return bad;
+    if (f.object.get("compositeFilter")) |c| {
+        if (c != .object) return bad;
+        const op = c.object.get("op") orelse return bad;
+        if (op != .string) return bad;
+        const all = std.mem.eql(u8, op.string, "AND");
+        if (!all and !std.mem.eql(u8, op.string, "OR")) return bad;
+        if (!all) seen.@"or" = true;
+        const children_json = c.object.get("filters") orelse return .{ .node = .{ .composite = .{ .all = all, .children = &.{} } } };
+        if (children_json != .array) return bad;
+        const children = try arena.alloc(FilterNode, children_json.array.items.len);
+        for (children_json.array.items, children) |cj, *child| child.* = switch (try parseFilter(arena, cj, seen)) {
+            .node => |n| n,
+            .refused => |r| return .{ .refused = r },
+        };
+        return .{ .node = .{ .composite = .{ .all = all, .children = children } } };
+    }
+    if (f.object.get("unaryFilter")) |u| {
+        if (u != .object) return bad;
+        const path = (try fieldReferencePath(arena, u.object.get("field"))) orelse return bad;
+        const op_json = u.object.get("op") orelse return bad;
+        if (op_json != .string) return bad;
+        const op = std.meta.stringToEnum(UnaryOp, op_json.string) orelse return bad;
+        if (isName(path)) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "__key__ filter value must be a Key") };
+        // Measured: these order their results by the field, as an
+        // inequality does.
+        if (op == .IS_NOT_NULL or op == .IS_NOT_NAN) {
+            seen.negations += 1;
+            try seen.inequalities.append(arena, path);
+        }
+        return .{ .node = .{ .unary = .{ .path = path, .op = op } } };
+    }
+    if (f.object.get("fieldFilter")) |ff| {
+        if (ff != .object) return bad;
+        const path = (try fieldReferencePath(arena, ff.object.get("field"))) orelse return bad;
+        const op_json = ff.object.get("op") orelse return bad;
+        if (op_json != .string) return bad;
+        const op = std.meta.stringToEnum(FieldOp, op_json.string) orelse return bad;
+        var parser: ValueParser = .{ .arena = arena, .query = true };
+        const value = parser.value(ff.object.get("value") orelse return bad, "value", 0, false) orelse return .{ .refused = try parser.refusal() };
+        if (isName(path) and (op == .ARRAY_CONTAINS or op == .ARRAY_CONTAINS_ANY)) {
+            return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", "the name __key__ is reserved") };
+        }
+        switch (op) {
+            .IN, .ARRAY_CONTAINS_ANY, .NOT_IN => {
+                const name = @tagName(op);
+                if (value != .array) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "'{s}' requires an ArrayValue.", .{name})) };
+                if (value.array.len == 0) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "'{s}' requires an non-empty ArrayValue.", .{name})) };
+                const most: usize = if (op == .NOT_IN) 10 else 30;
+                if (value.array.len > most) return .{ .refused = try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(arena, "'{s}' supports up to {d} comparison values.", .{ name, most })) };
+            },
+            else => {},
+        }
+        switch (op) {
+            .NOT_EQUAL, .NOT_IN => seen.negations += 1,
+            else => {},
+        }
+        switch (op) {
+            .NOT_IN => seen.not_in = true,
+            .IN => seen.in = true,
+            .ARRAY_CONTAINS_ANY => seen.in = true,
+            else => {},
+        }
+        switch (op) {
+            .LESS_THAN, .LESS_THAN_OR_EQUAL, .GREATER_THAN, .GREATER_THAN_OR_EQUAL, .NOT_EQUAL, .NOT_IN => try seen.inequalities.append(arena, path),
+            else => {},
+        }
+        if (isName(path) and (op == .EQUAL or op == .IN)) seen.name_equality = true;
+        return .{ .node = .{ .field = .{ .path = path, .op = op, .value = value } } };
+    }
+    return bad;
+}
+
+/// Whether every condition of the filter tests the name.
+fn onlyName(f: FilterNode) bool {
+    return switch (f) {
+        .field => |ff| isName(ff.path),
+        .unary => |u| isName(u.path),
+        .composite => |c| for (c.children) |child| {
+            if (!onlyName(child)) break false;
+        } else true,
+    };
+}
+
+/// The most array-contains and array-contains-any conditions any one
+/// conjunction of the filter's disjunctive form holds.
+fn arrayContainsPerTerm(f: FilterNode) usize {
+    return switch (f) {
+        .field => |ff| @intFromBool(ff.op == .ARRAY_CONTAINS or ff.op == .ARRAY_CONTAINS_ANY),
+        .unary => 0,
+        .composite => |c| blk: {
+            var n: usize = 0;
+            for (c.children) |child| {
+                const m = arrayContainsPerTerm(child);
+                n = if (c.all) n + m else @max(n, m);
+            }
+            break :blk n;
+        },
+    };
+}
+
+fn isNullOrNan(v: FakeFirestore.Val) bool {
+    return v == .null or isNan(v);
+}
+
+/// Equality as a filter sees it, measured: null and NaN equal nothing.
+fn filterEqual(a: FakeFirestore.Val, b: FakeFirestore.Val) bool {
+    if (isNullOrNan(a) or isNullOrNan(b)) return false;
+    return compareVals(a, b) == .eq;
+}
+
+fn matches(f: FilterNode, hit: Hit) bool {
+    switch (f) {
+        .composite => |c| {
+            for (c.children) |child| {
+                if (matches(child, hit) != c.all) return !c.all;
+            }
+            return c.all;
+        },
+        .unary => |u| {
+            const v = hit.orderValue(u.path) orelse return false;
+            return switch (u.op) {
+                .IS_NULL => v == .null,
+                .IS_NAN => isNan(v),
+                .IS_NOT_NULL => v != .null,
+                .IS_NOT_NAN => !isNullOrNan(v),
+            };
+        },
+        .field => |ff| {
+            const v = hit.orderValue(ff.path) orelse return false;
+            const x = ff.value;
+            return switch (ff.op) {
+                .EQUAL => filterEqual(v, x),
+                .NOT_EQUAL => x != .null and v != .null and (isNan(x) or !filterEqual(v, x)),
+                .LESS_THAN, .LESS_THAN_OR_EQUAL, .GREATER_THAN, .GREATER_THAN_OR_EQUAL => range: {
+                    if (isNullOrNan(x) or isNan(v) or typeRank(v) != typeRank(x)) break :range false;
+                    const order = compareVals(v, x);
+                    break :range switch (ff.op) {
+                        .LESS_THAN => order == .lt,
+                        .LESS_THAN_OR_EQUAL => order != .gt,
+                        .GREATER_THAN => order == .gt,
+                        .GREATER_THAN_OR_EQUAL => order != .lt,
+                        else => unreachable,
+                    };
+                },
+                .ARRAY_CONTAINS => v == .array and for (v.array) |e| {
+                    if (filterEqual(e, x)) break true;
+                } else false,
+                .ARRAY_CONTAINS_ANY => v == .array and for (v.array) |e| {
+                    if (anyEqual(e, x.array)) break true;
+                } else false,
+                .IN => anyEqual(v, x.array),
+                .NOT_IN => v != .null and !containsNull(x.array) and !anyEqual(v, x.array),
+            };
+        },
+    }
+}
+
+fn anyEqual(v: FakeFirestore.Val, candidates: []const FakeFirestore.Val) bool {
+    for (candidates) |c| if (filterEqual(v, c)) return true;
+    return false;
+}
+
+fn containsNull(values: []const FakeFirestore.Val) bool {
+    for (values) |v| if (v == .null) return true;
+    return false;
+}
+
+/// Firestore's order of kinds, measured: null, booleans, numbers,
+/// timestamps, strings, bytes, references, geo points, arrays, maps.
+fn typeRank(v: FakeFirestore.Val) u8 {
+    return switch (v) {
+        .null => 0,
+        .boolean => 1,
+        .integer, .double => 2,
+        .timestamp_us => 3,
+        .string => 4,
+        .bytes => 5,
+        .reference => 6,
+        .geo => 7,
+        .array => 8,
+        .map => 9,
+    };
+}
+
+/// Firestore's order of values: by kind, then within it; NaN first among
+/// numbers, 1 and 1.0 the same, strings and bytes by their bytes,
+/// references by segment, maps by their sorted keys, then values.
+fn compareVals(a: FakeFirestore.Val, b: FakeFirestore.Val) std.math.Order {
+    const ra = typeRank(a);
+    const rb = typeRank(b);
+    if (ra != rb) return std.math.order(ra, rb);
+    return switch (a) {
+        .null => .eq,
+        .boolean => |x| std.math.order(@intFromBool(x), @intFromBool(b.boolean)),
+        .integer, .double => {
+            if (isNan(a) or isNan(b)) return std.math.order(@intFromBool(!isNan(a)), @intFromBool(!isNan(b)));
+            return compareNumbers(a, b);
+        },
+        .timestamp_us => |x| std.math.order(x, b.timestamp_us),
+        .string => |x| std.mem.order(u8, x, b.string),
+        .bytes => |x| std.mem.order(u8, x, b.bytes),
+        .reference => |x| compareReferences(x, b.reference),
+        .geo => |x| switch (std.math.order(x[0], b.geo[0])) {
+            .eq => std.math.order(x[1], b.geo[1]),
+            else => |o| o,
+        },
+        .array => |x| {
+            for (x[0..@min(x.len, b.array.len)], b.array[0..@min(x.len, b.array.len)]) |p, q| {
+                const o = compareVals(p, q);
+                if (o != .eq) return o;
+            }
+            return std.math.order(x.len, b.array.len);
+        },
+        .map => |x| compareMaps(x, b.map),
+    };
+}
+
+fn compareReferences(a: []const u8, b: []const u8) std.math.Order {
+    var ia = std.mem.splitScalar(u8, a, '/');
+    var ib = std.mem.splitScalar(u8, b, '/');
+    while (true) {
+        const sa = ia.next() orelse return if (ib.next() == null) .eq else .lt;
+        const sb = ib.next() orelse return .gt;
+        const o = std.mem.order(u8, sa, sb);
+        if (o != .eq) return o;
+    }
+}
+
+fn compareMaps(a: []const FakeFirestore.Entry, b: []const FakeFirestore.Entry) std.math.Order {
+    var buf_a: [64]FakeFirestore.Entry = undefined;
+    var buf_b: [64]FakeFirestore.Entry = undefined;
+    const sa = sortedEntries(a, &buf_a);
+    const sb = sortedEntries(b, &buf_b);
+    for (sa[0..@min(sa.len, sb.len)], sb[0..@min(sa.len, sb.len)]) |x, y| {
+        const ko = std.mem.order(u8, x.name, y.name);
+        if (ko != .eq) return ko;
+        const vo = compareVals(x.value, y.value);
+        if (vo != .eq) return vo;
+    }
+    return std.math.order(sa.len, sb.len);
+}
+
+/// The entries by name; a map the fake orders has at most 64.
+fn sortedEntries(entries: []const FakeFirestore.Entry, buf: *[64]FakeFirestore.Entry) []const FakeFirestore.Entry {
+    const n = @min(entries.len, buf.len);
+    @memcpy(buf[0..n], entries[0..n]);
+    std.mem.sort(FakeFirestore.Entry, buf[0..n], {}, struct {
+        fn less(_: void, x: FakeFirestore.Entry, y: FakeFirestore.Entry) bool {
+            return std.mem.order(u8, x.name, y.name) == .lt;
+        }
+    }.less);
+    return buf[0..n];
+}
+
+/// Measured: integers sum to an integer while they fit, anything else to
+/// a double; values that are no number are left out; an average of none
+/// is null.
+fn sumOrAverage(hits: []const Hit, path: []const []const u8, average: bool) FakeFirestore.Val {
+    var int_sum: i64 = 0;
+    var int_ok = true;
+    var double_sum: f64 = 0;
+    var count: usize = 0;
+    for (hits) |hit| {
+        const v = hit.orderValue(path) orelse continue;
+        switch (v) {
+            .integer => |i| {
+                count += 1;
+                double_sum += @floatFromInt(i);
+                if (int_ok) int_sum = std.math.add(i64, int_sum, i) catch blk: {
+                    int_ok = false;
+                    break :blk int_sum;
+                };
+            },
+            .double => |d| {
+                count += 1;
+                double_sum += d;
+                int_ok = false;
+            },
+            else => {},
+        }
+    }
+    if (average) {
+        if (count == 0) return .null;
+        return .{ .double = double_sum / @as(f64, @floatFromInt(count)) };
+    }
+    return if (int_ok) .{ .integer = int_sum } else .{ .double = double_sum };
+}
+
+fn writeHits(jw: *Stringify, arena: Allocator, route: FakeFirestore.Route, hits: []const Hit, select: ?[]const []const []const u8, now_us: i64) !void {
+    _ = route;
+    try jw.beginArray();
+    if (hits.len == 0) {
+        // Measured: an empty result is one message, its read time.
+        try jw.beginObject();
+        try jw.objectField("readTime");
+        try writeTime(jw, now_us);
+        try jw.objectField("done");
+        try jw.write(true);
+        try jw.endObject();
+    }
+    for (hits, 0..) |hit, i| {
+        try jw.beginObject();
+        try jw.objectField("document");
+        try writeDoc(jw, arena, hit.name, hit.doc, select);
+        try jw.objectField("readTime");
+        try writeTime(jw, now_us);
+        // Measured: `done` rides on the last document.
+        if (i == hits.len - 1) {
+            try jw.objectField("done");
+            try jw.write(true);
+        }
+        try jw.endObject();
+    }
+    try jw.endArray();
 }
 
 // Transforms applied
@@ -1746,6 +2538,192 @@ test "fake: batchGet through the client, and a transform's lost answer" {
     var once = try h.client.doc("c/a").get(.{});
     defer once.deinit();
     try testing.expectEqual(21, once.value.get("v").?.integer);
+}
+
+/// The mixed collection `_tmp/firestore-m3/probe.py` queried on the
+/// emulator, one document per kind of value in `x`, and one without it.
+fn putMixed(h: *test_util.FakeHarness) !void {
+    const nan = std.math.nan(f64);
+    const docs = [_]struct { []const u8, ?Value }{
+        .{ "null", .null },                                                       .{ "false", .{ .boolean = false } },                                        .{ "true", .{ .boolean = true } },
+        .{ "nan", .{ .double = nan } },                                           .{ "neginf", .{ .double = -std.math.inf(f64) } },                           .{ "i1", .{ .integer = 1 } },
+        .{ "d1", .{ .double = 1.0 } },                                            .{ "d15", .{ .double = 1.5 } },                                             .{ "i2", .{ .integer = 2 } },
+        .{ "inf", .{ .double = std.math.inf(f64) } },                             .{ "ts", .{ .timestamp = .{ .nanoseconds = 1_767_225_600_000_000_000 } } }, .{ "sa", .{ .string = "a" } },
+        .{ "sB", .{ .string = "B" } },                                            .{ "bytes", .{ .bytes = "\x01" } },                                         .{ "ref", .{ .reference = "projects/extractctl/databases/(default)/documents/c/x" } },
+        .{ "geo", .{ .geo_point = .{ .latitude = 1, .longitude = 2 } } },         .{ "arr", .{ .array = &.{ .{ .integer = 1 }, .{ .integer = 2 } } } },       .{ "arr0", .{ .array = &.{} } },
+        .{ "map", .{ .map = &.{.{ .name = "a", .value = .{ .integer = 1 } }} } }, .{ "map0", .{ .map = &.{} } },                                              .{ "none", null },
+    };
+    for (docs) |d| {
+        var path_buf: [16]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "v/{s}", .{d[0]});
+        _ = try h.client.doc(path).set(if (d[1]) |v| &.{.{ .name = "x", .value = v }} else &.{.{ .name = "y", .value = .{ .integer = 1 } }}, .{});
+    }
+}
+
+fn expectIds(h: *test_util.FakeHarness, query: types.Query, expected: []const []const u8) !void {
+    var r = try h.client.runQuery(query, .{});
+    defer r.deinit();
+    var ok_ = r.value.documents.len == expected.len;
+    if (ok_) for (r.value.documents, expected) |d, e| {
+        if (!std.mem.eql(u8, d.id(), e)) ok_ = false;
+    };
+    if (!ok_) {
+        std.debug.print("expected", .{});
+        for (expected) |e| std.debug.print(" {s}", .{e});
+        std.debug.print("\ngot", .{});
+        for (r.value.documents) |d| std.debug.print(" {s}", .{d.id()});
+        std.debug.print("\n", .{});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "fake: queries answer as the emulator answered them" {
+    var h: test_util.FakeHarness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    try putMixed(&h);
+    const v: types.Query.From = .{ .collection = "v" };
+    const nan = std.math.nan(f64);
+    try expectIds(&h, .{ .from = v, .order_by = &.{.{ .field = "x" }} }, &.{ "null", "false", "true", "nan", "neginf", "d1", "i1", "d15", "i2", "inf", "ts", "sB", "sa", "bytes", "ref", "geo", "arr0", "arr", "map0", "map" });
+    try expectIds(&h, .{ .from = v, .order_by = &.{.{ .field = "x", .direction = .descending }} }, &.{ "map", "map0", "arr", "arr0", "geo", "ref", "bytes", "sa", "sB", "ts", "inf", "i2", "d15", "i1", "d1", "neginf", "nan", "true", "false", "null" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .greater_than, .value = .{ .integer = 1 } }} }, &.{ "d15", "i2", "inf" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .greater_than_or_equal, .value = .{ .integer = 1 } }} }, &.{ "d1", "i1", "d15", "i2", "inf" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .less_than, .value = .{ .string = "b" } }} }, &.{ "sB", "sa" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .less_than, .value = .{ .integer = 1 } }} }, &.{"neginf"});
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .equal, .value = .{ .integer = 1 } }} }, &.{ "d1", "i1" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .not_equal, .value = .{ .integer = 1 } }} }, &.{ "false", "true", "nan", "neginf", "d15", "i2", "inf", "ts", "sB", "sa", "bytes", "ref", "geo", "arr0", "arr", "map0", "map" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .equal, .value = .{ .double = nan } }} }, &.{"nan"});
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .is_not_nan }} }, &.{ "false", "true", "neginf", "d1", "i1", "d15", "i2", "inf", "ts", "sB", "sa", "bytes", "ref", "geo", "arr0", "arr", "map0", "map" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .not_equal, .value = .null }} }, &.{ "false", "true", "nan", "neginf", "d1", "i1", "d15", "i2", "inf", "ts", "sB", "sa", "bytes", "ref", "geo", "arr0", "arr", "map0", "map" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .equal, .value = .null }} }, &.{"null"});
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .in, .value = .{ .array = &.{ .{ .integer = 1 }, .{ .string = "a" }, .null } } }} }, &.{ "d1", "i1", "sa" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .not_in, .value = .{ .array = &.{ .{ .integer = 1 }, .{ .string = "a" } } } }} }, &.{ "false", "true", "nan", "neginf", "d15", "i2", "inf", "ts", "sB", "bytes", "ref", "geo", "arr0", "arr", "map0", "map" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .not_in, .value = .{ .array = &.{.{ .double = nan }} } }} }, &.{ "false", "true", "nan", "neginf", "d1", "i1", "d15", "i2", "inf", "ts", "sB", "sa", "bytes", "ref", "geo", "arr0", "arr", "map0", "map" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .array_contains, .value = .{ .integer = 1 } }} }, &.{"arr"});
+    // Measured: a null among not-in's values matches nothing at all.
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .not_in, .value = .{ .array = &.{ .null, .{ .integer = 5 } } } }} }, &.{});
+    // One array-contains per term: each OR branch may hold one, an AND not two.
+    try expectIds(&h, .{ .from = v, .filter = .{ .any = &.{
+        .{ .condition = .{ .field = "x", .op = .array_contains, .value = .{ .integer = 1 } } },
+        .{ .condition = .{ .field = "x", .op = .array_contains_any, .value = .{ .array = &.{.{ .integer = 7 }} } } },
+    } } }, &.{"arr"});
+    try testing.expectError(error.FailedPrecondition, h.client.runQuery(.{ .from = v, .where = &.{
+        .{ .field = "x", .op = .array_contains, .value = .{ .integer = 1 } },
+        .{ .field = "y", .op = .array_contains_any, .value = .{ .array = &.{.{ .integer = 7 }} } },
+    } }, .{}));
+    try h.expectDiag("Only a single array-contains clause");
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .array_contains_any, .value = .{ .array = &.{.{ .double = 2.0 }} } }} }, &.{"arr"});
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .equal, .value = .{ .map = &.{.{ .name = "a", .value = .{ .double = 1.0 } }} } }} }, &.{"map"});
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .less_than, .value = .{ .array = &.{.{ .integer = 5 }} } }} }, &.{ "arr0", "arr" });
+    try expectIds(&h, .{ .from = v, .filter = .{ .any = &.{
+        .{ .condition = .{ .field = "x", .op = .equal, .value = .{ .integer = 1 } } },
+        .{ .condition = .{ .field = "x", .op = .equal, .value = .{ .string = "a" } } },
+    } } }, &.{ "d1", "i1", "sa" });
+    try expectIds(&h, .{ .from = v, .order_by = &.{.{ .field = "x" }}, .limit = 3, .offset = 2 }, &.{ "true", "nan", "neginf" });
+    try expectIds(&h, .{ .from = v, .limit = 0 }, &.{});
+    try expectIds(&h, .{ .from = v, .order_by = &.{.{ .field = "x" }}, .start_at = .{ .values = &.{.{ .integer = 1 }} }, .limit = 4 }, &.{ "d1", "i1", "d15", "i2" });
+    try expectIds(&h, .{ .from = v, .order_by = &.{.{ .field = "x" }}, .start_at = .{ .values = &.{.{ .integer = 1 }}, .inclusive = false }, .limit = 4 }, &.{ "d15", "i2", "inf", "ts" });
+    try expectIds(&h, .{ .from = v, .order_by = &.{.{ .field = "x" }}, .end_at = .{ .values = &.{.{ .integer = 1 }}, .inclusive = false } }, &.{ "null", "false", "true", "nan", "neginf" });
+    try expectIds(&h, .{ .from = v, .order_by = &.{.{ .field = "x" }}, .end_at = .{ .values = &.{.{ .integer = 1 }} } }, &.{ "null", "false", "true", "nan", "neginf", "d1", "i1" });
+    try expectIds(&h, .{ .from = v, .order_by = &.{ .{ .field = "x" }, .{ .field = "__name__" } }, .start_at = .{ .values = &.{ .{ .integer = 1 }, .{ .reference = "projects/extractctl/databases/(default)/documents/v/i1" } }, .inclusive = false }, .limit = 3 }, &.{ "d15", "i2", "inf" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .greater_than, .value = .{ .integer = 0 } }}, .limit = 4 }, &.{ "d1", "i1", "d15", "i2" });
+    try expectIds(&h, .{ .from = v, .where = &.{.{ .field = "x", .op = .in, .value = .{ .array = &.{ .{ .integer = 1 }, .{ .integer = 2 } } } }}, .order_by = &.{.{ .field = "x", .direction = .descending }} }, &.{ "i2", "i1", "d1" });
+    try expectIds(&h, .{ .from = v, .order_by = &.{.{ .field = "y" }} }, &.{"none"});
+    try expectIds(&h, .{ .from = .{ .collection = "nothing" } }, &.{});
+
+    // Refusals in the emulator's words.
+    try testing.expectError(error.InvalidArgument, h.client.runQuery(.{ .from = v, .where = &.{
+        .{ .field = "x", .op = .not_in, .value = .{ .array = &.{.{ .integer = 1 }} } },
+        .{ .field = "x", .op = .not_equal, .value = .{ .integer = 2 } },
+    } }, .{}));
+    try h.expectDiag("Only a single 'NOT_EQUAL', 'NOT_IN', 'IS_NOT_NAN', or 'IS_NOT_NULL' filter allowed per query.");
+    try testing.expectError(error.FailedPrecondition, h.client.runQuery(.{ .from = v, .order_by = &.{.{ .field = "__name__", .direction = .descending }} }, .{}));
+    try h.expectDiag("descending key scans");
+
+    // Select: names only, or one field.
+    var names_only = try h.client.runQuery(.{ .from = v, .select = &.{}, .limit = 2 }, .{});
+    defer names_only.deinit();
+    try testing.expectEqual(0, names_only.value.documents[0].fields.len);
+    var one = try h.client.runQuery(.{ .from = v, .select = &.{"y"}, .where = &.{.{ .field = "y", .op = .equal, .value = .{ .integer = 1 } }} }, .{});
+    defer one.deinit();
+    try testing.expectEqual(1, one.value.documents[0].fields.len);
+}
+
+test "fake: collection groups and parents, as the emulator answered them" {
+    var h: test_util.FakeHarness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    for ([_][]const u8{ "g/1/kids/a", "g/2/kids/b", "kids/c", "g/1/other/kids" }) |path| _ = try h.client.doc(path).set(&.{}, .{});
+    try expectIds(&h, .{ .from = .{ .group = "kids" } }, &.{ "a", "b", "c" });
+    try expectIds(&h, .{ .from = .{ .group = "kids" }, .parent = "g/1" }, &.{"a"});
+    try expectIds(&h, .{ .from = .{ .collection = "kids" }, .parent = "g/1" }, &.{"a"});
+    try expectIds(&h, .{ .from = .{ .collection = "kids" } }, &.{"c"});
+}
+
+test "fake: aggregations answer as the emulator answered them" {
+    var h: test_util.FakeHarness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    try putMixed(&h);
+    const v: types.Query = .{ .from = .{ .collection = "v" } };
+    var all = try h.client.runAggregationQuery(v, &.{ .{ .count = .{} }, .{ .sum = "x" }, .{ .avg = "x" } }, .{});
+    defer all.deinit();
+    try codec.expectValueEqual(.{ .integer = 20 }, all.value.values[0]);
+    try testing.expect(std.math.isNan(all.value.values[1].double));
+    try testing.expect(std.math.isNan(all.value.values[2].double));
+    var capped = try h.client.runAggregationQuery(v, &.{.{ .count = .{ .up_to = 3 } }}, .{});
+    defer capped.deinit();
+    try testing.expectEqual(3, capped.value.values[0].integer);
+    var mixed = try h.client.runAggregationQuery(.{ .from = .{ .collection = "v" }, .where = &.{.{ .field = "x", .op = .in, .value = .{ .array = &.{ .{ .integer = 1 }, .{ .double = 1.5 }, .{ .integer = 2 } } } }} }, &.{ .{ .sum = "x" }, .{ .avg = "x" } }, .{});
+    defer mixed.deinit();
+    try codec.expectValueEqual(.{ .double = 5.5 }, mixed.value.values[0]);
+    try codec.expectValueEqual(.{ .double = 1.375 }, mixed.value.values[1]);
+    var limited = try h.client.runAggregationQuery(.{ .from = .{ .collection = "v" }, .limit = 2 }, &.{.{ .count = .{} }}, .{});
+    defer limited.deinit();
+    try testing.expectEqual(2, limited.value.values[0].integer);
+    var offset = try h.client.runAggregationQuery(.{ .from = .{ .collection = "v" }, .offset = 2 }, &.{.{ .count = .{} }}, .{});
+    defer offset.deinit();
+    try testing.expectEqual(19, offset.value.values[0].integer);
+    var cursor = try h.client.runAggregationQuery(.{ .from = .{ .collection = "v" }, .order_by = &.{.{ .field = "x" }}, .start_at = .{ .values = &.{.{ .integer = 1 }} } }, &.{.{ .count = .{} }}, .{});
+    defer cursor.deinit();
+    try testing.expectEqual(15, cursor.value.values[0].integer);
+
+    _ = try h.client.doc("big/1").set(&.{.{ .name = "n", .value = .{ .integer = std.math.maxInt(i64) } }}, .{});
+    _ = try h.client.doc("big/2").set(&.{.{ .name = "n", .value = .{ .integer = 1 } }}, .{});
+    var overflow = try h.client.runAggregationQuery(.{ .from = .{ .collection = "big" } }, &.{ .{ .sum = "n" }, .{ .count = .{} } }, .{});
+    defer overflow.deinit();
+    try codec.expectValueEqual(.{ .double = 9.223372036854776e18 }, overflow.value.values[0]);
+    try codec.expectValueEqual(.{ .integer = 2 }, overflow.value.values[1]);
+    // Measured: a field summed or averaged that no document holds leaves
+    // nothing to count, either.
+    var missing = try h.client.runAggregationQuery(.{ .from = .{ .collection = "big" } }, &.{ .{ .avg = "missing" }, .{ .sum = "n" }, .{ .count = .{} } }, .{});
+    defer missing.deinit();
+    try codec.expectValueEqual(.null, missing.value.values[0]);
+    try codec.expectValueEqual(.{ .integer = 0 }, missing.value.values[1]);
+    try codec.expectValueEqual(.{ .integer = 0 }, missing.value.values[2]);
+    var count_alone = try h.client.runAggregationQuery(.{ .from = .{ .collection = "v" } }, &.{.{ .count = .{} }}, .{});
+    defer count_alone.deinit();
+    try codec.expectValueEqual(.{ .integer = 21 }, count_alone.value.values[0]);
+
+    // Raw refusals the library never sends.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sq = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"big\"}]},";
+    try expectRefusal(try rawRequest(&h.server, a, .POST, ":runAggregationQuery", "{\"structuredAggregationQuery\":" ++ sq ++ "\"aggregations\":[{\"alias\":\"a\",\"count\":{}},{\"alias\":\"a\",\"count\":{}}]}}"), 400, "duplicate alias: a.");
+    try expectRefusal(try rawRequest(&h.server, a, .POST, ":runAggregationQuery", "{\"structuredAggregationQuery\":" ++ sq ++ "\"aggregations\":[{\"alias\":\"__x__\",\"count\":{}}]}}"), 400, "is reserved.");
+    try expectRefusal(try rawRequest(&h.server, a, .POST, ":runAggregationQuery", "{\"structuredAggregationQuery\":" ++ sq ++ "\"aggregations\":[{\"alias\":\"c\",\"count\":{\"upTo\":\"-1\"}}]}}"), 400, "greater than or equal to zero");
+    const no_alias = try rawRequest(&h.server, a, .POST, ":runAggregationQuery", "{\"structuredAggregationQuery\":" ++ sq ++ "\"aggregations\":[{\"count\":{}},{\"sum\":{\"field\":{\"fieldPath\":\"n\"}}}]}}");
+    try testing.expect(std.mem.indexOf(u8, no_alias.body, "\"field_1\":{\"integerValue\":\"2\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, no_alias.body, "\"field_2\"") != null);
+    const q = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"v\"}],";
+    try expectRefusal(try rawRequest(&h.server, a, .POST, ":runQuery", q ++ "\"where\":{\"fieldFilter\":{\"field\":{\"fieldPath\":\"x\"},\"op\":\"IN\",\"value\":{\"integerValue\":\"1\"}}}}}"), 400, "'IN' requires an ArrayValue.");
+    try expectRefusal(try rawRequest(&h.server, a, .POST, ":runQuery", q ++ "\"orderBy\":[{\"field\":{\"fieldPath\":\"x\"}}],\"startAt\":{\"values\":[{\"integerValue\":\"1\"},{\"integerValue\":\"2\"}]}}}"), 400, "Cursor has too many values.");
+    try expectRefusal(try rawRequest(&h.server, a, .POST, ":runQuery", q ++ "\"orderBy\":[{\"field\":{\"fieldPath\":\"__name__\"}}],\"startAt\":{\"values\":[{\"stringValue\":\"i1\"}]}}}"), 400, "Cursor __key__ value is not a document reference.");
+    try expectRefusal(try rawRequest(&h.server, a, .POST, ":runQuery", q ++ "\"limit\":-1}}"), 400, "limit is negative");
+    try expectRefusal(try rawRequest(&h.server, a, .POST, ":runQuery", "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"v\"},{\"collectionId\":\"w\"}]}}"), 400, "cannot have more than one collection selector");
+    const empty = try rawRequest(&h.server, a, .POST, ":runQuery", "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"none\"}]}}");
+    try testing.expect(std.mem.indexOf(u8, empty.body, "\"done\":true") != null);
 }
 
 test "fake: every allocation failure through a full path is OutOfMemory without leaks" {

@@ -369,6 +369,59 @@ pub fn decodeBatchGet(arena: Allocator, body: []const u8) DecodeError![]const Ba
     return out;
 }
 
+/// The `runQuery` answer: one JSON array of stream messages, measured on
+/// the emulator: a document with its read time each, a lone read time for
+/// an empty result, `done` riding on the last, and, from production,
+/// `skippedResults` counting what an offset passed over.
+pub fn decodeRunQuery(arena: Allocator, body: []const u8) DecodeError!types.QueryResult {
+    const tree = try parseTree(arena, body);
+    if (tree != .array) return error.InvalidResponse;
+    var documents: std.ArrayList(types.Snapshot) = .empty;
+    var read_time: ?std.Io.Timestamp = null;
+    var skipped: u64 = 0;
+    for (tree.array.items) |item| {
+        const obj = objectOf(item) orelse return error.InvalidResponse;
+        if (present(obj, "document")) |d| try documents.append(arena, try snapshotFrom(arena, d));
+        if (present(obj, "readTime")) |_| read_time = try requiredTime(obj, "readTime");
+        if (present(obj, "skippedResults")) |n| {
+            const text = numberText(n) orelse return error.InvalidResponse;
+            skipped +|= std.fmt.parseInt(u64, text, 10) catch return error.InvalidResponse;
+        }
+    }
+    return .{
+        .documents = documents.items,
+        .read_time = read_time orelse return error.InvalidResponse,
+        .skipped_results = skipped,
+    };
+}
+
+/// The `runAggregationQuery` answer: one JSON array whose result message
+/// holds each aggregation under the alias it was sent with, `a0` to
+/// `a{count - 1}`.
+pub fn decodeAggregation(arena: Allocator, body: []const u8, count: usize) DecodeError!types.AggregationResult {
+    const tree = try parseTree(arena, body);
+    if (tree != .array) return error.InvalidResponse;
+    var values: ?[]Value = null;
+    var read_time: ?std.Io.Timestamp = null;
+    for (tree.array.items) |item| {
+        const obj = objectOf(item) orelse return error.InvalidResponse;
+        if (present(obj, "readTime")) |_| read_time = try requiredTime(obj, "readTime");
+        const result = objectOf(present(obj, "result") orelse continue) orelse return error.InvalidResponse;
+        if (values != null) return error.InvalidResponse;
+        const fields = objectOf(present(result, "aggregateFields") orelse return error.InvalidResponse) orelse return error.InvalidResponse;
+        const out = try arena.alloc(Value, count);
+        for (out, 0..) |*v, i| {
+            var buf: [8]u8 = undefined;
+            v.* = try valueFrom(arena, fields.get(@import("query.zig").alias(&buf, i)) orelse return error.InvalidResponse, 0);
+        }
+        values = out;
+    }
+    return .{
+        .values = values orelse return error.InvalidResponse,
+        .read_time = read_time orelse return error.InvalidResponse,
+    };
+}
+
 /// One page of `listDocuments`.
 pub fn decodeSnapshotPage(arena: Allocator, body: []const u8) DecodeError!types.SnapshotPage {
     const obj = objectOf(try parseTree(arena, body)) orelse return error.InvalidResponse;

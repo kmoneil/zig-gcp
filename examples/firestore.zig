@@ -6,6 +6,8 @@
 //!     ... -- update cities/LA population=4000000 --delete nickname
 //!     ... -- incr cities/LA visits 1
 //!     ... -- getall cities/LA cities/SF
+//!     ... -- query cities population '>' 1000000 --order population:desc --limit 2
+//!     ... -- count cities state == CA
 //!     ... -- ls cities
 //!     ... -- collections [cities/LA]
 //!     ... -- rm cities/LA
@@ -15,7 +17,10 @@
 //! the fields named and must find the document; `set` replaces it whole.
 //! `incr` adds to a number on the server, creating the field (and the
 //! document) when missing, so concurrent increments never lose one;
-//! `getall` reads several documents in one request.
+//! `getall` reads several documents in one request. `query` and `count`
+//! take conditions as FIELD OP VALUE triples, OP one of `==`, `!=`, `<`,
+//! `<=`, `>`, `>=` and `contains` (an array holding the value), and
+//! `--group` reads every collection of that id at any depth.
 //! `--project` names the project, by default GOOGLE_CLOUD_PROJECT, or
 //! `test` against the emulator; `--database` a named database.
 //!
@@ -37,6 +42,8 @@ const usage =
     \\       firestore update DOC_PATH FIELD=VALUE... [--delete FIELD]...
     \\       firestore incr DOC_PATH FIELD AMOUNT
     \\       firestore getall DOC_PATH...
+    \\       firestore query COLLECTION [FIELD OP VALUE]... [--order FIELD[:desc]] [--limit N] [--group]
+    \\       firestore count COLLECTION [FIELD OP VALUE]... [--group]
     \\       firestore ls COLLECTION_PATH
     \\       firestore collections [DOC_PATH]
     \\       firestore rm DOC_PATH
@@ -56,16 +63,29 @@ pub fn main(init: std.process.Init) !void {
     var deletes: std.ArrayList([]const u8) = .empty;
     var project: ?[]const u8 = init.environ_map.get("GOOGLE_CLOUD_PROJECT");
     var database: []const u8 = "(default)";
+    var orders: std.ArrayList(firestore.Order) = .empty;
+    var limit: ?u32 = null;
+    var group = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--delete") or std.mem.eql(u8, arg, "--project") or std.mem.eql(u8, arg, "--database")) {
+        if (std.mem.eql(u8, arg, "--group")) {
+            group = true;
+        } else if (std.mem.eql(u8, arg, "--delete") or std.mem.eql(u8, arg, "--project") or std.mem.eql(u8, arg, "--database") or
+            std.mem.eql(u8, arg, "--order") or std.mem.eql(u8, arg, "--limit"))
+        {
             i += 1;
             if (i == args.len) return badUsage(out);
             if (std.mem.eql(u8, arg, "--delete")) {
                 try deletes.append(arena, args[i]);
             } else if (std.mem.eql(u8, arg, "--project")) {
                 project = args[i];
+            } else if (std.mem.eql(u8, arg, "--order")) {
+                const desc = std.mem.endsWith(u8, args[i], ":desc");
+                const field = if (desc) args[i][0 .. args[i].len - ":desc".len] else args[i];
+                try orders.append(arena, .{ .field = field, .direction = if (desc) .descending else .ascending });
+            } else if (std.mem.eql(u8, arg, "--limit")) {
+                limit = std.fmt.parseInt(u32, args[i], 10) catch return badUsage(out);
             } else database = args[i];
         } else try positional.append(arena, arg);
     }
@@ -137,6 +157,28 @@ pub fn main(init: std.process.Init) !void {
         for (p[1..], r.value.documents) |path, d| {
             if (d) |doc| try printDoc(out, doc) else try out.print("{s}: missing\n", .{path});
         }
+    } else if (std.mem.eql(u8, command, "query") or std.mem.eql(u8, command, "count")) {
+        if (p.len < 2 or (p.len - 2) % 3 != 0) return badUsage(out);
+        const where = try arena.alloc(firestore.Condition, (p.len - 2) / 3);
+        for (where, 0..) |*c, n| {
+            const t = p[2 + 3 * n ..][0..3];
+            c.* = .{ .field = t[0], .op = parseOp(t[1]) orelse return badUsage(out), .value = parseValue(t[2]) };
+        }
+        const query: firestore.Query = .{
+            .from = if (group) .{ .group = p[1] } else .{ .collection = p[1] },
+            .where = where,
+            .order_by = orders.items,
+            .limit = limit,
+        };
+        if (std.mem.eql(u8, command, "count")) {
+            var r = client.runAggregationQuery(query, &.{.{ .count = .{} }}, .{}) catch |err| return fail(err, &diag);
+            defer r.deinit();
+            try out.print("{d}\n", .{r.value.values[0].integer});
+        } else {
+            var r = client.runQuery(query, .{}) catch |err| return fail(err, &diag);
+            defer r.deinit();
+            for (r.value.documents) |d| try printDoc(out, d);
+        }
     } else if (std.mem.eql(u8, command, "get")) {
         if (p.len != 2) return badUsage(out);
         var got = client.doc(p[1]).get(.{}) catch |err| return fail(err, &diag);
@@ -180,6 +222,15 @@ fn parseFields(arena: std.mem.Allocator, pairs: []const []const u8) ![]const fir
         f.* = .{ .name = pair[0..eq], .value = parseValue(pair[eq + 1 ..]) };
     }
     return fields;
+}
+
+fn parseOp(text: []const u8) ?firestore.Operator {
+    const ops = std.StaticStringMap(firestore.Operator).initComptime(.{
+        .{ "==", .equal },                .{ "!=", .not_equal },   .{ "<", .less_than },
+        .{ "<=", .less_than_or_equal },   .{ ">", .greater_than }, .{ ">=", .greater_than_or_equal },
+        .{ "contains", .array_contains },
+    });
+    return ops.get(text);
 }
 
 fn parseValue(text: []const u8) firestore.Value {

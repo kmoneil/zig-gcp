@@ -16,6 +16,7 @@ const Collection = @import("Collection.zig");
 const Document = @import("Document.zig");
 const Endpoint = @import("Endpoint.zig");
 const batch_get = @import("batch_get.zig");
+const query_ = @import("query.zig");
 const errors = @import("errors.zig");
 const names = @import("names.zig");
 const rpc = @import("rpc.zig");
@@ -230,6 +231,35 @@ pub fn batchGet(self: *Client, paths: []const []const u8, options: types.BatchGe
     var result: types.Owned(types.BatchGetResult) = try .init(self.gpa);
     errdefer result.deinit();
     result.value = try batch_get.batchGet(self, paths, options, result.arena);
+    return result;
+}
+
+/// Runs `query` and returns every result, as one answer. Checked first as
+/// the server would check it; see `Query` and `Operator`.
+pub fn runQuery(self: *Client, query: types.Query, options: types.QueryOptions) Error!types.Owned(types.QueryResult) {
+    rpc.begin(self);
+    var result: types.Owned(types.QueryResult) = try .init(self.gpa);
+    errdefer result.deinit();
+    result.value = try query_.run(self, query, options, result.arena);
+    return result;
+}
+
+/// Counts, sums or averages `query`'s results on the server, without
+/// reading them: 1 to 5 aggregations, answered in the order given. The
+/// query's limit, offset and cursors apply first; its order matters only
+/// to its cursors, and its select is not sent. With a sum or an average
+/// among them, the emulator counts only documents that hold each field
+/// summed or averaged, a count included.
+pub fn runAggregationQuery(
+    self: *Client,
+    query: types.Query,
+    aggregations: []const types.Aggregation,
+    options: types.QueryOptions,
+) Error!types.Owned(types.AggregationResult) {
+    rpc.begin(self);
+    var result: types.Owned(types.AggregationResult) = try .init(self.gpa);
+    errdefer result.deinit();
+    result.value = try query_.aggregate(self, query, aggregations, options, result.arena);
     return result;
 }
 
