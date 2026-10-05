@@ -65,13 +65,13 @@ const ignored_prefix = "x-ignore-";
 /// and checked the bucket name.
 pub fn signPolicy(
     client: *Client,
-    signer: core.Signer,
+    signer: types.UrlSigner,
     bucket: []const u8,
     key: types.PostKey,
     options: types.PostPolicyOptions,
 ) Error!types.Owned(types.PostPolicy) {
     const diag = client.diagnostics;
-    try check(diag, client.base_url, bucket, key, options, signer.lifetimeS());
+    try check(diag, client.base_url, bucket, key, options, signing.lifetimeS(signer));
     const now = std.Io.Clock.real.now(client.io);
     const signed_at = signing.timestamp(now) orelse {
         if (diag) |d| d.print("the clock reads a time a policy cannot carry: before 1970, or after 9999", .{});
@@ -90,25 +90,18 @@ pub fn signPolicy(
     defer scratch.deinit();
     const arena = scratch.allocator();
 
-    const email = try signer.email(client.io, arena);
-    if (email.len == 0) {
-        if (diag) |d| d.print("the signer named no service account", .{});
-        return error.SigningFailed;
-    }
+    const authorizer = try signing.authorizerOf(client, arena, signer);
     const prepared = try prepare(arena, .{
         .bucket = bucket,
         .key = key,
-        .email = email,
+        .algorithm = signing.algorithmOf(signer),
+        .authorizer = authorizer,
         .signed_at = &signed_at,
         .expires_at = &expires_at,
         .fields = options.fields,
         .conditions = options.conditions,
     });
-    const signature = try signer.sign(client.io, arena, prepared.policy);
-    if (signature.len == 0) {
-        if (diag) |d| d.print("the signer returned an empty signature", .{});
-        return error.SigningFailed;
-    }
+    const signature = try signing.signWith(client, arena, signer, &signed_at, prepared.policy);
 
     var result: types.Owned(types.PostPolicy) = try .init(client.gpa);
     errdefer result.deinit();
@@ -250,7 +243,11 @@ pub fn check(
 pub const Request = struct {
     bucket: []const u8,
     key: types.PostKey,
-    email: []const u8,
+    /// `GOOG4-RSA-SHA256` or `GOOG4-HMAC-SHA256`.
+    algorithm: []const u8 = signing.algorithm,
+    /// What the credential names: a service account's email, or an HMAC
+    /// key's access ID.
+    authorizer: []const u8,
     /// `YYYYMMDDTHHMMSSZ`, in UTC.
     signed_at: []const u8,
     /// `YYYY-MM-DDTHH:MM:SSZ`, in UTC.
@@ -269,8 +266,10 @@ pub const Prepared = struct {
     /// `${filename}`, which Cloud Storage replaces with the name of the
     /// file the browser sent.
     key_field: []const u8,
-    /// `{email}/{yyyymmdd}/auto/storage/goog4_request`.
+    /// `{authorizer}/{yyyymmdd}/auto/storage/goog4_request`.
     credential: []const u8,
+    /// The algorithm the conditions name, which the form's field repeats.
+    algorithm: []const u8 = signing.algorithm,
     /// `YYYYMMDDTHHMMSSZ`, as the form's `x-goog-date` field carries it.
     signed_at: []const u8,
     condition_count: usize,
@@ -282,7 +281,7 @@ pub fn prepare(arena: Allocator, request: Request) Allocator.Error!Prepared {
 
 fn prepareInner(arena: Allocator, request: Request) (Allocator.Error || Writer.Error)!Prepared {
     const credential = try std.mem.concat(arena, u8, &.{
-        request.email, "/", request.signed_at[0..8], "/auto/storage/goog4_request",
+        request.authorizer, "/", request.signed_at[0..8], "/auto/storage/goog4_request",
     });
     const key_field = switch (request.key) {
         .exact => |name| name,
@@ -333,7 +332,7 @@ fn prepareInner(arena: Allocator, request: Request) (Allocator.Error || Writer.E
     }
     try writeMatch(&jw, "x-goog-date", request.signed_at);
     try writeMatch(&jw, "x-goog-credential", credential);
-    try writeMatch(&jw, "x-goog-algorithm", signing.algorithm);
+    try writeMatch(&jw, "x-goog-algorithm", request.algorithm);
     count += 3;
     try jw.endArray();
     try jw.objectField("expiration");
@@ -348,6 +347,7 @@ fn prepareInner(arena: Allocator, request: Request) (Allocator.Error || Writer.E
         .policy = encoder.encode(policy, document),
         .key_field = key_field,
         .credential = credential,
+        .algorithm = request.algorithm,
         .signed_at = request.signed_at,
         .condition_count = count,
     };
@@ -393,7 +393,7 @@ pub fn finish(
     var hex: Writer.Allocating = .init(arena);
     hex.writer.printHex(signature, .lower) catch return error.OutOfMemory;
     const tail = out[1 + fields.len ..];
-    tail[0] = .{ .name = "x-goog-algorithm", .value = signing.algorithm };
+    tail[0] = .{ .name = "x-goog-algorithm", .value = prepared.algorithm };
     tail[1] = .{ .name = "x-goog-credential", .value = try arena.dupe(u8, prepared.credential) };
     tail[2] = .{ .name = "x-goog-date", .value = try arena.dupe(u8, prepared.signed_at) };
     tail[3] = .{ .name = "policy", .value = try arena.dupe(u8, prepared.policy) };
@@ -492,7 +492,7 @@ const Harness = struct {
     }
 
     fn sign(h: *Harness, bucket: []const u8, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
-        return h.client.bucket(bucket).postPolicy(h.signer.signer(), options);
+        return h.client.bucket(bucket).postPolicy(.{ .rsa = h.signer.signer() }, options);
     }
 };
 
@@ -850,17 +850,17 @@ test "postPolicy: the object names the key, and a bucket needs one" {
     try h.init(testing.allocator, null);
     defer h.deinit();
     const object = h.client.bucket("photos").object("cats/tom.jpg");
-    var policy = try object.postPolicy(h.signer.signer(), .{ .expires_in_s = 600 });
+    var policy = try object.postPolicy(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 600 });
     defer policy.deinit();
     try testing.expectEqualStrings("cats/tom.jpg", policy.value.field("key").?);
     // Setting one there is a contradiction, not a silent override.
-    try testing.expectError(error.InvalidPostPolicyOptions, object.postPolicy(h.signer.signer(), .{
+    try testing.expectError(error.InvalidPostPolicyOptions, object.postPolicy(.{ .rsa = h.signer.signer() }, .{
         .expires_in_s = 600,
         .key = .{ .exact = "other" },
     }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "only Bucket.postPolicy") != null);
     // And a bucket's policy has no name to fall back on.
-    try testing.expectError(error.InvalidPostPolicyOptions, h.client.bucket("photos").postPolicy(h.signer.signer(), .{ .expires_in_s = 600 }));
+    try testing.expectError(error.InvalidPostPolicyOptions, h.client.bucket("photos").postPolicy(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 600 }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "needs a key") != null);
 }
 
@@ -868,11 +868,11 @@ test "postPolicy: names are checked like every other call" {
     var h: Harness = undefined;
     try h.init(testing.allocator, null);
     defer h.deinit();
-    try testing.expectError(error.InvalidBucketName, h.client.bucket("has space").postPolicy(h.signer.signer(), .{
+    try testing.expectError(error.InvalidBucketName, h.client.bucket("has space").postPolicy(.{ .rsa = h.signer.signer() }, .{
         .expires_in_s = 600,
         .key = .{ .exact = "o" },
     }));
-    try testing.expectError(error.InvalidObjectName, h.client.bucket("photos").object("a\nb").postPolicy(h.signer.signer(), .{
+    try testing.expectError(error.InvalidObjectName, h.client.bucket("photos").object("a\nb").postPolicy(.{ .rsa = h.signer.signer() }, .{
         .expires_in_s = 600,
     }));
 }
@@ -1006,7 +1006,7 @@ fn drawnRequest(d: Drawn) Request {
     return .{
         .bucket = d.bucket,
         .key = d.key,
-        .email = "signer@test-project.iam.gserviceaccount.com",
+        .authorizer = "signer@test-project.iam.gserviceaccount.com",
         .signed_at = signed_at_text,
         .expires_at = "2025-09-22T16:10:00Z",
         .fields = d.options.fields,
@@ -1135,7 +1135,7 @@ fn modelDocument(arena: Allocator, request: Request) ![]const u8 {
         try modelMatch(arena, w, field.name, field.value);
     }
     const credential = try std.mem.concat(arena, u8, &.{
-        request.email, "/", request.signed_at[0..8], "/auto/storage/goog4_request",
+        request.authorizer, "/", request.signed_at[0..8], "/auto/storage/goog4_request",
     });
     if (!first) try w.append(arena, ',');
     try modelMatch(arena, w, "bucket", request.bucket);

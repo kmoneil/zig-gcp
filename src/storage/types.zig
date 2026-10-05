@@ -1457,6 +1457,27 @@ pub const PostPolicyOptions = struct {
     style: UrlStyle = .path,
 };
 
+/// An HMAC key as a signer: its access ID, which the URL or policy names,
+/// and its secret, which never travels; only the signature does. It signs
+/// with `GOOG4-HMAC-SHA256`, needs no I/O, and its signatures last as long
+/// as the key stays active: a deactivated or deleted key ends every URL it
+/// signed. Borrowed: the caller keeps the secret, as a credential.
+pub const HmacSigner = struct {
+    access_id: []const u8,
+    /// The 40 characters `Client.createHmacKey` answered, used as they
+    /// are: never base64-decoded, as measured 2026-10-05.
+    secret: []const u8,
+};
+
+/// What signs a URL or a POST policy: a service account's RSA key, held
+/// locally or used through IAM, or an HMAC key.
+pub const UrlSigner = union(enum) {
+    /// `GOOG4-RSA-SHA256`, as a service account signs.
+    rsa: core.Signer,
+    /// `GOOG4-HMAC-SHA256`, with an HMAC key.
+    hmac: HmacSigner,
+};
+
 pub const SignedUrlOptions = struct {
     method: SignedMethod = .GET,
     /// How long the URL works, counted from now: 1 to 604,800 seconds

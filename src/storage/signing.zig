@@ -25,6 +25,7 @@ const core = @import("core");
 
 const Client = @import("Client.zig");
 const encryption = @import("encryption.zig");
+const hmac = @import("hmac_signing.zig");
 const logging = @import("logging.zig");
 const types = @import("types.zig");
 const Error = @import("errors.zig").Error;
@@ -58,7 +59,7 @@ const reserved_params = [_][]const u8{
 /// reach the URL.
 pub fn signUrl(
     client: *Client,
-    signer: core.Signer,
+    signer: types.UrlSigner,
     bucket: []const u8,
     object: ?[]const u8,
     caller_options: types.SignedUrlOptions,
@@ -94,31 +95,24 @@ pub fn signUrl(
         const headers = try arena.alloc(types.Header, caller_options.headers.len + 3);
         options.headers = encryption.withKey(headers, caller_options.headers, &key);
     }
-    try check(diag, client.base_url, bucket, object, options, signer.lifetimeS());
+    try check(diag, client.base_url, bucket, object, options, lifetimeS(signer));
     const signed_at = timestamp(std.Io.Clock.real.now(client.io)) orelse {
         if (diag) |d| d.print("the clock reads a time a signed URL cannot carry: before 1970, or after 9999", .{});
         return error.InvalidSignedUrlOptions;
     };
 
-    const email = try signer.email(client.io, arena);
-    if (email.len == 0) {
-        if (diag) |d| d.print("the signer named no service account", .{});
-        return error.SigningFailed;
-    }
+    const authorizer = try authorizerOf(client, arena, signer);
     const prepared = try prepare(arena, .{
         .method = options.method,
         .target = try target(arena, client.base_url, bucket, object, options.style),
-        .email = email,
+        .algorithm = algorithmOf(signer),
+        .authorizer = authorizer,
         .signed_at = signed_at,
         .expires_in_s = options.expires_in_s,
         .headers = options.headers,
         .query = options.query,
     });
-    const signature = try signer.sign(client.io, arena, prepared.string_to_sign);
-    if (signature.len == 0) {
-        if (diag) |d| d.print("the signer returned an empty signature", .{});
-        return error.SigningFailed;
-    }
+    const signature = try signWith(client, arena, signer, &signed_at, prepared.string_to_sign);
 
     var result: types.Owned([]const u8) = try .init(client.gpa);
     errdefer result.deinit();
@@ -128,6 +122,59 @@ pub fn signUrl(
         options.method, bucket, object orelse "", options.expires_in_s, prepared.signed_headers,
     });
     return result;
+}
+
+/// How long a signature made now is sure to verify: an RSA signer says;
+/// an HMAC key's last until the key is deactivated or deleted, which only
+/// its owner decides.
+pub fn lifetimeS(signer: types.UrlSigner) ?u32 {
+    return switch (signer) {
+        .rsa => |s| s.lifetimeS(),
+        .hmac => null,
+    };
+}
+
+pub fn algorithmOf(signer: types.UrlSigner) []const u8 {
+    return switch (signer) {
+        .rsa => algorithm,
+        .hmac => hmac.algorithm,
+    };
+}
+
+/// Who the credential names: the service account's email, or the HMAC
+/// key's access ID. Either must be there.
+pub fn authorizerOf(client: *Client, arena: Allocator, signer: types.UrlSigner) Error![]const u8 {
+    switch (signer) {
+        .rsa => |s| {
+            const email = try s.email(client.io, arena);
+            if (email.len == 0) {
+                if (client.diagnostics) |d| d.print("the signer named no service account", .{});
+                return error.SigningFailed;
+            }
+            return email;
+        },
+        .hmac => |h| {
+            if (hmac.problem(h)) |p| {
+                if (client.diagnostics) |d| d.print("{s}", .{p});
+                return error.SigningFailed;
+            }
+            return h.access_id;
+        },
+    }
+}
+
+/// The signature over `message`, signed at `signed_at`: an HMAC key's
+/// derives its key from that date, never a second reading of the clock.
+pub fn signWith(client: *Client, arena: Allocator, signer: types.UrlSigner, signed_at: *const [16]u8, message: []const u8) Error![]const u8 {
+    const signature = switch (signer) {
+        .rsa => |s| try s.sign(client.io, arena, message),
+        .hmac => |h| try hmac.sign(arena, h, signed_at[0..8], message),
+    };
+    if (signature.len == 0) {
+        if (client.diagnostics) |d| d.print("the signer returned an empty signature", .{});
+        return error.SigningFailed;
+    }
+    return signature;
 }
 
 /// Refuses what cannot be signed into a URL that works, and says why in
@@ -269,7 +316,11 @@ pub fn target(
 pub const Request = struct {
     method: types.SignedMethod,
     target: Target,
-    email: []const u8,
+    /// `GOOG4-RSA-SHA256` or `GOOG4-HMAC-SHA256`.
+    algorithm: []const u8 = algorithm,
+    /// What the credential names: a service account's email, or an HMAC
+    /// key's access ID.
+    authorizer: []const u8,
     /// `YYYYMMDDTHHMMSSZ`, in UTC.
     signed_at: [16]u8,
     expires_in_s: u32,
@@ -317,8 +368,8 @@ fn prepareInner(arena: Allocator, request: Request) (Allocator.Error || Writer.E
     var expires: [10]u8 = undefined;
     // The five parameters the signature is made of, then the caller's.
     const pairs = try arena.alloc(Pair, 5 + request.query.len);
-    pairs[0] = try .encode(arena, "X-Goog-Algorithm", algorithm);
-    pairs[1] = try .encode(arena, "X-Goog-Credential", try std.mem.concat(arena, u8, &.{ request.email, "/", scope }));
+    pairs[0] = try .encode(arena, "X-Goog-Algorithm", request.algorithm);
+    pairs[1] = try .encode(arena, "X-Goog-Credential", try std.mem.concat(arena, u8, &.{ request.authorizer, "/", scope }));
     pairs[2] = try .encode(arena, "X-Goog-Date", &request.signed_at);
     pairs[3] = try .encode(arena, "X-Goog-Expires", std.fmt.bufPrint(&expires, "{d}", .{request.expires_in_s}) catch unreachable);
     pairs[4] = try .encode(arena, "X-Goog-SignedHeaders", signed_headers);
@@ -341,7 +392,7 @@ fn prepareInner(arena: Allocator, request: Request) (Allocator.Error || Writer.E
     var digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(canonical_request, &digest, .{});
     const string_to_sign = try std.mem.concat(arena, u8, &.{
-        algorithm,                           "\n",
+        request.algorithm,                   "\n",
         &request.signed_at,                  "\n",
         scope,                               "\n",
         &std.fmt.bytesToHex(digest, .lower),
@@ -822,8 +873,8 @@ const goldens = [_]Golden{
 
 fn signGolden(h: *Harness, golden: Golden) Error!types.Owned([]const u8) {
     const bucket = h.client.bucket(golden.bucket);
-    if (golden.object) |name| return bucket.object(name).signedUrl(h.signer.signer(), golden.options);
-    return bucket.signedUrl(h.signer.signer(), golden.options);
+    if (golden.object) |name| return bucket.object(name).signedUrl(.{ .rsa = h.signer.signer() }, golden.options);
+    return bucket.signedUrl(.{ .rsa = h.signer.signer() }, golden.options);
 }
 
 test "golden: URLs and strings to sign that another implementation computed" {
@@ -853,7 +904,7 @@ test "prepare: the canonical request, line by line" {
     const prepared = try prepare(arena.allocator(), .{
         .method = .POST,
         .target = .{ .scheme = "https", .authority = "storage.googleapis.com", .path = "/photos/big.bin" },
-        .email = "signer@test-project.iam.gserviceaccount.com",
+        .authorizer = "signer@test-project.iam.gserviceaccount.com",
         .signed_at = "20250922T160000Z".*,
         .expires_in_s = 3600,
         .headers = &.{
@@ -892,7 +943,7 @@ test "target: every style against production, a port, and an IPv6 emulator" {
     const prepared = try prepare(a, .{
         .method = .GET,
         .target = bucket_level,
-        .email = "e",
+        .authorizer = "e",
         .signed_at = "20250922T160000Z".*,
         .expires_in_s = 1,
         .headers = &.{},
@@ -907,7 +958,7 @@ test "target: every style against production, a port, and an IPv6 emulator" {
 fn expectRefused(h: *Harness, object: ?[]const u8, options: types.SignedUrlOptions, says: []const u8) !void {
     const bucket = h.client.bucket("photos");
     const calls = h.signer.calls;
-    const result = if (object) |name| bucket.object(name).signedUrl(h.signer.signer(), options) else bucket.signedUrl(h.signer.signer(), options);
+    const result = if (object) |name| bucket.object(name).signedUrl(.{ .rsa = h.signer.signer() }, options) else bucket.signedUrl(.{ .rsa = h.signer.signer() }, options);
     try testing.expectError(error.InvalidSignedUrlOptions, result);
     if (std.mem.indexOf(u8, h.diag.message(), says) == null) {
         std.debug.print("diagnostics: {s}\nexpected to contain: {s}\n", .{ h.diag.message(), says });
@@ -918,7 +969,7 @@ fn expectRefused(h: *Harness, object: ?[]const u8, options: types.SignedUrlOptio
 
 fn expectSigned(h: *Harness, object: ?[]const u8, options: types.SignedUrlOptions) !void {
     const bucket = h.client.bucket("photos");
-    var url = if (object) |name| try bucket.object(name).signedUrl(h.signer.signer(), options) else try bucket.signedUrl(h.signer.signer(), options);
+    var url = if (object) |name| try bucket.object(name).signedUrl(.{ .rsa = h.signer.signer() }, options) else try bucket.signedUrl(.{ .rsa = h.signer.signer() }, options);
     url.deinit();
 }
 
@@ -936,6 +987,32 @@ test "check: expiry from 1 second to 7 days, and no longer than the signer's key
     try expectSigned(&h, "o", .{ .expires_in_s = 43_200 });
 }
 
+test "an HMAC signer: no I/O, 7 days whatever IAM's keys would last, and refused when half of it is missing" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator, null);
+    defer h.deinit();
+    const obj = h.object("b", "o");
+    const signer: types.UrlSigner = .{ .hmac = .{ .access_id = "GOOG1E-TEST-ONLY", .secret = "TEST_ONLY_not_a_real_secret_000000000000" } };
+    var url = try obj.signedUrl(signer, .{ .expires_in_s = max_expires_s });
+    defer url.deinit();
+    try testing.expect(std.mem.startsWith(u8, url.value, "https://storage.googleapis.com/b/o?X-Goog-Algorithm=GOOG4-HMAC-SHA256&X-Goog-Credential=GOOG1E-TEST-ONLY%2F"));
+    // The signature is the HMAC over the string to sign: 32 bytes as hex.
+    const marker = "&X-Goog-Signature=";
+    try testing.expectEqual(64, url.value.len - (std.mem.lastIndexOf(u8, url.value, marker).? + marker.len));
+    try testing.expectEqual(0, h.signer.calls);
+    try testing.expectEqual(0, h.fake.requests.items.len);
+
+    for ([_]types.HmacSigner{
+        .{ .access_id = "", .secret = "s" },
+        .{ .access_id = "GOOG1E-TEST-ONLY", .secret = "" },
+        .{ .access_id = "GOOG1E TEST", .secret = "s" },
+    }) |bad| {
+        try testing.expectError(error.SigningFailed, obj.signedUrl(.{ .hmac = bad }, .{ .expires_in_s = 60 }));
+        try testing.expect(std.mem.indexOf(u8, h.diag.message(), "HMAC signer") != null);
+        try testing.expectError(error.SigningFailed, obj.postPolicy(.{ .hmac = bad }, .{ .expires_in_s = 60 }));
+    }
+}
+
 test "check: object names a browser would rewrite" {
     var h: Harness = undefined;
     try h.init(testing.allocator, null);
@@ -943,7 +1020,7 @@ test "check: object names a browser would rewrite" {
     for ([_][]const u8{ "a/../b", "./a", "a/.", "..", "a/./b/c" }) |name| {
         // "." and ".." alone fail the name check every call makes.
         const bucket = h.client.bucket("photos");
-        const result = bucket.object(name).signedUrl(h.signer.signer(), .{ .expires_in_s = 60 });
+        const result = bucket.object(name).signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 });
         if (std.mem.eql(u8, name, "..")) {
             try testing.expectError(error.InvalidObjectName, result);
         } else {
@@ -1002,28 +1079,28 @@ test "check: virtual-hosted needs a host label for the bucket, and a host name f
     const virtual: types.SignedUrlOptions = .{ .expires_in_s = 60, .style = .virtual_hosted };
     try expectSigned(&h, "o", virtual);
     for ([_][]const u8{ "a.b", "www.example.com" }) |name| {
-        const url = h.client.bucket(name).object("o").signedUrl(h.signer.signer(), virtual);
+        const url = h.client.bucket(name).object("o").signedUrl(.{ .rsa = h.signer.signer() }, virtual);
         try testing.expectError(error.InvalidSignedUrlOptions, url);
         try testing.expect(std.mem.indexOf(u8, h.diag.message(), "certificate covers one label") != null);
     }
     // App Engine's default bucket is the one dotted name the certificate covers.
-    var appspot = try h.client.bucket("my-project.appspot.com").object("o").signedUrl(h.signer.signer(), virtual);
+    var appspot = try h.client.bucket("my-project.appspot.com").object("o").signedUrl(.{ .rsa = h.signer.signer() }, virtual);
     appspot.deinit();
-    try testing.expectError(error.InvalidSignedUrlOptions, h.client.bucket("my_bucket").object("o").signedUrl(h.signer.signer(), virtual));
+    try testing.expectError(error.InvalidSignedUrlOptions, h.client.bucket("my_bucket").object("o").signedUrl(.{ .rsa = h.signer.signer() }, virtual));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "host label") != null);
-    try testing.expectError(error.InvalidSignedUrlOptions, h.client.bucket("-bucket").object("o").signedUrl(h.signer.signer(), virtual));
+    try testing.expectError(error.InvalidSignedUrlOptions, h.client.bucket("-bucket").object("o").signedUrl(.{ .rsa = h.signer.signer() }, virtual));
 
     var ip: Harness = undefined;
     try ip.init(testing.allocator, .{ .url = "127.0.0.1:4443", .emulator = true });
     defer ip.deinit();
-    try testing.expectError(error.InvalidSignedUrlOptions, ip.client.bucket("photos").object("o").signedUrl(ip.signer.signer(), virtual));
+    try testing.expectError(error.InvalidSignedUrlOptions, ip.client.bucket("photos").object("o").signedUrl(.{ .rsa = ip.signer.signer() }, virtual));
     try testing.expect(std.mem.indexOf(u8, ip.diag.message(), "IP address") != null);
 
     // Over plain http there is no certificate, so dots are fine.
     var named: Harness = undefined;
     try named.init(testing.allocator, .{ .url = "localhost:4443", .emulator = true });
     defer named.deinit();
-    var dotted = try named.client.bucket("a.b").object("o").signedUrl(named.signer.signer(), virtual);
+    var dotted = try named.client.bucket("a.b").object("o").signedUrl(.{ .rsa = named.signer.signer() }, virtual);
     defer dotted.deinit();
     try testing.expect(std.mem.startsWith(u8, dotted.value, "http://a.b.localhost:4443/o?"));
 }
@@ -1042,9 +1119,9 @@ test "signedUrl: names are checked like every other call" {
     var h: Harness = undefined;
     try h.init(testing.allocator, null);
     defer h.deinit();
-    try testing.expectError(error.InvalidBucketName, h.client.bucket("a/b").object("o").signedUrl(h.signer.signer(), .{ .expires_in_s = 60 }));
-    try testing.expectError(error.InvalidBucketName, h.client.bucket("").signedUrl(h.signer.signer(), .{ .expires_in_s = 60 }));
-    try testing.expectError(error.InvalidObjectName, h.client.bucket("b").object("").signedUrl(h.signer.signer(), .{ .expires_in_s = 60 }));
+    try testing.expectError(error.InvalidBucketName, h.client.bucket("a/b").object("o").signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
+    try testing.expectError(error.InvalidBucketName, h.client.bucket("").signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
+    try testing.expectError(error.InvalidObjectName, h.client.bucket("b").object("").signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
     try testing.expectEqual(0, h.signer.calls);
 }
 
@@ -1054,16 +1131,16 @@ test "signedUrl: a signer's failure is the call's, and an empty answer is Signin
     defer h.deinit();
     const object = h.object("photos", "o");
     h.signer.fail = error.SigningRejected;
-    try testing.expectError(error.SigningRejected, object.signedUrl(h.signer.signer(), .{ .expires_in_s = 60 }));
+    try testing.expectError(error.SigningRejected, object.signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
     h.signer.fail = error.MetadataUnavailable;
-    try testing.expectError(error.MetadataUnavailable, object.signedUrl(h.signer.signer(), .{ .expires_in_s = 60 }));
+    try testing.expectError(error.MetadataUnavailable, object.signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
     h.signer.fail = null;
     h.signer.account = "";
-    try testing.expectError(error.SigningFailed, object.signedUrl(h.signer.signer(), .{ .expires_in_s = 60 }));
+    try testing.expectError(error.SigningFailed, object.signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "no service account") != null);
     h.signer.account = "signer@test-project.iam.gserviceaccount.com";
     h.signer.signature = "";
-    try testing.expectError(error.SigningFailed, object.signedUrl(h.signer.signer(), .{ .expires_in_s = 60 }));
+    try testing.expectError(error.SigningFailed, object.signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "empty signature") != null);
 }
 
@@ -1072,7 +1149,7 @@ test "signedUrl: a clock before 1970 is refused" {
     try h.init(testing.allocator, null);
     defer h.deinit();
     h.clock.now_ns = -std.time.ns_per_s;
-    try testing.expectError(error.InvalidSignedUrlOptions, h.object("photos", "o").signedUrl(h.signer.signer(), .{ .expires_in_s = 60 }));
+    try testing.expectError(error.InvalidSignedUrlOptions, h.object("photos", "o").signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 }));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "clock") != null);
     try testing.expectEqual(0, h.signer.calls);
 }
@@ -1082,7 +1159,7 @@ test "signedUrl: the log names the request, never the URL or its signature" {
     try h.init(testing.allocator, null);
     defer h.deinit();
     logging.capture.reset();
-    var url = try h.object("photos", "uploads/avatar.png").signedUrl(h.signer.signer(), goldens[1].options);
+    var url = try h.object("photos", "uploads/avatar.png").signedUrl(.{ .rsa = h.signer.signer() }, goldens[1].options);
     defer url.deinit();
     try testing.expectEqualStrings(
         "debug: signed a PUT URL for photos/uploads/avatar.png, valid 600 s, signed headers content-type;host;x-goog-content-length-range;x-goog-if-generation-match\n",
@@ -1097,7 +1174,7 @@ test "signedUrl: the scratch memory that held the signature is wiped" {
     var h: Harness = undefined;
     try h.init(checker.allocator(), null);
     defer h.deinit();
-    var url = try h.object("photos", "cats/tom.jpg").signedUrl(h.signer.signer(), .{ .expires_in_s = 60 });
+    var url = try h.object("photos", "cats/tom.jpg").signedUrl(.{ .rsa = h.signer.signer() }, .{ .expires_in_s = 60 });
     // Only the result is left to free, and it is the caller's to keep.
     try testing.expectEqual(0, checker.unwiped);
     url.deinit();
@@ -1197,7 +1274,7 @@ const Drawn = struct {
     bucket: []const u8,
     object: ?[]const u8,
     options: types.SignedUrlOptions,
-    email: []const u8,
+    authorizer: []const u8,
     signed_at: [16]u8,
     lifetime_s: ?u32,
     headers: [4]types.Header,
@@ -1217,7 +1294,7 @@ const Drawn = struct {
         });
         d.bucket = g.pick([]const u8, &.{ "b", "test-bucket", "my-project.appspot.com", "a.b", "my_bucket" });
         d.object = if (g.intRange(u8, 0, 7) == 0) null else g.slice(40);
-        d.email = g.pick([]const u8, &.{ "signer@p.iam.gserviceaccount.com", "a+b@c", "x" });
+        d.authorizer = g.pick([]const u8, &.{ "signer@p.iam.gserviceaccount.com", "a+b@c", "x" });
         d.signed_at = timestamp(.{ .nanoseconds = @as(i96, g.intRange(u64, 0, 253_402_300_799)) * std.time.ns_per_s }).?;
         d.lifetime_s = if (g.boolean()) null else 43_200;
         const expires = if (valid_only) g.intRange(u32, 1, max_expires_s) else g.int(u32);
@@ -1344,7 +1421,7 @@ fn modelCanonicalRequest(arena: Allocator, d: *const Drawn) ![]const u8 {
     const date = d.signed_at[0..8];
     const Param = struct { name: []const u8, value: []const u8 };
     var params: std.ArrayList(Param) = .empty;
-    const credential_value = try arena.print("{s}/{s}/auto/storage/goog4_request", .{ d.email, date });
+    const credential_value = try arena.print("{s}/{s}/auto/storage/goog4_request", .{ d.authorizer, date });
     const expires = try arena.print("{d}", .{d.options.expires_in_s});
     for ([_][2][]const u8{
         .{ "X-Goog-Algorithm", "GOOG4-RSA-SHA256" },
@@ -1403,7 +1480,7 @@ fn modelProperty(_: void, input: []const u8) !void {
     const prepared = try prepare(a, .{
         .method = d.options.method,
         .target = try target(a, d.base_url, d.bucket, d.object, d.options.style),
-        .email = d.email,
+        .authorizer = d.authorizer,
         .signed_at = d.signed_at,
         .expires_in_s = d.options.expires_in_s,
         .headers = d.options.headers,
@@ -1490,10 +1567,10 @@ fn urlProperty(_: void, input: []const u8) !void {
     const emulator = !std.mem.startsWith(u8, d.base_url, "https:");
     try h.init(testing.allocator, .{ .url = d.base_url, .emulator = emulator });
     defer h.deinit();
-    h.signer.account = d.email;
+    h.signer.account = d.authorizer;
     h.signer.lifetime_s = d.lifetime_s;
     const bucket = h.client.bucket(d.bucket);
-    const result = if (d.object) |o| bucket.object(o).signedUrl(h.signer.signer(), d.options) else bucket.signedUrl(h.signer.signer(), d.options);
+    const result = if (d.object) |o| bucket.object(o).signedUrl(.{ .rsa = h.signer.signer() }, d.options) else bucket.signedUrl(.{ .rsa = h.signer.signer() }, d.options);
     var url = result catch |err| switch (err) {
         // The draw cannot tell every name the client refuses.
         error.InvalidSignedUrlOptions, error.InvalidObjectName => return,

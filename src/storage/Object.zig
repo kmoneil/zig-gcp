@@ -138,18 +138,21 @@ fn getBilled(self: Object, options: types.GetOptions) Error!types.Owned(types.Ob
 /// A V4 signed URL: whoever holds it can make the one request it describes
 /// on this object until it expires, with no credentials of their own, as a
 /// browser downloading a private file or uploading straight into the
-/// bucket does. `signer` signs as a service account, which must itself be
-/// allowed to make the request. Nothing is sent to Cloud Storage; a signer
-/// that signs through IAM makes one call there.
+/// bucket does. `signer` is a service account's RSA key, `.{ .rsa = s }`,
+/// or an HMAC key, `.{ .hmac = .{ .access_id, .secret } }`; whichever it
+/// is, its account must itself be allowed to make the request. Nothing is
+/// sent to Cloud Storage; an RSA signer that signs through IAM makes one
+/// call there. An HMAC key's URLs work from the moment the key exists until
+/// they expire or the key is deactivated or deleted.
 ///
 /// The URL points at the client's endpoint, or at `options.style`'s host.
 /// It is a bearer credential until it expires, so it is never logged.
-pub fn signedUrl(self: Object, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
+pub fn signedUrl(self: Object, signer: types.UrlSigner, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
     var client: Client = undefined;
     return (try self.forCall(&client)).signedUrlBilled(signer, options);
 }
 
-fn signedUrlBilled(self: Object, signer: core.Signer, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
+fn signedUrlBilled(self: Object, signer: types.UrlSigner, options: types.SignedUrlOptions) Error!types.Owned([]const u8) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);
@@ -161,13 +164,13 @@ fn signedUrlBilled(self: Object, signer: core.Signer, options: types.SignedUrlOp
 /// the headers a signed PUT pins. The policy names this object exactly, so
 /// the form stores that name and no other; `Bucket.postPolicy` is the one
 /// that allows a prefix. Everything else is as `signedUrl` says: `signer`
-/// signs as a service account, which must itself be allowed to write, and
-/// nothing is sent to Cloud Storage.
+/// is an RSA or an HMAC key, whose account must itself be allowed to
+/// write, and nothing is sent to Cloud Storage.
 ///
 /// The returned fields are the form's hidden inputs. The form must also
 /// send `file`, last, holding the bytes. The fields are a bearer
 /// credential together until they expire, so they are never logged.
-pub fn postPolicy(self: Object, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
+pub fn postPolicy(self: Object, signer: types.UrlSigner, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
     var client: Client = undefined;
     const this = try self.forCall(&client);
     if (this.billing_project != null) {
@@ -181,7 +184,7 @@ pub fn postPolicy(self: Object, signer: core.Signer, options: types.PostPolicyOp
     return this.postPolicyBilled(signer, options);
 }
 
-fn postPolicyBilled(self: Object, signer: core.Signer, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
+fn postPolicyBilled(self: Object, signer: types.UrlSigner, options: types.PostPolicyOptions) Error!types.Owned(types.PostPolicy) {
     rpc.begin(self.client);
     try rpc.checkBucketName(self.client, self.bucket);
     try rpc.checkObjectName(self.client, self.name);

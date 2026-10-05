@@ -18,6 +18,7 @@ const rsa = std.crypto.Certificate.rsa;
 const vectors_json = @embedFile("testdata/v4_signatures.json");
 const oracle_json = @embedFile("testdata/signed_url_oracle.json");
 const post_oracle_json = @embedFile("testdata/post_policy_oracle.json");
+const hmac_vectors_json = @embedFile("testdata/hmac_v4_signatures.json");
 
 /// The account Google's vectors are signed as, and its key: `private_key`
 /// of storage/v1/test_service_account.not-a-test.json in
@@ -226,9 +227,9 @@ test "Google's V4 signing vectors, byte for byte, signatures included" {
         const bucket = client.bucket(v.bucket);
         const object = v.object orelse "";
         var url = if (object.len > 0)
-            try bucket.object(object).signedUrl(recording.signer(), options)
+            try bucket.object(object).signedUrl(.{ .rsa = recording.signer() }, options)
         else
-            try bucket.signedUrl(recording.signer(), options);
+            try bucket.signedUrl(.{ .rsa = recording.signer() }, options);
         defer url.deinit();
 
         try testing.expectEqualStrings(v.expectedUrl, url.value);
@@ -318,9 +319,9 @@ test "800 cases Google's Python library signed, byte for byte" {
         };
         const bucket = client.bucket(case.bucket);
         var url = if (case.object) |object|
-            try bucket.object(object).signedUrl(signer.signer(), options)
+            try bucket.object(object).signedUrl(.{ .rsa = signer.signer() }, options)
         else
-            try bucket.signedUrl(signer.signer(), options);
+            try bucket.signedUrl(.{ .rsa = signer.signer() }, options);
         defer url.deinit();
 
         try testing.expectEqualStrings(try std.mem.concat(arena, u8, &.{ case.url, "&X-Goog-Signature=5aa500ff" }), url.value);
@@ -367,7 +368,7 @@ test "through IAM: Google's first vector, with IAM answering its signature" {
     defer storage_fake.deinit();
     var client: storage.Client = try .init(gpa, clock.io(), .{ .token_provider = token.provider(), .transport = storage_fake.transport() });
     defer client.deinit();
-    var url = try client.bucket(v.bucket).object(v.object.?).signedUrl(iam.signer(), .{ .expires_in_s = v.expiration });
+    var url = try client.bucket(v.bucket).object(v.object.?).signedUrl(.{ .rsa = iam.signer() }, .{ .expires_in_s = v.expiration });
     defer url.deinit();
     try testing.expectEqualStrings(v.expectedUrl, url.value);
 
@@ -383,9 +384,9 @@ test "through IAM: Google's first vector, with IAM answering its signature" {
 
     // And through IAM, a URL may not outlast the 12 hours Google promises
     // its key for: refused before IAM is asked.
-    try testing.expectError(error.InvalidSignedUrlOptions, client.bucket(v.bucket).object(v.object.?).signedUrl(iam.signer(), .{ .expires_in_s = 43_201 }));
+    try testing.expectError(error.InvalidSignedUrlOptions, client.bucket(v.bucket).object(v.object.?).signedUrl(.{ .rsa = iam.signer() }, .{ .expires_in_s = 43_201 }));
     try testing.expectEqual(1, iam_fake.requests.items.len);
-    var longest = try client.bucket(v.bucket).object(v.object.?).signedUrl(iam.signer(), .{ .expires_in_s = 43_200 });
+    var longest = try client.bucket(v.bucket).object(v.object.?).signedUrl(.{ .rsa = iam.signer() }, .{ .expires_in_s = 43_200 });
     longest.deinit();
     try testing.expectEqual(2, iam_fake.requests.items.len);
 }
@@ -493,7 +494,7 @@ test "Google's V4 POST policy vectors, byte for byte, signatures included" {
             .transport = fake.transport(),
         });
         defer client.deinit();
-        var policy = try client.bucket(in.bucket).object(in.object).postPolicy(recording.signer(), .{
+        var policy = try client.bucket(in.bucket).object(in.object).postPolicy(.{ .rsa = recording.signer() }, .{
             .expires_in_s = in.expiration,
             .fields = try postFieldsOf(arena, in.fields),
             .conditions = try postConditionsOf(arena, in.conditions),
@@ -521,6 +522,84 @@ test "Google's V4 POST policy vectors, byte for byte, signatures included" {
         const signature_hex = policy.value.field("x-goog-signature").?;
         try testing.expectEqual(signature.len, (try std.fmt.hexToBytes(&signature, signature_hex)).len);
         try rsa.PKCS1v1_5Signature.verify(256, &signature, recording.message.items, public_key, Sha256);
+    }
+    try testing.expectEqual(0, fake.requests.items.len);
+}
+
+/// testdata/hmac_v4_signatures.json: Google's vectors signed again with an
+/// HMAC key by tools/hmac_vectors.py, standard library only.
+const HmacVectorFile = struct {
+    accessId: []const u8,
+    secret: []const u8,
+    signingV4Tests: []const struct { description: []const u8, expectedUrl: []const u8, expectedStringToSign: []const u8 },
+    postPolicyV4Tests: []const struct { description: []const u8, credential: []const u8, policy: []const u8, signature: []const u8 },
+};
+
+test "Google's V4 vectors signed with an HMAC key: every URL and POST policy, byte for byte" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rsa_file = try std.json.parseFromSliceLeaky(VectorFile, arena, vectors_json, .{ .ignore_unknown_fields = true });
+    const post_file = try std.json.parseFromSliceLeaky(PostVectorFile, arena, vectors_json, .{ .ignore_unknown_fields = true });
+    const file = try std.json.parseFromSliceLeaky(HmacVectorFile, arena, hmac_vectors_json, .{ .ignore_unknown_fields = true });
+    // One URL vector is left out: Google's own canonical request for it is
+    // wrong (see the RSA test).
+    try testing.expectEqual(28, file.signingV4Tests.len);
+    try testing.expectEqual(11, file.postPolicyV4Tests.len);
+    const signer: storage.UrlSigner = .{ .hmac = .{ .access_id = file.accessId, .secret = file.secret } };
+
+    // Nothing is sent: an HMAC key signs here, with no call anywhere.
+    var fake: core.testing.FakeTransport = .init(gpa, &.{});
+    defer fake.deinit();
+    for (file.signingV4Tests) |want| {
+        errdefer std.debug.print("vector: {s}\n", .{want.description});
+        const v = for (rsa_file.signingV4Tests) |r| {
+            if (std.mem.eql(u8, r.description, want.description)) break r;
+        } else return error.TestVectorMissing;
+        var clock: core.testing.FakeClock = .{ .now_ns = (try storage.parseTimestamp(v.timestamp)).nanoseconds };
+        var token: core.testing.FakeTokenProvider = .{};
+        var client: storage.Client = try .init(gpa, clock.io(), .{
+            .endpoint = try endpointOf(arena, v),
+            .token_provider = token.provider(),
+            .transport = fake.transport(),
+        });
+        defer client.deinit();
+        const options: storage.SignedUrlOptions = .{
+            .method = std.meta.stringToEnum(storage.SignedMethod, v.method).?,
+            .expires_in_s = v.expiration,
+            .headers = try headersOf(arena, v.headers),
+            .query = try queryOf(arena, v.queryParameters),
+            .style = styleOf(v),
+        };
+        const bucket = client.bucket(v.bucket);
+        const object = v.object orelse "";
+        var url = if (object.len > 0) try bucket.object(object).signedUrl(signer, options) else try bucket.signedUrl(signer, options);
+        defer url.deinit();
+        try testing.expectEqualStrings(want.expectedUrl, url.value);
+    }
+    for (file.postPolicyV4Tests) |want| {
+        errdefer std.debug.print("POST policy vector: {s}\n", .{want.description});
+        const v = for (post_file.postPolicyV4Tests) |r| {
+            if (std.mem.eql(u8, r.description, want.description)) break r;
+        } else return error.TestVectorMissing;
+        const in = v.policyInput;
+        var clock: core.testing.FakeClock = .{ .now_ns = (try storage.parseTimestamp(in.timestamp)).nanoseconds };
+        var token: core.testing.FakeTokenProvider = .{};
+        var client: storage.Client = try .init(gpa, clock.io(), .{ .token_provider = token.provider(), .transport = fake.transport() });
+        defer client.deinit();
+        var policy = try client.bucket(in.bucket).object(in.object).postPolicy(signer, .{
+            .expires_in_s = in.expiration,
+            .fields = try postFieldsOf(arena, in.fields),
+            .conditions = try postConditionsOf(arena, in.conditions),
+            .style = postStyleOf(in),
+        });
+        defer policy.deinit();
+        try testing.expectEqualStrings(try base64Decode(arena, want.policy), try base64Decode(arena, policy.value.field("policy").?));
+        try testing.expectEqualStrings(want.policy, policy.value.field("policy").?);
+        try testing.expectEqualStrings("GOOG4-HMAC-SHA256", policy.value.field("x-goog-algorithm").?);
+        try testing.expectEqualStrings(want.credential, policy.value.field("x-goog-credential").?);
+        try testing.expectEqualStrings(want.signature, policy.value.field("x-goog-signature").?);
     }
     try testing.expectEqual(0, fake.requests.items.len);
 }
@@ -594,7 +673,7 @@ test "400 POST policies Google's Python library signed, byte for byte" {
             } }
         else
             .path;
-        var policy = try client.bucket(case.bucket).object(case.object).postPolicy(signer.signer(), .{
+        var policy = try client.bucket(case.bucket).object(case.object).postPolicy(.{ .rsa = signer.signer() }, .{
             .expires_in_s = case.expires,
             .fields = fields,
             .conditions = conditions,
