@@ -4,7 +4,7 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
-## 0.34.0 (unreleased)
+## 0.34.0 (2026-10-06)
 
 - firestore: **Fixed:** an error the server sends inside a streamed
   answer fails the call with that error. Production answers a query that
