@@ -26,6 +26,14 @@ including the ones that did not change.
   digits and `-._~` as `%XX`, as Google's own REST clients encode them.
   Found by running the emulator suite against production, which it now
   can (`docs/development.md`).
+- firestore: a document over 1 MiB, and a request over 11 MiB, are
+  refused before sending, `error.InvalidArgument`, as production would
+  refuse them. A document's size is counted as production counts it,
+  measured to the byte for every kind of value, empty arrays and maps
+  included (1 byte, not the 0 Google documents), and is public as
+  `limits.documentSize`; `limits.max_document_bytes` and
+  `limits.max_request_bytes` are the measured limits, the second 11 MiB
+  where Google documents 10.
 - firestore: streamed reads. `Client.runQueryEach(query, options,
   handler)` and `Client.batchGetEach(paths, options, handler)` hand each
   document to a `DocumentHandler` or `BatchGetHandler` as it arrives,

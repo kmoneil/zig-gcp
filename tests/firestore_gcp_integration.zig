@@ -302,3 +302,127 @@ test "transactions: concurrent increments against production, and the contention
     defer r.deinit();
     fact("server time: {d} ns past the second", .{@mod(r.value.writes[0].transform_results[0].timestamp.nanoseconds, std.time.ns_per_s)});
 }
+
+/// Writes `v` as Firestore's JSON, by hand: the test sends what the client
+/// refuses to.
+fn writeValue(jw: *std.json.Stringify, v: Value) !void {
+    try jw.beginObject();
+    switch (v) {
+        .null => {
+            try jw.objectField("nullValue");
+            try jw.write(null);
+        },
+        .integer => |i| {
+            try jw.objectField("integerValue");
+            try jw.print("\"{d}\"", .{i});
+        },
+        .geo_point => |g| {
+            try jw.objectField("geoPointValue");
+            try jw.write(.{ .latitude = g.latitude, .longitude = g.longitude });
+        },
+        .string => |s| {
+            try jw.objectField("stringValue");
+            try jw.write(s);
+        },
+        .bytes => |b| {
+            try jw.objectField("bytesValue");
+            var buf: [64]u8 = undefined;
+            try jw.write(std.base64.standard.Encoder.encode(&buf, b));
+        },
+        .reference => |r| {
+            try jw.objectField("referenceValue");
+            try jw.write(r);
+        },
+        .array => |items| {
+            try jw.objectField("arrayValue");
+            try jw.beginObject();
+            try jw.objectField("values");
+            try jw.beginArray();
+            for (items) |item| try writeValue(jw, item);
+            try jw.endArray();
+            try jw.endObject();
+        },
+        .map => |fields| {
+            try jw.objectField("mapValue");
+            try jw.beginObject();
+            try jw.objectField("fields");
+            try jw.beginObject();
+            for (fields) |field| {
+                try jw.objectField(field.name);
+                try writeValue(jw, field.value);
+            }
+            try jw.endObject();
+            try jw.endObject();
+        },
+        else => return error.NotWrittenHere,
+    }
+    try jw.endObject();
+}
+
+test "limits: the document size the client counts is production's, and the largest it takes" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pad = try a.alloc(u8, 600_000);
+    @memset(pad, 'y');
+    var buf: [64]u8 = undefined;
+    const path = f.path(&buf, "big");
+    const name = try f.client.documentName(a, path);
+    const kinds = [_]Value{
+        .null,
+        .{ .integer = 1 },
+        .{ .geo_point = .{ .latitude = 1, .longitude = 2 } },
+        .{ .string = "été🔥" },
+        .{ .bytes = "\x01\x02" },
+        .{ .reference = name },
+        .{ .array = &.{} },
+        .{ .map = &.{} },
+        .{ .map = &.{.{ .name = "m", .value = .{ .array = &.{ .{ .map = &.{} }, .{ .integer = 2 } } } }} },
+    };
+    for (kinds) |v| {
+        const fields: []const firestore.Field = &.{ .{ .name = "a", .value = .{ .string = pad } }, .{ .name = "b", .value = .{ .string = pad } }, .{ .name = "v", .value = v } };
+        var body: std.Io.Writer.Allocating = .init(a);
+        var jw: std.json.Stringify = .{ .writer = &body.writer };
+        try jw.beginObject();
+        try jw.objectField("writes");
+        try jw.beginArray();
+        try jw.beginObject();
+        try jw.objectField("update");
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(name);
+        try jw.objectField("fields");
+        try jw.beginObject();
+        for (fields) |field| {
+            try jw.objectField(field.name);
+            try writeValue(&jw, field.value);
+        }
+        try jw.endObject();
+        try jw.endObject();
+        try jw.endObject();
+        try jw.endArray();
+        try jw.endObject();
+        const text = body.written();
+        const reply = try f.raw(a, .POST, ":commit", text);
+        try testing.expectEqual(400, reply.status);
+        const marker = "its size (";
+        const from = (std.mem.indexOf(u8, reply.body, marker) orelse {
+            std.debug.print("{s}\n", .{reply.body});
+            return error.TestUnexpectedResult;
+        }) + marker.len;
+        const to = std.mem.indexOfPos(u8, reply.body, from, " bytes)").?;
+        const digits = try std.mem.replaceOwned(u8, a, reply.body[from..to], ",", "");
+        try testing.expectEqual(try std.fmt.parseInt(u64, digits, 10), firestore.limits.documentSize(path, fields));
+        // The client refuses it before sending.
+        try testing.expectError(error.InvalidArgument, f.client.doc(path).set(fields, .{}));
+    }
+    // The largest the client sends, production takes.
+    const rest = firestore.limits.max_document_bytes - firestore.limits.documentSize(path, &.{ .{ .name = "a", .value = .{ .string = pad } }, .{ .name = "b", .value = .{ .string = "" } } });
+    const fit: []const firestore.Field = &.{ .{ .name = "a", .value = .{ .string = pad } }, .{ .name = "b", .value = .{ .string = pad[0..rest] } } };
+    try testing.expectEqual(firestore.limits.max_document_bytes, firestore.limits.documentSize(path, fit));
+    _ = try f.client.doc(path).set(fit, .{});
+    fact("a document of exactly {d} bytes as the client counts them: taken", .{firestore.limits.max_document_bytes});
+}

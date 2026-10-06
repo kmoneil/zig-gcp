@@ -62,6 +62,7 @@ pub fn create(self: Collection, fields: []const types.Field, options: types.Crea
     if (document_path.len + client.name_prefix_len > validate.max_name_bytes) {
         return rpc.refuse(client, error.InvalidResourceId, "invalid document path: the full name is over 6 KiB", .{});
     }
+    try rpc.checkDocumentSize(client, document_path, fields);
     const url = writeCreateUrl(a, client, path, document_id) catch return error.OutOfMemory;
     const body = try codec.encodeDocument(a, fields);
 

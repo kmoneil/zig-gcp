@@ -175,5 +175,20 @@ Checked before anything is sent, as production enforces them:
 | Transforms on one document in one commit | 500 |
 | `in` and `array_contains_any` | 1 to 30 values; `not_in` 1 to 10 |
 | Aggregations in one query | 5 |
+| A document | 1,048,576 bytes, counted as Firestore counts them (below) |
+| A request | 11,534,336 bytes (11 MiB), though Google documents 10 MiB |
 
-A document's 1 MiB size, and index limits, are the server's to check.
+A document's size is counted as production counts it, checked to the byte
+for every kind of value against the size production reports when it
+refuses one (2026-10-05). Its path, each collection and document id as a
+string, plus 16; each field, its name as a string and its value; plus 32.
+A string is its UTF-8 bytes plus one, bytes their length, a boolean or
+null 1, a number or timestamp 8, a geo point 16, a reference its
+document's path, an array its values, a map its names and values, and an
+empty array or map 1 (Google documents 0). `firestore.limits.documentSize`
+gives it. A write through a mask can only be checked for what it sends:
+growing a stored document past the limit is the server's refusal,
+`error.InvalidArgument` with its words.
+
+Index entries, at most 40,000 per document, are left to the server too:
+how many a document makes depends on the database's index settings.

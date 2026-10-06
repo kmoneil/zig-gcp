@@ -35,6 +35,60 @@ pub const max_value_depth = 20;
 /// Most field transforms on one document in one commit, as documented.
 /// The emulator took 501.
 pub const max_transforms_per_document = 500;
+/// Largest document, as `documentSize` counts it: production takes
+/// 1,048,576 bytes and refuses one more, "Document '...' cannot be written
+/// because its size (1,048,577 bytes) exceeds the maximum allowed size of
+/// 1,048,576 bytes." (measured 2026-10-05).
+pub const max_document_bytes = 1_048_576;
+/// Largest request body production takes: 11 MiB, though the
+/// documentation says 10. A body of 11,534,336 bytes is taken and one more
+/// refused, "Request payload size exceeds the limit: 11534336 bytes."
+/// (measured 2026-10-05).
+pub const max_request_bytes = 11 * 1024 * 1024;
+
+/// A document's size as Firestore counts it, to the byte: production
+/// reports the same number for every kind of value, in its refusal of a
+/// document too large (measured 2026-10-05). The path, each collection and
+/// document id counted as a string, plus 16; each field, its name as a
+/// string and its value; plus 32. A string is its UTF-8 bytes plus one;
+/// bytes their length; a boolean or null 1; an integer, a double or a
+/// timestamp 8; a geo point 16; a reference its document's path, counted
+/// as a document's is; an array its values, a map its entries, each name
+/// and value; and an empty array or map 1, where Google's documentation
+/// says 0. Fields as checked by `fieldsProblem`, so bounded in depth.
+pub fn documentSize(path: []const u8, fields: []const Field) u64 {
+    return pathSize(path) +| fieldsSize(fields) +| 32;
+}
+
+fn pathSize(path: []const u8) u64 {
+    var size: u64 = 16;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |id| size +|= id.len + 1;
+    return size;
+}
+
+fn fieldsSize(fields: []const Field) u64 {
+    var size: u64 = 0;
+    for (fields) |f| size +|= (f.name.len + 1) +| valueSize(f.value);
+    return size;
+}
+
+fn valueSize(v: Value) u64 {
+    return switch (v) {
+        .null, .boolean => 1,
+        .integer, .double, .timestamp => 8,
+        .geo_point => 16,
+        .string => |s| s.len + 1,
+        .bytes => |b| b.len,
+        .reference => |r| pathSize(names.relativePath(r) orelse r),
+        .array => |items| if (items.len == 0) 1 else sum: {
+            var size: u64 = 0;
+            for (items) |item| size +|= valueSize(item);
+            break :sum size;
+        },
+        .map => |entries| if (entries.len == 0) 1 else fieldsSize(entries),
+    };
+}
 
 /// Why `id` is not a collection or document id, or null when it is: valid
 /// UTF-8 of 1 to 1,500 bytes, no `/`, not `.` or `..`, and no reserved
@@ -315,4 +369,45 @@ test "fieldsProblem: a long path is shortened, never overflows" {
     var tiny: [16]u8 = undefined;
     const problem = fieldsProblem(&.{.{ .name = "abcdefghij", .value = .{ .map = &.{.{ .name = "klmnopqrst", .value = .{ .string = "\xff" } }} } }}, &tiny).?;
     try testing.expect(std.mem.endsWith(u8, problem.where, "..."));
+}
+
+test "golden: documentSize is production's count, to the byte, for every kind of value" {
+    // Each case as production reported it, refusing the document as too
+    // large (_tmp/fs-hardening/probe_m3.py, 2026-10-05): two strings of
+    // 600,000 bytes, `a` and `b`, and a field `v` of each kind, at two paths.
+    const pad_a = try testing.allocator.alloc(u8, 600_000);
+    defer testing.allocator.free(pad_a);
+    @memset(pad_a, 'y');
+    const pad_b = try testing.allocator.alloc(u8, 600_000);
+    defer testing.allocator.free(pad_b);
+    @memset(pad_b, 'z');
+    const cases = [_]struct { Value, u64 }{
+        .{ .null, 1_200_061 },
+        .{ .{ .boolean = true }, 1_200_061 },
+        .{ .{ .integer = 42 }, 1_200_068 },
+        .{ .{ .double = 1.5 }, 1_200_068 },
+        .{ .{ .timestamp = .{ .nanoseconds = 1_791_201_600_123_456_000 } }, 1_200_068 },
+        .{ .{ .geo_point = .{ .latitude = 1, .longitude = 2 } }, 1_200_076 },
+        .{ .{ .string = "abc" }, 1_200_064 },
+        .{ .{ .string = "été🔥" }, 1_200_070 },
+        .{ .{ .bytes = "\x01\x02\x03" }, 1_200_063 },
+        .{ .{ .reference = "projects/extractctl/databases/zigps-fs-9620b6bd/documents/cities/LA/landmarks/tower" }, 1_200_102 },
+        .{ .{ .array = &.{ .{ .integer = 1 }, .{ .string = "ab" }, .null } }, 1_200_072 },
+        // An empty array or map is 1 byte, not the 0 the documentation gives.
+        .{ .{ .array = &.{} }, 1_200_061 },
+        .{ .{ .map = &.{ .{ .name = "k", .value = .{ .integer = 1 } }, .{ .name = "kk", .value = .{ .string = "ab" } } } }, 1_200_076 },
+        .{ .{ .map = &.{} }, 1_200_061 },
+        .{ .{ .map = &.{.{ .name = "m", .value = .{ .map = &.{.{ .name = "a", .value = .{ .array = &.{.{ .boolean = false }} } }} } }} }, 1_200_065 },
+    };
+    for (cases) |case| {
+        const fields: []const Field = &.{ .{ .name = "a", .value = .{ .string = pad_a } }, .{ .name = "b", .value = .{ .string = pad_b } }, .{ .name = "v", .value = case[0] } };
+        try testing.expectEqual(case[1], documentSize("s/x", fields));
+        // Each id a string: the deeper, unicode path counts 15 bytes more.
+        try testing.expectEqual(case[1] + 15, documentSize("deep/é/sub/🔥id", fields));
+    }
+    const named: []const Field = &.{ .{ .name = "a", .value = .{ .string = pad_a } }, .{ .name = "b", .value = .{ .string = pad_b } }, .{ .name = "ñame🔥", .value = .{ .integer = 1 } } };
+    try testing.expectEqual(1_200_076, documentSize("s/x", named));
+    // The boundary production holds to: 1,048,576 taken, one more refused.
+    const at_limit: []const Field = &.{ .{ .name = "a", .value = .{ .string = pad_a } }, .{ .name = "b", .value = .{ .string = pad_b[0..448_518] } } };
+    try testing.expectEqual(max_document_bytes, documentSize("s/x", at_limit));
 }

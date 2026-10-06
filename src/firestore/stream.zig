@@ -98,6 +98,7 @@ const State = struct {
 /// call in `Diagnostics`. Returns the server's error, the reader's, or the
 /// engine's.
 pub fn read(client: *Client, path: []const u8, body: []const u8, timeout_ms: u32, reader: Reader, what: []const u8) anyerror!void {
+    try rpc.checkRequestSize(client, body.len);
     var state: State = .{ .reader = reader, .splitter = undefined };
     state.splitter = .init(client.gpa, .{ .ptr = &state, .element = State.element }, max_message_bytes);
     defer state.splitter.deinit();
