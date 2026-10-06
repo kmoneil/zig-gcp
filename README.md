@@ -51,7 +51,7 @@ Pub/Sub, Cloud Storage, Secret Manager and Firestore, with credentials that find
 | :-: | --- | --- | --- |
 | 📨 | [`pubsub`](docs/pubsub/README.md) | Pub/Sub v1: publish one call at a time or batched from many tasks; pull, a worker loop that manages leases, and exactly-once delivery; topics and subscriptions, with their IAM policies | beta |
 | 🪣 | [`storage`](docs/storage/README.md) | Cloud Storage: objects of any size, streamed, parallel, resumable and checksummed both ways; preconditions, compose and server-side copies; buckets, versions, soft delete, retention and holds, IAM; folders, tree renames and managed folders; access control lists; signed URLs and POST policies, signed by a service account or an HMAC key; HMAC keys; encryption keys; Pub/Sub notifications | experimental |
-| 🔥 | [`firestore`](docs/firestore/README.md) | Cloud Firestore: documents read and written under preconditions, commits with field transforms, batched reads, queries and aggregations over collections and collection groups, transactions run again on contention; the default database or a named one | experimental |
+| 🔥 | [`firestore`](docs/firestore/README.md) | Cloud Firestore: documents read and written under preconditions, commits with field transforms, batched reads, queries and aggregations over collections and collection groups, large answers read one document at a time as they arrive, transactions run again on contention; the default database or a named one | experimental |
 | 🔑 | [`secret_manager`](docs/secret-manager/README.md) | Secret Manager v1: a secret's bytes, verified and wiped after use; versions; secrets global or regional, their settings, notifications, rotation, encryption keys and IAM policies | experimental |
 | 🪪 | [`auth`](docs/auth.md) | Credentials for the other modules: the metadata server, gcloud's login, service account keys, workload identity federation and impersonation; signing on this machine or through IAM | experimental |
 | ⚙️ | [`core`](docs/essentials.md) | What the service modules share: the HTTP transport, retries, `Diagnostics`, CRC-32C at the CPU's speed, IAM policies, the `TokenProvider` and `Signer` seams, and test fakes. Each service re-exports what its callers need. | beta |
@@ -74,7 +74,7 @@ Zig **0.17.0** (`minimum_zig_version` enforces it). For Zig 0.16.0, use
 v0.30.0, the last release that builds with it.
 
 ```sh
-zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.33.0
+zig fetch --save git+https://github.com/kmoneil/zig-gcp#v0.34.0
 ```
 
 ```zig
