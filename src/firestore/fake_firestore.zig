@@ -182,6 +182,14 @@ pub const FakeFirestore = struct {
         return self.docs.get(key);
     }
 
+    /// A stored document's size, counted here again from what was stored
+    /// as production counts it, so that a property can hold the client's
+    /// `validate.documentSize` to it; null when there is no document.
+    pub fn documentSize(self: *const FakeFirestore, database_id: []const u8, path: []const u8) ?u64 {
+        const d = self.doc(database_id, path) orelse return null;
+        return storedSize(path, d.fields);
+    }
+
     /// How many documents the database holds.
     pub fn count(self: *const FakeFirestore, database_id: []const u8) usize {
         var n: usize = 0;
@@ -661,6 +669,7 @@ pub const FakeFirestore = struct {
         const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ collection, decoded_id });
         const key = try std.fmt.allocPrint(arena, "{s}|{s}", .{ route.database, path });
         if (self.docs.get(key) != null) return alreadyExists(arena, route, path);
+        if (try tooLarge(arena, route, path, fields)) |r| return r;
         self.now_us += 1000;
         const d = try self.keep(key, fields, self.now_us, self.now_us);
         if (self.lose()) return lost(arena);
@@ -708,6 +717,11 @@ pub const FakeFirestore = struct {
             outcome.* = .{};
             if (try self.stage(arena, route, w, commit_us, &staged, outcome)) |refusal| return refusal;
         }
+        var sizes = staged.iterator();
+        while (sizes.next()) |entry| if (entry.value_ptr.*) |d| {
+            const path = entry.key_ptr.*[std.mem.indexOfScalar(u8, entry.key_ptr.*, '|').? + 1 ..];
+            if (try tooLarge(arena, route, path, d.fields)) |r| return r;
+        };
         self.now_us = commit_us;
         if (txn) |t| {
             t.state = .ended;
@@ -940,6 +954,65 @@ fn badPath(arena: Allocator, texts: []const []const u8) Allocator.Error!FakeFire
         };
     }
     return fail(arena, 400, "INVALID_ARGUMENT", "fake: bad field path");
+}
+
+/// Production's refusal of a document over 1 MiB as it counts sizes
+/// (measured 2026-10-05), or null when it fits.
+fn tooLarge(arena: Allocator, route: FakeFirestore.Route, path: []const u8, fields: []const FakeFirestore.Entry) Allocator.Error!?FakeFirestore.Reply {
+    const size = storedSize(path, fields);
+    if (size <= 1_048_576) return null;
+    return try fail(arena, 400, "INVALID_ARGUMENT", try std.fmt.allocPrint(
+        arena,
+        "Document '{s}' cannot be written because its size ({s} bytes) exceeds the maximum allowed size of 1,048,576 bytes.",
+        .{ try fullName(arena, route, path), try withCommas(arena, size) },
+    ));
+}
+
+/// `n` as production writes it in its words: 1,200,062.
+fn withCommas(arena: Allocator, n: u64) Allocator.Error![]const u8 {
+    var digits_buf: [24]u8 = undefined;
+    const digits = std.fmt.bufPrint(&digits_buf, "{d}", .{n}) catch unreachable;
+    var out: std.ArrayList(u8) = .empty;
+    for (digits, 0..) |c, i| {
+        if (i > 0 and (digits.len - i) % 3 == 0) try out.append(arena, ',');
+        try out.append(arena, c);
+    }
+    return out.items;
+}
+
+/// A document's size as production counts it, from the stored values.
+fn storedSize(path: []const u8, fields: []const FakeFirestore.Entry) u64 {
+    return idsSize(path) + 32 + entriesSize(fields);
+}
+
+fn idsSize(path: []const u8) u64 {
+    var size: u64 = 16;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |id| size += id.len + 1;
+    return size;
+}
+
+fn entriesSize(entries: []const FakeFirestore.Entry) u64 {
+    var size: u64 = 0;
+    for (entries) |e| size += e.name.len + 1 + valSize(e.value);
+    return size;
+}
+
+fn valSize(v: FakeFirestore.Val) u64 {
+    return switch (v) {
+        .null, .boolean => 1,
+        .integer, .double, .timestamp_us => 8,
+        .geo => 16,
+        .string => |s| s.len + 1,
+        .bytes => |b| b.len,
+        .reference => |r| idsSize(r[(std.mem.indexOf(u8, r, "/documents/") orelse return r.len + 1) + "/documents/".len ..]),
+        .array => |items| if (items.len == 0) 1 else sum: {
+            var size: u64 = 0;
+            for (items) |item| size += valSize(item);
+            break :sum size;
+        },
+        .map => |entries| if (entries.len == 0) 1 else entriesSize(entries),
+    };
 }
 
 fn fullName(arena: Allocator, route: FakeFirestore.Route, path: []const u8) Allocator.Error![]const u8 {
@@ -2288,6 +2361,7 @@ const test_util = @import("test_util.zig");
 const types = @import("types.zig");
 const codec = @import("codec.zig");
 const names = @import("names.zig");
+const validate = @import("validate.zig");
 const Field = types.Field;
 const Value = types.Value;
 
@@ -2777,6 +2851,62 @@ test "fake: a query past its deadline answers part, then the error, inside a 200
     h.server.deadline_after = 0;
     try testing.expectError(error.DeadlineExceeded, h.client.runQuery(.{ .from = .{ .collection = "c" } }, .{}));
     try h.expectDiag("exceeded the deadline");
+}
+
+test "fake: a document grown past 1 MiB through a mask is refused in production's words" {
+    var h: test_util.FakeHarness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    const big = try testing.allocator.alloc(u8, 600_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'y');
+    _ = try h.client.doc("big/two").set(&.{.{ .name = "a", .value = .{ .string = big } }}, .{});
+    // Each write fits on its own, so the client sends it; only the server
+    // knows what the document already holds.
+    try testing.expectError(error.InvalidArgument, h.client.doc("big/two").update(&.{.{ .name = "b", .value = .{ .string = big } }}, .{}));
+    try h.expectDiag("cannot be written because its size (1,200,062 bytes) exceeds the maximum allowed size of 1,048,576 bytes.");
+    try testing.expectEqual(600_059, h.server.documentSize("(default)", "big/two").?);
+    try testing.expectEqual(null, h.server.documentSize("(default)", "big/none"));
+    // Grown to exactly 1,048,576 bytes it is taken: 600,059 and a field
+    // "b" of 2 + 448,515 + 1.
+    _ = try h.client.doc("big/two").update(&.{.{ .name = "b", .value = .{ .string = big[0..448_514] } }}, .{});
+    try testing.expectEqual(1_048_576, h.server.documentSize("(default)", "big/two").?);
+    try testing.expectError(error.InvalidArgument, h.client.doc("big/two").update(&.{.{ .name = "b", .value = .{ .string = big[0..448_515] } }}, .{}));
+    try h.expectDiag("its size (1,048,577 bytes)");
+    // A create the client would not send, refused the same way.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const body = try std.fmt.allocPrint(arena.allocator(), "{{\"fields\":{{\"a\":{{\"stringValue\":\"{s}\"}},\"b\":{{\"stringValue\":\"{s}\"}}}}}}", .{ big, big });
+    try expectRefusal(try rawRequest(&h.server, arena.allocator(), .POST, "/big?documentId=new", body), 400, "its size (1,200,062 bytes) exceeds the maximum allowed size of 1,048,576 bytes.");
+    try testing.expectEqual(null, h.server.documentSize("(default)", "big/new"));
+}
+
+/// A random document, written through the client: the size the client
+/// counts before sending is the size the fake counts from what it stored.
+fn sizeProperty(_: void, input: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var g: test_util.ByteGen = .init(input);
+    var h: test_util.FakeHarness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    const fields = try a.alloc(Field, g.intRange(u8, 0, 6));
+    for (fields, 0..) |*f, i| f.* = .{
+        .name = try std.fmt.allocPrint(a, "{s}{d}", .{ g.pick([]const u8, &.{ "k", "a-b", "é", "🔥", "`" }), i }),
+        .value = try codec.randomValue(&g, a, 4, false),
+    };
+    const path = g.pick([]const u8, &.{ "c/x", "c/é/s/🔥", "a b/c+d" });
+    _ = try h.client.doc(path).set(fields, .{});
+    try testing.expectEqual(validate.documentSize(path, fields), h.server.documentSize("(default)", path).?);
+}
+
+test "fuzz documentSize: the client counts what the fake stores, as production counts it" {
+    try test_util.fuzzBytes({}, sizeProperty, .{ .corpus = &.{
+        "",
+        "\x05\x00\x00\x09\x00\x0a\x00",
+        "\x06\x01\x07\x02\x0a\x03\x09\x02\x05\x04\x08\x05\x06\x01",
+    } });
 }
 
 fn expectIds(h: *test_util.FakeHarness, query: types.Query, expected: []const []const u8) !void {

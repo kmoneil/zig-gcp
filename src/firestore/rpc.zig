@@ -50,7 +50,18 @@ pub fn begin(client: *Client) void {
 /// Sends `call` and returns the body of the first 2xx response, which
 /// lives in `response`.
 pub fn execute(client: *Client, response: *std.heap.ArenaAllocator, call: Call) Error![]const u8 {
+    if (call.body) |body| try checkRequestSize(client, body.len);
     return engine(client).execute(response, call);
+}
+
+/// Refuses a request body larger than production takes.
+pub fn checkRequestSize(client: *Client, len: usize) Error!void {
+    if (len > validate.max_request_bytes) return refuse(
+        client,
+        error.InvalidArgument,
+        "the request is {d} bytes, over the {d} Firestore takes: split the writes or the reads across requests",
+        .{ len, validate.max_request_bytes },
+    );
 }
 
 /// Sends `call` with its answer streamed into `call.sink`; see
@@ -126,6 +137,19 @@ pub fn checkFields(client: *Client, fields: []const types.Field) Error!void {
     if (validate.fieldsProblem(fields, &where_buf)) |problem| {
         return refuse(client, error.InvalidArgument, "invalid field {s}: {s}", .{ problem.where, problem.what });
     }
+}
+
+/// Checks that the document at `path` with `fields`, checked already,
+/// fits. For a write through a mask the fields are part of the document
+/// written, so their size is the least it can be.
+pub fn checkDocumentSize(client: *Client, path: []const u8, fields: []const types.Field) Error!void {
+    const size = validate.documentSize(path, fields);
+    if (size > validate.max_document_bytes) return refuse(
+        client,
+        error.InvalidArgument,
+        "the document {s} is at least {d} bytes as Firestore counts them, over the {d} it takes",
+        .{ path, size, validate.max_document_bytes },
+    );
 }
 
 /// Checks a transaction's id, and that a read does not also ask for a
@@ -252,4 +276,13 @@ fn writeListCollectionIds(jw: *std.json.Stringify, options: types.ListCollection
         try codec.writeTimestamp(jw, t);
     }
     try jw.endObject();
+}
+
+test "checkRequestSize: 11 MiB is taken, one byte more refused" {
+    var h: @import("test_util.zig").Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    try checkRequestSize(&h.client, validate.max_request_bytes);
+    try std.testing.expectError(error.InvalidArgument, checkRequestSize(&h.client, validate.max_request_bytes + 1));
+    try h.expectDiag("the request is 11534337 bytes, over the 11534336 Firestore takes");
 }

@@ -166,6 +166,7 @@ fn resolve(client: *Client, a: Allocator, w: types.Write) Error!codec.Write {
         .update => |u| {
             const path = try rpc.checkedPath(client, a, .init(u.path), .document);
             try rpc.checkFields(client, u.fields);
+            try rpc.checkDocumentSize(client, path, u.fields);
             if (u.mask) |mask| try checkUpdateMask(client, mask, u.fields);
             try checkTransforms(client, u.transforms);
             try rpc.checkPrecondition(client, u.precondition);
@@ -412,6 +413,55 @@ test "commit refuses what the server would, naming the write" {
         .{ .field_path = "`n`", .op = .{ .increment = .{ .integer = 1 } } },
     });
     try h.expectRequestCount(0);
+}
+
+test "commit: a document or a request larger than Firestore takes is refused before sending" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = test_util.commit_body } },
+        .{ .respond = .{ .body = test_util.docBody("c/new", "{}") } },
+    }, .{});
+    defer h.deinit();
+    const big = try testing.allocator.alloc(u8, 1_000_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    // 1,048,576 bytes exactly, as Firestore counts them, is taken: the
+    // path 20, two fields, 32.
+    const fit: []const types.Field = &.{ .{ .name = "a", .value = .{ .string = big } }, .{ .name = "b", .value = .{ .string = big[0..48_518] } } };
+    try testing.expectEqual(validate.max_document_bytes, validate.documentSize("s/x", fit));
+    _ = try h.client.doc("s/x").set(fit, .{});
+    const over: []const types.Field = &.{ .{ .name = "a", .value = .{ .string = big } }, .{ .name = "b", .value = .{ .string = big[0..48_519] } } };
+    try testing.expectError(error.InvalidArgument, h.client.doc("s/x").set(over, .{}));
+    try h.expectDiag("the document s/x is at least 1048577 bytes as Firestore counts them, over the 1048576 it takes");
+    // Through a mask, the fields sent are the least the document holds.
+    try testing.expectError(error.InvalidArgument, h.client.doc("s/x").update(over, .{ .mask = &.{ "a", "b" } }));
+    try testing.expectError(error.InvalidArgument, h.client.commit(&.{.{ .update = .{ .path = "s/x", .fields = over } }}, .{}));
+    try testing.expectError(error.InvalidArgument, h.client.collection("s").create(over, .{ .document_id = "x" }));
+    try h.expectDiag("the document s/x is at least 1048577 bytes");
+    var made = try h.client.collection("c").create(&.{}, .{ .document_id = "new" });
+    made.deinit();
+
+    // Twelve documents of 1,000,000 bytes each fit, but not in one request.
+    var writes: [12]types.Write = undefined;
+    var paths: [12][8]u8 = undefined;
+    for (&writes, &paths, 0..) |*w, *p, i| w.* = .{ .update = .{ .path = try std.fmt.bufPrint(p, "c/d{d:0>2}", .{i}), .fields = &.{.{ .name = "s", .value = .{ .string = big } }} } };
+    try testing.expectError(error.InvalidArgument, h.client.commit(&writes, .{}));
+    try h.expectDiag("over the 11534336 Firestore takes");
+    // A query, buffered or streamed: thirty values of 1,000,000 bytes.
+    var values: [30]types.Value = @splat(.{ .string = big });
+    const q: types.Query = .{ .from = .{ .collection = "c" }, .where = &.{.{ .field = "s", .op = .in, .value = .{ .array = &values } }} };
+    try testing.expectError(error.InvalidArgument, h.client.runQuery(q, .{}));
+    const Nothing = struct {
+        fn document(_: *anyopaque, snapshot: types.Owned(types.Snapshot)) anyerror!void {
+            var s = snapshot;
+            s.deinit();
+        }
+    };
+    var nothing: u8 = 0;
+    try testing.expectError(error.InvalidArgument, h.client.runQueryEach(q, .{}, .{ .ptr = &nothing, .vtable = &.{ .document = Nothing.document } }));
+    try h.expectDiag("over the 11534336 Firestore takes");
+    try h.expectRequestCount(2);
+    try testing.expectEqual(0, h.fake.stream_requests.items.len);
 }
 
 test "commit: at most 500 transforms for one document, across writes" {
