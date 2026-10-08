@@ -418,7 +418,15 @@ jobs:
         # heavy-firestore holds the model property of writes, transforms
         # and batch reads against FakeFirestore, 8.5 ms a run on a Mac,
         # about 22 on CI: 150K for about 55 minutes. Both start below their
-        # aim, to be sized from their first nightlies.
+        # aim, to be sized from their first nightlies. Those nightlies put
+        # the Mac-to-CI ratio far off for both. firestore at 8M ran past
+        # the 180-minute timeout on 10-06 and 10-07 (runs 37448270837 and
+        # 37605764869) and took 164 minutes on 10-08 (run 37763884636),
+        # about 1.2 ms a run on CI, four times the estimate: it drops to
+        # 4M, for about 82 minutes. heavy-firestore took 8.6 minutes at
+        # 150K on 10-08, about 3.4 ms a run: it rises to 800K, for about
+        # 46 minutes, held under the aim until more nights price a corpus
+        # that only began accumulating on 10-08.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 850K }
           - { job: auth, module: auth, filter: fuzz, iterations: 500K }
@@ -434,8 +442,8 @@ jobs:
           - { job: heavy-storage, module: storage, filter: heavy property, iterations: 24K }
           - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 50K }
           - { job: fault-gzip, module: storage, filter: fault property gzip|fault property compressed, iterations: 150 }
-          - { job: firestore, module: firestore, filter: fuzz, iterations: 8M }
-          - { job: heavy-firestore, module: firestore, filter: heavy property, iterations: 150K }
+          - { job: firestore, module: firestore, filter: fuzz, iterations: 4M }
+          - { job: heavy-firestore, module: firestore, filter: heavy property, iterations: 800K }
     runs-on: ubuntu-latest
     timeout-minutes: 180
     # actions: read finds and downloads the corpus an earlier run kept.
