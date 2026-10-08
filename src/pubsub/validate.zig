@@ -569,6 +569,9 @@ test "subscription settings: each rule at its boundary" {
     try expiration(.{ .after = min_expiration }, null, &d);
     try expiration(.never, .fromSeconds(99 * 24 * 3600), &d);
     try testing.expectError(error.InvalidArgument, expiration(.{ .after = .fromSeconds(24 * 3600 - 1) }, null, &d));
+    // A ttl the wire format itself cannot carry.
+    try testing.expectError(error.InvalidArgument, expiration(.{ .after = .fromSeconds(@as(i64, @import("core").duration.max_seconds) + 1) }, null, &d));
+    try testing.expectEqualStrings("the expiration ttl is out of range", d.message());
     // No shorter than the retention it would outlive.
     try expiration(.{ .after = .fromSeconds(2 * 24 * 3600) }, .fromSeconds(2 * 24 * 3600), &d);
     try testing.expectError(error.InvalidArgument, expiration(.{ .after = .fromSeconds(2 * 24 * 3600) }, .fromSeconds(3 * 24 * 3600), &d));
@@ -629,4 +632,9 @@ test "updates: something must change, and what changes must be valid" {
     }, &d));
     try topicUpdate(.{ .kms_key_name = .clear }, &d);
     try testing.expectError(error.InvalidArgument, topicUpdate(.{ .kms_key_name = .{ .set = "nope" } }, &d));
+    // The set arms of the other two topic fields, valid and not.
+    try topicUpdate(.{ .message_retention = .{ .set = .fromSeconds(3600) } }, &d);
+    try testing.expectError(error.InvalidArgument, topicUpdate(.{ .message_retention = .{ .set = .fromSeconds(1) } }, &d));
+    try topicUpdate(.{ .message_storage_policy = .{ .set = .{ .allowed_persistence_regions = &.{"us-east1"} } } }, &d);
+    try testing.expectError(error.InvalidArgument, topicUpdate(.{ .message_storage_policy = .{ .set = .{ .allowed_persistence_regions = &.{} } } }, &d));
 }

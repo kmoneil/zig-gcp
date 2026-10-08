@@ -3034,6 +3034,30 @@ test "slow property Publisher: any script of publishes, answers, time and pauses
     });
 }
 
+test "a slow answer is still the answer" {
+    var s: Solo = undefined;
+    try s.init(.{});
+    defer s.deinit();
+    s.fake.script = &.{.{ .slow = 5 }};
+    const receipt = try s.publishText("patient");
+    defer receipt.release();
+    s.advance(10);
+    try s.publisher.sendDue();
+    try testing.expectEqualStrings("1", try idOf(receipt));
+}
+
+test "run: a canceled timer returns from its park as canceled" {
+    const io = testing.io;
+    var l: Live = undefined;
+    try l.init(.{});
+    defer l.deinit();
+    var timer = try io.concurrent(timerLoop, .{&l.publisher});
+    // Let it park on its event with no deadline, so the cancel lands in
+    // the wait rather than at the lock.
+    try io.sleep(.fromMilliseconds(25), .awake);
+    try testing.expectError(error.Canceled, timer.cancel(io));
+}
+
 test "run: when no sender can start, the timer already running is taken down and run refused" {
     // The real Io, except that group tasks, the senders, cannot start. The
     // timer, a task of its own, does start, and must be canceled again.
