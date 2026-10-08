@@ -943,6 +943,23 @@ test "decode refuses what is no value" {
     }
 }
 
+test "decoding a bytes value: every allocation failure is OutOfMemory" {
+    // Straight at valueFrom with the failing allocator: through an arena,
+    // the decoded bytes ride in the slack of the chunk the parsed text
+    // grew, and no failure can land in the decode.
+    var tree_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer tree_arena.deinit();
+    const tree = try parseTree(tree_arena.allocator(), "{\"bytesValue\":\"AP_-\"}");
+    const Run = struct {
+        fn run(gpa: Allocator, parsed: @TypeOf(tree)) !void {
+            const v = try valueFrom(gpa, parsed, 0);
+            defer gpa.free(v.bytes);
+            try testing.expectEqualSlices(u8, &.{ 0x00, 0xff, 0xfe }, v.bytes);
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{tree});
+}
+
 test "decode: nesting is bounded" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
