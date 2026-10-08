@@ -426,21 +426,35 @@ jobs:
         # 4M, for about 82 minutes. heavy-firestore took 8.6 minutes at
         # 150K on 10-08, about 3.4 ms a run: it rises to 800K, for about
         # 46 minutes, held under the aim until more nights price a corpus
-        # that only began accumulating on 10-08.
+        # that only began accumulating on 10-08. The same three nights
+        # re-price the rest (the 10-06 and 10-07 runs were cancelled by
+        # firestore's timeout, but every other job finished, so its timing
+        # stands), each count putting its worst night at about 90 minutes:
+        # core 95 at 850K drops to 800K; auth, steady at 40 at 500K, rises
+        # to 1100K; slow-auth 134 at 100K drops to 65K; pubsub 99 at 1500K
+        # and rising with its corpus drops to 1300K; slow-pubsub 56 at
+        # 1200K rises to 1900K; heavy-pubsub 78 at 8M rises to 9M;
+        # secret_manager 72 at 4500K rises to 5500K; heavy-secret_manager
+        # 48 at 80K rises to 140K; heavy-storage 108 at 24K drops to 20K;
+        # fault-storage 73 at 50K rises to 60K. slow-subscriber (80 at
+        # 65K), storage (89 at 1600K) and slow-storage (84 at 4800K) sit
+        # at the aim and stay. fault-gzip tripled across the three nights
+        # (23, 35, 66 minutes at 150) while its corpus prices itself, so
+        # it stays put, like heavy-firestore.
         include:
-          - { job: core, module: core, filter: fuzz, iterations: 850K }
-          - { job: auth, module: auth, filter: fuzz, iterations: 500K }
-          - { job: slow-auth, module: auth, filter: slow property, iterations: 100K }
-          - { job: pubsub, module: pubsub, filter: fuzz, iterations: 1500K }
-          - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1200K }
+          - { job: core, module: core, filter: fuzz, iterations: 800K }
+          - { job: auth, module: auth, filter: fuzz, iterations: 1100K }
+          - { job: slow-auth, module: auth, filter: slow property, iterations: 65K }
+          - { job: pubsub, module: pubsub, filter: fuzz, iterations: 1300K }
+          - { job: slow-pubsub, module: pubsub, filter: slow property Publisher, iterations: 1900K }
           - { job: slow-subscriber, module: pubsub, filter: slow property Subscriber, iterations: 65K }
-          - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 8M }
-          - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 4500K }
-          - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 80K }
+          - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 9M }
+          - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 5500K }
+          - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 140K }
           - { job: storage, module: storage, filter: fuzz, iterations: 1600K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 4800K }
-          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 24K }
-          - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 50K }
+          - { job: heavy-storage, module: storage, filter: heavy property, iterations: 20K }
+          - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 60K }
           - { job: fault-gzip, module: storage, filter: fault property gzip|fault property compressed, iterations: 150 }
           - { job: firestore, module: firestore, filter: fuzz, iterations: 4M }
           - { job: heavy-firestore, module: firestore, filter: heavy property, iterations: 800K }
