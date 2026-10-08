@@ -1515,6 +1515,39 @@ test "FakeSecrets: what production refuses, refused in its words" {
     try testing.expect(f.secret(null, "s").?.etag != before);
     try testing.expectEqual(200, (try f.serve(.PATCH, base ++ "/s?updateMask=labels", "{\"labels\":{\"a\":\"1\"},\"etag\":\"\"}", a)).status);
     try testing.expectEqual(200, (try f.serve(.DELETE, base ++ "/s?etag=", "", a)).status);
+
+    // Arms the client never drives, because it refuses these itself.
+    try testing.expectEqual(200, (try f.serve(.POST, base ++ "?secretId=s2", "{\"replication\":{\"automatic\":{}}}", a)).status);
+    try testing.expectEqual(501, (try f.serve(.PUT, base ++ "/s2", "{}", a)).status);
+    try testing.expectEqual(400, (try f.serve(.POST, base ++ "?secretId=x", "not json", a)).status);
+    try testing.expectEqual(400, (try f.serve(.POST, base ++ "?secretId=x", "{\"replication\":{\"automatic\":{}},\"labels\":[1]}", a)).status);
+    try testing.expectEqual(400, (try f.serve(.POST, base ++ "?secretId=x", "{\"replication\":{\"automatic\":{}},\"annotations\":[1]}", a)).status);
+    const short_delay = try f.serve(.POST, base ++ "?secretId=x", "{\"replication\":{\"automatic\":{}},\"versionDestroyTtl\":\"1s\"}", a);
+    try testing.expectEqual(400, short_delay.status);
+    try testing.expect(std.mem.indexOf(u8, short_delay.body, "at least [24h]") != null);
+    const twins = try f.serve(.PATCH, base ++ "/s2?updateMask=topics", "{\"topics\":[{\"name\":\"projects/p/topics/t\"},{\"name\":\"projects/p/topics/t\"}]}", a);
+    try testing.expectEqual(400, twins.status);
+    try testing.expect(std.mem.indexOf(u8, twins.body, "distinct names") != null);
+    try testing.expectEqual(400, (try f.serve(.PATCH, base ++ "/s2?updateMask=labels", "{\"labels\":[1]}", a)).status);
+    try testing.expectEqual(400, (try f.serve(.PATCH, base ++ "/s2?updateMask=annotations", "{\"annotations\":[1]}", a)).status);
+    try testing.expectEqual(400, (try f.serve(.PATCH, base ++ "/s2?updateMask=version_aliases", "{\"versionAliases\":[1]}", a)).status);
+    var many: std.Io.Writer.Allocating = .init(a);
+    try many.writer.writeAll("{\"labels\":{");
+    for (0..65) |i| try many.writer.print("{s}\"l{d}\":\"v\"", .{ if (i == 0) "" else ",", i });
+    try many.writer.writeAll("}}");
+    const crowded = try f.serve(.PATCH, base ++ "/s2?updateMask=labels", many.written(), a);
+    try testing.expectEqual(400, crowded.status);
+    try testing.expect(std.mem.indexOf(u8, crowded.body, "at most 64 entries") != null);
+    // User-managed replicas: a key in the wrong location, and a key
+    // missing from one replica, in production's words.
+    const wrong_loc = try f.serve(.POST, base ++ "?secretId=x", "{\"replication\":{\"userManaged\":{\"replicas\":[{\"location\":\"us-east1\"," ++
+        "\"customerManagedEncryption\":{\"kmsKeyName\":\"projects/p/locations/us-west1/keyRings/r/cryptoKeys/k\"}}]}}}", a);
+    try testing.expectEqual(400, wrong_loc.status);
+    try testing.expect(std.mem.indexOf(u8, wrong_loc.body, "can only be configured with Cloud KMS keys in location [us-east1]") != null);
+    const half_keyed = try f.serve(.POST, base ++ "?secretId=x", "{\"replication\":{\"userManaged\":{\"replicas\":[{\"location\":\"us-east1\"," ++
+        "\"customerManagedEncryption\":{\"kmsKeyName\":\"projects/p/locations/us-east1/keyRings/r/cryptoKeys/k\"}},{\"location\":\"us-west1\"}]}}}", a);
+    try testing.expectEqual(400, half_keyed.status);
+    try testing.expect(std.mem.indexOf(u8, half_keyed.body, "Missing configuration for [us-west1]") != null);
 }
 
 /// What a secret should hold after a sequence of calls, kept independently
@@ -2001,6 +2034,75 @@ fn keyConfigProperty(_: void, input: []const u8) !void {
             }
         }
     }
+}
+
+test "FakeSecrets: the arms the suites and the properties leave out" {
+    var r: Rig = undefined;
+    try r.init(null);
+    defer r.deinit();
+
+    // A create of an id that exists answers production's 409.
+    const secret = r.client.secret("twice");
+    var created = try secret.create(.{});
+    created.deinit();
+    try testing.expectError(error.AlreadyExists, secret.create(.{}));
+
+    // Topics and a rotation on the create itself, not only patched in
+    // later, and a topic that is not there named in production's words.
+    try r.fake.setTopic("projects/p/topics/missing", .missing);
+    var told = try r.client.secret("told").create(.{
+        .topics = &.{"projects/p/topics/changes"},
+        .rotation = .{ .next_time = "2026-10-02T14:00:00Z", .period_s = 86_400 },
+    });
+    defer told.deinit();
+    try testing.expectEqualStrings("projects/p/topics/changes", told.value.topics[0]);
+    try testing.expectEqualStrings("2026-10-02T14:00:00Z", told.value.rotation.?.next_time);
+    try testing.expectError(error.TopicNotPublishable, r.client.secret("lost").create(.{ .topics = &.{"projects/p/topics/missing"} }));
+    try testing.expect(std.mem.indexOf(u8, r.diag.message(), "not found") != null);
+
+    // A key gone missing refuses new versions and reads, like the
+    // disabled key the key test drives.
+    const g = "projects/p/locations/global/keyRings/r/cryptoKeys/g";
+    const keyed = r.client.secret("keyed");
+    var k = try keyed.create(.{ .kms_key = g });
+    k.deinit();
+    var v = try keyed.addVersion("one");
+    v.deinit();
+    try r.fake.setKey(g, .missing);
+    try testing.expectError(error.KeyUnavailable, keyed.addVersion("two"));
+    try testing.expectError(error.KeyUnavailable, keyed.access(.{ .number = 1 }));
+
+    // Versions that are not there answer 404: by number, to read and to
+    // destroy, and as latest when none was ever added.
+    const hollow = r.client.secret("hollow");
+    var made = try hollow.create(.{});
+    made.deinit();
+    try testing.expectError(error.NotFound, hollow.access(.latest));
+    try testing.expectError(error.NotFound, hollow.access(.{ .number = 9 }));
+    try testing.expectError(error.NotFound, hollow.version(.{ .number = 9 }).destroy());
+
+    // Regional secrets take the cmek arms of create and patch.
+    var reg: Rig = undefined;
+    try reg.init("us-east1");
+    defer reg.deinit();
+    const east = "projects/p/locations/us-east1/keyRings/r/cryptoKeys/e";
+    try reg.fake.setKey(east, .ungranted);
+    try testing.expectError(error.KeyUnavailable, reg.client.secret("r1").create(.{ .kms_key = east }));
+    var plain = try reg.client.secret("r2").create(.{});
+    plain.deinit();
+    try testing.expectError(error.KeyUnavailable, reg.client.secret("r2").update(.{ .kms_key = .{ .set = east } }));
+}
+
+test "the model's etag ring forgets the oldest, never a recent one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var m: Model = .{};
+    for (0..65) |i| try m.sawEtag(a, try a.print("\"{d}\"", .{i}));
+    try testing.expectEqual(64, m.etag_count);
+    try testing.expectEqualStrings("\"64\"", m.currentEtag());
+    // The first etag fell off the front; the second is the oldest kept.
+    try testing.expectEqualStrings("\"1\"", m.etags[0]);
 }
 
 test "heavy property key configurations: what the client sends, the server takes" {

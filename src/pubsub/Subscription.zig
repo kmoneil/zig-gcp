@@ -1082,7 +1082,11 @@ test "golden: create with settings, and update" {
         \\"deadLetterPolicy":{"deadLetterTopic":"projects/p/topics/orders-dead","maxDeliveryAttempts":5},"labels":{"team":"zig"}}
     ;
     var h: Harness = undefined;
-    try h.init(&.{ .{ .respond = .{ .body = info_body } }, .{ .respond = .{ .body = info_body } } }, .{});
+    try h.init(&.{
+        .{ .respond = .{ .body = info_body } },
+        .{ .respond = .{ .body = info_body } },
+        .{ .respond = .{ .body = info_body } },
+    }, .{});
     defer h.deinit();
     const work = h.client.subscription("work");
 
@@ -1103,13 +1107,19 @@ test "golden: create with settings, and update" {
     try h.expectRequest(1, .PATCH, base_url, "{\"subscription\":{\"ackDeadlineSeconds\":30},\"updateMask\":\"ackDeadlineSeconds,deadLetterPolicy\"}");
     try testing.expectEqual(30, updated.value.ack_deadline_seconds);
 
+    // A dead-letter topic set by an update is named the same way the
+    // create above named its.
+    var redirected = try work.update(.{ .dead_letter_policy = .{ .set = .{ .topic = "orders-dead-2" } } });
+    defer redirected.deinit();
+    try h.expectRequest(2, .PATCH, base_url, "{\"subscription\":{\"deadLetterPolicy\":{\"deadLetterTopic\":\"projects/p/topics/orders-dead-2\",\"maxDeliveryAttempts\":5}},\"updateMask\":\"deadLetterPolicy\"}");
+
     // Refused before any request: nothing to change, a label the server
     // would refuse, a filter over its limit.
     try testing.expectError(error.InvalidArgument, work.update(.{}));
     try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .labels = &.{.{ .key = "Bad", .value = "" }} }));
     try testing.expectError(error.InvalidArgument, work.create(.{ .topic_id = "orders", .filter = test_util.repeat("x", 257) }));
     try testing.expectError(error.InvalidResourceId, h.client.subscription("s").update(.{ .ack_deadline_seconds = 10 }));
-    try h.expectRequestCount(2);
+    try h.expectRequestCount(3);
 }
 
 test "create and update with settings: every allocation failure is OutOfMemory without leaks" {
