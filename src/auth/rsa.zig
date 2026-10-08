@@ -470,6 +470,9 @@ fn wrappedProperty(_: void, input: []const u8) !void {
 
 test "fuzz rsa: arbitrary PEM input never crashes" {
     try test_util.fuzzBytes({}, pemProperty, .{ .corpus = &.{
+        // The whole key, so the property's success arm runs on the
+        // corpus alone, not only when mutation stumbles into a key.
+        test_key_2048,
         test_key_2048[0..64],
         "-----BEGIN RSA PRIVATE KEY-----\nMA==\n-----END RSA PRIVATE KEY-----",
         "-----BEGIN PRIVATE KEY-----\n\n-----END PRIVATE KEY-----",

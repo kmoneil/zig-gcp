@@ -473,3 +473,29 @@ fn signWithFailingAllocations(gpa: Allocator) !void {
 test "IamSigner: every allocation failure is OutOfMemory, and nothing leaks" {
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, signWithFailingAllocations, .{});
 }
+
+test "IamSigner: without a transport it builds and frees its own" {
+    // No request is ever sent: init and deinit only.
+    var token: test_util.FakeTokenProvider = .{};
+    var iam: IamSigner = try .init(testing.allocator, testing.io, .{
+        .service_account = account_email,
+        .token_provider = token.provider(),
+    });
+    iam.deinit();
+}
+
+test "IamSigner: init without a transport survives every allocation failure" {
+    // The sweep above passes a fake transport, so the built-in one's
+    // creation and the errdefer freeing the user agent never run there.
+    const Run = struct {
+        fn init(gpa: Allocator) !void {
+            var token: test_util.FakeTokenProvider = .{};
+            var iam: IamSigner = try .init(gpa, testing.io, .{
+                .service_account = account_email,
+                .token_provider = token.provider(),
+            });
+            iam.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.init, .{});
+}
