@@ -780,6 +780,13 @@ test "uploadFile: a checkpoint of another transfer, or one unreadable, is refuse
     var garbage: MemoryCheckpoint = .{ .gpa = testing.allocator, .stored = try testing.allocator.dupe(u8, "~/.gsutil/tracker") };
     defer garbage.deinit();
     try testing.expectError(error.CheckpointFailed, client.bucket("b").object("o").uploadFile(file, .{ .checkpoint = garbage.checkpoint() }));
+
+    // One that cannot even be read fails the same way, said differently.
+    var unreadable: MemoryCheckpoint = .{ .gpa = testing.allocator, .fail_loads = true };
+    defer unreadable.deinit();
+    try testing.expectError(error.CheckpointFailed, client.bucket("b").object("o").uploadFile(file, .{ .checkpoint = unreadable.checkpoint() }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "could not be read") != null);
+
     try testing.expectEqual(0, fake.counts.session_starts);
     try testing.expectEqual(0, fake.counts.session_puts);
 }
@@ -897,6 +904,12 @@ test "abandonTransfer: each kind of checkpoint, an empty one, and garbage" {
     saved.stored = try testing.allocator.dupe(u8, "not a state");
     try testing.expectError(error.CheckpointFailed, client.abandonTransfer(saved.checkpoint()));
     try testing.expect(saved.stored != null);
+
+    // One that cannot even be read is the same error, said differently.
+    saved.fail_loads = true;
+    try testing.expectError(error.CheckpointFailed, client.abandonTransfer(saved.checkpoint()));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "could not be read") != null);
+    saved.fail_loads = false;
 }
 
 test "the uploadFile checkpoint's session URL reaches neither the log nor the diagnostics" {

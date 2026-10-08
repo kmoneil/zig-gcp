@@ -600,6 +600,17 @@ test "requests: a list first, then the body and its token, each billed when the 
     try h.expectRequestCount(6);
 }
 
+test "a create whose answer does not decode is InvalidResponse, and leaks nothing" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = empty_list } },
+        .{ .respond = .{ .body = "[]" } },
+    }, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidResponse, h.client.bucket("zigps-ntf").createNotification(minimal));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "notification") != null);
+}
+
 fn clientOnFake(fake: *test_util.FakeMultipart, token: *core.StaticToken, diag: *core.Diagnostics) !Client {
     return .init(testing.allocator, fake.io, .{
         .project_id = "extractctl",
