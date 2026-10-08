@@ -316,6 +316,22 @@ test "splits an array into its elements, however it is cut into writes" {
     try expectElements("[[],[[]],{}]", &.{ "[]", "[[]]", "{}" });
 }
 
+test "a vectored write is scanned segment by segment, its pattern as often as splatted" {
+    var c: Collect = .init(testing.allocator);
+    defer c.deinit();
+    var s: JsonArraySplitter = .init(testing.allocator, c.handler(), 1 << 20);
+    defer s.deinit();
+    var pieces = [_][]const u8{ "[{\"a\":[1,", "2]}", ",\"b]\"" };
+    try s.writer.writeVecAll(&pieces);
+    var pattern = [_][]const u8{",null"};
+    try s.writer.writeSplatAll(&pattern, 2);
+    try s.writer.writeAll("]");
+    try s.finish();
+    try testing.expectEqual(4, c.elements.items.len);
+    for ([_][]const u8{ "{\"a\":[1,2]}", "\"b]\"", "null", "null" }, c.elements.items) |e, got|
+        try testing.expectEqualStrings(e, got);
+}
+
 test "framing that is no array is refused, and the failure stays" {
     for ([_][]const u8{
         "", "{}", "x", "[", "[1", "[1,", "[1,]", "[,1]", "[1 2]", "[{}{}]", "[{}", "[\"a", "[{\"a\":\"}", "[]]", "[] x", "[}]", "[:]", "[1]2",

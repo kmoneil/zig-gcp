@@ -369,6 +369,12 @@ test "fieldsProblem: a long path is shortened, never overflows" {
     var tiny: [16]u8 = undefined;
     const problem = fieldsProblem(&.{.{ .name = "abcdefghij", .value = .{ .map = &.{.{ .name = "klmnopqrst", .value = .{ .string = "\xff" } }} } }}, &tiny).?;
     try testing.expect(std.mem.endsWith(u8, problem.where, "..."));
+    // A name whose raw length fits the room but whose backtick quoting
+    // does not: the path stops where the room ends, and the problem is
+    // still found.
+    const quoted = fieldsProblem(&.{.{ .name = "\\\\\\\\\\\\\\\\", .value = .{ .string = "\xff" } }}, &tiny).?;
+    try testing.expect(quoted.where.len <= tiny.len);
+    try testing.expect(std.mem.indexOf(u8, quoted.what, "UTF-8") != null);
 }
 
 test "golden: documentSize is production's count, to the byte, for every kind of value" {

@@ -273,6 +273,25 @@ test "runQueryEach: the handler's error stops the read and is returned" {
     try testing.expectEqual(1, h.fake.stream_requests.items.len);
 }
 
+test "runQueryEach: a handler out of memory is said as such in the diagnostics" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .body = test_util.streamed(&.{queryDoc("c/a")}) } }}, .{});
+    defer h.deinit();
+    const Starved = struct {
+        fn document(_: *anyopaque, snapshot: types.Owned(types.Snapshot)) anyerror!void {
+            var s = snapshot;
+            s.deinit();
+            return error.OutOfMemory;
+        }
+    };
+    var starved: u8 = 0;
+    try testing.expectError(error.OutOfMemory, h.client.runQueryEach(.{ .from = .{ .collection = "c" } }, .{}, .{
+        .ptr = &starved,
+        .vtable = &.{ .document = Starved.document },
+    }));
+    try h.expectDiag("out of memory reading the runQuery answer");
+}
+
 test "runQueryEach: a status is retried; a dropped connection only before the first document" {
     const answer = test_util.streamed(&.{ "{\"readTime\":\"2026-10-05T22:28:44.615753Z\",\"skippedResults\":1}", queryDoc("c/a"), queryDoc("c/b") });
     // Inside the first document, after the read time alone.
