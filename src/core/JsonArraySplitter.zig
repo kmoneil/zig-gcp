@@ -526,5 +526,17 @@ test "fuzz JsonArraySplitter: the elements of a whole parse, cut anywhere, or a 
         "\x00\x00\x00\x00",
         "\x10\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11",
         "\x05\x07\x01\x08\x01\x00\x01",
+        // Drawn as the four bytes "[tx]": framing that holds while the
+        // element fails to parse alone.
+        "\x00\x00\x00\x00\x00\x00\x00\x04" ++
+            "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+            "\x00\x00\x00\x00\x00\x00\x00\x0f" ++
+            "\x00\x00\x00\x00\x00\x00\x00\x12" ++
+            "\x00\x00\x00\x00\x00\x00\x00\x01" ++
+            "\x01",
     } });
+}
+
+test "reference reports running out of memory instead of refusing the text" {
+    try testing.expectError(error.OutOfMemory, reference(testing.failing_allocator, "[1]"));
 }

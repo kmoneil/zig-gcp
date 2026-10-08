@@ -548,6 +548,22 @@ test "AuthorizedUser: init refuses a bad retry policy, cache setting or user age
         "{\"type\":\"service_account\",\"client_email\":\"e@p\",\"private_key\":\"SECRET\"}",
         .{},
     ));
+    // The other two credential types, each pointed at its own door.
+    var diag: Diagnostics = .{};
+    try testing.expectError(error.UnsupportedCredentialType, AuthorizedUser.initFromJson(
+        testing.allocator,
+        io,
+        "{\"type\":\"external_account\",\"audience\":\"a\",\"subject_token_type\":\"t\",\"credential_source\":{\"file\":\"/t\"}}",
+        .{ .diagnostics = &diag },
+    ));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "use ExternalAccount") != null);
+    try testing.expectError(error.UnsupportedCredentialType, AuthorizedUser.initFromJson(
+        testing.allocator,
+        io,
+        "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken\",\"source_credentials\":{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"}}",
+        .{ .diagnostics = &diag },
+    ));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "use ImpersonatedServiceAccount") != null);
 }
 
 test "AuthorizedUser: secrets reach neither the log nor Diagnostics" {

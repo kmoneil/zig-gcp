@@ -715,11 +715,38 @@ test "ImpersonatedServiceAccount: quota project, and the file types it refuses" 
 
     try testing.expectError(error.UnsupportedCredentialType, ImpersonatedServiceAccount.initFromJson(testing.allocator, testing.io, user_source, options));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "use AuthorizedUser") != null);
+    try testing.expectError(error.UnsupportedCredentialType, ImpersonatedServiceAccount.initFromJson(
+        testing.allocator,
+        testing.io,
+        "{\"type\":\"service_account\",\"client_email\":\"e@p.iam.gserviceaccount.com\",\"private_key\":\"k\"}",
+        options,
+    ));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "use ServiceAccount") != null);
+    try testing.expectError(error.UnsupportedCredentialType, ImpersonatedServiceAccount.initFromJson(
+        testing.allocator,
+        testing.io,
+        "{\"type\":\"external_account\",\"audience\":\"a\",\"subject_token_type\":\"t\",\"credential_source\":{\"file\":\"/t\"}}",
+        options,
+    ));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "use ExternalAccount") != null);
     try testing.expectError(error.InvalidCredentialsFile, ImpersonatedServiceAccount.initFromJson(testing.allocator, testing.io, fileJson("https://x/sa:generateToken", user_source, ""), options));
     try testing.expectError(error.UnsupportedCredentialType, ImpersonatedServiceAccount.initFromJson(testing.allocator, testing.io, fileJson(google_url, "{\"type\": \"external_account\"}", ""), options));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "only authorized_user and service_account") != null);
 
     var bad = options;
+    bad.retry = .{ .max_attempts = 0 };
+    try testing.expectError(error.InvalidOptions, ImpersonatedServiceAccount.initFromJson(testing.allocator, testing.io, user_file, bad));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "max_attempts") != null);
+    bad = options;
+    bad.user_agent = "agent\x01";
+    try testing.expectError(error.InvalidOptions, ImpersonatedServiceAccount.initFromJson(testing.allocator, testing.io, user_file, bad));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "printable ASCII") != null);
+    bad = options;
+    bad.cache = .{ .refresh_margin_s = 300 };
+    try testing.expectError(error.InvalidOptions, ImpersonatedServiceAccount.initFromJson(testing.allocator, testing.io, user_file, bad));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "refresh_margin_s") != null);
+
+    bad = options;
     bad.iam_endpoint = "http://iamcredentials.example.com";
     try testing.expectError(error.InvalidOptions, ImpersonatedServiceAccount.initFromJson(testing.allocator, testing.io, user_file, bad));
     bad = options;
@@ -766,6 +793,24 @@ test "ImpersonatedServiceAccount: every block it frees is wiped first" {
     account.deinit();
     try testing.expect(checker.frees > 0);
     try testing.expectEqual(0, checker.unwiped);
+}
+
+test "ImpersonatedServiceAccount: without a transport it builds and frees its own" {
+    // No request is ever sent: init and deinit only.
+    var account: ImpersonatedServiceAccount = try .initFromJson(testing.allocator, testing.io, user_file, .{});
+    account.deinit();
+}
+
+test "ImpersonatedServiceAccount: init without a transport survives every allocation failure" {
+    // The sweep below passes a fake transport, so the built-in one's
+    // creation and the errdefer that destroys it never run there.
+    const Run = struct {
+        fn init(gpa: Allocator) !void {
+            var account: ImpersonatedServiceAccount = try .initFromJson(gpa, testing.io, user_file, .{});
+            account.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.init, .{});
 }
 
 test "ImpersonatedServiceAccount: every allocation failure is OutOfMemory without leaks" {

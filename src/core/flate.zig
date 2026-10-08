@@ -86,6 +86,14 @@ fn anyInput(_: void, input: []const u8) !void {
     }
 }
 
+test "decompressAll: the destination failing is WriteFailed, not a bad stream" {
+    const gz = try gzipAlloc("the window has to write something for the destination to refuse");
+    defer testing.allocator.free(gz);
+    var out: std.Io.Writer.Allocating = .init(testing.failing_allocator);
+    defer out.deinit();
+    try testing.expectError(error.WriteFailed, decompressAll(.gzip, gz, &out));
+}
+
 test "fuzz flate: any bytes, as gzip, zlib or raw deflate, decompress or are refused" {
     try test_util.fuzzBytes({}, anyInput, .{
         .corpus = &.{

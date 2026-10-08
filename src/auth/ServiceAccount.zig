@@ -740,6 +740,52 @@ test "ServiceAccount: init refuses what cannot work, and says why" {
     try testing.expectError(error.InvalidOptions, ServiceAccount.initFromJson(testing.allocator, io, json, .{ .retry = .{ .max_attempts = 0 } }));
     try testing.expectError(error.InvalidOptions, ServiceAccount.initFromJson(testing.allocator, io, json, .{ .cache = .{ .refresh_margin_s = 300 } }));
     try testing.expectError(error.InvalidOptions, ServiceAccount.initFromJson(testing.allocator, io, json, .{ .user_agent = "a\r\nX: y" }));
+
+    // The other two credential types, each pointed at its own door.
+    try testing.expectError(error.UnsupportedCredentialType, ServiceAccount.initFromJson(
+        testing.allocator,
+        io,
+        "{\"type\":\"external_account\",\"audience\":\"a\",\"subject_token_type\":\"t\",\"credential_source\":{\"file\":\"/t\"}}",
+        .{ .diagnostics = &diag },
+    ));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "use ExternalAccount") != null);
+    try testing.expectError(error.UnsupportedCredentialType, ServiceAccount.initFromJson(
+        testing.allocator,
+        io,
+        "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken\",\"source_credentials\":{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"}}",
+        .{ .diagnostics = &diag },
+    ));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "use ImpersonatedServiceAccount") != null);
+}
+
+test "ServiceAccount: a corrupt key fails signing loudly, not wrongly" {
+    var h: Harness = undefined;
+    try h.init(&.{});
+    defer h.deinit();
+    // A flipped bit in the private exponent: parsing cannot see it, and
+    // the self-check against the public key catches it before anything
+    // signed with it could leave.
+    h.account.key.d[0] ^= 1;
+    try testing.expectError(error.SigningFailed, h.account.signer().sign(h.clock.io(), h.arena.allocator(), "message"));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "does not verify against itself") != null);
+    try testing.expectError(error.TokenUnavailable, h.get());
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "JWT") != null);
+    try testing.expectEqual(0, h.fake.requests.items.len);
+}
+
+test "ServiceAccount: init without a transport survives every allocation failure" {
+    // The sweep below passes a fake transport, so the built-in one's
+    // creation never fails there. No request is ever sent.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const json = try keyFileJson(arena.allocator(), rsa.test_key_1024, false);
+    const Run = struct {
+        fn init(gpa: Allocator, cred: []const u8) !void {
+            var account: ServiceAccount = try .initFromJson(gpa, testing.io, cred, .{});
+            account.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.init, .{json});
 }
 
 test "ServiceAccount: an explicit token_url wins over the file's token_uri" {
