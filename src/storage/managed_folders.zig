@@ -290,6 +290,43 @@ test "a create whose answer was lost is read back, not sent again" {
     try testing.expectEqual(0, h.diag.message().len);
 }
 
+test "a lost create whose read-back fails says it may exist, and NotFound tries again" {
+    // The read-back fails with neither NotFound nor a reason to stop:
+    // the create's own error comes back, with both failures named.
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .status = 503, .body = "{}" } },
+        .{ .respond = .{ .status = 403, .body = "{\"error\":{\"code\":403,\"message\":\"no\",\"errors\":[{\"reason\":\"forbidden\"}]}}" } },
+    }, .{ .retry = .{ .max_attempts = 3, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer h.deinit();
+    try testing.expectError(error.Unavailable, h.client.bucket("zigps-mf").managedFolder("m1/").create());
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "it may exist") != null);
+    try h.expectRequestCount(2);
+
+    // NotFound from the read-back means it never landed: the create goes
+    // out again, and the attempts run out on the create's error.
+    var again: test_util.Harness = undefined;
+    try again.init(&.{
+        .{ .respond = .{ .status = 503, .body = "{}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"x\",\"errors\":[{\"reason\":\"notFound\"}]}}" } },
+        .{ .respond = .{ .body = managed_answer } },
+    }, .{ .retry = .{ .max_attempts = 2, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer again.deinit();
+    var made = try again.client.bucket("zigps-mf").managedFolder("m1/").create();
+    made.deinit();
+    try again.expectRequestCount(3);
+
+    // With one attempt allowed, the NotFound read-back is the end of it.
+    var once: test_util.Harness = undefined;
+    try once.init(&.{
+        .{ .respond = .{ .status = 503, .body = "{}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"x\",\"errors\":[{\"reason\":\"notFound\"}]}}" } },
+    }, .{ .retry = .{ .max_attempts = 1, .initial_backoff_ms = 1, .max_backoff_ms = 2 } });
+    defer once.deinit();
+    try testing.expectError(error.Unavailable, once.client.bucket("zigps-mf").managedFolder("m1/").create());
+    try once.expectRequestCount(2);
+}
+
 const FakeBuckets = @import("fake_buckets.zig").FakeBuckets;
 
 const Fixture = struct {

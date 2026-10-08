@@ -337,6 +337,12 @@ test "text: entities, character references, CDATA and comments" {
     try testing.expectEqualStrings("xy", root.childText("d").?);
     try testing.expectEqualStrings("", root.childText("e").?);
     try testing.expectEqualStrings("ns", root.childText("f").?);
+
+    // A comment before the root, and a processing instruction inside it.
+    const commented = try parse(arena.allocator(), "<!-- c --><r>t</r>");
+    try testing.expectEqualStrings("t", commented.text);
+    const instructed = try parse(arena.allocator(), "<r>a<?pi x?>b</r>");
+    try testing.expectEqualStrings("ab", instructed.text);
 }
 
 test "refused: everything that is not a plain, well-formed document" {

@@ -440,6 +440,34 @@ test "init rejects bad options before allocating" {
         .user_agent = "agent\r\nX: y",
         .diagnostics = &diag,
     }));
+    try testing.expectError(error.InvalidChunkSize, Client.init(gpa, testing.io, .{
+        .token_provider = token.provider(),
+        .chunk_size = 1,
+        .diagnostics = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "256 KiB") != null);
+
+    // The endpoint check allocates on success, so it gets a real
+    // allocator and a URL no endpoint accepts.
+    try testing.expectError(error.InvalidEndpoint, Client.init(testing.allocator, testing.io, .{
+        .token_provider = token.provider(),
+        .endpoint = .{ .url = "ftp://host" },
+        .diagnostics = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "scheme://host") != null);
+}
+
+test "a list answer that does not decode is InvalidResponse, and leaks nothing" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body = "[" } },
+        .{ .respond = .{ .body = "[" } },
+    }, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidResponse, h.client.listBuckets(.{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "bucket list") != null);
+    try testing.expectError(error.InvalidResponse, h.client.listHmacKeys(.{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "HMAC key list") != null);
 }
 
 test "init: production needs credentials; an emulator refuses to see them" {

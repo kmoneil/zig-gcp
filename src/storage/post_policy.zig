@@ -907,6 +907,37 @@ test "postPolicy: a clock before 1970 is refused" {
     try testing.expectEqual(0, h.signer.calls);
 }
 
+test "postPolicy: a policy that would outlive the year 9999 is refused" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator, null);
+    defer h.deinit();
+    // Ten seconds before the last carryable moment: the timestamp still
+    // prints, and the expiry ten minutes later does not.
+    h.clock.now_ns = (253_402_300_799 - 10) * std.time.ns_per_s;
+    try testing.expectError(error.InvalidPostPolicyOptions, h.sign("photos", .{
+        .expires_in_s = 600,
+        .key = .{ .exact = "o" },
+    }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "after the year 9999") != null);
+}
+
+test "check: a prefix longer than an object name, and a condition without a field" {
+    var h: Harness = undefined;
+    try h.init(testing.allocator, null);
+    defer h.deinit();
+    try testing.expectError(error.InvalidPostPolicyOptions, h.sign("photos", .{
+        .expires_in_s = 600,
+        .key = .{ .starts_with = test_util.repeat("a", validate.max_object_name_len + 1) },
+    }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "longer than an object name") != null);
+    try testing.expectError(error.InvalidPostPolicyOptions, h.sign("photos", .{
+        .expires_in_s = 600,
+        .key = .{ .exact = "o" },
+        .conditions = &.{.{ .starts_with = .{ .field = "", .prefix = "p" } }},
+    }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "has no field name") != null);
+}
+
 test "postPolicy: the log names the bucket and key, never the document or the signature" {
     var h: Harness = undefined;
     try h.init(testing.allocator, null);

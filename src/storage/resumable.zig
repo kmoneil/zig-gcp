@@ -1139,6 +1139,54 @@ test "a dead session fails a reader, whose bytes are gone" {
     );
 }
 
+test "a session answer without a Location header is an invalid response" {
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .status = 200, .body = "" } }}, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+    try testing.expectError(error.InvalidResponse, h.client.bucket("b").object("backup.tar").upload(data, .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "no Location header") != null);
+}
+
+test "a 308 claiming more than was ever sent is refused, and the session cancelled" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        opened,
+        kept(2 * chunk_size - 1),
+        .{ .respond = .{ .status = 204, .body = "" } },
+    }, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+    // One chunk went out; the answer claims two were stored. No server
+    // can hold bytes that were never sent, and believing it would read
+    // past the source.
+    try testing.expectError(error.InvalidResponse, h.client.bucket("b").object("backup.tar").upload(data, .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "more than the") != null);
+    const cancel = try h.fake.streamRequest(2);
+    try testing.expectEqual(.DELETE, cancel.method);
+}
+
+test "a 308 moving backwards past a reader's resend point loses the session" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        opened,
+        kept(chunk_size - 1),
+        kept(chunk_size / 2 - 1),
+        .{ .respond = .{ .status = 204, .body = "" } },
+    }, resumableOptions());
+    defer h.deinit();
+    const data = try testData(testing.allocator, 600 * 1024);
+    defer testing.allocator.free(data);
+    var reader: std.Io.Reader = .fixed(data);
+    // The server forgot bytes the reader cannot make again: as good as a
+    // lost session, and this one still exists, so it is cancelled.
+    try testing.expectError(error.UploadSessionLost, h.client.bucket("b").object("backup.tar").uploadFrom(&reader, .{}));
+    const cancel = try h.fake.streamRequest(3);
+    try testing.expectEqual(.DELETE, cancel.method);
+}
+
 test "unknown size: chunks say /*, and a boundary end finishes with an empty PUT" {
     var h: Harness = undefined;
     try h.init(&.{ opened, kept(chunk_size - 1), finishedAt(chunk_size) }, resumableOptions());
