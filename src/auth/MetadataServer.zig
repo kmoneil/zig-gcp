@@ -742,7 +742,12 @@ const signed: Reply = .{ .respond = .{ .body = "{\"keyId\":\"k1\",\"signedBlob\"
 
 test "MetadataServer: email reads the attached account, and refuses what is not one" {
     var h: Harness = undefined;
-    try h.init(&.{ email_ok, .{ .respond = .{ .body = "not an email", .headers = flavor } } });
+    try h.init(&.{
+        email_ok,
+        .{ .respond = .{ .body = "not an email", .headers = flavor } },
+        .{ .respond = .{ .status = 404, .body = "Not Found", .headers = flavor } },
+        .{ .respond = .{ .status = 403, .body = "Forbidden", .headers = flavor } },
+    });
     defer h.deinit();
     try testing.expectEqualStrings("worker@my-project.iam.gserviceaccount.com", try h.metadata.email(h.clock.io(), h.arena.allocator()));
     const req = try h.fake.request(0);
@@ -750,6 +755,9 @@ test "MetadataServer: email reads the attached account, and refuses what is not 
     try testing.expectEqualStrings("Google", req.header("Metadata-Flavor").?);
     try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
     try testing.expect(std.mem.indexOf(u8, h.diag.message(), "email is not one") != null);
+    // Even a refusal is only ever "no metadata server to read this from".
+    try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
+    try testing.expectError(error.MetadataUnavailable, h.metadata.email(h.clock.io(), h.arena.allocator()));
 }
 
 test "MetadataServer: the signer asks for its email once, then signs through IAM with the server's token" {

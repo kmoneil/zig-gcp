@@ -804,13 +804,19 @@ fn arbitraryProperty(_: void, input: []const u8) !void {
 }
 
 test "fuzz adc_file: arbitrary input never crashes" {
-    try test_util.fuzzBytes({}, arbitraryProperty, .{ .corpus = &.{
-        "{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"}",
-        "{\"type\":\"authorized_user\",\"type\":\"service_account\"}",
-        "{\"type\":null}",
-        "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken\",\"source_credentials\":{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"},\"delegates\":[]}",
-        "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"x/a:generateAccessToken\",\"source_credentials\":{\"type\":\"impersonated_service_account\"}}",
-    } });
+    try test_util.fuzzBytes({}, arbitraryProperty, .{
+        .corpus = &.{
+            "{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"}",
+            // One whole file of each remaining kind, so the property's
+            // success arms run on the corpus alone.
+            "{\"type\":\"service_account\",\"client_email\":\"e@p.iam.gserviceaccount.com\",\"private_key\":\"k\"}",
+            "{\"type\":\"external_account\",\"audience\":\"a\",\"subject_token_type\":\"t\",\"credential_source\":{\"file\":\"/t\"}}",
+            "{\"type\":\"authorized_user\",\"type\":\"service_account\"}",
+            "{\"type\":null}",
+            "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken\",\"source_credentials\":{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"},\"delegates\":[]}",
+            "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"x/a:generateAccessToken\",\"source_credentials\":{\"type\":\"impersonated_service_account\"}}",
+        },
+    });
 }
 
 /// Each field of a generated file: absent, empty, or with a value.

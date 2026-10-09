@@ -577,6 +577,27 @@ test "signBlob: each answer says what to do next" {
     }
 }
 
+test "decodeSignature: running out of memory is OutOfMemory, in the parse and in the decode" {
+    // In the parse: the escape forces it to allocate the string.
+    switch (decodeSignature(testing.failing_allocator, "{\"signedBlob\":\"Q\\u0051\"}", null)) {
+        .fail => |err| try testing.expectEqual(error.OutOfMemory, err),
+        else => return error.TestExpectedOutOfMemory,
+    }
+    // In the base64 decode: a plain string parses as a view of the body,
+    // but the parse still allocates its scanner state, so walk the first
+    // few failure indexes; one of them is the decode's output buffer.
+    for (0..4) |fail| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = fail });
+        switch (decodeSignature(failing.allocator(), signed_body, null)) {
+            .signature => |s| try testing.expect(s.len >= 128),
+            .fail => |err| try testing.expectEqual(error.OutOfMemory, err),
+            else => return error.TestUnexpectedOutcome,
+        }
+    }
+}
+
 test "isEmail and isDelegate" {
     try testing.expect(isEmail(target));
     try testing.expect(!isEmail("123456789012345678901"));

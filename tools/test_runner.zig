@@ -23,9 +23,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-//! Zig 0.17.0's test runner (lib/compiler/test_runner.zig), with one change:
-//! `std_options_debug_io` below, which makes `std.debug`'s futex waits
-//! uncancelable.
+//! Zig 0.17.0's test runner (lib/compiler/test_runner.zig), with two
+//! changes: `std_options_debug_io` below, which makes `std.debug`'s futex
+//! waits uncancelable, and `runner_test_run` putting the fuzzed tests'
+//! `testing.io` on the runner's gpa, which outlives the per-input swaps of
+//! `testing.allocator_instance` (see the comment there).
 //!
 //! `std.testing.allocator` is a `std.heap.SafeAllocator`, which records a
 //! stack trace for every allocation. On macOS, capturing one locks the
@@ -506,7 +508,16 @@ var fuzz_runner: if (builtin.fuzz) struct {
         defer if (testing.allocator_instance.deinit() != 0) std.process.exit(1);
         is_fuzz_test = false;
 
-        testing.io_instance = .init(testing.allocator, .{
+        // On the runner's gpa, not testing.allocator: this io and its
+        // workers live across fuzz inputs, while `fuzz` below swaps and
+        // leak-checks testing.allocator_instance per input. A group task
+        // frees itself only after signaling its awaiter (Threaded.zig's
+        // Group.Task.start), so a test's last task can still hold its
+        // allocation when the test returns; an input's leak check then
+        // takes it for a leak, and the late free lands in the next
+        // input's allocator state and panics. The nightly fault-storage
+        // job hit that once in 263K runs on 2026-10-09.
+        testing.io_instance = .init(fuzz_runner.gpa, .{
             .argv0 = fuzz_runner.threaded_io.argv0,
             .environ = fuzz_runner.threaded_io.environ.process_environ,
         });
