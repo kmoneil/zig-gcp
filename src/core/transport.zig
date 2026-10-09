@@ -1683,6 +1683,31 @@ fn dechunkRoundTrip(_: void, input: []const u8) !void {
     try testing.expectError(error.ConnectionResetByPeer, dechunk(gpa, encoded.written()[0..cut], 1024));
 }
 
+test "Dechunker: the destination failing is WriteFailed, not a framing error" {
+    var in: std.Io.Reader = .fixed("5\r\nhello\r\n0\r\n\r\n");
+    var buffer: [64]u8 = undefined;
+    var d: Dechunker = .init(&in, &buffer, 1024);
+    const Failing = struct {
+        fn drain(_: *std.Io.Writer, _: []const []const u8, _: usize) std.Io.Writer.Error!usize {
+            return error.WriteFailed;
+        }
+    };
+    var out: std.Io.Writer = .{ .buffer = &.{}, .vtable = &.{ .drain = Failing.drain } };
+    try testing.expectError(error.WriteFailed, d.interface.stream(&out, .unlimited));
+    // The caller's side failed, not the connection: nothing recorded.
+    try testing.expectEqual(null, d.err);
+}
+
+test "ForwardWriter forwards every slice of a vectored write" {
+    var list: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer list.deinit();
+    var forward: ForwardWriter = .init(&list.writer, &.{});
+    var pieces = [_][]const u8{ "one,", "two,", "three" };
+    try forward.writer.writeVecAll(&pieces);
+    try forward.writer.flush();
+    try testing.expectEqualStrings("one,two,three", list.written());
+}
+
 test "fuzz Dechunker: encoded data decodes exactly; every prefix is a dropped connection" {
     try test_util.fuzzBytes({}, dechunkRoundTrip, .{ .corpus = &.{
         "\x00\x05hello\x00\x03\x01",
@@ -2220,6 +2245,58 @@ test "sendStream: a streamed body cut short is a dropped connection, and the wri
     // Delivered bytes stay delivered; a resuming download counts them
     // through its own counting writer.
     try testing.expectEqualStrings("partial data", out.buffered());
+}
+
+test "sendStream: a chunked body cut mid-chunk still flushes what arrived to the writer" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab",
+    });
+    defer server.deinit(io);
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var buf: [128]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    // Unlike a Content-Length body, whose truncation shows as a quiet end
+    // of stream after the loop, a cut inside a chunk fails the read
+    // itself, and that arm must still hand over what the loop forwarded.
+    try testing.expectError(error.ConnectionResetByPeer, ht.transport().sendStream(.{
+        .method = .GET,
+        .url = server.url(&buf, "/a"),
+        .sink = .{ .writer = &out },
+    }, arena.allocator()));
+    try testing.expectEqualStrings("ab", out.buffered());
+}
+
+test "sendStream: the server hanging up mid-upload is a dropped connection" {
+    const io = testing.io;
+    var server: ScriptedServer = try .start(io, &.{});
+    defer server.deinit(io);
+    server.close_on_accept = true;
+    var serving = try io.concurrent(ScriptedServer.run, .{ &server, io });
+    defer _ = serving.cancel(io) catch {};
+
+    var ht: HttpTransport = .init(testing.allocator, io, "t");
+    defer ht.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // Big enough that the kernel cannot hold it all: the write itself has
+    // to fail, not the read of an answer that never comes.
+    const big = try testing.allocator.alloc(u8, 8 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.ConnectionResetByPeer, ht.transport().sendStream(.{
+        .method = .POST,
+        .url = server.url(&buf, "/up"),
+        .body = .{ .segments = &.{big} },
+    }, arena.allocator()));
 }
 
 test "sendStream: the head is readable even when the body is cut short" {
