@@ -437,10 +437,14 @@ jobs:
         # secret_manager 72 at 4500K rises to 5500K; heavy-secret_manager
         # 48 at 80K rises to 140K; heavy-storage 108 at 24K drops to 20K;
         # fault-storage 73 at 50K rises to 60K. slow-subscriber (80 at
-        # 65K), storage (89 at 1600K) and slow-storage (84 at 4800K) sit
-        # at the aim and stay. fault-gzip tripled across the three nights
-        # (23, 35, 66 minutes at 150) while its corpus prices itself, so
-        # it stays put, like heavy-firestore.
+        # 65K) and slow-storage (84 at 4800K) sit at the aim and stay.
+        # storage sat there too (89 at 1600K), then overran the timeout
+        # on 10-09 (run 37917833904) after its corpus grew to 3303 files:
+        # it drops to 800K, priced from the only bound that night gives
+        # (over 6.8 ms a run), until more nights price the corpus.
+        # fault-gzip tripled across the three nights (23, 35, 66 minutes
+        # at 150) while its corpus prices itself, so it stays put, like
+        # heavy-firestore.
         include:
           - { job: core, module: core, filter: fuzz, iterations: 800K }
           - { job: auth, module: auth, filter: fuzz, iterations: 1100K }
@@ -451,7 +455,7 @@ jobs:
           - { job: heavy-pubsub, module: pubsub, filter: heavy property, iterations: 9M }
           - { job: secret_manager, module: secret_manager, filter: fuzz, iterations: 5500K }
           - { job: heavy-secret_manager, module: secret_manager, filter: heavy property, iterations: 140K }
-          - { job: storage, module: storage, filter: fuzz, iterations: 1600K }
+          - { job: storage, module: storage, filter: fuzz, iterations: 800K }
           - { job: slow-storage, module: storage, filter: slow property, iterations: 4800K }
           - { job: heavy-storage, module: storage, filter: heavy property, iterations: 20K }
           - { job: fault-storage, module: storage, filter: fault property parallel|fault property uploadFile resume, iterations: 60K }
