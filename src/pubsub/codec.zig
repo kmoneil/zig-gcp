@@ -1487,6 +1487,18 @@ test "golden: topic create and update bodies" {
             .message_storage_policy = .{ .set = .{ .allowed_persistence_regions = &.{"us-east1"} } },
         }),
     );
+    // The arms the update above leaves out: retention and key set, the
+    // storage policy cleared, which is mask-only.
+    try testing.expectEqualStrings(
+        "{\"topic\":{\"messageRetentionDuration\":\"3600s\"," ++
+            "\"kmsKeyName\":\"projects/p/locations/l/keyRings/r/cryptoKeys/k\"}," ++
+            "\"updateMask\":\"messageRetentionDuration,kmsKeyName,messageStoragePolicy\"}",
+        try encodeTopicUpdate(a, .{
+            .message_retention = .{ .set = .fromSeconds(3600) },
+            .kms_key_name = .{ .set = "projects/p/locations/l/keyRings/r/cryptoKeys/k" },
+            .message_storage_policy = .clear,
+        }),
+    );
 }
 
 test "decode a subscription with every setting, as the emulator echoes it" {
@@ -1566,6 +1578,8 @@ test "decode a topic with every setting" {
     try testing.expectEqual(null, bare.kms_key_name);
     try testing.expectEqual(null, bare.message_storage_policy);
     try testing.expectEqual(.active, bare.state);
+    // A state this client does not know, like the subscription twin.
+    try testing.expectEqual(.unknown, (try decodeTopic(a, "{\"state\":\"SOMETHING_NEW\"}")).state);
 }
 
 /// Draws settings the checks accept, as a caller might write them.

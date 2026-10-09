@@ -1085,6 +1085,9 @@ const FakePubSub = struct {
     /// Fail this many acknowledge requests with `fail_status`.
     fail_acks: usize = 0,
     fail_status: u16 = 503,
+    /// Answer this many pulls with no messages at all before holding, as
+    /// the real server ends a long poll empty-handed at times.
+    empty_pulls: usize = 0,
     /// Hold this many acknowledge requests open until they are canceled, as
     /// a server that stopped answering would. Later ones answer normally.
     hold_acks: usize = 0,
@@ -1259,7 +1262,12 @@ const FakePubSub = struct {
         const Body = struct { maxMessages: u32 = 0 };
         const wanted = std.json.parseFromSliceLeaky(Body, arena, req.body orelse "{}", .{
             .ignore_unknown_fields = true,
-        }) catch return error.HttpProtocolError;
+        }) catch |err| switch (err) {
+            // Running out of memory is not a malformed request: the
+            // allocation sweeps drive this fake through a failing arena.
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.HttpProtocolError,
+        };
 
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
@@ -1268,6 +1276,10 @@ const FakePubSub = struct {
         if (f.fail_pulls > 0) {
             f.fail_pulls -= 1;
             return f.failure(arena);
+        }
+        if (f.empty_pulls > 0) {
+            f.empty_pulls -= 1;
+            return .{ .status = 200, .body = "{\"receivedMessages\":[]}" };
         }
         // A held pull, as the real server does when there is nothing yet.
         while (f.pending.items.len == 0) {
@@ -2622,4 +2634,262 @@ test "acks put back keep room for every message in flight" {
     for (0..3) |_| h.subscriber.resolve(try h.subscriber.queue.getOne(io), .acked);
     try testing.expectEqual(held.len + 3, h.subscriber.to_ack.items.len);
     try testing.expectEqual(0, h.subscriber.inflight.items.len);
+}
+
+test "acks put back without memory are given up and counted, not lost quietly" {
+    const io = testing.io;
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var fake: FakePubSub = .init(testing.allocator, io);
+    defer fake.deinit();
+    var subscriber: Subscriber = try .init(failing.allocator(), io, .{
+        .subscription_id = "worker",
+        .client = .{
+            .project_id = "p",
+            .endpoint = .{ .url = "localhost:1", .emulator = true },
+            .transport = fake.transport(),
+        },
+    });
+    defer subscriber.deinit();
+    subscriber.tick_override_ms = 50;
+    const held = [_]Pending{.{
+        .ack_id = try failing.allocator().dupe(u8, "held-0"),
+        .resolved_at = .{ .nanoseconds = 0 },
+        .not_before = .{ .nanoseconds = 0 },
+    }};
+    // The next allocation is the list's own growth, which fails: the
+    // entry is freed and counted as failed, never kept half-registered.
+    failing.fail_index = failing.alloc_index;
+    subscriber.mutex.lockUncancelable(io);
+    subscriber.reinsert(.ack, &held);
+    subscriber.mutex.unlock(io);
+    try testing.expectEqual(0, subscriber.to_ack.items.len);
+    try testing.expectEqual(1, subscriber.stats().ack_failed);
+}
+
+test "run: a subscription that cannot be read at all is the caller's error" {
+    const io = testing.io;
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"status\":\"NOT_FOUND\",\"message\":\"no such subscription\"}}" } },
+    });
+    defer fake.deinit();
+    var diag: Diagnostics = .{};
+    var subscriber: Subscriber = try .init(testing.allocator, io, .{
+        .subscription_id = "worker",
+        .extension_period_s = null,
+        .client = .{
+            .project_id = "p",
+            .endpoint = .{ .url = "localhost:1", .emulator = true },
+            .transport = fake.transport(),
+            .diagnostics = &diag,
+            .retry = .{ .max_attempts = 1 },
+        },
+    });
+    defer subscriber.deinit();
+    var handler: TestHandler = .{ .gpa = testing.allocator, .io = io, .subscriber = &subscriber };
+    defer handler.deinit();
+    // It fails before any task spawns, so the plain fake transport serves.
+    try testing.expectError(error.NotFound, subscriber.run(handler.handler()));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "no such subscription") != null);
+}
+
+test "run: an Io without concurrency is refused with a word" {
+    const Refused = struct {
+        const vtable: std.Io.VTable = v: {
+            var v = testing.io.vtable.*;
+            v.concurrent = std.Io.failingConcurrent;
+            break :v v;
+        };
+        fn io() std.Io {
+            return .{ .userdata = testing.io.userdata, .vtable = &vtable };
+        }
+    };
+    var fake: FakePubSub = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var diag: Diagnostics = .{};
+    var subscriber: Subscriber = try .init(testing.allocator, Refused.io(), .{
+        .subscription_id = "worker",
+        .extension_period_s = 10,
+        .client = .{
+            .project_id = "p",
+            .endpoint = .{ .url = "localhost:1", .emulator = true },
+            .transport = fake.transport(),
+            .diagnostics = &diag,
+        },
+    });
+    defer subscriber.deinit();
+    var handler: TestHandler = .{ .gpa = testing.allocator, .io = Refused.io(), .subscriber = &subscriber };
+    defer handler.deinit();
+    try testing.expectError(error.InvalidOptions, subscriber.run(handler.handler()));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "concurrent tasks") != null);
+}
+
+test "run: a janitor that cannot start takes the puller down with it" {
+    const JanitorRefused = struct {
+        var spawned: usize = 0;
+        const vtable: std.Io.VTable = v: {
+            var v = testing.io.vtable.*;
+            v.concurrent = concurrent;
+            break :v v;
+        };
+        fn io() std.Io {
+            return .{ .userdata = testing.io.userdata, .vtable = &vtable };
+        }
+        fn concurrent(
+            userdata: ?*anyopaque,
+            result_len: usize,
+            result_alignment: std.mem.Alignment,
+            context: []const u8,
+            context_alignment: std.mem.Alignment,
+            start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+        ) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            spawned += 1;
+            if (spawned > 1) return error.ConcurrencyUnavailable;
+            return testing.io.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
+        }
+    };
+    JanitorRefused.spawned = 0;
+    var fake: FakePubSub = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var diag: Diagnostics = .{};
+    var subscriber: Subscriber = try .init(testing.allocator, JanitorRefused.io(), .{
+        .subscription_id = "worker",
+        .extension_period_s = 10,
+        .client = .{
+            .project_id = "p",
+            .endpoint = .{ .url = "localhost:1", .emulator = true },
+            .transport = fake.transport(),
+            .diagnostics = &diag,
+        },
+    });
+    defer subscriber.deinit();
+    var handler: TestHandler = .{ .gpa = testing.allocator, .io = JanitorRefused.io(), .subscriber = &subscriber };
+    defer handler.deinit();
+    try testing.expectError(error.InvalidOptions, subscriber.run(handler.handler()));
+    // The flags went up before the puller's cancel, in case that cancel
+    // never landed.
+    try testing.expect(subscriber.halted);
+}
+
+test "run: workers that cannot start stop the subscriber cleanly" {
+    const GroupsRefused = struct {
+        const vtable: std.Io.VTable = v: {
+            var v = testing.io.vtable.*;
+            v.groupConcurrent = std.Io.failingGroupConcurrent;
+            break :v v;
+        };
+        fn io() std.Io {
+            return .{ .userdata = testing.io.userdata, .vtable = &vtable };
+        }
+    };
+    var fake: FakePubSub = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var diag: Diagnostics = .{};
+    var subscriber: Subscriber = try .init(testing.allocator, GroupsRefused.io(), .{
+        .subscription_id = "worker",
+        .extension_period_s = 10,
+        .client = .{
+            .project_id = "p",
+            .endpoint = .{ .url = "localhost:1", .emulator = true },
+            .transport = fake.transport(),
+            .diagnostics = &diag,
+        },
+    });
+    defer subscriber.deinit();
+    subscriber.tick_override_ms = 10;
+    var handler: TestHandler = .{ .gpa = testing.allocator, .io = GroupsRefused.io(), .subscriber = &subscriber };
+    defer handler.deinit();
+    try testing.expectError(error.InvalidOptions, subscriber.run(handler.handler()));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "concurrent tasks") != null);
+    try testing.expect(subscriber.halted);
+}
+
+test "Subscriber: a pull with nothing in it is just pulled again" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    h.fake.empty_pulls = 1;
+    try h.fake.publish("after the empty one");
+    h.handler.stop_after = 1;
+    try h.subscriber.run(h.handler.handler());
+    try testing.expectEqual(1, h.subscriber.stats().acked);
+    try testing.expect(h.fake.pull_wants.items.len >= 2);
+}
+
+test "dispatch: every allocation failure is OutOfMemory, and no message leaks" {
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            const io = testing.io;
+            var fake: FakePubSub = .init(testing.allocator, io);
+            defer fake.deinit();
+            try fake.publish("a");
+            try fake.publish("b");
+            var subscriber: Subscriber = try .init(gpa, io, .{
+                .subscription_id = "worker",
+                .client = .{
+                    .project_id = "p",
+                    .endpoint = .{ .url = "localhost:1", .emulator = true },
+                    .transport = fake.transport(),
+                },
+            });
+            defer subscriber.deinit();
+            subscriber.tick_override_ms = 50;
+            const pulled = try subscriber.puller.subscription("worker").pull(.{ .max_messages = 2 });
+            try dispatchForTest(&subscriber, pulled);
+            // What dispatched before a failure is on the queue; resolve it
+            // the usual way, which frees the batch with its last message.
+            subscriber.mutex.lockUncancelable(io);
+            const dispatched = subscriber.inflight.items.len;
+            subscriber.mutex.unlock(io);
+            for (0..dispatched) |_| subscriber.resolve(try subscriber.queue.getOne(io), .acked);
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{});
+}
+
+test "workerLoop: a cancel parked at the empty queue is taken" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    const io = testing.io;
+    var worker = try io.concurrent(workerLoop, .{ &h.subscriber, h.handler.handler() });
+    // Let it park in the queue's wait; a cancel landing earlier is taken
+    // at the same point, the loop's only cancellation point.
+    try io.sleep(.fromMilliseconds(25), .awake);
+    try testing.expectError(error.Canceled, worker.cancel(io));
+}
+
+test "workerLoop: a handler that is itself canceled releases the message and ends" {
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    const io = testing.io;
+    try h.fake.publish("doomed");
+    const pulled = try h.subscriber.puller.subscription("worker").pull(.{ .max_messages = 1 });
+    try dispatchForTest(&h.subscriber, pulled);
+    const Canceling = struct {
+        fn handle(_: *anyopaque, _: std.Io, _: types.ReceivedMessage) anyerror!void {
+            return error.Canceled;
+        }
+    };
+    var ctx: u8 = 0;
+    var worker = try io.concurrent(workerLoop, .{ &h.subscriber, Handler{ .ptr = &ctx, .vtable = &.{ .handle = Canceling.handle } } });
+    try testing.expectError(error.Canceled, worker.await(io));
+    // At-least-once holds: the message went back for redelivery.
+    try testing.expectEqual(1, h.subscriber.stats().nacked);
+}
+
+test "tickMs: without an override, half the period, at least half a second" {
+    const io = testing.io;
+    var h: Harness = undefined;
+    try h.init(.{});
+    defer h.deinit();
+    h.subscriber.tick_override_ms = null;
+    h.subscriber.mutex.lockUncancelable(io);
+    h.subscriber.period_s = 60;
+    h.subscriber.mutex.unlock(io);
+    try testing.expectEqual(30_000, h.subscriber.tickMs());
+    h.subscriber.mutex.lockUncancelable(io);
+    h.subscriber.period_s = 0;
+    h.subscriber.mutex.unlock(io);
+    try testing.expectEqual(500, h.subscriber.tickMs());
 }

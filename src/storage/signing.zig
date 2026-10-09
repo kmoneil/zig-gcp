@@ -1559,6 +1559,101 @@ test "fuzz signing: check accepts exactly what the rules allow" {
     try test_util.fuzzBytes({}, checkProperty, .{ .random_runs = 500, .max_len = 1024 });
 }
 
+test "check and the rules agree on cases built by hand, each refusal a real one" {
+    // The drawn property draws expires from the whole u32, so a run
+    // almost never gets past the expiry rule; these pin every rule after
+    // it, in both the check and the oracle.
+    const base: Drawn = .{
+        .base_url = "https://storage.googleapis.com",
+        .bucket = "test-bucket",
+        .object = "folder/object",
+        .options = .{ .expires_in_s = 3600 },
+        .authorizer = "signer@p.iam.gserviceaccount.com",
+        .signed_at = timestamp(.{ .nanoseconds = 0 }).?,
+        .lifetime_s = null,
+        .headers = undefined,
+        .query = undefined,
+        .name_buffers = undefined,
+        .value_buffers = undefined,
+    };
+    const Case = struct { bool, Drawn };
+    var cases: [12]Case = undefined;
+    cases[0] = .{ true, base };
+    cases[1] = d: {
+        var d = base;
+        d.lifetime_s = 43_200;
+        d.options.expires_in_s = 43_201;
+        break :d .{ false, d };
+    };
+    cases[2] = d: {
+        var d = base;
+        d.object = "a/../b";
+        break :d .{ false, d };
+    };
+    cases[3] = d: {
+        var d = base;
+        d.options.headers = &.{.{ .name = "x-goog-meta-a", .value = "v" }};
+        break :d .{ true, d };
+    };
+    cases[4] = d: {
+        var d = base;
+        d.options.headers = &.{ .{ .name = "x-goog-meta-a", .value = "v" }, .{ .name = "X-GOOG-META-A", .value = "w" } };
+        break :d .{ false, d };
+    };
+    cases[5] = d: {
+        var d = base;
+        d.options.headers = &.{.{ .name = "Host", .value = "elsewhere" }};
+        break :d .{ false, d };
+    };
+    cases[6] = d: {
+        var d = base;
+        d.options.headers = &.{.{ .name = "x-goog-meta-a", .value = "line\nbreak" }};
+        break :d .{ false, d };
+    };
+    cases[7] = d: {
+        var d = base;
+        d.options.query = &.{ .{ .name = "prefix", .value = "photos/" }, .{ .name = "generation", .value = "7" } };
+        break :d .{ true, d };
+    };
+    cases[8] = d: {
+        var d = base;
+        d.options.query = &.{.{ .name = "X-Goog-Signature", .value = "x" }};
+        break :d .{ false, d };
+    };
+    cases[9] = d: {
+        var d = base;
+        d.bucket = "my_bucket";
+        d.options.style = .virtual_hosted;
+        break :d .{ false, d };
+    };
+    cases[10] = d: {
+        var d = base;
+        d.bucket = "a.b";
+        d.options.style = .virtual_hosted;
+        break :d .{ false, d };
+    };
+    cases[11] = d: {
+        var d = base;
+        d.options.style = .{ .bucket_bound = .{ .host = "media.example.com", .scheme = .https } };
+        break :d .{ true, d };
+    };
+    for (cases) |case| {
+        const expected, const d = case;
+        var diag: core.Diagnostics = .{};
+        const accepted = if (check(&diag, d.base_url, d.bucket, d.object, d.options, d.lifetime_s)) true else |_| false;
+        try testing.expectEqual(expected, accepted);
+        try testing.expectEqual(expected, allowedByRules(&d));
+        if (!accepted) try testing.expect(diag.message().len > 0);
+    }
+}
+
+test "bytesBefore orders byte by byte, a prefix first" {
+    try testing.expect(bytesBefore("a", "ab"));
+    try testing.expect(!bytesBefore("ab", "a"));
+    try testing.expect(!bytesBefore("a", "a"));
+    try testing.expect(bytesBefore("ab", "b"));
+}
+
 fn urlProperty(_: void, input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
     var d: Drawn = undefined;

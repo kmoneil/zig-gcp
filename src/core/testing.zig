@@ -1329,6 +1329,12 @@ test "FakeClock records sleeps and advances time" {
     try std.testing.expectEqual(150, clock.sleepMs(0));
     try std.testing.expectEqual(170 * std.time.ns_per_ms, std.Io.Clock.awake.now(io).nanoseconds);
 
+    // A deadline sleeps the gap between it and now.
+    const deadline: std.Io.Clock.Timestamp = .{ .clock = .awake, .raw = .{ .nanoseconds = 200 * std.time.ns_per_ms } };
+    try deadline.wait(io);
+    try std.testing.expectEqual(30, clock.sleepMs(2));
+    try std.testing.expectEqual(200 * std.time.ns_per_ms, std.Io.Clock.awake.now(io).nanoseconds);
+
     clock.cancel_sleep = true;
     try std.testing.expectError(error.Canceled, io.sleep(.fromMilliseconds(1), .awake));
 }
@@ -1349,15 +1355,30 @@ test "FakeClock random is deterministic or pinned" {
 
 test "no_grow_allocator refuses every grow and allows the rest" {
     const a = no_grow_allocator;
-    const block = try a.alloc(u8, 64);
+    var block = try a.alloc(u8, 64);
     try std.testing.expect(!a.resize(block, 65));
     try std.testing.expect(a.remap(block, 4096) == null);
+    // A shrink is not a grow: it reaches the child, whose answer stands.
+    if (a.resize(block, 32)) block.len = 32;
     // An ArrayList still grows, by moving.
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(a);
     for (0..10_000) |i| try list.append(a, @truncate(i));
     try std.testing.expectEqual(10_000, list.items.len);
     a.free(block);
+}
+
+test "WipeChecker passes a remap through to its child" {
+    var checker: WipeChecker = .{ .child = std.testing.allocator };
+    const a = checker.allocator();
+    var block = try a.alloc(u8, 16);
+    if (a.remap(block, 8)) |smaller| block = smaller;
+    // Wipe and free raw, as code under a WipeChecker does: `free` would
+    // paint the block with the debug pattern first and look unwiped.
+    @memset(block, 0);
+    a.rawFree(block, .of(u8), @returnAddress());
+    try std.testing.expectEqual(1, checker.frees);
+    try std.testing.expectEqual(0, checker.unwiped);
 }
 
 fn growMany(gpa: Allocator) !void {
@@ -1734,13 +1755,36 @@ test "FaultTransport passes requests through and records both sides" {
     try std.testing.expectEqual(.GET, first.method);
     try std.testing.expectEqualStrings("http://x/a", first.url);
     try std.testing.expectEqualStrings("1", first.header("x-test").?);
+    try std.testing.expectEqual(null, first.header("x-absent"));
     try std.testing.expectEqual(200, first.status.?);
     try std.testing.expectEqualStrings("5", first.responseHeader("X-Goog-Generation").?);
+    try std.testing.expectEqual(null, first.responseHeader("x-absent"));
     try std.testing.expectEqual(null, first.err);
     try std.testing.expectEqual(null, first.fault);
     const second = faults.exchanges.items[1];
     try std.testing.expectEqual(4, second.body_len);
     try std.testing.expectEqual(404, second.status.?);
+}
+
+test "FaultTransport: recording an exchange survives every allocation failure" {
+    const Run = struct {
+        fn run(gpa: Allocator) !void {
+            var fake: FakeTransport = .init(std.testing.allocator, &.{
+                .{ .respond = .{ .status = 200, .body = "{}", .headers = &.{.{ .name = "x-h", .value = "v" }} } },
+            });
+            defer fake.deinit();
+            var faults: FaultTransport = .{ .inner = fake.transport(), .record = gpa };
+            defer faults.deinit();
+            var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+            defer arena.deinit();
+            _ = try faults.transport().send(.{
+                .method = .GET,
+                .url = "http://x/a",
+                .headers = &.{.{ .name = "X-Test", .value = "1" }},
+            }, arena.allocator());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(no_grow_allocator, Run.run, .{});
 }
 
 test "FaultTransport cuts the request body it names, and only that one" {

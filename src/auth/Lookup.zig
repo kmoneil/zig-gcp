@@ -221,13 +221,15 @@ test "Lookup: fromEnv reads this process's environment" {
     const a = arena.allocator();
     var map = try testing.environ.createMap(testing.allocator);
     defer map.deinit();
+    // Pinned both ways, so the test does not depend on what this machine
+    // has in its environment.
+    try map.put("GOOGLE_APPLICATION_CREDENTIALS", "/keys/adc.json");
     const l = try fromEnv(&map, a);
+    try testing.expectEqualStrings("/keys/adc.json", l.credentials_path.?);
+    _ = map.swapRemove("GOOGLE_APPLICATION_CREDENTIALS");
+    const bare = try fromEnv(&map, a);
+    try testing.expectEqual(null, bare.credentials_path);
 
-    if (map.get("GOOGLE_APPLICATION_CREDENTIALS")) |path| {
-        if (path.len > 0) try testing.expectEqualStrings(path, l.credentials_path.?);
-    } else {
-        try testing.expectEqual(null, l.credentials_path);
-    }
     const home_var = if (Platform.host == .windows) "APPDATA" else "HOME";
     if (map.get(home_var)) |home| {
         if (home.len > 0) {

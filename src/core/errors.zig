@@ -554,6 +554,19 @@ test "decodeErrorBody reports running out of memory, not an unreadable body" {
         error.OutOfMemory,
         decodeErrorBody(testing.failing_allocator, "{\"error\":{\"status\":\"FAILED_PRECONDITION\"}}"),
     );
+    // The streamed shape has the same trap in both of its parses: the
+    // object parse allocates refusing the `[`, and the array parse
+    // allocates reading past it, so each failure index lands in one of
+    // them, and either way the caller must see the memory failure.
+    for (0..4) |fail| {
+        var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = fail });
+        if (decodeErrorBody(failing.allocator(), "[{\"error\":{\"status\":\"FAILED_PRECONDITION\"}}]")) |body|
+            try testing.expectEqualStrings("FAILED_PRECONDITION", body.?.status)
+        else |err|
+            try testing.expectEqual(error.OutOfMemory, err);
+    }
 }
 
 fn decodeErrorBodyArbitrary(_: void, input: []const u8) !void {

@@ -591,6 +591,7 @@ test "set and grant refuse before sending what the server would refuse or keep d
         .{ .list = b.acl(), .entries = &.{ .{ .entity = .{ .user = "A@x.com" }, .role = .reader }, .{ .entity = .{ .user = "a@X.com" }, .role = .owner } }, .words = "names an entity" },
         .{ .list = b.acl(), .entries = &.{.{ .entity = .{ .project = .{ .team = .viewers, .number = "extractctl" } }, .role = .reader }}, .words = "by its number" },
         .{ .list = b.acl(), .entries = &.{.{ .entity = .{ .user = "" }, .role = .reader }}, .words = "empty" },
+        .{ .list = b.acl(), .entries = &.{.{ .entity = .{ .other = "" }, .role = .reader }}, .words = "an entity is empty" },
     };
     for (cases) |case| {
         errdefer std.debug.print("{s}: {s}\n", .{ case.words, h.diag.message() });
@@ -605,6 +606,41 @@ test "set and grant refuse before sending what the server would refuse or keep d
     try testing.expectError(error.InvalidArgument, object.grant(.all_users, .writer));
     try testing.expectError(error.InvalidArgument, object.entry(.{ .group = "" }));
     try h.expectRequestCount(0);
+}
+
+test "an entity this library cannot spell is still sent as given" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{ ok(bucket_read), ok(bucket_read) }, .{});
+    defer h.deinit();
+    var written = try h.client.bucket("b").acl().grant(.{ .other = "serviceAccount-sa@p.iam.gserviceaccount.com" }, .reader);
+    written.deinit();
+    try testing.expect(std.mem.indexOf(u8, (try h.fake.request(1)).body.?, "serviceAccount-sa@p.iam.gserviceaccount.com") != null);
+}
+
+test "a resource without a list, though the list reads fine, is an invalid answer" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        ok("{\"metageneration\":\"3\"}"),
+        ok("{\"items\":[]}"),
+    }, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidResponse, h.client.bucket("b").acl().get());
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "though the list can be read") != null);
+}
+
+test "a grant onto a full list is refused with the limit, not sent" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var body: std.Io.Writer.Allocating = .init(arena.allocator());
+    try body.writer.writeAll("{\"metageneration\":\"3\",\"owner\":{\"entity\":\"project-owners-1\"},\"acl\":[{\"entity\":\"project-owners-1\",\"role\":\"OWNER\"}");
+    for (1..max_entries) |i| try body.writer.print(",{{\"entity\":\"domain-d{d}.example\",\"role\":\"READER\"}}", .{i});
+    try body.writer.writeAll("]}");
+    var h: test_util.Harness = undefined;
+    try h.init(&.{ok(body.written())}, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidArgument, h.client.bucket("b").acl().grant(.{ .user = "new@x.com" }, .reader));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "at most 100") != null);
+    try h.expectRequestCount(1);
 }
 
 // Against `FakeMultipart`, which keeps lists by the rules production was

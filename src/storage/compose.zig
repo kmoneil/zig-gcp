@@ -634,6 +634,16 @@ fn modelString(arena: Allocator, out: *std.ArrayList(u8), text: []const u8) !voi
     try out.append(arena, '"');
 }
 
+test "modelString escapes exactly as std's JSON writer does" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = "q\"b\\s\x08t\tn\nf\x0cr\ru\x01done";
+    var out: std.ArrayList(u8) = .empty;
+    try modelString(arena, &out, text);
+    try testing.expectEqualStrings(try std.json.Stringify.valueAlloc(arena, text, .{}), out.items);
+}
+
 fn modelProperty(_: void, bytes: []const u8) !void {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();

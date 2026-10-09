@@ -793,6 +793,112 @@ test "ExternalAccount: init refuses what cannot work, and says why" {
     const aws = try credJson(a, "{\"environment_id\": \"aws1\", \"url\": \"u\"}", false);
     try testing.expectError(error.UnsupportedCredentialType, ExternalAccount.initFromJson(testing.allocator, io, aws, .{ .diagnostics = &diag }));
     try testing.expect(std.mem.indexOf(u8, diag.message(), "AWS") != null);
+
+    // Options that cannot work, each said in its own words.
+    try testing.expectError(error.InvalidOptions, ExternalAccount.initFromJson(testing.allocator, io, good, .{
+        .retry = .{ .max_attempts = 0 },
+        .diagnostics = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "max_attempts") != null);
+    try testing.expectError(error.InvalidOptions, ExternalAccount.initFromJson(testing.allocator, io, good, .{
+        .user_agent = "agent\x01",
+        .diagnostics = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "printable ASCII") != null);
+    try testing.expectError(error.InvalidOptions, ExternalAccount.initFromJson(testing.allocator, io, good, .{
+        .cache = .{ .refresh_margin_s = 300 },
+        .diagnostics = &diag,
+    }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "refresh_margin_s") != null);
+
+    // The other two credential types, each pointed at its own door.
+    try testing.expectError(error.UnsupportedCredentialType, ExternalAccount.initFromJson(
+        testing.allocator,
+        io,
+        "{\"type\":\"service_account\",\"client_email\":\"e@p.iam.gserviceaccount.com\",\"private_key\":\"k\"}",
+        .{ .diagnostics = &diag },
+    ));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "ServiceAccount") != null);
+    try testing.expectError(error.UnsupportedCredentialType, ExternalAccount.initFromJson(
+        testing.allocator,
+        io,
+        "{\"type\":\"impersonated_service_account\",\"service_account_impersonation_url\":\"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken\",\"source_credentials\":{\"type\":\"authorized_user\",\"client_id\":\"c\",\"client_secret\":\"s\",\"refresh_token\":\"r\"}}",
+        .{ .diagnostics = &diag },
+    ));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "ImpersonatedServiceAccount") != null);
+
+    // An impersonation URL from the file that would carry the STS token
+    // in the clear.
+    const bad_imp = try a.print("{{\"type\":\"external_account\",\"audience\":\"{s}\",\"subject_token_type\":\"t\",\"credential_source\":{{\"file\":\"/t\"}},\"service_account_impersonation_url\":\"http://elsewhere.example/gen\"}}", .{test_audience});
+    try testing.expectError(error.InvalidCredentialsFile, ExternalAccount.initFromJson(testing.allocator, io, bad_imp, .{ .diagnostics = &diag }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "service_account_impersonation_url") != null);
+
+    // A credential_source url no parser accepts.
+    const bad_url = try credJson(a, "{\"url\": \"http://e:x/t\"}", false);
+    try testing.expectError(error.InvalidCredentialsFile, ExternalAccount.initFromJson(testing.allocator, io, bad_url, .{ .diagnostics = &diag }));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "cannot be parsed") != null);
+}
+
+test "ExternalAccount: the provider hands over the file's quota project, or null" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    try testing.expectEqual(null, h.account.provider().quotaProject());
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const with_quota = try arena.allocator().print(
+        "{{\"type\":\"external_account\",\"audience\":\"{s}\",\"subject_token_type\":\"t\",\"credential_source\":{{\"file\":\"/t\"}},\"quota_project_id\":\"quota-p\"}}",
+        .{test_audience},
+    );
+    var fake: test_util.FakeTransport = .init(testing.allocator, &.{});
+    defer fake.deinit();
+    var account: ExternalAccount = try .initFromJson(testing.allocator, testing.io, with_quota, .{ .transport = fake.transport() });
+    defer account.deinit();
+    try testing.expectEqualStrings("quota-p", account.provider().quotaProject().?);
+}
+
+test "ExternalAccount: a credential_source url out of reach retries, then keeps its error" {
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .fail = error.ConnectionRefused }, .{ .fail = error.ConnectionRefused } }, .{ .source =
+        \\{"url": "http://127.0.0.1:1/t"}
+    });
+    defer h.deinit();
+    try testing.expectError(error.ConnectionRefused, h.get());
+    try testing.expectEqual(2, h.fake.requests.items.len);
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "could not be reached") != null);
+}
+
+test "ExternalAccount: a credential_source url answering an error retries only when the server might recover" {
+    var h: Harness = undefined;
+    try h.init(&.{.{ .respond = .{ .status = 404, .body = "nope" } }}, .{ .source =
+        \\{"url": "http://127.0.0.1:1/t"}
+    });
+    defer h.deinit();
+    try testing.expectError(error.TokenUnavailable, h.get());
+    try testing.expectEqual(1, h.fake.requests.items.len);
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "answered HTTP 404") != null);
+
+    var busy: Harness = undefined;
+    try busy.init(&.{
+        .{ .respond = .{ .status = 503, .body = "busy" } },
+        .{ .respond = .{ .body = "subject-doc-token" } },
+        sts_ok,
+    }, .{ .source =
+        \\{"url": "http://127.0.0.1:1/t"}
+    });
+    defer busy.deinit();
+    try testing.expectEqualStrings("ya29.STS-SECRET", try busy.get());
+    try testing.expectEqual(3, busy.fake.requests.items.len);
+}
+
+test "ExternalAccount: an STS out of reach is retried, and said as such" {
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .fail = error.ConnectionRefused }, .{ .fail = error.ConnectionRefused } }, .{});
+    defer h.deinit();
+    try testing.expectError(error.ConnectionRefused, h.get());
+    try testing.expectEqual(2, h.fake.requests.items.len);
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "STS endpoint could not be reached") != null);
 }
 
 test "ExternalAccount: the first call's scopes stick" {
@@ -870,6 +976,28 @@ test "ExternalAccount: every allocation failure is OutOfMemory without leaks" {
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.get, .{json});
+}
+
+test "ExternalAccount: a url source with headers survives every allocation failure" {
+    // The file-source sweep above never fails inside copySource, whose
+    // dupes there are all empty; a url source with headers and a json
+    // field walks every errdefer in it. No transport is given, so the
+    // account builds and frees its own, and the create can fail too. No
+    // request is ever sent.
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const source =
+        \\{"url": "http://127.0.0.1:1/t", "headers": {"Metadata": "True", "Accept": "application/json"},
+        \\ "format": {"type": "json", "subject_token_field_name": "access_token"}}
+    ;
+    const json = try credJson(arena.allocator(), source, false);
+    const Run = struct {
+        fn init(gpa: Allocator, cred: []const u8) !void {
+            var account: ExternalAccount = try .initFromJson(gpa, testing.io, cred, .{});
+            account.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.init, .{json});
 }
 
 test "ExternalAccount: against an STS on loopback" {

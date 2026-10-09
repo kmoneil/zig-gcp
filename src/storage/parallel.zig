@@ -3555,6 +3555,15 @@ test "uploadParallel: a checkpoint of another transfer, or one unreadable, is re
         .checkpoint = garbage.checkpoint(),
     }));
 
+    // One that cannot even be read is the same error, said differently.
+    var unreadable: MemoryCheckpoint = .{ .gpa = testing.allocator, .fail_loads = true };
+    defer unreadable.deinit();
+    try testing.expectError(error.CheckpointFailed, s.object("o").uploadParallel(.{ .file = file }, .{
+        .part_size = 1024,
+        .checkpoint = unreadable.checkpoint(),
+    }));
+    try testing.expect(std.mem.indexOf(u8, s.diag.message(), "could not be read") != null);
+
     // None of it reached the server, and nothing was aborted.
     try testing.expectEqual(0, s.fake.counts.starts);
     try testing.expectEqual(0, s.fake.counts.lists);

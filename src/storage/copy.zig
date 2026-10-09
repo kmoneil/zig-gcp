@@ -533,6 +533,22 @@ test "copyTo with no change sends {} and reads nothing" {
     try h.expectRequestCount(1);
 }
 
+test "copyTo: a rewrite that never reports done stops at the round cap" {
+    const gpa = testing.allocator;
+    const never_done: test_util.FakeTransport.Reply = .{ .respond = .{
+        .body = "{\"done\":false,\"rewriteToken\":\"t\",\"totalBytesRewritten\":\"1\",\"objectSize\":\"2\"}",
+    } };
+    const script = try gpa.alloc(test_util.FakeTransport.Reply, max_rounds + 1);
+    defer gpa.free(script);
+    @memset(script, never_done);
+    var h: test_util.Harness = undefined;
+    try h.init(script, .{});
+    defer h.deinit();
+    try testing.expectError(error.InvalidResponse, h.client.bucket("s").object("a").copyTo(h.client.bucket("d").object("c"), .{}));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "never reported done") != null);
+    try h.expectRequestCount(max_rounds);
+}
+
 test "copyTo: the read retries like any read, the unconditioned write still does not" {
     const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{}" } };
     var h: test_util.Harness = undefined;
