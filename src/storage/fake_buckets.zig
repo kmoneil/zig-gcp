@@ -1829,3 +1829,104 @@ test "the fake keeps a retention policy as Cloud Storage did on 2026-09-30" {
     try testing.expectEqual(200, (try fake.serve(.PATCH, target, "{\"defaultEventBasedHold\":true}", a)).status);
     try testing.expect(fake.defaultEventBasedHold("b"));
 }
+
+test "a policy etag is the metageneration as a varint, and anything else is no etag" {
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("CAE=", etagOf(&buf, 1));
+    // Round trips across the varint widths, the multi-byte ones included.
+    const decoder = std.base64.standard.Decoder;
+    for ([_]u64{ 1, 2, 127, 128, 300, 16383, 16384, 1 << 40, (1 << 63) - 1 }) |m| {
+        const encoded = etagOf(&buf, m);
+        var raw: [11]u8 = undefined;
+        const size = decoder.calcSizeForSlice(encoded) catch unreachable;
+        decoder.decode(raw[0..size], encoded) catch unreachable;
+        try testing.expectEqual(m, metagenerationOfEtag(raw[0..size]));
+    }
+    // What is no etag: empty, the tag alone, another field's tag, a
+    // continuation that never ends, and bytes after the value.
+    try testing.expectEqual(null, metagenerationOfEtag(""));
+    try testing.expectEqual(null, metagenerationOfEtag(&.{0x08}));
+    try testing.expectEqual(null, metagenerationOfEtag(&.{ 0x10, 0x01 }));
+    try testing.expectEqual(null, metagenerationOfEtag(&.{ 0x08, 0x80 }));
+    try testing.expectEqual(null, metagenerationOfEtag(&.{ 0x08, 0x01, 0x00 }));
+    // The decoder stops at nine varint bytes, so a tenth is refused: no
+    // real metageneration reaches 2^63.
+    var raw: [11]u8 = undefined;
+    const size = decoder.calcSizeForSlice(etagOf(&buf, 1 << 63)) catch unreachable;
+    decoder.decode(raw[0..size], etagOf(&buf, 1 << 63)) catch unreachable;
+    try testing.expectEqual(null, metagenerationOfEtag(raw[0..size]));
+}
+
+test "the fake bounds a notification's custom attributes as Cloud Storage does" {
+    var fake: FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqual(200, (try fake.serve(.POST, .{ .name = null, .project = "p" }, "{\"name\":\"b\"}", a)).status);
+
+    const create: FakeBuckets.Target = .{ .name = "b", .notification = .collection };
+    const head = "{\"topic\":\"//pubsub.googleapis.com/projects/p/topics/t\",\"payload_format\":\"JSON_API_V1\",\"custom_attributes\":";
+    // Six attributes, an empty key, a key past 256 characters and a value
+    // past 1024 are each 400, in the words production used, and nothing
+    // is kept.
+    const refused = [_]struct { []const u8, []const u8 }{
+        .{ "{\"a1\":\"v\",\"a2\":\"v\",\"a3\":\"v\",\"a4\":\"v\",\"a5\":\"v\",\"a6\":\"v\"}", "Maximum of 5 custom attributes, notification config had 6" },
+        .{ "{\"\":\"v\"}", "Custom attribute keys may not be empty" },
+        .{ "{\"" ++ core.testing.repeat("k", 257) ++ "\":\"v\"}", "may not be longer than 256 characters" },
+        .{ "{\"k\":\"" ++ core.testing.repeat("v", 1025) ++ "\"}", "may not be longer than 1024 characters" },
+    };
+    for (refused) |case| {
+        errdefer std.debug.print("attributes: {s}\n", .{case[0][0..@min(case[0].len, 80)]});
+        const reply = try fake.serve(.POST, create, try a.print("{s}{s}}}", .{ head, case[0] }), a);
+        try testing.expectEqual(400, reply.status);
+        try testing.expect(std.mem.indexOf(u8, reply.body, case[1]) != null);
+        try testing.expectEqual(0, fake.notifications("b").len);
+    }
+
+    // Five attributes, a 256-character key and a 1024-character value are
+    // the measured edges, kept as sent.
+    const edge = "{\"a1\":\"v\",\"a2\":\"v\",\"a3\":\"v\",\"a4\":\"v\",\"" ++
+        core.testing.repeat("k", 256) ++ "\":\"" ++ core.testing.repeat("v", 1024) ++ "\"}";
+    const reply = try fake.serve(.POST, create, try a.print("{s}{s}}}", .{ head, edge }), a);
+    try testing.expectEqual(200, reply.status);
+    const kept = fake.notifications("b");
+    try testing.expectEqual(1, kept.len);
+    const attributes = objectOf(kept[0].get("custom_attributes").?).?;
+    try testing.expectEqual(5, attributes.count());
+    try testing.expectEqualStrings(
+        core.testing.repeat("v", 1024),
+        stringOf(attributes.get(core.testing.repeat("k", 256)).?).?,
+    );
+}
+
+test "the fake's ACL reads: each list, one entry, a missing entity, and uniform access" {
+    var fake: FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqual(200, (try fake.serve(.POST, .{ .name = null, .project = "p" }, "{\"name\":\"b\"}", a)).status);
+
+    // The bucket's own list and its default object list, whole.
+    const bucket_list = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .bucket } }, "", a);
+    try testing.expectEqual(200, bucket_list.status);
+    try testing.expect(std.mem.indexOf(u8, bucket_list.body, "storage#bucketAccessControls") != null);
+    const default_list = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .default_object } }, "", a);
+    try testing.expectEqual(200, default_list.status);
+    try testing.expect(std.mem.indexOf(u8, default_list.body, "storage#objectAccessControls") != null);
+
+    // One entry by its entity, and production's 404 for one the list
+    // does not hold.
+    const entry = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .bucket, .entity = fake_acl.viewers } }, "", a);
+    try testing.expectEqual(200, entry.status);
+    try testing.expect(std.mem.indexOf(u8, entry.body, "READER") != null);
+    const missing = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .bucket, .entity = "allUsers" } }, "", a);
+    try testing.expectEqual(404, missing.status);
+
+    // Uniform bucket-level access hides every list.
+    try testing.expectEqual(200, (try fake.serve(.PATCH, .{ .name = "b" }, "{\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true}}}", a)).status);
+    const hidden = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .bucket } }, "", a);
+    try testing.expectEqual(400, hidden.status);
+    try testing.expect(std.mem.indexOf(u8, hidden.body, "Cannot get legacy ACL for a bucket that has uniform bucket-level access.") != null);
+}
