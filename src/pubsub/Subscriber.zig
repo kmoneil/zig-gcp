@@ -1125,6 +1125,21 @@ const FakePubSub = struct {
     /// requests before any answer, as a network would.
     drop_acks: usize = 0,
     drop_modacks: usize = 0,
+    /// The data of every message published, in order: what a seek back
+    /// brings again. Owned.
+    log: std.ArrayList([]u8) = .empty,
+    /// Ack ids a seek made stale. An ack or a lease change with one is
+    /// taken and forgotten, as production's were on 2026-10-10, with
+    /// exactly-once delivery and without. Owned.
+    stale: std.ArrayList([]u8) = .empty,
+    /// Detached, as production's subscription is seconds after a detach:
+    /// pull, acknowledge and modifyAckDeadline are refused in its words.
+    detached: bool = false,
+
+    const detached_reply: Response = .{
+        .status = 400,
+        .body = "{\"error\":{\"code\":400,\"message\":\"This method is not supported on detached subscriptions.\",\"status\":\"FAILED_PRECONDITION\"}}",
+    };
 
     const Msg = struct {
         data: []u8,
@@ -1159,6 +1174,10 @@ const FakePubSub = struct {
         for (f.modacks.items) |m| f.gpa.free(m.ack_id);
         f.modacks.deinit(f.gpa);
         f.pull_wants.deinit(f.gpa);
+        for (f.log.items) |data| f.gpa.free(data);
+        f.log.deinit(f.gpa);
+        for (f.stale.items) |id| f.gpa.free(id);
+        f.stale.deinit(f.gpa);
         f.* = undefined;
     }
 
@@ -1170,12 +1189,100 @@ const FakePubSub = struct {
     fn publish(f: *FakePubSub, data: []const u8) !void {
         f.mutex.lockUncancelable(f.io);
         defer f.mutex.unlock(f.io);
+        try f.log.ensureUnusedCapacity(f.gpa, 1);
+        const kept = try f.gpa.dupe(u8, data);
+        errdefer f.gpa.free(kept);
         const copy = try f.gpa.dupe(u8, data);
         errdefer f.gpa.free(copy);
         const ack_id = try f.gpa.print("ack-{d}", .{f.next_id});
-        f.next_id += 1;
+        errdefer f.gpa.free(ack_id);
         try f.pending.append(f.gpa, .{ .data = copy, .ack_id = ack_id });
+        f.next_id += 1;
+        f.log.appendAssumeCapacity(kept);
         f.cond.broadcast(f.io);
+    }
+
+    /// A seek back to before everything, on a subscription that retains
+    /// what it acknowledged: every message published comes again under a
+    /// new ack id, whether it was acknowledged, out on a lease or still
+    /// waiting, and every ack id handed out before is stale. Applied at
+    /// once, where production took 2 to 50 seconds.
+    fn seekBack(f: *FakePubSub) !void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        try f.forgetDeliveries();
+        try f.pending.ensureUnusedCapacity(f.gpa, f.log.items.len);
+        for (f.log.items) |data| {
+            const copy = try f.gpa.dupe(u8, data);
+            errdefer f.gpa.free(copy);
+            const ack_id = try f.gpa.print("ack-{d}", .{f.next_id});
+            f.next_id += 1;
+            f.pending.appendAssumeCapacity(.{ .data = copy, .ack_id = ack_id });
+        }
+        f.cond.broadcast(f.io);
+    }
+
+    /// A seek ahead of everything: what waits is dropped, and what is out
+    /// on a lease is acknowledged by the seek, its ack id stale. What is
+    /// published afterwards is delivered: a seek is no standing filter.
+    fn seekAhead(f: *FakePubSub) !void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        try f.forgetDeliveries();
+    }
+
+    /// Drops the backlog, and makes every lease's ack id stale. The caller
+    /// holds the mutex.
+    fn forgetDeliveries(f: *FakePubSub) !void {
+        try f.stale.ensureUnusedCapacity(f.gpa, f.leased.count());
+        for (f.pending.items) |m| {
+            f.gpa.free(m.data);
+            f.gpa.free(m.ack_id);
+        }
+        f.pending.clearRetainingCapacity();
+        var it = f.leased.valueIterator();
+        while (it.next()) |m| {
+            f.gpa.free(m.data);
+            // The id is the lease's key too: it moves to the stale list.
+            f.stale.appendAssumeCapacity(m.ack_id);
+        }
+        f.leased.clearRetainingCapacity();
+    }
+
+    fn isStale(f: *const FakePubSub, id: []const u8) bool {
+        for (f.stale.items) |stale_id| {
+            if (std.mem.eql(u8, stale_id, id)) return true;
+        }
+        return false;
+    }
+
+    /// Detaches the subscription: from now on a pull, a held one included,
+    /// an ack and a lease change are refused.
+    fn detach(f: *FakePubSub) void {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        f.detached = true;
+        f.cond.broadcast(f.io);
+    }
+
+    fn isDetached(f: *FakePubSub) bool {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        return f.detached;
+    }
+
+    /// How many acknowledgements took a message off the backlog: an ack
+    /// with a stale id is taken, and takes none.
+    fn ackedMessages(f: *FakePubSub) usize {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        return f.acked_data.items.len;
+    }
+
+    fn backlog(f: *FakePubSub) usize {
+        f.mutex.lockUncancelable(f.io);
+        defer f.mutex.unlock(f.io);
+        return f.pending.items.len + f.leased.count();
     }
 
     /// How many times `ack_id` was released (a lease set to 0 seconds).
@@ -1214,6 +1321,9 @@ const FakePubSub = struct {
 
     fn send(ptr: *anyopaque, req: Request, arena: Allocator) TransportError!Response {
         const f: *FakePubSub = @ptrCast(@alignCast(ptr));
+        const settles = std.mem.endsWith(u8, req.url, ":pull") or std.mem.endsWith(u8, req.url, ":acknowledge") or
+            std.mem.endsWith(u8, req.url, ":modifyAckDeadline");
+        if (settles and f.isDetached()) return detached_reply;
         if (std.mem.endsWith(u8, req.url, ":pull")) return f.pull(req, arena);
         if (std.mem.endsWith(u8, req.url, ":acknowledge")) {
             if (f.take(&f.drop_acks)) return error.ConnectionResetByPeer;
@@ -1283,6 +1393,7 @@ const FakePubSub = struct {
         }
         // A held pull, as the real server does when there is nothing yet.
         while (f.pending.items.len == 0) {
+            if (f.detached) return detached_reply;
             if (f.exactly_once and f.leased.count() > 0) {
                 // Leases lapse with time, which signals nothing: look again
                 // soon, as the server would hand back a lapsed message.
@@ -1383,6 +1494,9 @@ const FakePubSub = struct {
                 try f.acked.append(f.gpa, try f.gpa.dupe(u8, id));
                 try f.acked_data.append(f.gpa, entry.value.data);
                 f.gpa.free(entry.value.ack_id);
+            } else if (f.isStale(id)) {
+                // Stale since a seek: taken, and forgotten.
+                try f.acked.append(f.gpa, try f.gpa.dupe(u8, id));
             } else if (!f.wasAcked(id)) {
                 try refused.append(arena, id);
             }
@@ -1507,7 +1621,8 @@ const FakePubSub = struct {
         var refused: std.ArrayList([]const u8) = .empty;
         for (body.ackIds) |id| {
             const leased = f.leased.getPtr(id) orelse {
-                try refused.append(arena, id);
+                // An id stale since a seek is taken, and changes nothing.
+                if (!f.isStale(id)) try refused.append(arena, id);
                 continue;
             };
             if (body.ackDeadlineSeconds == 0) {
@@ -1577,6 +1692,10 @@ const TestHandler = struct {
     active: usize = 0,
     max_active: usize = 0,
     stop_after: ?usize = null,
+    /// Once this many messages were seen, the handler that saw the last of
+    /// them does this to the harness before it returns: its own message is
+    /// still out on its lease then, and its ack still to come.
+    after_seen: ?struct { count: usize, do: *const fn (*Harness) anyerror!void } = null,
 
     fn deinit(h: *TestHandler) void {
         for (h.seen.items) |data| h.gpa.free(data);
@@ -1629,11 +1748,25 @@ const TestHandler = struct {
             }
         };
 
-        h.mutex.lockUncancelable(io);
-        defer h.mutex.unlock(io);
-        if (h.fail_first and attempt == 1) return error.NotToday;
-        try h.seen.append(h.gpa, try h.gpa.dupe(u8, message.data));
-        if (h.stop_after) |n| if (h.seen.items.len >= n) h.subscriber.stop();
+        const due = d: {
+            h.mutex.lockUncancelable(io);
+            defer h.mutex.unlock(io);
+            if (h.fail_first and attempt == 1) return error.NotToday;
+            try h.seen.append(h.gpa, try h.gpa.dupe(u8, message.data));
+            if (h.stop_after) |n| if (h.seen.items.len >= n) h.subscriber.stop();
+            const hook = h.after_seen orelse break :d null;
+            if (h.seen.items.len != hook.count) break :d null;
+            h.after_seen = null;
+            break :d hook.do;
+        };
+        // Outside the handler's lock: what it does takes the fake's.
+        if (due) |do| try do(@alignCast(@fieldParentPtr("handler", h)));
+    }
+
+    fn attemptsOf(h: *TestHandler, data: []const u8) usize {
+        h.mutex.lockUncancelable(h.io);
+        defer h.mutex.unlock(h.io);
+        return h.attempts.get(data) orelse 0;
     }
 
     fn seenCount(h: *TestHandler) usize {
@@ -2327,6 +2460,114 @@ test "Subscriber: init failures under memory pressure are OutOfMemory without le
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.initDeinit, .{});
 }
 
+const Seeks = struct {
+    fn back(h: *Harness) anyerror!void {
+        try h.fake.seekBack();
+    }
+
+    /// A purge, and one message published after it.
+    fn aheadThenOne(h: *Harness) anyerror!void {
+        try h.fake.seekAhead();
+        try h.fake.publish("after");
+    }
+
+    fn detach(h: *Harness) anyerror!void {
+        h.fake.detach();
+    }
+};
+
+test "Subscriber: a seek back mid-run brings every message again with no restart, and an ack that crossed it is taken and forgotten" {
+    for ([_]bool{ false, true }) |exactly_once| {
+        var h: Harness = undefined;
+        try h.init(.{});
+        defer h.deinit();
+        h.fake.exactly_once = exactly_once;
+        // Long enough that no lease lapses on its own.
+        h.fake.lease_ms = 30_000;
+        for ([_][]const u8{ "replay-0", "replay-1", "replay-2" }) |data| try h.fake.publish(data);
+        // The handler of the third message seeks back before it returns, so
+        // its own ack is sent with an id the seek made stale.
+        h.handler.after_seen = .{ .count = 3, .do = Seeks.back };
+        h.handler.stop_after = 6;
+        try runWithin(&h, 20_000);
+
+        // The same subscriber, never restarted, handled each one twice.
+        try testing.expectEqual(6, h.handler.seenCount());
+        for ([_][]const u8{ "replay-0", "replay-1", "replay-2" }) |data| {
+            try testing.expectEqual(2, h.handler.attemptsOf(data));
+            // Acknowledged for good by the second round, at the latest.
+            try testing.expect(h.fake.ackedData(data) >= 1);
+        }
+        // The server answered every ack as taken, the stale ones too, so
+        // the subscriber counts six. The third message's first ack took
+        // nothing off the backlog: that message came again.
+        const counts = h.subscriber.stats();
+        try testing.expectEqual(6, counts.received);
+        try testing.expectEqual(6, counts.acked);
+        try testing.expectEqual(0, counts.ack_failed);
+        try expectAccounted(counts);
+        try testing.expectEqual(6, h.fake.ackedCount());
+        try testing.expectEqual(1, h.fake.ackedData("replay-2"));
+        try testing.expect(h.fake.ackedMessages() <= 5);
+        try testing.expectEqual(0, h.fake.backlog());
+    }
+}
+
+test "Subscriber: a seek ahead purges what waits, and the subscriber goes on to what is published after" {
+    var h: Harness = undefined;
+    // One message out at a time, so the rest wait on the server when the
+    // first one's handler purges them.
+    try h.init(.{ .max_outstanding = 1 });
+    defer h.deinit();
+    for ([_][]const u8{ "old-0", "old-1", "old-2" }) |data| try h.fake.publish(data);
+    h.handler.after_seen = .{ .count = 1, .do = Seeks.aheadThenOne };
+    h.handler.stop_after = 2;
+    try runWithin(&h, 20_000);
+
+    // Idle, not stopped: it took the one message published after the seek,
+    // and the two the seek purged never came.
+    try testing.expectEqual(2, h.handler.seenCount());
+    try testing.expectEqual(1, h.handler.attemptsOf("old-0"));
+    try testing.expectEqual(1, h.handler.attemptsOf("after"));
+    try testing.expectEqual(0, h.handler.attemptsOf("old-1"));
+    try testing.expectEqual(0, h.handler.attemptsOf("old-2"));
+    const counts = h.subscriber.stats();
+    try testing.expectEqual(2, counts.received);
+    try testing.expectEqual(2, counts.acked);
+    try expectAccounted(counts);
+    // The seek had acknowledged `old-0` before its own ack arrived.
+    try testing.expectEqual(0, h.fake.ackedData("old-0"));
+    try testing.expectEqual(1, h.fake.ackedData("after"));
+    try testing.expectEqual(0, h.fake.backlog());
+}
+
+test "Subscriber: a detach stops run with FailedPrecondition and the server's words, with exactly-once delivery or without" {
+    for ([_]bool{ false, true }) |exactly_once| {
+        var h: Harness = undefined;
+        try h.init(.{});
+        defer h.deinit();
+        h.fake.exactly_once = exactly_once;
+        h.fake.lease_ms = 30_000;
+        var diag: Diagnostics = .{};
+        h.subscriber.caller_diag = &diag;
+        try h.fake.publish("last");
+        // Detached while its one message is being handled: the pull the
+        // puller holds meanwhile is refused, and so is the message's ack.
+        h.handler.after_seen = .{ .count = 1, .do = Seeks.detach };
+
+        try testing.expectError(error.FailedPrecondition, runWithin(&h, 20_000));
+        try testing.expectEqual(400, diag.http_status);
+        try testing.expectEqualStrings("FAILED_PRECONDITION", diag.status());
+        try testing.expectEqualStrings("This method is not supported on detached subscriptions.", diag.message());
+        // Nothing was acknowledged, and the stats still add up.
+        const counts = h.subscriber.stats();
+        try testing.expectEqual(1, counts.received);
+        try testing.expectEqual(0, counts.acked);
+        try expectAccounted(counts);
+        try testing.expectEqual(0, h.fake.ackedCount());
+    }
+}
+
 fn chaosProperty(_: void, input: []const u8) !void {
     var g: test_util.ByteGen = .init(input);
     const message_count = g.intRange(u8, 1, 24);
@@ -2369,6 +2610,10 @@ fn chaosProperty(_: void, input: []const u8) !void {
             },
         }
     }
+    // Drawn last of all, for the same reason: a seek back at some point of
+    // the run, which brings every message again and makes the ack ids out
+    // then stale.
+    if (g.boolean()) h.handler.after_seen = .{ .count = g.intRange(u8, 1, message_count), .do = Seeks.back };
     for (0..message_count) |i| {
         var buf: [16]u8 = undefined;
         try h.fake.publish(try std.fmt.bufPrint(&buf, "chaos-{d}", .{i}));
@@ -2377,6 +2622,23 @@ fn chaosProperty(_: void, input: []const u8) !void {
     // Whatever the mix, every message is handled and the loop stops clean.
     try h.subscriber.run(h.handler.handler());
     try testing.expect(h.handler.seenCount() >= message_count);
+    // No message is lost, seek or no seek: each one was handled, or is
+    // still the server's to deliver.
+    for (0..message_count) |i| {
+        var buf: [16]u8 = undefined;
+        const data = try std.fmt.bufPrint(&buf, "chaos-{d}", .{i});
+        if (h.handler.attemptsOf(data) > 0) continue;
+        h.fake.mutex.lockUncancelable(testing.io);
+        defer h.fake.mutex.unlock(testing.io);
+        const waiting = for (h.fake.pending.items) |m| {
+            if (std.mem.eql(u8, m.data, data)) break true;
+        } else false;
+        var leased = h.fake.leased.valueIterator();
+        const out = while (leased.next()) |m| {
+            if (std.mem.eql(u8, m.data, data)) break true;
+        } else false;
+        if (!waiting and !out) return error.TestMessageLost;
+    }
     const counts = h.subscriber.stats();
     // Every message received is counted once, and `acked` is what the
     // server took, no more.
@@ -2399,7 +2661,8 @@ test "slow property Subscriber: random loads, failures and limits never lose a m
     try test_util.fuzzBytes({}, chaosProperty, .{
         // Real tasks and real time: a few runs, not hundreds.
         .random_runs = 8,
-        .max_len = 8,
+        // Room for a plain run to draw a seek, and where.
+        .max_len = 10,
         .corpus = &.{
             "\x01\x01\x00\x00\x00\x01",
             "\x18\x04\x01\x02\x02\x08",
@@ -2410,6 +2673,12 @@ test "slow property Subscriber: random loads, failures and limits never lose a m
             "\x0b\x02\x00\x00\x01\x05\x01\x14\x02\x01\x01\x32\x01",
             "\x05\x00\x01\x01\x00\x01\x01\x00\x00\x02\x02\x3c\x02",
             "\x17\x03\x00\x00\x00\x07\x01\x64\x03\x00\x00\x00\x00",
+            // A seek back: early and late on a plain subscription with
+            // failing first deliveries, and in the middle of an
+            // exactly-once one whose leases lapse.
+            "\x0c\x02\x01\x00\x00\x04\x00\x01\x00",
+            "\x17\x03\x00\x01\x01\x07\x00\x01\x16",
+            "\x0b\x02\x00\x00\x01\x05\x01\x14\x02\x01\x01\x10\x00\x01\x05",
         },
     });
 }

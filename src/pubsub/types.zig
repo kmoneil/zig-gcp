@@ -303,6 +303,17 @@ pub const SubscriptionPage = struct {
     next_page_token: ?[]const u8,
 };
 
+/// Where `Subscription.seek` takes a subscription.
+pub const SeekTarget = union(enum) {
+    /// The messages the subscription holds that were published before
+    /// this time become acknowledged, and those published after it
+    /// unacknowledged. A time ahead of now purges what it holds.
+    time: std.Io.Timestamp,
+    /// A snapshot of the subscription's topic: an id in the client's
+    /// project, or `projects/{project}/snapshots/{id}`.
+    snapshot: []const u8,
+};
+
 /// What `Snapshot.create` keeps, and under which labels.
 pub const SnapshotConfig = struct {
     /// The subscription whose backlog the snapshot keeps: an id in the

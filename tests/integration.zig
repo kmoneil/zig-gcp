@@ -1363,6 +1363,141 @@ test "snapshots: one is made, read, found in its project's list and its topic's,
     try testing.expectError(error.NotFound, snapshot.get());
 }
 
+// Seek and detach.
+
+/// Pulls and acknowledges until every one of `wanted` came at least once.
+/// More may come, and the same one twice: around a seek, production's
+/// deliveries take up to a minute to settle.
+fn pullEach(f: *Fixture, sub: pubsub.Subscription, wanted: []const []const u8, timeout_s: i64) !void {
+    var seen: Collector = .init();
+    defer seen.deinit();
+    const deadline = nowMs() + timeout_s * 1000;
+    while (true) {
+        const missing = for (wanted) |data| {
+            if (seen.find(data) == null) break data;
+        } else return;
+        if (nowMs() > deadline) {
+            std.debug.print("timed out waiting for \"{s}\"\n", .{missing});
+            return error.TestTimedOut;
+        }
+        var batch = sub.pull(.{ .max_messages = 1000, .return_immediately = true }) catch |err| return f.fail(err);
+        defer batch.deinit();
+        for (batch.value.messages) |m| try seen.add(m);
+        if (batch.value.messages.len > 0) {
+            const ids = try testing.allocator.alloc([]const u8, batch.value.messages.len);
+            defer testing.allocator.free(ids);
+            for (batch.value.messages, ids) |m, *id| id.* = m.ack_id;
+            sub.ack(ids) catch |err| return f.fail(err);
+        } else {
+            try testing.io.sleep(.fromMilliseconds(250), .awake);
+        }
+    }
+}
+
+fn publishEach(f: *Fixture, topic: pubsub.Topic, data: []const []const u8) !void {
+    for (data) |d| _ = try publishOne(f, topic, .{ .data = d }, .{});
+}
+
+test "seek: to a snapshot, back to a time, and ahead, on a subscription that retains what it acknowledged" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("seek");
+    const sub = try f.createSubscription("seek-sub", .{ .topic_id = topic.id, .retain_acked_messages = true });
+    const other_topic = try f.createTopic("seek-other");
+    const other_sub = try f.createSubscription("seek-other-sub", .{ .topic_id = other_topic.id });
+    // A time before anything is published, by this machine's clock and,
+    // with a second to spare, by the server's.
+    const before = std.Io.Clock.real.now(testing.io);
+    try testing.io.sleep(.fromMilliseconds(2000), .awake);
+
+    try publishEach(&f, topic, &.{ "a", "b" });
+    try pullEach(&f, sub, &.{ "a", "b" }, f.patience());
+    // `c` and `d` are what the snapshot keeps: published, not acknowledged.
+    try publishEach(&f, topic, &.{ "c", "d" });
+    const snapshot = f.client.snapshot(f.id("seek-snap"));
+    try f.snapshots.append(testing.allocator, snapshot.id);
+    var kept = snapshot.create(.{ .subscription = sub.id }) catch |err| return f.fail(err);
+    kept.deinit();
+    try pullEach(&f, sub, &.{ "c", "d" }, f.patience());
+
+    // To the snapshot: its two messages come again, and it stays.
+    sub.seek(.{ .snapshot = snapshot.id }) catch |err| return f.fail(err);
+    try pullEach(&f, sub, &.{ "c", "d" }, f.patience());
+    var still = snapshot.get() catch |err| return f.fail(err);
+    still.deinit();
+
+    // Back to before everything: all four, the acknowledged ones retained.
+    sub.seek(.{ .time = before }) catch |err| return f.fail(err);
+    try pullEach(&f, sub, &.{ "a", "b", "c", "d" }, f.patience());
+
+    // Ahead of everything: a purge. It is no standing filter: what is
+    // published after it is delivered, an hour before the time it named.
+    const ahead: std.Io.Timestamp = .{ .nanoseconds = std.Io.Clock.real.now(testing.io).nanoseconds + 3600 * std.time.ns_per_s };
+    sub.seek(.{ .time = ahead }) catch |err| return f.fail(err);
+    // Production can still deliver, for up to a minute, what the seek
+    // acknowledged; the emulator's seek shows at once.
+    if (!f.production) try expectNoMessages(&f, sub);
+    try publishEach(&f, topic, &.{"e"});
+    try pullEach(&f, sub, &.{"e"}, f.patience());
+
+    // A snapshot serves its own topic's subscriptions and no other's.
+    try testing.expectError(error.FailedPrecondition, other_sub.seek(.{ .snapshot = snapshot.id }));
+    try testing.expect(std.mem.startsWith(u8, f.diag.message(), "The subscription's topic"));
+    try testing.expectError(error.NotFound, sub.seek(.{ .snapshot = f.id("no-such-snap") }));
+    try testing.expectError(error.NotFound, f.client.subscription(f.id("no-such-sub")).seek(.{ .time = before }));
+}
+
+test "detach: the emulator has none; production cuts the subscription off its topic for good" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const topic = try f.createTopic("detach");
+    const sub = try f.createSubscription("detach-sub", .{ .topic_id = topic.id });
+    if (!f.production) {
+        try testing.expectError(error.Unimplemented, sub.detach());
+        return;
+    }
+    const a = f.arena.allocator();
+    const name = try a.print("projects/{s}/subscriptions/{s}", .{ f.client.project_id, sub.id });
+    try testing.expect(holds(try allNames(&f, topic, .subscriptions, 100), name));
+
+    sub.detach() catch |err| return f.fail(err);
+    // It stays, reads back detached, and is gone from its topic's list.
+    var got = sub.get() catch |err| return f.fail(err);
+    defer got.deinit();
+    try testing.expect(got.value.detached);
+    try testing.expect(!holds(try allNames(&f, topic, .subscriptions, 100), name));
+
+    // Within seconds, everything but a read, an update and a delete is
+    // refused, a second detach among it.
+    const Refused = struct {
+        fn pull(s: pubsub.Subscription) anyerror!void {
+            var batch = s.pull(.{ .return_immediately = true }) catch |err| {
+                return if (err == error.FailedPrecondition) {} else err;
+            };
+            batch.deinit();
+            return error.TestStillAttached;
+        }
+    };
+    try eventually(&f, f.patience(), sub, Refused.pull);
+    try testing.expectEqualStrings("This method is not supported on detached subscriptions.", f.diag.message());
+    try testing.expectError(error.FailedPrecondition, sub.detach());
+    try testing.expectError(error.FailedPrecondition, sub.seek(.{ .time = std.Io.Clock.real.now(testing.io) }));
+    try testing.expectError(error.FailedPrecondition, f.client.snapshot(f.id("of-detached")).create(.{ .subscription = sub.id }));
+
+    // An update still lands. Its own answer leaves `detached` out, as
+    // measured on 2026-10-10, and a read after it says what is true.
+    var updated = sub.update(.{ .labels = &.{.{ .key = "state", .value = "detached" }} }) catch |err| return f.fail(err);
+    defer updated.deinit();
+    try testing.expectEqualStrings("detached", updated.value.label("state").?);
+    try testing.expect(!updated.value.detached);
+    var again = sub.get() catch |err| return f.fail(err);
+    defer again.deinit();
+    try testing.expect(again.value.detached);
+    try testing.expectEqualStrings("detached", again.value.label("state").?);
+}
+
 // Publisher.
 
 const Publisher = pubsub.Publisher;
