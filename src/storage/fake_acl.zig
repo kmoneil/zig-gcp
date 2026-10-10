@@ -239,6 +239,8 @@ test "fake ACL rules: production's expansions, normalizing, the owner, and the r
     const a = arena_state.allocator();
     try testing.expectEqual(3, bucketList("projectPrivate").?.len);
     try testing.expectEqual(null, bucketList("bucketOwnerRead"));
+    // And a bucket's alone is no object's.
+    try testing.expectEqual(null, objectList("publicReadWrite"));
     try testing.expectEqual(0, objectList("private").?.len);
     const fresh = try newObjectList(a, "user-w@x.com", null, project_private);
     try testing.expectEqualStrings("user-w@x.com", fresh[3].entity);

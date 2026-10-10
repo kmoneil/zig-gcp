@@ -3599,3 +3599,363 @@ pub fn gzipAlloc(gpa: Allocator, data: []const u8, options: std.compress.flate.C
     compress.finish() catch return error.OutOfMemory;
     return out.toOwnedSlice();
 }
+
+const testing = std.testing;
+
+const Ask = struct {
+    headers: []const Header = &.{},
+    body: []const u8 = "",
+    content_type: ?[]const u8 = null,
+    accept_gzip: bool = false,
+};
+
+/// One request straight to the fake, past this library: it refuses most of
+/// what these tests send before sending it, and sends some of the rest
+/// another way.
+fn ask(fake: *FakeMultipart, arena: Allocator, method: Method, path: []const u8, with: Ask) !FakeMultipart.Reply {
+    const url = try std.mem.concat(arena, u8, &.{ "https://storage.googleapis.com", path });
+    return fake.handle(method, url, with.content_type, with.headers, with.body, with.accept_gzip, arena);
+}
+
+fn expectSays(reply: FakeMultipart.Reply, status: u16, words: []const u8) !void {
+    errdefer std.debug.print("{d}: {s}\n", .{ reply.status, reply.body });
+    try testing.expectEqual(status, reply.status);
+    try testing.expect(std.mem.indexOf(u8, reply.body, words) != null);
+}
+
+fn makeBucket(fake: *FakeMultipart, arena: Allocator, body: []const u8) !void {
+    try testing.expectEqual(200, (try ask(fake, arena, .POST, "/storage/v1/b?project=extractctl", .{ .body = body })).status);
+}
+
+const related_type = "multipart/related; boundary=zz";
+
+/// A one-request upload's body, framed as this library frames it.
+fn related(arena: Allocator, metadata: []const u8, data: []const u8) ![]const u8 {
+    return arena.print("--zz\r\nContent-Type: application/json\r\n\r\n{s}\r\n--zz\r\nContent-Type: application/octet-stream\r\n\r\n{s}\r\n--zz--\r\n", .{ metadata, data });
+}
+
+test "a canned list on an upload: refused under uniform access and under public access prevention, in each API's words" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try makeBucket(&fake, a, "{\"name\":\"u\",\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true}}}");
+    try makeBucket(&fake, a, "{\"name\":\"p\",\"iamConfiguration\":{\"publicAccessPrevention\":\"enforced\"}}");
+    const uniform_words = "Cannot insert legacy ACL for an object when uniform bucket-level access is enabled.";
+    const prevented_words = "The member bindings allUsers and allAuthenticatedUsers are not allowed since public access prevention is enforced.";
+    const upload = try related(a, "{\"name\":\"a\"}", "x");
+    const named: Ask = .{ .body = "{\"name\":\"a\"}" };
+
+    // Uniform access keeps no lists, so each way of writing an object
+    // refuses a canned one, whichever it names, and writes nothing.
+    try expectSays(try ask(&fake, a, .POST, "/upload/storage/v1/b/u/o?uploadType=multipart&predefinedAcl=private", .{ .content_type = related_type, .body = upload }), 400, uniform_words);
+    try expectSays(try ask(&fake, a, .POST, "/upload/storage/v1/b/u/o?uploadType=resumable&predefinedAcl=private", named), 400, uniform_words);
+    try expectSays(try ask(&fake, a, .POST, "/u/a?uploads", .{ .headers = &.{.{ .name = "x-goog-acl", .value = "private" }} }), 400, "<Code>InvalidArgument</Code><Message>" ++ uniform_words);
+    try testing.expectEqual(null, fake.object("a"));
+    try testing.expectEqual(0, fake.openSessions());
+    try testing.expectEqual(0, fake.openUploads());
+
+    // Public access prevention refuses only a list that grants the public
+    // something, with 412: the JSON API's body, or the XML API's.
+    try expectSays(try ask(&fake, a, .POST, "/upload/storage/v1/b/p/o?uploadType=multipart&predefinedAcl=publicRead", .{ .content_type = related_type, .body = upload }), 412, prevented_words);
+    try expectSays(try ask(&fake, a, .POST, "/upload/storage/v1/b/p/o?uploadType=resumable&predefinedAcl=authenticatedRead", named), 412, prevented_words);
+    try expectSays(try ask(&fake, a, .POST, "/p/a?uploads", .{ .headers = &.{.{ .name = "x-goog-acl", .value = "public-read" }} }), 412, "<Code>PreconditionFailed</Code><Message>" ++ prevented_words);
+    try testing.expectEqual(null, fake.object("a"));
+    try testing.expectEqual(0, fake.openSessions());
+    try testing.expectEqual(0, fake.openUploads());
+    try testing.expectEqual(200, (try ask(&fake, a, .POST, "/upload/storage/v1/b/p/o?uploadType=multipart&predefinedAcl=private", .{ .content_type = related_type, .body = upload })).status);
+    try testing.expectEqual(.private, fake.object("a").?.predefined_acl.?);
+
+    // The XML API names its lists its own way: the JSON API's name is none.
+    try expectSays(try ask(&fake, a, .POST, "/p/b?uploads", .{ .headers = &.{.{ .name = "x-goog-acl", .value = "publicRead" }} }), 400, "Invalid canned ACL");
+    try testing.expectEqual(0, fake.openUploads());
+}
+
+test "access control lists read through the fake: a bucket's two lists, their entries, and an object's list whole" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // A create's canned list reaches the bucket's own list, and leaves the
+    // default object list `projectPrivate`.
+    try testing.expectEqual(200, (try ask(&fake, a, .POST, "/storage/v1/b?project=extractctl&predefinedAcl=publicRead", .{ .body = "{\"name\":\"b\"}" })).status);
+    try expectSays(try ask(&fake, a, .GET, "/storage/v1/b/b/acl", .{}), 200, "storage#bucketAccessControls");
+    try testing.expectEqualStrings("{\"entity\":\"allUsers\",\"role\":\"READER\"}", (try ask(&fake, a, .GET, "/storage/v1/b/b/acl/allUsers", .{})).body);
+    try expectSays(try ask(&fake, a, .GET, "/storage/v1/b/b/defaultObjectAcl", .{}), 200, "storage#objectAccessControls");
+    try expectSays(try ask(&fake, a, .GET, "/storage/v1/b/b/defaultObjectAcl/" ++ fake_acl.viewers, .{}), 200, "\"role\":\"READER\"");
+    try expectSays(try ask(&fake, a, .GET, "/storage/v1/b/b/defaultObjectAcl/allUsers", .{}), 404, "The specified key does not exist.");
+
+    // An object written without a list gets the default one, then its
+    // writer as OWNER, and the list's own endpoint answers all of it.
+    try testing.expectEqual(200, (try ask(&fake, a, .POST, "/upload/storage/v1/b/b/o?uploadType=multipart", .{ .content_type = related_type, .body = try related(a, "{\"name\":\"a\"}", "x") })).status);
+    const whole = try ask(&fake, a, .GET, "/storage/v1/b/b/o/a/acl", .{});
+    try testing.expectEqual(200, whole.status);
+    const list = try std.json.parseFromSliceLeaky(struct { kind: []const u8, items: []const fake_acl.Entry }, a, whole.body, .{});
+    try testing.expectEqualStrings("storage#objectAccessControls", list.kind);
+    try testing.expectEqual(4, list.items.len);
+    for (fake_acl.project_private, list.items[0..3]) |expected, got| {
+        try testing.expectEqualStrings(expected.entity, got.entity);
+        try testing.expectEqualStrings(expected.role, got.role);
+    }
+    try testing.expectEqualStrings(try std.mem.concat(a, u8, &.{ "user-", fake.principal }), list.items[3].entity);
+    try testing.expectEqualStrings("OWNER", list.items[3].role);
+}
+
+test "HMAC keys through the fake: a listing in pages, and what its URLs do not take" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const keys = "/storage/v1/projects/extractctl/hmacKeys";
+    for (0..3) |_| {
+        try testing.expectEqual(200, (try ask(&fake, a, .POST, keys ++ "?serviceAccountEmail=zig-gcp%40extractctl.iam.gserviceaccount.com", .{})).status);
+    }
+
+    // Two to a page: the token is where the next page starts, and the
+    // last page carries none.
+    const Page = struct { items: []const struct { accessId: []const u8 } = &.{}, nextPageToken: ?[]const u8 = null };
+    const first = try std.json.parseFromSliceLeaky(Page, a, (try ask(&fake, a, .GET, keys ++ "?maxResults=2", .{})).body, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(2, first.items.len);
+    try testing.expectEqualStrings("2", first.nextPageToken.?);
+    const last = try std.json.parseFromSliceLeaky(Page, a, (try ask(&fake, a, .GET, keys ++ "?maxResults=2&pageToken=2", .{})).body, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(1, last.items.len);
+    try testing.expectEqualStrings(fake.hmac.keys.items[2].access_id, last.items[0].accessId);
+    try testing.expectEqual(null, last.nextPageToken);
+
+    // A page size that is no number, and a method a key does not take,
+    // fail the test that sent them, and change nothing.
+    try testing.expectError(error.HttpProtocolError, ask(&fake, a, .GET, keys ++ "?maxResults=two", .{}));
+    const one = try a.print(keys ++ "/{s}", .{fake.hmac.keys.items[0].access_id});
+    try testing.expectError(error.HttpProtocolError, ask(&fake, a, .PATCH, one, .{ .body = "{\"state\":\"INACTIVE\"}" }));
+    try testing.expectEqual(0, fake.hmac.counts.updates);
+    try testing.expectEqual(.ACTIVE, fake.hmac.keys.items[0].state);
+}
+
+test "a resumable session at its edges: a key refused at the start, a chunk that is not its range, a hash with no crc32c, and a finished session cancelled" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const start = "/upload/storage/v1/b/b/o?uploadType=resumable";
+    const named: Ask = .{ .body = "{\"name\":\"s\"}" };
+
+    // A Cloud KMS key the service agent may not use is refused at the
+    // start, and no session opens.
+    fake.kms_granted = false;
+    try expectSays(try ask(&fake, a, .POST, start ++ "&kmsKeyName=projects%2Fp%2Flocations%2Fl%2FkeyRings%2Fr%2FcryptoKeys%2Fk", named), 403, "Permission denied on Cloud KMS key.");
+    try testing.expectEqual(0, fake.openSessions());
+    fake.kms_granted = true;
+
+    const opened = try ask(&fake, a, .POST, start, named);
+    try testing.expectEqual(200, opened.status);
+    try testing.expect(std.mem.endsWith(u8, headerValue(opened.headers, "Location").?, "/upload/session/sess-1"));
+    const session = "/upload/session/sess-1";
+    const whole_range: Header = .{ .name = "Content-Range", .value = "bytes 0-4/5" };
+    const status_query: Ask = .{ .headers = &.{.{ .name = "Content-Range", .value = "bytes */5" }} };
+
+    // A chunk whose body is not the length its range says is refused, and
+    // none of it is stored.
+    try expectSays(try ask(&fake, a, .PUT, session, .{ .headers = &.{whole_range}, .body = "hel" }), 400, "the body does not match its Content-Range");
+    try testing.expectEqual(0, fake.sessionHolds(session).?);
+
+    // The finishing chunk's `X-Goog-Hash` names an md5 alone: it claims no
+    // crc32c, so there is none to hold the bytes to.
+    try fake.put("other", "o");
+    const finished = try ask(&fake, a, .PUT, session, .{
+        .headers = &.{ whole_range, .{ .name = "X-Goog-Hash", .value = "md5=XUFAKrxLKna5cZ2REBfFkg==" } },
+        .body = "hello",
+    });
+    try testing.expectEqual(200, finished.status);
+    try testing.expectEqualStrings("hello", fake.object("s").?.bytes);
+
+    // A finished session keeps answering with its object, found among the
+    // others, as a status query after a lost answer needs.
+    const again = try ask(&fake, a, .PUT, session, status_query);
+    try testing.expectEqual(200, again.status);
+    try testing.expectEqualStrings(finished.body, again.body);
+
+    // Cancelled, a finished session is forgotten: the cancel is 499, as
+    // every cancel, the session 404 from then on, and its object stands.
+    try testing.expectEqual(499, (try ask(&fake, a, .DELETE, session, .{})).status);
+    try expectSays(try ask(&fake, a, .PUT, session, status_query), 404, "No such upload.");
+    try testing.expectEqual(null, fake.sessionHolds(session));
+    try testing.expectEqual(1, fake.counts.session_cancels);
+    try testing.expectEqualStrings("hello", fake.object("s").?.bytes);
+}
+
+test "reads at their edges: a range past the end, a stall that passes, and a soft-deleted generation that is not there" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try fake.put("a", "0123456789");
+    const media = "/storage/v1/b/b/o/a?alt=media";
+
+    // A range that starts at the object's size is 416, naming the size;
+    // one byte before it is the last byte.
+    const past = try ask(&fake, a, .GET, media, .{ .headers = &.{.{ .name = "Range", .value = "bytes=10-" }} });
+    try testing.expectEqual(416, past.status);
+    try testing.expectEqualStrings("bytes */10", headerValue(past.headers, "Content-Range").?);
+    const last = try ask(&fake, a, .GET, media, .{ .headers = &.{.{ .name = "Range", .value = "bytes=9-" }} });
+    try testing.expectEqual(206, last.status);
+    try testing.expectEqualStrings("9", last.body);
+    try testing.expectEqualStrings("bytes 9-9/10", headerValue(last.headers, "Content-Range").?);
+
+    // A stall holds its request, then answers it as if nothing had.
+    const Plan = struct {
+        fn decide(_: ?*anyopaque, kind: FakeMultipart.Kind, _: u32) FakeMultipart.Fault {
+            return if (kind == .media) .stall else .none;
+        }
+    };
+    fake.faults = .{ .decide = Plan.decide };
+    fake.stall_ms = 1;
+    const held = try ask(&fake, a, .GET, media, .{});
+    try testing.expectEqual(200, held.status);
+    try testing.expectEqualStrings("0123456789", held.body);
+    fake.faults = null;
+
+    // A soft-deleted generation reads by its generation and no other.
+    fake.soft_delete = true;
+    const generation = fake.object("a").?.generation;
+    try testing.expectEqual(204, (try ask(&fake, a, .DELETE, "/storage/v1/b/b/o/a", .{})).status);
+    try testing.expectEqual(200, (try ask(&fake, a, .GET, try a.print("/storage/v1/b/b/o/a?softDeleted=true&generation={d}", .{generation}), .{})).status);
+    try expectSays(try ask(&fake, a, .GET, try a.print("/storage/v1/b/b/o/a?softDeleted=true&generation={d}", .{generation + 1}), .{}), 404, "No such object");
+    try expectSays(try ask(&fake, a, .GET, "/storage/v1/b/b/o/a?softDeleted=true", .{}), 400, "You must specify a generation.");
+}
+
+test "what the fake will not take: a body that is no multipart, and a token where this library sends none" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const insert = "/upload/storage/v1/b/b/o?uploadType=multipart";
+    const token: []const Header = &.{.{ .name = "X-Goog-Gcs-Idempotency-Token", .value = "t-1" }};
+
+    // A body that does not frame two parts is refused whole. Under a
+    // token it names no object to keep an answer for, so its repeat is
+    // judged again, not answered from memory.
+    try expectSays(try ask(&fake, a, .POST, insert, .{ .content_type = related_type, .body = "not two parts" }), 400, "bad multipart body");
+    for (0..2) |_| {
+        try expectSays(try ask(&fake, a, .POST, insert, .{ .content_type = related_type, .body = "not two parts", .headers = token }), 400, "bad multipart body");
+    }
+    try testing.expectEqual(3, fake.counts.inserts);
+    try testing.expectEqual(0, fake.counts.deduplicated);
+    try testing.expectEqual(0, fake.kept.items.len);
+    try testing.expectEqual(0, fake.objects.items.len);
+
+    // A token on a read or on the XML API is this library's bug: refused
+    // before anything is read or counted.
+    try fake.put("a", "x");
+    try expectSays(try ask(&fake, a, .GET, "/storage/v1/b/b/o/a", .{ .headers = token }), 400, "an idempotency token on a GET read");
+    try expectSays(try ask(&fake, a, .POST, "/b/a?uploads", .{ .headers = token }), 400, "an idempotency token on a POST start");
+    try testing.expectEqual(0, fake.counts.reads);
+    try testing.expectEqual(0, fake.counts.starts);
+}
+
+test "metadata that says gzip over bytes that are not: stored as sent, and served decompressed as nothing" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const data = "plain bytes, no gzip stream";
+    const upload = try related(a, "{\"name\":\"z\",\"contentEncoding\":\"gzip\"}", data);
+    try testing.expectEqual(200, (try ask(&fake, a, .POST, "/upload/storage/v1/b/b/o?uploadType=multipart", .{ .content_type = related_type, .body = upload })).status);
+    const media = "/storage/v1/b/b/o/z?alt=media";
+
+    const transcoded = try ask(&fake, a, .GET, media, .{});
+    try testing.expectEqual(200, transcoded.status);
+    try testing.expectEqualStrings("", transcoded.body);
+    try testing.expectEqualStrings("gzip", headerValue(transcoded.headers, "x-goog-stored-content-encoding").?);
+    const as_sent = try ask(&fake, a, .GET, media, .{ .accept_gzip = true });
+    try testing.expectEqual(200, as_sent.status);
+    try testing.expectEqualStrings(data, as_sent.body);
+    try testing.expectEqualStrings("gzip", headerValue(as_sent.headers, "Content-Encoding").?);
+}
+
+test "a restore keeps the custom metadata its object was uploaded with" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    fake.soft_delete = true;
+
+    // The XML API's start is what carries custom metadata here.
+    const started = try ask(&fake, a, .POST, "/b/m?uploads", .{ .headers = &.{.{ .name = "x-goog-meta-Color", .value = "blue" }} });
+    try expectSays(started, 200, "<UploadId>VXBs+1=</UploadId>");
+    const upload = "/b/m?uploadId=VXBs%2B1%3D";
+    const part = try ask(&fake, a, .PUT, upload ++ "&partNumber=1", .{ .body = "data" });
+    try testing.expectEqual(200, part.status);
+    const finish = try xml.encodeComplete(a, &.{.{ .number = 1, .etag = headerValue(part.headers, "ETag").? }});
+    try testing.expectEqual(200, (try ask(&fake, a, .POST, upload, .{ .body = finish })).status);
+    const first = fake.object("m").?.generation;
+
+    try testing.expectEqual(204, (try ask(&fake, a, .DELETE, "/storage/v1/b/b/o/m", .{})).status);
+    try testing.expectEqual(null, fake.object("m"));
+    try testing.expectEqual(200, (try ask(&fake, a, .POST, try a.print("/storage/v1/b/b/o/m/restore?generation={d}", .{first}), .{})).status);
+    const restored = fake.object("m").?;
+    try testing.expect(restored.generation != first);
+    try testing.expectEqualStrings("data", restored.bytes);
+    try testing.expectEqual(1, restored.metadata.len);
+    try testing.expectEqualStrings("color", restored.metadata[0].name);
+    try testing.expectEqualStrings("blue", restored.metadata[0].value);
+}
+
+test "folders and managed folders at their edges: a listing's prefix and pages, a folder under an object, a policy that is none, and requester pays" {
+    var fake: FakeMultipart = .init(testing.allocator, testing.io);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try makeBucket(&fake, a, "{\"name\":\"h\",\"hierarchicalNamespace\":{\"enabled\":true},\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true}}}");
+    const folders = "/storage/v1/b/h/folders";
+    const managed = "/storage/v1/b/h/managedFolders";
+
+    // A listing's prefix names a folder, slash and all.
+    try expectSays(try ask(&fake, a, .GET, folders ++ "?prefix=d", .{}), 400, "Prefix must end with '/'.");
+    // A folder is not empty while an object's name begins with it, though
+    // no folder is under it.
+    try testing.expectEqual(200, (try ask(&fake, a, .POST, folders, .{ .body = "{\"name\":\"d/\"}" })).status);
+    try fake.put("d/x", "1");
+    try expectSays(try ask(&fake, a, .DELETE, folders ++ "/d%2F", .{}), 409, "The folder you tried to delete is not empty.");
+    try testing.expectEqual(200, (try ask(&fake, a, .GET, folders ++ "/d%2F", .{})).status);
+    // Either collection takes a create and a listing, and nothing else.
+    try expectSays(try ask(&fake, a, .DELETE, folders, .{}), 400, "this fake serves no such folder request");
+    try expectSays(try ask(&fake, a, .DELETE, managed, .{}), 400, "this fake serves no such managed folder request");
+
+    // Managed folders: one read back, then all of them two to a page,
+    // each page's token the last name it served.
+    for ([_][]const u8{ "m1", "m2", "m3" }) |name| {
+        try testing.expectEqual(200, (try ask(&fake, a, .POST, managed, .{ .body = try a.print("{{\"name\":\"{s}\"}}", .{name}) })).status);
+    }
+    try expectSays(try ask(&fake, a, .GET, managed ++ "/m1%2F", .{}), 200, "\"name\":\"m1/\"");
+    const Page = struct { items: []const struct { name: []const u8 } = &.{}, nextPageToken: ?[]const u8 = null };
+    const first = try std.json.parseFromSliceLeaky(Page, a, (try ask(&fake, a, .GET, managed ++ "?pageSize=2", .{})).body, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(2, first.items.len);
+    try testing.expectEqualStrings("m2/", first.nextPageToken.?);
+    const last = try std.json.parseFromSliceLeaky(Page, a, (try ask(&fake, a, .GET, managed ++ "?pageSize=2&pageToken=m2%2F", .{})).body, .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(1, last.items.len);
+    try testing.expectEqualStrings("m3/", last.items[0].name);
+    try testing.expectEqual(null, last.nextPageToken);
+
+    // A policy that is no policy is refused, and the folder's own stays
+    // bare, at the etag it began with.
+    try expectSays(try ask(&fake, a, .PUT, managed ++ "/m1%2F/iam", .{ .body = "[]" }), 400, "Invalid policy");
+    try expectSays(try ask(&fake, a, .GET, managed ++ "/m1%2F/iam", .{}), 200, "\"etag\":\"CAA=\"");
+
+    // Requester pays reaches both: no project is 400, another's 403, and
+    // the billable one is served.
+    fake.requester_pays = true;
+    try expectSays(try ask(&fake, a, .GET, folders ++ "/d%2F", .{}), 400, "Bucket is a requester pays bucket but no user project provided.");
+    try testing.expectEqual(200, (try ask(&fake, a, .GET, folders ++ "/d%2F?userProject=extractctl", .{})).status);
+    try expectSays(try ask(&fake, a, .GET, managed ++ "/m1%2F?userProject=another", .{}), 403, "serviceusage.services.use");
+    try testing.expectEqual(200, (try ask(&fake, a, .GET, managed ++ "/m1%2F?userProject=extractctl", .{})).status);
+}
