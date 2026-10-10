@@ -90,7 +90,7 @@ pub const ReceivedMessage = struct {
     }
 };
 
-/// A label on a topic or subscription.
+/// A label on a topic, subscription or snapshot.
 pub const Label = struct {
     key: []const u8,
     value: []const u8,
@@ -299,6 +299,55 @@ pub const AckResult = enum {
 
 pub const SubscriptionPage = struct {
     subscriptions: []const SubscriptionInfo,
+    /// Pass as `page_token` to get the next page. Null on the last page.
+    next_page_token: ?[]const u8,
+};
+
+/// What `Snapshot.create` keeps, and under which labels.
+pub const SnapshotConfig = struct {
+    /// The subscription whose backlog the snapshot keeps: an id in the
+    /// client's project, or `projects/{project}/subscriptions/{id}`.
+    subscription: []const u8,
+    /// The emulator keeps none.
+    labels: []const Label = &.{},
+};
+
+/// A snapshot as the server describes it.
+pub const SnapshotInfo = struct {
+    /// `projects/{project}/snapshots/{id}`.
+    name: []const u8,
+    /// The topic whose messages it keeps, in full. `_deleted-topic_` once
+    /// that topic is deleted, which the snapshot outlives.
+    topic: []const u8,
+    /// The snapshot is there until then: at most 7 days from its creation,
+    /// less the age of the oldest message its subscription held.
+    expire_time: std.Io.Timestamp,
+    labels: []const Label = &.{},
+
+    /// The value of the label named `key`, or null.
+    pub fn label(self: SnapshotInfo, key: []const u8) ?[]const u8 {
+        return findLabel(self.labels, key);
+    }
+};
+
+/// What `Snapshot.update` changes: the labels, which are all Pub/Sub lets
+/// a snapshot change.
+pub const SnapshotUpdate = struct {
+    /// Replaces every label; `&.{}` removes them all.
+    labels: ?[]const Label = null,
+};
+
+pub const SnapshotPage = struct {
+    snapshots: []const SnapshotInfo,
+    /// Pass as `page_token` to get the next page. Null on the last page.
+    next_page_token: ?[]const u8,
+};
+
+/// One page of full resource names, such as
+/// `projects/{project}/subscriptions/{id}`. What is attached to a topic
+/// may lie in another project than the topic.
+pub const NamePage = struct {
+    names: []const []const u8,
     /// Pass as `page_token` to get the next page. Null on the last page.
     next_page_token: ?[]const u8,
 };
