@@ -10,6 +10,7 @@ const core = @import("core");
 pub const Client = @import("Client.zig");
 pub const Topic = @import("Topic.zig");
 pub const Subscription = @import("Subscription.zig");
+pub const Snapshot = @import("Snapshot.zig");
 pub const Subscriber = @import("Subscriber.zig");
 pub const Publisher = @import("Publisher.zig");
 pub const Endpoint = @import("Endpoint.zig");
@@ -52,6 +53,11 @@ pub const DeadLetterPolicy = @import("types.zig").DeadLetterPolicy;
 pub const Backoff = @import("types.zig").Backoff;
 pub const Expiration = @import("types.zig").Expiration;
 pub const SubscriptionUpdate = @import("types.zig").SubscriptionUpdate;
+pub const SnapshotConfig = @import("types.zig").SnapshotConfig;
+pub const SnapshotInfo = @import("types.zig").SnapshotInfo;
+pub const SnapshotUpdate = @import("types.zig").SnapshotUpdate;
+pub const SnapshotPage = @import("types.zig").SnapshotPage;
+pub const NamePage = @import("types.zig").NamePage;
 
 /// Parses a `publish_time` (RFC 3339) to nanoseconds since the Unix epoch.
 pub const parseTimestamp = core.timestamp.parse;

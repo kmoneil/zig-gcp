@@ -174,6 +174,39 @@ pub fn publish(
     return result;
 }
 
+/// One page of the subscriptions attached to the topic, each by its full
+/// name. A detached subscription is not among them, and one that is may
+/// lie in another project.
+pub fn listSubscriptions(self: Topic, page: types.PageOptions) Error!Owned(types.NamePage) {
+    return self.attached(.subscriptions, page);
+}
+
+/// One page of the snapshots kept of the topic, each by its full name:
+/// `Snapshot.get` reads one. A deleted topic has no list, though its
+/// snapshots outlive it.
+pub fn listSnapshots(self: Topic, page: types.PageOptions) Error!Owned(types.NamePage) {
+    return self.attached(.snapshots, page);
+}
+
+fn attached(self: Topic, list: codec.NameList, page: types.PageOptions) Error!Owned(types.NamePage) {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "topic", self.id);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const kind: url.Collection = switch (list) {
+        .subscriptions => .subscriptions,
+        .snapshots => .snapshots,
+    };
+    const path = try url.attachedPath(scratch.allocator(), c.project_id, self.id, kind, page.page_size, page.page_token);
+    var result: Owned(types.NamePage) = try .init(c.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(c, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeNamePage(result.arena.allocator(), body, list) catch |err|
+        return rpc.decodeFailed(c, err, "name list");
+    return result;
+}
+
 fn fetch(c: *Client, call: rpc.Call) Error!Owned(types.TopicInfo) {
     var result: Owned(types.TopicInfo) = try .init(c.gpa);
     errdefer result.deinit();
@@ -642,4 +675,50 @@ test "IAM: a grant that meets another change starts over, and stops at the retry
         try testing.expectError(error.Aborted, h.client.topic("orders").addIamBinding("roles/pubsub.publisher", agent));
         try h.expectRequestCount(4);
     }
+}
+
+test "golden: a topic's subscriptions and snapshots, by name and in pages" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // Production's answers, 2026-10-10: names alone, and a token that
+        // is no name.
+        .{ .respond = .{ .body = "{\"subscriptions\":[\"projects/p/subscriptions/orders-worker\"],\"nextPageToken\":\"enhhcGpTGwQLRFJ7VwwbBVEOGA\"}" } },
+        .{ .respond = .{ .body = "{\"subscriptions\":[\"projects/other-project/subscriptions/far\"]}" } },
+        .{ .respond = .{ .body = "{\"snapshots\":[\"projects/p/snapshots/before\"]}" } },
+        .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Resource not found (resource=orders).\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .body = "{\"snapshots\":[17]}" } },
+    }, .{});
+    defer h.deinit();
+    const orders = h.client.topic("orders");
+    const base = "http://localhost:8085/v1/projects/p/topics/orders";
+
+    var first = try orders.listSubscriptions(.{ .page_size = 1 });
+    defer first.deinit();
+    try h.expectRequest(0, .GET, base ++ "/subscriptions?pageSize=1", null);
+    try testing.expectEqual(1, first.value.names.len);
+    try testing.expectEqualStrings("projects/p/subscriptions/orders-worker", first.value.names[0]);
+    var second = try orders.listSubscriptions(.{ .page_size = 1, .page_token = first.value.next_page_token });
+    defer second.deinit();
+    try h.expectRequest(1, .GET, base ++ "/subscriptions?pageSize=1&pageToken=enhhcGpTGwQLRFJ7VwwbBVEOGA", null);
+    // A subscription of another project, attached to this topic.
+    try testing.expectEqualStrings("projects/other-project/subscriptions/far", second.value.names[0]);
+    try testing.expectEqual(null, second.value.next_page_token);
+
+    var kept = try orders.listSnapshots(.{});
+    defer kept.deinit();
+    try h.expectRequest(2, .GET, base ++ "/snapshots?pageSize=100", null);
+    try testing.expectEqualStrings("projects/p/snapshots/before", kept.value.names[0]);
+    // A topic with nothing attached lists as `{}`.
+    var none = try orders.listSnapshots(.{ .page_size = 0 });
+    defer none.deinit();
+    try h.expectRequest(3, .GET, base ++ "/snapshots", null);
+    try testing.expectEqual(0, none.value.names.len);
+
+    // A deleted topic has no list.
+    try testing.expectError(error.NotFound, orders.listSnapshots(.{}));
+    try testing.expectError(error.InvalidResponse, orders.listSnapshots(.{}));
+    try testing.expectEqualStrings("the name list response could not be decoded", h.diag.message());
+    try testing.expectError(error.InvalidResourceId, h.client.topic("go").listSubscriptions(.{}));
+    try h.expectRequestCount(6);
 }

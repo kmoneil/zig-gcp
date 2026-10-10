@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 const Stringify = std.json.Stringify;
 const base64 = @import("core").base64;
 const duration = @import("core").duration;
+const timestamp = @import("core").timestamp;
 const types = @import("types.zig");
 const test_util = @import("test_util.zig");
 
@@ -365,6 +366,54 @@ const TopicUpdateBody = struct {
     }
 };
 
+/// The `snapshots.create` body: the subscription by its full name, and the
+/// labels when there are any.
+pub fn encodeSnapshot(arena: Allocator, subscription_name: []const u8, config: types.SnapshotConfig) Allocator.Error![]u8 {
+    return render(arena, SnapshotBody{ .subscription_name = subscription_name, .config = config });
+}
+
+const SnapshotBody = struct {
+    subscription_name: []const u8,
+    config: types.SnapshotConfig,
+
+    fn write(self: SnapshotBody, jw: *Stringify) Stringify.Error!void {
+        try jw.beginObject();
+        try jw.objectField("subscription");
+        try jw.write(self.subscription_name);
+        if (self.config.labels.len > 0) {
+            try jw.objectField("labels");
+            try writeLabels(jw, self.config.labels);
+        }
+        try jw.endObject();
+    }
+};
+
+/// The `snapshots.patch` body, as for topics. Production takes labels and
+/// refuses every other field as "not mutable" (measured 2026-10-10).
+pub fn encodeSnapshotUpdate(arena: Allocator, update: types.SnapshotUpdate) Allocator.Error![]u8 {
+    return render(arena, SnapshotUpdateBody{ .update = update });
+}
+
+const SnapshotUpdateBody = struct {
+    update: types.SnapshotUpdate,
+
+    fn write(self: SnapshotUpdateBody, jw: *Stringify) Stringify.Error!void {
+        var mask: Mask = .{};
+        try jw.beginObject();
+        try jw.objectField("snapshot");
+        try jw.beginObject();
+        if (self.update.labels) |labels| {
+            mask.add("labels");
+            try jw.objectField("labels");
+            try writeLabels(jw, labels);
+        }
+        try jw.endObject();
+        try jw.objectField("updateMask");
+        try mask.write(jw);
+        try jw.endObject();
+    }
+};
+
 /// An update mask: the camelCase paths an update names, comma-separated in
 /// one JSON string, as the REST API takes a `FieldMask`.
 const Mask = struct {
@@ -591,6 +640,25 @@ const WireSubscriptionList = struct {
     nextPageToken: ?[]const u8 = null,
 };
 
+const WireSnapshot = struct {
+    name: ?[]const u8 = null,
+    topic: ?[]const u8 = null,
+    expireTime: ?[]const u8 = null,
+    labels: ?std.json.ArrayHashMap(?[]const u8) = null,
+};
+
+const WireSnapshotList = struct {
+    snapshots: ?[]const WireSnapshot = null,
+    nextPageToken: ?[]const u8 = null,
+};
+
+/// What is attached to a topic: names alone, under the key of their kind.
+const WireNameList = struct {
+    subscriptions: ?[]const []const u8 = null,
+    snapshots: ?[]const []const u8 = null,
+    nextPageToken: ?[]const u8 = null,
+};
+
 const WirePublishResponse = struct {
     messageIds: ?[]const []const u8 = null,
 };
@@ -701,6 +769,41 @@ pub fn decodeSubscriptionPage(arena: Allocator, body: []const u8) DecodeError!ty
     const subscriptions = try arena.alloc(types.SubscriptionInfo, list.len);
     for (list, subscriptions) |s, *out| out.* = try subscriptionFromWire(arena, s);
     return .{ .subscriptions = subscriptions, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+fn snapshotFromWire(arena: Allocator, w: WireSnapshot) DecodeError!types.SnapshotInfo {
+    return .{
+        .name = w.name orelse "",
+        .topic = w.topic orelse "",
+        // Production and the emulator send one for every snapshot. Without
+        // it there is no true time to give, so the answer is no snapshot.
+        .expire_time = timestamp.parse(w.expireTime orelse return error.InvalidResponse) catch return error.InvalidResponse,
+        .labels = try labelsFromWire(arena, w.labels),
+    };
+}
+
+pub fn decodeSnapshot(arena: Allocator, body: []const u8) DecodeError!types.SnapshotInfo {
+    return snapshotFromWire(arena, try parseWire(WireSnapshot, arena, body));
+}
+
+pub fn decodeSnapshotPage(arena: Allocator, body: []const u8) DecodeError!types.SnapshotPage {
+    const wire = try parseWire(WireSnapshotList, arena, body);
+    const list = wire.snapshots orelse &.{};
+    const snapshots = try arena.alloc(types.SnapshotInfo, list.len);
+    for (list, snapshots) |s, *out| out.* = try snapshotFromWire(arena, s);
+    return .{ .snapshots = snapshots, .next_page_token = nonEmpty(wire.nextPageToken) };
+}
+
+/// Which of a topic's two lists of names an answer holds.
+pub const NameList = enum { subscriptions, snapshots };
+
+pub fn decodeNamePage(arena: Allocator, body: []const u8, list: NameList) DecodeError!types.NamePage {
+    const wire = try parseWire(WireNameList, arena, body);
+    const names = switch (list) {
+        .subscriptions => wire.subscriptions,
+        .snapshots => wire.snapshots,
+    };
+    return .{ .names = names orelse &.{}, .next_page_token = nonEmpty(wire.nextPageToken) };
 }
 
 fn parseDuration(text: []const u8) DecodeError!std.Io.Duration {
@@ -1751,4 +1854,134 @@ fn updateMaskProperty(_: void, input: []const u8) !void {
 
 test "fuzz subscription update: the mask names what the update sets or clears, and the body carries what it sets" {
     try test_util.fuzzBytes({}, updateMaskProperty, .{ .corpus = &.{ "", "\x01\x1f\x01\x01\x02\x02\x02\x01\x01\x03\x01\x00" } });
+}
+
+test "decode snapshots, their pages, and a topic's lists of names" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Production's answer to a create, 2026-10-10.
+    const s = try decodeSnapshot(a,
+        \\{"name":"projects/extractctl/snapshots/zigps-snap","topic":"projects/extractctl/topics/zigps-t","expireTime":"2026-10-17T13:46:36.836Z","labels":{"k":"v"}}
+    );
+    try testing.expectEqualStrings("projects/extractctl/snapshots/zigps-snap", s.name);
+    try testing.expectEqualStrings("projects/extractctl/topics/zigps-t", s.topic);
+    try testing.expectEqual(try timestamp.parse("2026-10-17T13:46:36.836Z"), s.expire_time);
+    try testing.expectEqualStrings("v", s.label("k").?);
+    try testing.expectEqual(null, s.label("missing"));
+    // And to a read after its topic was deleted.
+    const orphan = try decodeSnapshot(a, "{\"name\":\"projects/p/snapshots/s\",\"topic\":\"_deleted-topic_\",\"expireTime\":\"2026-10-17T13:46:36Z\"}");
+    try testing.expectEqualStrings("_deleted-topic_", orphan.topic);
+    try testing.expectEqual(0, orphan.labels.len);
+    // An expiry in any form a timestamp takes: nine digits, or an offset.
+    const fine = try decodeSnapshot(a, "{\"expireTime\":\"2026-10-17T13:46:36.123456789Z\"}");
+    try testing.expectEqual(123_456_789, @mod(fine.expire_time.nanoseconds, std.time.ns_per_s));
+    try testing.expectEqual(fine.expire_time, (try decodeSnapshot(a, "{\"expireTime\":\"2026-10-17T15:46:36.123456789+02:00\"}")).expire_time);
+    // A snapshot has an expiry: without one, or with one that is no time,
+    // the answer is no snapshot.
+    try testing.expectError(error.InvalidResponse, decodeSnapshot(a, "{\"name\":\"projects/p/snapshots/s\"}"));
+    try testing.expectError(error.InvalidResponse, decodeSnapshot(a, "{\"expireTime\":\"next week\"}"));
+    try testing.expectError(error.InvalidResponse, decodeSnapshot(a, "{\"expireTime\":17}"));
+
+    const page = try decodeSnapshotPage(a,
+        \\{"snapshots":[{"name":"projects/p/snapshots/a","topic":"projects/p/topics/t","expireTime":"2026-10-17T13:46:36.836Z"},
+        \\{"name":"projects/p/snapshots/b","topic":"projects/p/topics/t","expireTime":"2026-10-17T13:46:36.839Z"}],"nextPageToken":"n"}
+    );
+    try testing.expectEqual(2, page.snapshots.len);
+    try testing.expectEqualStrings("projects/p/snapshots/b", page.snapshots[1].name);
+    try testing.expectEqualStrings("n", page.next_page_token.?);
+    try testing.expectEqual(0, (try decodeSnapshotPage(a, "{}")).snapshots.len);
+    try testing.expectEqual(null, (try decodeSnapshotPage(a, "{\"nextPageToken\":\"\"}")).next_page_token);
+    // One that is no snapshot spoils its page.
+    try testing.expectError(error.InvalidResponse, decodeSnapshotPage(a, "{\"snapshots\":[{\"name\":\"x\"}]}"));
+
+    // A topic's lists hold names alone, under the key of what was asked for,
+    // and production's page token is no name.
+    const body =
+        \\{"subscriptions":["projects/p/subscriptions/s","projects/other/subscriptions/far"],"nextPageToken":"enhhcGpTGwQLRFJ7VwwbBVEOGA"}
+    ;
+    const subs = try decodeNamePage(a, body, .subscriptions);
+    try testing.expectEqual(2, subs.names.len);
+    try testing.expectEqualStrings("projects/other/subscriptions/far", subs.names[1]);
+    try testing.expectEqualStrings("enhhcGpTGwQLRFJ7VwwbBVEOGA", subs.next_page_token.?);
+    try testing.expectEqual(0, (try decodeNamePage(a, body, .snapshots)).names.len);
+    const snaps = try decodeNamePage(a, "{\"snapshots\":[\"projects/p/snapshots/a\"]}", .snapshots);
+    try testing.expectEqualStrings("projects/p/snapshots/a", snaps.names[0]);
+    try testing.expectEqual(null, snaps.next_page_token);
+    try testing.expectEqual(0, (try decodeNamePage(a, "", .subscriptions)).names.len);
+    try testing.expectError(error.InvalidResponse, decodeNamePage(a, "{\"subscriptions\":[{\"name\":\"x\"}]}", .subscriptions));
+}
+
+test "golden: snapshot create and update bodies" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "{\"subscription\":\"projects/p/subscriptions/orders\"}",
+        try encodeSnapshot(a, "projects/p/subscriptions/orders", .{ .subscription = "orders" }),
+    );
+    try testing.expectEqualStrings(
+        "{\"subscription\":\"projects/p/subscriptions/orders\",\"labels\":{\"env\":\"test\",\"team\":\"\"}}",
+        try encodeSnapshot(a, "projects/p/subscriptions/orders", .{
+            .subscription = "orders",
+            .labels = &.{ .{ .key = "env", .value = "test" }, .{ .key = "team", .value = "" } },
+        }),
+    );
+    try testing.expectEqualStrings(
+        "{\"snapshot\":{\"labels\":{\"env\":\"prod\"}},\"updateMask\":\"labels\"}",
+        try encodeSnapshotUpdate(a, .{ .labels = &.{.{ .key = "env", .value = "prod" }} }),
+    );
+    // An empty set clears: the mask names the labels, and the body holds none.
+    try testing.expectEqualStrings(
+        "{\"snapshot\":{\"labels\":{}},\"updateMask\":\"labels\"}",
+        try encodeSnapshotUpdate(a, .{ .labels = &.{} }),
+    );
+}
+
+fn snapshotRoundTrip(_: void, input: []const u8) !void {
+    var g: ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const labels = try a.alloc(types.Label, g.intRange(u8, 0, 4));
+    for (labels, 0..) |*l, i| l.* = .{
+        .key = try a.print("k{d}{s}", .{ i, g.pick([]const u8, &.{ "", "_x", "-y", "z9" }) }),
+        .value = g.pick([]const u8, &.{ "", "v", "prod", "a-b_c" }),
+    };
+    const config: types.SnapshotConfig = .{
+        .subscription = g.pick([]const u8, &.{ "orders", "a%41+b", "projects/other/subscriptions/far" }),
+        .labels = labels,
+    };
+    try @import("validate.zig").snapshotConfig(config, null);
+
+    // The create body names the subscription it is given, and labels only
+    // when there are some.
+    const body = try encodeSnapshot(a, "projects/p/subscriptions/s", config);
+    const sent = try std.json.parseFromSliceLeaky(struct {
+        subscription: []const u8,
+        labels: ?std.json.ArrayHashMap([]const u8) = null,
+    }, a, body, .{});
+    try testing.expectEqualStrings("projects/p/subscriptions/s", sent.subscription);
+    try testing.expectEqual(labels.len == 0, sent.labels == null);
+    // With the name and expiry the server adds, it reads back as the
+    // snapshot that was asked for.
+    const info = try decodeSnapshot(a, try a.print("{{\"name\":\"projects/p/snapshots/x\",\"expireTime\":\"2026-10-17T13:46:36.836Z\",{s}", .{body[1..]}));
+    try testing.expectEqual(labels.len, info.labels.len);
+    for (labels, info.labels) |want, have| {
+        try testing.expectEqualStrings(want.key, have.key);
+        try testing.expectEqualStrings(want.value, have.value);
+    }
+    // An update to the same labels names them in its mask, and carries them.
+    const update = try std.json.parseFromSliceLeaky(struct {
+        snapshot: struct { labels: std.json.ArrayHashMap([]const u8) },
+        updateMask: []const u8,
+    }, a, try encodeSnapshotUpdate(a, .{ .labels = labels }), .{});
+    try testing.expectEqualStrings("labels", update.updateMask);
+    try testing.expectEqual(labels.len, update.snapshot.labels.map.count());
+    for (labels) |want| try testing.expectEqualStrings(want.value, update.snapshot.labels.map.get(want.key).?);
+}
+
+test "fuzz snapshot settings: a create body reads back as the snapshot asked for, and an update names its labels" {
+    try test_util.fuzzBytes({}, snapshotRoundTrip, .{ .corpus = &.{ "", "\x04\x01\x02\x03\x00\x01\x02\x03\x02", "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" } });
 }

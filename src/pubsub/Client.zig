@@ -13,6 +13,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const Endpoint = @import("Endpoint.zig");
+const Snapshot = @import("Snapshot.zig");
 const Subscription = @import("Subscription.zig");
 const Topic = @import("Topic.zig");
 const codec = @import("codec.zig");
@@ -167,6 +168,12 @@ pub fn subscription(self: *Client, id: []const u8) Subscription {
     return .{ .client = self, .id = id };
 }
 
+/// A handle for the snapshot `id`, such as "before-deploy". Sends nothing.
+/// The handle borrows the client and `id`, and must not outlive either.
+pub fn snapshot(self: *Client, id: []const u8) Snapshot {
+    return .{ .client = self, .id = id };
+}
+
 /// One page of the project's topics.
 pub fn listTopics(self: *Client, page: types.PageOptions) Error!types.Owned(types.TopicPage) {
     rpc.begin(self);
@@ -192,6 +199,21 @@ pub fn listSubscriptions(self: *Client, page: types.PageOptions) Error!types.Own
     const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
     result.value = codec.decodeSubscriptionPage(result.arena.allocator(), body) catch |err|
         return rpc.decodeFailed(self, err, "subscription list");
+    return result;
+}
+
+/// One page of the project's snapshots, each as `Snapshot.get` reads it.
+/// Needs `pubsub.snapshots.list`.
+pub fn listSnapshots(self: *Client, page: types.PageOptions) Error!types.Owned(types.SnapshotPage) {
+    rpc.begin(self);
+    var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+    defer scratch.deinit();
+    const path = try url.listPath(scratch.allocator(), self.project_id, .snapshots, page.page_size, page.page_token);
+    var result: types.Owned(types.SnapshotPage) = try .init(self.gpa);
+    errdefer result.deinit();
+    const body = try rpc.execute(self, result.arena, .{ .method = .GET, .path = path });
+    result.value = codec.decodeSnapshotPage(result.arena.allocator(), body) catch |err|
+        return rpc.decodeFailed(self, err, "snapshot list");
     return result;
 }
 
@@ -291,6 +313,7 @@ test "every public call: every allocation failure is OutOfMemory without leaks" 
     const Reply = test_util.FakeTransport.Reply;
     const topic_body = "{\"name\":\"projects/p/topics/orders\"}";
     const sub_body = "{\"name\":\"projects/p/subscriptions/orders-worker\",\"topic\":\"projects/p/topics/orders\",\"ackDeadlineSeconds\":10}";
+    const snap_body = "{\"name\":\"projects/p/snapshots/before\",\"topic\":\"projects/p/topics/orders\",\"expireTime\":\"2026-10-17T13:46:36.836Z\",\"labels\":{\"k\":\"v\"}}";
     const ok: Reply = .{ .respond = .{ .body = "{}" } };
     // One reply per request, in the order the calls below make them.
     const script = [_]Reply{
@@ -304,8 +327,11 @@ test "every public call: every allocation failure is OutOfMemory without leaks" 
         .{ .respond = .{ .body = "{\"subscriptions\":[" ++ sub_body ++ "]}" } },
         .{ .respond = .{ .body = "{\"receivedMessages\":[{\"ackId\":\"a1\",\"message\":{\"data\":\"aGk=\",\"attributes\":{\"k\":\"v\"},\"messageId\":\"1\",\"publishTime\":\"2026-09-19T00:00:00Z\",\"orderingKey\":\"o\"},\"deliveryAttempt\":1}]}" } },
         ok, ok, // ack takes two requests
-        ok, ok, // modifyAckDeadline, nack
-        ok, ok, // the two deletes
+        ok,                                                                                                                      ok, // modifyAckDeadline, nack
+        .{ .respond = .{ .body = snap_body } },                                                                                  .{ .respond = .{ .body = snap_body } },
+        .{ .respond = .{ .body = snap_body } },                                                                                  .{ .respond = .{ .body = "{\"snapshots\":[" ++ snap_body ++ "],\"nextPageToken\":\"n\"}" } },
+        .{ .respond = .{ .body = "{\"subscriptions\":[\"projects/p/subscriptions/orders-worker\"],\"nextPageToken\":\"n\"}" } }, .{ .respond = .{ .body = "{\"snapshots\":[\"projects/p/snapshots/before\"]}" } },
+        ok, ok, ok, // the three deletes
     };
     const Run = struct {
         /// One more id than a request may carry.
@@ -345,6 +371,21 @@ test "every public call: every allocation failure is OutOfMemory without leaks" 
             try s.ack(&many_ids);
             try s.modifyAckDeadline(&.{"a1"}, 30);
             try s.nack(&.{"a1"});
+
+            const snap = client.snapshot("before");
+            var kept = try snap.create(.{ .subscription = "orders-worker", .labels = &.{.{ .key = "k", .value = "v" }} });
+            kept.deinit();
+            var kept_got = try snap.get();
+            kept_got.deinit();
+            var relabelled = try snap.update(.{ .labels = &.{.{ .key = "k", .value = "w" }} });
+            relabelled.deinit();
+            var snaps = try client.listSnapshots(.{ .page_size = 1 });
+            snaps.deinit();
+            var attached = try t.listSubscriptions(.{});
+            attached.deinit();
+            var kept_of = try t.listSnapshots(.{ .page_token = "n" });
+            kept_of.deinit();
+            try snap.delete();
             try s.delete();
             try t.delete();
             // The calls above used the whole script, so none was skipped.
@@ -402,4 +443,35 @@ test "domain-scoped project ids keep their colon in paths and bodies" {
         "http://localhost:8085/v1/projects/example.com:proj/subscriptions/work",
         "{\"topic\":\"projects/example.com:proj/topics/orders\",\"enableMessageOrdering\":false}",
     );
+}
+
+test "golden: listSnapshots passes page options, and reads whole snapshots" {
+    var h: test_util.Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{ .body =
+        \\{"snapshots":[{"name":"projects/p/snapshots/a","topic":"projects/p/topics/t","expireTime":"2026-10-17T13:46:36.836Z","labels":{"k":"v"}}],
+        \\"nextPageToken":"next"}
+        } },
+        .{ .respond = .{ .body = "{}" } },
+        .{ .respond = .{ .body = "{\"snapshots\":[{\"name\":\"projects/p/snapshots/a\"}]}" } },
+    }, .{});
+    defer h.deinit();
+
+    var first = try h.client.listSnapshots(.{ .page_size = 1 });
+    defer first.deinit();
+    try h.expectRequest(0, .GET, "http://localhost:8085/v1/projects/p/snapshots?pageSize=1", null);
+    try testing.expectEqual(1, first.value.snapshots.len);
+    try testing.expectEqualStrings("projects/p/topics/t", first.value.snapshots[0].topic);
+    try testing.expectEqualStrings("v", first.value.snapshots[0].label("k").?);
+    try testing.expectEqualStrings("next", first.value.next_page_token.?);
+
+    // A project with none lists as `{}`.
+    var none = try h.client.listSnapshots(.{ .page_token = first.value.next_page_token });
+    defer none.deinit();
+    try h.expectRequest(1, .GET, "http://localhost:8085/v1/projects/p/snapshots?pageSize=100&pageToken=next", null);
+    try testing.expectEqual(0, none.value.snapshots.len);
+    try testing.expectEqual(null, none.value.next_page_token);
+
+    try testing.expectError(error.InvalidResponse, h.client.listSnapshots(.{}));
+    try testing.expectEqualStrings("the snapshot list response could not be decoded", h.diag.message());
 }

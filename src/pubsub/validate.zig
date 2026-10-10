@@ -208,11 +208,21 @@ pub fn deadLetterPolicy(policy: types.DeadLetterPolicy, diag: ?*Diagnostics) err
 
 /// `projects/{project}/topics/{id}`, with a valid project and topic id.
 pub fn isTopicName(name: []const u8) bool {
+    return isNameIn(name, "/topics/");
+}
+
+/// `projects/{project}/subscriptions/{id}`, with a valid project and
+/// subscription id.
+pub fn isSubscriptionName(name: []const u8) bool {
+    return isNameIn(name, "/subscriptions/");
+}
+
+fn isNameIn(name: []const u8, comptime collection: []const u8) bool {
     const prefix = "projects/";
     if (!std.mem.startsWith(u8, name, prefix)) return false;
     const rest = name[prefix.len..];
-    const cut = std.mem.indexOf(u8, rest, "/topics/") orelse return false;
-    return isProjectId(rest[0..cut]) and isResourceId(rest[cut + "/topics/".len ..]);
+    const cut = std.mem.indexOf(u8, rest, collection) orelse return false;
+    return isProjectId(rest[0..cut]) and isResourceId(rest[cut + collection.len ..]);
 }
 
 /// A retry policy: each bound 0 to 600 seconds, the minimum no more than the
@@ -331,6 +341,22 @@ pub fn topicUpdate(u: types.TopicUpdate, diag: ?*Diagnostics) error{InvalidArgum
     if (u.labels == null and u.message_retention == .keep and u.kms_key_name == .keep and u.message_storage_policy == .keep) {
         return refuse(diag, "the update changes nothing", .{});
     }
+}
+
+/// A snapshot's settings: a subscription id or a full subscription name,
+/// and labels by the rules for every label. The emulator keeps no labels,
+/// so it cannot hold one to them.
+pub fn snapshotConfig(config: types.SnapshotConfig, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    if (!isResourceId(config.subscription) and !isSubscriptionName(config.subscription)) {
+        return refuse(diag, "the subscription is neither a subscription id nor projects/{{project}}/subscriptions/{{id}}", .{});
+    }
+    try labels(config.labels, diag);
+}
+
+/// A snapshot update: something to change, and the new labels valid.
+pub fn snapshotUpdate(u: types.SnapshotUpdate, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    const l = u.labels orelse return refuse(diag, "the update changes nothing", .{});
+    try labels(l, diag);
 }
 
 fn refuse(diag: ?*Diagnostics, comptime format: []const u8, args: anytype) error{InvalidArgument} {
@@ -637,4 +663,36 @@ test "updates: something must change, and what changes must be valid" {
     try testing.expectError(error.InvalidArgument, topicUpdate(.{ .message_retention = .{ .set = .fromSeconds(1) } }, &d));
     try topicUpdate(.{ .message_storage_policy = .{ .set = .{ .allowed_persistence_regions = &.{"us-east1"} } } }, &d);
     try testing.expectError(error.InvalidArgument, topicUpdate(.{ .message_storage_policy = .{ .set = .{ .allowed_persistence_regions = &.{} } } }, &d));
+}
+
+test "snapshot settings: the subscription's two forms, labels, and an update that changes something" {
+    var d: Diagnostics = .{};
+    try snapshotConfig(.{ .subscription = "orders" }, &d);
+    try snapshotConfig(.{ .subscription = "projects/other-project/subscriptions/orders", .labels = &.{.{ .key = "env", .value = "test" }} }, &d);
+    try testing.expect(isSubscriptionName("projects/example.com:proj/subscriptions/a%41+b"));
+    try testing.expectError(error.InvalidArgument, snapshotConfig(.{ .subscription = "" }, &d));
+    try testing.expectEqualStrings("the subscription is neither a subscription id nor projects/{project}/subscriptions/{id}", d.message());
+    // A topic's name, a snapshot's, half a name, and a bad id or project
+    // inside a whole one are none.
+    for ([_][]const u8{
+        "projects/p/topics/orders",
+        "projects/p/snapshots/orders",
+        "subscriptions/orders",
+        "projects/p/subscriptions/go",
+        "projects//subscriptions/orders",
+        "projects/p/subscriptions/orders/x",
+    }) |bad| {
+        try testing.expect(!isSubscriptionName(bad));
+        try testing.expectError(error.InvalidArgument, snapshotConfig(.{ .subscription = bad }, &d));
+    }
+    // The split did not change what a topic's name is.
+    try testing.expect(isTopicName("projects/p/topics/orders"));
+    try testing.expect(!isTopicName("projects/p/subscriptions/orders"));
+
+    try testing.expectError(error.InvalidArgument, snapshotConfig(.{ .subscription = "orders", .labels = &.{.{ .key = "UPPER", .value = "v" }} }, &d));
+    try testing.expectError(error.InvalidArgument, snapshotUpdate(.{}, &d));
+    try testing.expectEqualStrings("the update changes nothing", d.message());
+    try snapshotUpdate(.{ .labels = &.{} }, &d);
+    try snapshotUpdate(.{ .labels = &.{.{ .key = "env", .value = "prod" }} }, &d);
+    try testing.expectError(error.InvalidArgument, snapshotUpdate(.{ .labels = &.{.{ .key = "Bad Key", .value = "v" }} }, &d));
 }

@@ -4,6 +4,27 @@ Until 1.0, minor versions may break the API; each entry says how. One
 version covers the whole package, and each entry lists every module,
 including the ones that did not change.
 
+## 0.35.0 (unreleased)
+
+- pubsub: snapshots. `client.snapshot(id)` is a `Snapshot` handle, as
+  `client.topic` and `client.subscription` are. `create(.{ .subscription
+  = ... })` keeps a subscription's backlog as it stands, and every
+  message published to its topic afterwards, for up to 7 days; `get`,
+  `update` (its labels, which are all Pub/Sub lets a snapshot change),
+  `delete` and the five IAM calls complete it, and
+  `Client.listSnapshots` pages through a project's. A snapshot outlives
+  the subscription it was made of, and the topic too, whose name it then
+  gives as `_deleted-topic_` (measured 2026-10-10). Ids, the
+  subscription's name and labels are checked before sending: the
+  emulator keeps no labels, so it cannot refuse a bad one, and it has no
+  snapshot update and no snapshot IAM. New types: `SnapshotConfig`,
+  `SnapshotInfo`, `SnapshotUpdate`, `SnapshotPage`.
+- pubsub: `Topic.listSubscriptions` and `Topic.listSnapshots` page
+  through what is attached to a topic, by full name (`NamePage`). A
+  detached subscription is not among them, and a name may lie in another
+  project.
+- auth, core, firestore, secret_manager and storage: unchanged.
+
 ## 0.34.0 (2026-10-06)
 
 - firestore: **Fixed:** an error the server sends inside a streamed

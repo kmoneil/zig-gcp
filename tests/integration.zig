@@ -27,6 +27,7 @@ const Fixture = struct {
     arena: std.heap.ArenaAllocator,
     topics: std.ArrayList([]const u8),
     subscriptions: std.ArrayList([]const u8),
+    snapshots: std.ArrayList([]const u8),
 
     /// Returns false when no server is configured; the test should skip.
     fn init(f: *Fixture) !bool {
@@ -38,6 +39,7 @@ const Fixture = struct {
         errdefer f.arena.deinit();
         f.topics = .empty;
         f.subscriptions = .empty;
+        f.snapshots = .empty;
 
         var random: [4]u8 = undefined;
         testing.io.random(&random);
@@ -73,10 +75,13 @@ const Fixture = struct {
         return true;
     }
 
-    /// Deletes everything the test created, subscriptions first.
+    /// Deletes everything the test created: snapshots, then subscriptions,
+    /// then topics.
     fn deinit(f: *Fixture) void {
+        for (f.snapshots.items) |snapshot_id| f.client.snapshot(snapshot_id).delete() catch {};
         for (f.subscriptions.items) |sub_id| f.client.subscription(sub_id).delete() catch {};
         for (f.topics.items) |topic_id| f.client.topic(topic_id).delete() catch {};
+        f.snapshots.deinit(testing.allocator);
         f.subscriptions.deinit(testing.allocator);
         f.topics.deinit(testing.allocator);
         f.client.deinit();
@@ -1215,6 +1220,147 @@ test "topic settings: labels and retention read back, and retention changes and 
     var relabelled = topic.update(.{ .labels = &.{.{ .key = "suite", .value = "updated" }} }) catch |err| return f.fail(err);
     defer relabelled.deinit();
     try testing.expectEqualStrings("updated", relabelled.value.label("suite").?);
+}
+
+// Snapshots, and what a topic has attached.
+
+/// Every name in one of a topic's lists, read a page of `page_size` at a
+/// time.
+fn allNames(f: *Fixture, topic: pubsub.Topic, comptime list: enum { subscriptions, snapshots }, page_size: u32) ![]const []const u8 {
+    const a = f.arena.allocator();
+    var names: std.ArrayList([]const u8) = .empty;
+    var token: ?[]const u8 = null;
+    var pages: usize = 0;
+    while (true) : (pages += 1) {
+        if (pages > 50) return error.TestTooManyPages;
+        const options: pubsub.PageOptions = .{ .page_size = page_size, .page_token = token };
+        var page = (switch (list) {
+            .subscriptions => topic.listSubscriptions(options),
+            .snapshots => topic.listSnapshots(options),
+        }) catch |err| return f.fail(err);
+        defer page.deinit();
+        try testing.expect(page.value.names.len <= page_size);
+        for (page.value.names) |name| try names.append(a, try a.dupe(u8, name));
+        token = try a.dupe(u8, page.value.next_page_token orelse break);
+    }
+    return names.items;
+}
+
+fn holds(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+test "snapshots: one is made, read, found in its project's list and its topic's, relabelled, and outlives its subscription and its topic" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    const a = f.arena.allocator();
+    const project = f.client.project_id;
+    const topic = try f.createTopic("snap");
+    const sub = try f.createSubscription("snap-sub", .{ .topic_id = topic.id });
+    const other = try f.createSubscription("snap-sub2", .{ .topic_id = topic.id });
+    const topic_name = try a.print("projects/{s}/topics/{s}", .{ project, topic.id });
+
+    const snapshot = f.client.snapshot(f.id("snap"));
+    try f.snapshots.append(testing.allocator, snapshot.id);
+    const name = try a.print("projects/{s}/snapshots/{s}", .{ project, snapshot.id });
+    var created = snapshot.create(.{
+        .subscription = sub.id,
+        .labels = &.{.{ .key = "suite", .value = "integration" }},
+    }) catch |err| return f.fail(err);
+    defer created.deinit();
+    try testing.expectEqualStrings(name, created.value.name);
+    try testing.expectEqualStrings(topic_name, created.value.topic);
+    // It lives 7 days, less the age of what its subscription held, and
+    // nothing here is minutes old.
+    const lifetime_s = created.value.expire_time.toSeconds() - std.Io.Clock.real.now(testing.io).toSeconds();
+    try testing.expect(lifetime_s <= 7 * 86400 + 120);
+    try testing.expect(lifetime_s >= 7 * 86400 - 600);
+    if (f.production) {
+        try testing.expectEqualStrings("integration", created.value.label("suite").?);
+    } else {
+        // The emulator keeps no labels, and says nothing of it.
+        try testing.expectEqual(0, created.value.labels.len);
+    }
+
+    // Its name is taken, and a subscription that is not there has no
+    // backlog to keep.
+    try testing.expectError(error.AlreadyExists, snapshot.create(.{ .subscription = sub.id }));
+    const absent = f.client.snapshot(f.id("snap-none"));
+    try testing.expectError(error.NotFound, absent.create(.{ .subscription = f.id("no-such-sub") }));
+    try testing.expectError(error.NotFound, absent.get());
+
+    var got = snapshot.get() catch |err| return f.fail(err);
+    defer got.deinit();
+    try testing.expectEqual(created.value.expire_time, got.value.expire_time);
+
+    // Whole among its project's snapshots, and by name among its topic's.
+    var token: ?[]const u8 = null;
+    const listed = search: while (true) {
+        var page = f.client.listSnapshots(.{ .page_size = 1000, .page_token = token }) catch |err| return f.fail(err);
+        defer page.deinit();
+        for (page.value.snapshots) |s| {
+            if (!std.mem.eql(u8, s.name, name)) continue;
+            try testing.expectEqualStrings(topic_name, s.topic);
+            try testing.expectEqual(created.value.expire_time, s.expire_time);
+            break :search true;
+        }
+        token = try a.dupe(u8, page.value.next_page_token orelse break :search false);
+    };
+    try testing.expect(listed);
+    const of_topic = try allNames(&f, topic, .snapshots, 100);
+    try testing.expectEqual(1, of_topic.len);
+    try testing.expectEqualStrings(name, of_topic[0]);
+
+    // The topic's two subscriptions, one to a page, in the server's order.
+    const attached = try allNames(&f, topic, .subscriptions, 1);
+    try testing.expectEqual(2, attached.len);
+    try testing.expect(holds(attached, try a.print("projects/{s}/subscriptions/{s}", .{ project, sub.id })));
+    try testing.expect(holds(attached, try a.print("projects/{s}/subscriptions/{s}", .{ project, other.id })));
+
+    if (f.production) {
+        var relabelled = snapshot.update(.{ .labels = &.{.{ .key = "suite", .value = "updated" }} }) catch |err| return f.fail(err);
+        defer relabelled.deinit();
+        try testing.expectEqualStrings("updated", relabelled.value.label("suite").?);
+        try testing.expectEqual(created.value.expire_time, relabelled.value.expire_time);
+        var bare = snapshot.update(.{ .labels = &.{} }) catch |err| return f.fail(err);
+        defer bare.deinit();
+        try testing.expectEqual(0, bare.value.labels.len);
+        // A fresh snapshot's policy is empty, and its maker may seek to it.
+        var policy = snapshot.iamPolicy() catch |err| return f.fail(err);
+        defer policy.deinit();
+        try testing.expectEqual(0, policy.value.bindings.len);
+        var held = snapshot.testIamPermissions(&.{"pubsub.snapshots.seek"}) catch |err| return f.fail(err);
+        defer held.deinit();
+        try testing.expectEqual(1, held.value.len);
+    } else {
+        // The emulator has no snapshot update, and serves a snapshot no
+        // IAM call: it takes the method for part of the name.
+        try testing.expectError(error.Unimplemented, snapshot.update(.{ .labels = &.{} }));
+        try testing.expectError(error.InvalidArgument, snapshot.iamPolicy());
+    }
+
+    // It outlives the subscription it was made of, and then the topic.
+    sub.delete() catch |err| return f.fail(err);
+    var outlived = snapshot.get() catch |err| return f.fail(err);
+    outlived.deinit();
+    other.delete() catch |err| return f.fail(err);
+    topic.delete() catch |err| return f.fail(err);
+    var orphan = snapshot.get() catch |err| return f.fail(err);
+    defer orphan.deinit();
+    if (f.production) {
+        try testing.expectEqualStrings("_deleted-topic_", orphan.value.topic);
+        try testing.expectError(error.NotFound, topic.listSnapshots(.{}));
+    } else {
+        // The emulator goes on naming the topic, and listing for it.
+        try testing.expectEqualStrings(topic_name, orphan.value.topic);
+        try testing.expectEqual(1, (try allNames(&f, topic, .snapshots, 100)).len);
+    }
+
+    snapshot.delete() catch |err| return f.fail(err);
+    try testing.expectError(error.NotFound, snapshot.delete());
+    try testing.expectError(error.NotFound, snapshot.get());
 }
 
 // Publisher.

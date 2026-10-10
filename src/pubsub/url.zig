@@ -10,6 +10,7 @@ const query = @import("core").query;
 pub const Collection = enum {
     topics,
     subscriptions,
+    snapshots,
 };
 
 /// `/v1/projects/{project}/{collection}/{id}{suffix}`, with `project` and `id`
@@ -66,6 +67,38 @@ fn writeListPath(
     try w.writeAll("/v1/projects/");
     try query.writeSegment(w, project);
     try w.print("/{t}", .{collection});
+    var params: query.Params = .init(w);
+    try params.addNonZero("pageSize", page_size);
+    try params.addOptional("pageToken", page_token);
+}
+
+/// `/v1/projects/{project}/topics/{topic}/{kind}?pageSize=N&pageToken=T`: what
+/// is attached to a topic, its `.subscriptions` or its `.snapshots`.
+pub fn attachedPath(
+    arena: Allocator,
+    project: []const u8,
+    topic: []const u8,
+    kind: Collection,
+    page_size: u32,
+    page_token: ?[]const u8,
+) Allocator.Error![]u8 {
+    std.debug.assert(kind != .topics);
+    var out: Writer.Allocating = .init(arena);
+    writeAttachedPath(&out.writer, project, topic, kind, page_size, page_token) catch
+        return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn writeAttachedPath(
+    w: *Writer,
+    project: []const u8,
+    topic: []const u8,
+    kind: Collection,
+    page_size: u32,
+    page_token: ?[]const u8,
+) Writer.Error!void {
+    try writeResourcePath(w, project, .topics, topic, "");
+    try w.print("/{t}", .{kind});
     var params: query.Params = .init(w);
     try params.addNonZero("pageSize", page_size);
     try params.addOptional("pageToken", page_token);
@@ -135,4 +168,29 @@ test "resourceName is not encoded" {
         "projects/test/topics/a%41",
         try resourceName(arena.allocator(), "test", .topics, "a%41"),
     );
+}
+
+test "attachedPath names what is attached to a topic, with the page options" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "/v1/projects/test/topics/orders/subscriptions?pageSize=100",
+        try attachedPath(a, "test", "orders", .subscriptions, 100, null),
+    );
+    // The topic's id is encoded as every id is, and the token as every token.
+    try testing.expectEqualStrings(
+        "/v1/projects/test/topics/a%2541b/snapshots?pageSize=2&pageToken=n%2F1",
+        try attachedPath(a, "test", "a%41b", .snapshots, 2, "n/1"),
+    );
+    try testing.expectEqualStrings("/v1/projects/test/topics/orders/snapshots", try attachedPath(a, "test", "orders", .snapshots, 0, ""));
+}
+
+test "snapshots are a collection as topics and subscriptions are" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings("/v1/projects/test/snapshots/before", try resourcePath(a, "test", .snapshots, "before", ""));
+    try testing.expectEqualStrings("/v1/projects/test/snapshots?pageSize=5", try listPath(a, "test", .snapshots, 5, null));
+    try testing.expectEqualStrings("projects/test/snapshots/before", try resourceName(a, "test", .snapshots, "before"));
 }
