@@ -23,6 +23,22 @@ including the ones that did not change.
   through what is attached to a topic, by full name (`NamePage`). A
   detached subscription is not among them, and a name may lie in another
   project.
+- pubsub: `Subscription.seek(target)` moves a subscription to a time or
+  to a snapshot (`SeekTarget`). A time in the past replays what the
+  subscription or its topic retains, a time ahead purges, and a snapshot
+  restores the backlog it kept. Measured 2026-10-10: a seek back took 2
+  to 50 seconds to show; an ack sent meanwhile for a delivery made
+  before it is answered as taken and then forgotten, with exactly-once
+  delivery too, so the message comes again; and a seek to a future time
+  is no filter on what is published afterwards. A running `Subscriber`
+  needs no restart. Retried as any call is.
+- pubsub: `Subscription.detach()` cuts a subscription off its topic for
+  good. Within seconds everything but a read, an update and a delete of
+  it is `error.FailedPrecondition`, a second detach among it. When that
+  refusal answers a retry, the subscription is read back, and the call
+  succeeds if the earlier attempt had landed. A `Subscriber` on a
+  detached subscription stops with `error.FailedPrecondition`. The
+  emulator has no detach.
 - auth, core, firestore, secret_manager and storage: unchanged.
 
 ## 0.34.0 (2026-10-06)

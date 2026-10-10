@@ -53,6 +53,7 @@ pub const DeadLetterPolicy = @import("types.zig").DeadLetterPolicy;
 pub const Backoff = @import("types.zig").Backoff;
 pub const Expiration = @import("types.zig").Expiration;
 pub const SubscriptionUpdate = @import("types.zig").SubscriptionUpdate;
+pub const SeekTarget = @import("types.zig").SeekTarget;
 pub const SnapshotConfig = @import("types.zig").SnapshotConfig;
 pub const SnapshotInfo = @import("types.zig").SnapshotInfo;
 pub const SnapshotUpdate = @import("types.zig").SnapshotUpdate;

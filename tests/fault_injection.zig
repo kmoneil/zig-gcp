@@ -634,6 +634,30 @@ test "create: a response lost after the server acted is AlreadyExists on the ret
     got.deinit();
 }
 
+test "seek: an answer lost after the server acted is asked for again, and the subscription is where the seek put it" {
+    var f: Fixture = undefined;
+    if (!try f.init(&.{ .swallow_response, .pass }, .{})) return error.SkipZigTest;
+    defer f.deinit();
+    try f.startProxy();
+
+    const topic = try f.directTopic("seek");
+    const sub = try f.directSubscription("seek-sub", .{ .topic_id = topic.id, .retain_acked_messages = true });
+    const before = std.Io.Clock.real.now(testing.io);
+    try testing.io.sleep(.fromMilliseconds(1100), .awake);
+    var sent = topic.publish(&.{ .{ .data = "one" }, .{ .data = "two" } }, .{}) catch |err| return f.fail(err);
+    sent.deinit();
+    // Both acknowledged: nothing waits.
+    try testing.expectEqual(2, (try f.pullData(sub, 2, 30)).len);
+    try f.expectNoMessages(sub);
+
+    // A seek back to before both. The first attempt reached the server and
+    // its answer was lost; the repeat leaves the subscription where the
+    // first put it, so the call succeeds and both come again.
+    f.proxied.subscription(sub.id).seek(.{ .time = before }) catch |err| return f.fail(err);
+    try testing.expectEqual(2, f.proxy.forwarded);
+    try testing.expectEqual(2, (try f.pullData(sub, 2, 30)).len);
+}
+
 test "publish: a swallowed response is retried, and the message is stored twice" {
     var f: Fixture = undefined;
     if (!try f.init(&.{ .swallow_response, .pass }, .{})) return error.SkipZigTest;

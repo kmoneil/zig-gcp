@@ -13,6 +13,7 @@ const std = @import("std");
 const codec = @import("codec.zig");
 const types = @import("types.zig");
 const Diagnostics = @import("core").Diagnostics;
+const timestamp = @import("core").timestamp;
 const test_util = @import("test_util.zig");
 
 pub const max_messages_per_publish = 1000;
@@ -217,6 +218,12 @@ pub fn isSubscriptionName(name: []const u8) bool {
     return isNameIn(name, "/subscriptions/");
 }
 
+/// `projects/{project}/snapshots/{id}`, with a valid project and snapshot
+/// id.
+pub fn isSnapshotName(name: []const u8) bool {
+    return isNameIn(name, "/snapshots/");
+}
+
 fn isNameIn(name: []const u8, comptime collection: []const u8) bool {
     const prefix = "projects/";
     if (!std.mem.startsWith(u8, name, prefix)) return false;
@@ -357,6 +364,19 @@ pub fn snapshotConfig(config: types.SnapshotConfig, diag: ?*Diagnostics) error{I
 pub fn snapshotUpdate(u: types.SnapshotUpdate, diag: ?*Diagnostics) error{InvalidArgument}!void {
     const l = u.labels orelse return refuse(diag, "the update changes nothing", .{});
     try labels(l, diag);
+}
+
+/// A seek's target: a time a `google.protobuf.Timestamp` can hold, or a
+/// snapshot id or full snapshot name.
+pub fn seekTarget(target: types.SeekTarget, diag: ?*Diagnostics) error{InvalidArgument}!void {
+    switch (target) {
+        .time => |t| if (!timestamp.inRange(t)) {
+            return refuse(diag, "the seek time is outside 0001-01-01T00:00:00Z to 9999-12-31T23:59:59.999999999Z", .{});
+        },
+        .snapshot => |s| if (!isResourceId(s) and !isSnapshotName(s)) {
+            return refuse(diag, "the snapshot is neither a snapshot id nor projects/{{project}}/snapshots/{{id}}", .{});
+        },
+    }
 }
 
 fn refuse(diag: ?*Diagnostics, comptime format: []const u8, args: anytype) error{InvalidArgument} {
@@ -695,4 +715,23 @@ test "snapshot settings: the subscription's two forms, labels, and an update tha
     try snapshotUpdate(.{ .labels = &.{} }, &d);
     try snapshotUpdate(.{ .labels = &.{.{ .key = "env", .value = "prod" }} }, &d);
     try testing.expectError(error.InvalidArgument, snapshotUpdate(.{ .labels = &.{.{ .key = "Bad Key", .value = "v" }} }, &d));
+}
+
+test "a seek's target: a time a timestamp can hold, or a snapshot's id or full name" {
+    var d: Diagnostics = .{};
+    try seekTarget(.{ .time = .{ .nanoseconds = 0 } }, &d);
+    try seekTarget(.{ .time = timestamp.min }, &d);
+    try seekTarget(.{ .time = timestamp.max }, &d);
+    try testing.expectError(error.InvalidArgument, seekTarget(.{ .time = .{ .nanoseconds = timestamp.max.nanoseconds + 1 } }, &d));
+    try testing.expectEqualStrings("the seek time is outside 0001-01-01T00:00:00Z to 9999-12-31T23:59:59.999999999Z", d.message());
+    try testing.expectError(error.InvalidArgument, seekTarget(.{ .time = .{ .nanoseconds = timestamp.min.nanoseconds - 1 } }, &d));
+
+    try seekTarget(.{ .snapshot = "before-deploy" }, &d);
+    try seekTarget(.{ .snapshot = "projects/other-project/snapshots/before-deploy" }, &d);
+    try testing.expect(isSnapshotName("projects/example.com:proj/snapshots/a%41+b"));
+    for ([_][]const u8{ "", "go", "projects/p/subscriptions/orders", "snapshots/before", "projects/p/snapshots/go", "projects/p/snapshots/a/b" }) |bad| {
+        try testing.expect(!isSnapshotName(bad));
+        try testing.expectError(error.InvalidArgument, seekTarget(.{ .snapshot = bad }, &d));
+    }
+    try testing.expectEqualStrings("the snapshot is neither a snapshot id nor projects/{project}/snapshots/{id}", d.message());
 }

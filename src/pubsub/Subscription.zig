@@ -216,6 +216,110 @@ pub fn nackWithResults(self: Subscription, ack_ids: []const []const u8, results:
     return self.modifyAckDeadlineWithResults(ack_ids, 0, results);
 }
 
+/// Moves the subscription to `target`.
+///
+/// To a time: the messages it holds that were published before the time
+/// become acknowledged, and those published after it unacknowledged. A
+/// time in the past replays, and reaches back only as far as messages are
+/// retained: by the subscription (`retain_acked_messages`, within its
+/// `message_retention`) or by its topic (`TopicConfig.message_retention`).
+/// With neither, nothing acknowledged comes back. A time ahead of now
+/// purges what the subscription holds; it is no filter on what is
+/// published afterwards.
+///
+/// To a snapshot: the subscription's backlog becomes what the snapshot
+/// kept, and everything published since it was made. The snapshot must be
+/// of this subscription's topic, or the seek is
+/// `error.FailedPrecondition`, and it stays, to be sought to again.
+///
+/// A seek takes up to a minute to show, Google says, and took 2 to 50
+/// seconds when measured. Until then messages it acknowledged can still
+/// arrive, and an ack for a delivery made before a seek back answers as
+/// taken and is forgotten: the message comes again, with exactly-once
+/// delivery or without. A running `Subscriber` needs no restart. Retried
+/// as any call is: a repeat leaves the subscription where the first
+/// attempt did. Needs `pubsub.subscriptions.consume`, and
+/// `pubsub.snapshots.seek` on the snapshot.
+pub fn seek(self: Subscription, target: types.SeekTarget) Error!void {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "subscription", self.id);
+    try validate.seekTarget(target, c.diagnostics);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const path = try url.resourcePath(a, c.project_id, .subscriptions, self.id, ":seek");
+    // A full name as given, or an id in the client's project.
+    const snapshot_name: ?[]const u8 = switch (target) {
+        .time => null,
+        .snapshot => |s| if (validate.isSnapshotName(s)) s else try url.resourceName(a, c.project_id, .snapshots, s),
+    };
+    const body = try codec.encodeSeek(a, target, snapshot_name);
+    return rpc.executeDiscard(c, .{ .method = .POST, .path = path, .body = body });
+}
+
+/// Cuts the subscription off its topic, for good: it drops what it holds,
+/// receives nothing more, and cannot be attached again. It stays, reading
+/// back with `detached` set, until it is deleted. Within seconds `pull`,
+/// `ack`, `modifyAckDeadline`, `seek` and a snapshot of it all answer
+/// `error.FailedPrecondition`, and so does a second `detach`. When that
+/// refusal answers a retry, the subscription is read, and if it is
+/// detached the call succeeds: the earlier attempt landed, and only its
+/// answer was lost. A first attempt's refusal is returned as it is. Needs
+/// `pubsub.topics.detachSubscription` on the topic, not on the
+/// subscription; the read after a refused retry needs
+/// `pubsub.subscriptions.get`, and without it the refusal stands. The
+/// emulator answers `error.Unimplemented`.
+pub fn detach(self: Subscription) Error!void {
+    const c = self.client;
+    rpc.begin(c);
+    try rpc.checkId(c, "subscription", self.id);
+    var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+    defer scratch.deinit();
+    const path = try url.resourcePath(scratch.allocator(), c.project_id, .subscriptions, self.id, ":detach");
+    var attempt: u32 = 0;
+    while (true) {
+        attempt += 1;
+        // A repeat of a detach that landed is refused, so this loop
+        // decides what a failure means, not the engine's.
+        rpc.executeDiscard(c, .{ .method = .POST, .path = path, .retry = false }) catch |err| {
+            if (err == error.FailedPrecondition and attempt > 1) return self.settleDetach(err);
+            if (!core.isRetryable(err) or attempt >= c.retry.max_attempts) return err;
+            const delay_ms = c.retry.backoffMs(attempt, core.rpc.entropy(c.io));
+            logging.warn("detaching subscription {s} failed with {t}; trying again in {d} ms", .{ self.id, err, delay_ms });
+            try c.io.sleep(.fromMilliseconds(delay_ms), .awake);
+            continue;
+        };
+        return;
+    }
+}
+
+/// A retry of a detach was refused, as a detached subscription refuses
+/// one: the attempt before it may have landed with its answer lost. A read
+/// says whether it did.
+fn settleDetach(self: Subscription, refusal: Error) Error!void {
+    const c = self.client;
+    // The read begins a call of its own, and takes the diagnostics over.
+    const refused: ?Diagnostics = if (c.diagnostics) |d| d.* else null;
+    var info = self.get() catch |err| switch (err) {
+        error.OutOfMemory, error.Canceled => return err,
+        else => {
+            if (c.diagnostics) |d| d.print(
+                "a retried detach was refused, and reading the subscription to see whether the first attempt landed failed with {t}: it may be detached",
+                .{err},
+            );
+            return refusal;
+        },
+    };
+    defer info.deinit();
+    if (info.value.detached) {
+        if (c.diagnostics) |d| d.clear();
+        return;
+    }
+    if (c.diagnostics) |d| d.* = refused.?;
+    return refusal;
+}
+
 fn sendAckIds(
     self: Subscription,
     ack_ids: []const []const u8,
@@ -1163,4 +1267,230 @@ test "create and update with settings: every allocation failure is OutOfMemory w
         }
     };
     try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.run, .{@as([]const Reply, &script)});
+}
+
+// Seek and detach.
+
+/// What production answers everything but a read, an update and a delete
+/// of a detached subscription, a second detach among it (2026-10-10).
+const detached_refusal: test_util.FakeTransport.Reply = .{ .respond = .{
+    .status = 400,
+    .body = "{\"error\":{\"code\":400,\"message\":\"This method is not supported on detached subscriptions.\",\"status\":\"FAILED_PRECONDITION\"}}",
+} };
+const unavailable: test_util.FakeTransport.Reply = .{ .respond = .{ .status = 503, .body = "{\"error\":{\"code\":503,\"status\":\"UNAVAILABLE\"}}" } };
+/// A detached subscription as production reads it back.
+const detached_body =
+    \\{"name":"projects/p/subscriptions/orders-worker","topic":"projects/p/topics/orders","pushConfig":{},"ackDeadlineSeconds":60,"messageRetentionDuration":"604800s","expirationPolicy":{"ttl":"2678400s"},"detached":true,"state":"ACTIVE"}
+;
+const attached_body =
+    \\{"name":"projects/p/subscriptions/orders-worker","topic":"projects/p/topics/orders","pushConfig":{},"ackDeadlineSeconds":60,"state":"ACTIVE"}
+;
+const quick: core.RetryPolicy = .{ .max_attempts = 3, .initial_backoff_ms = 1, .max_backoff_ms = 2 };
+
+test "golden: seek to a time, and to a snapshot by id or by full name" {
+    var h: Harness = undefined;
+    try h.init(&.{ .{ .respond = .{} }, .{ .respond = .{} }, .{ .respond = .{} } }, .{});
+    defer h.deinit();
+    const worker = h.client.subscription("orders-worker");
+    const path = "http://localhost:8085/v1/projects/p/subscriptions/orders-worker:seek";
+
+    try worker.seek(.{ .time = try core.timestamp.parse("2026-10-10T13:46:36.839Z") });
+    try h.expectRequest(0, .POST, path, "{\"time\":\"2026-10-10T13:46:36.839Z\"}");
+    try worker.seek(.{ .snapshot = "before-deploy" });
+    try h.expectRequest(1, .POST, path, "{\"snapshot\":\"projects/p/snapshots/before-deploy\"}");
+    // A snapshot of another project, named in full, goes as given.
+    try worker.seek(.{ .snapshot = "projects/other-project/snapshots/far" });
+    try h.expectRequest(2, .POST, path, "{\"snapshot\":\"projects/other-project/snapshots/far\"}");
+    try h.expectRequestCount(3);
+}
+
+test "seek: a bad id, time or snapshot fails before any request" {
+    var h: Harness = undefined;
+    try h.init(&.{}, .{});
+    defer h.deinit();
+    const worker = h.client.subscription("orders-worker");
+    try testing.expectError(error.InvalidResourceId, h.client.subscription("go").seek(.{ .snapshot = "before" }));
+    try testing.expectError(error.InvalidArgument, worker.seek(.{ .time = .{ .nanoseconds = core.timestamp.max.nanoseconds + 1 } }));
+    try testing.expect(std.mem.indexOf(u8, h.diag.message(), "the seek time is outside") != null);
+    try testing.expectError(error.InvalidArgument, worker.seek(.{ .snapshot = "projects/p/subscriptions/orders-worker" }));
+    try testing.expectEqualStrings("the snapshot is neither a snapshot id nor projects/{project}/snapshots/{id}", h.diag.message());
+    try testing.expectError(error.InvalidArgument, worker.seek(.{ .snapshot = "" }));
+    try h.expectRequestCount(0);
+}
+
+test "seek: retried as any call is, and its refusals are returned in production's words" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        unavailable,
+        .{ .fail = error.ConnectionResetByPeer },
+        .{ .respond = .{} },
+        // Production's words, 2026-10-10, for another topic's snapshot.
+        .{ .respond = .{ .status = 400, .body = "{\"error\":{\"code\":400,\"message\":\"The subscription's topic (projects/p/topics/other) is different from that of the snapshot (projects/p/topics/orders); they must match in order for Seek work. Note that if a topic is deleted and then re-created with the same name, it is considered a distinct topic for these purposes.\",\"status\":\"FAILED_PRECONDITION\"}}" } },
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Resource not found (resource=before).\",\"status\":\"NOT_FOUND\"}}" } },
+        detached_refusal,
+    }, .{ .retry = quick });
+    defer h.deinit();
+    const worker = h.client.subscription("orders-worker");
+
+    // A repeat leaves the subscription where the first attempt did, so an
+    // answer that never came is asked for again, with the same body.
+    try worker.seek(.{ .snapshot = "before" });
+    try h.expectRequestCount(3);
+    for (0..3) |i| try h.expectRequest(i, .POST, "http://localhost:8085/v1/projects/p/subscriptions/orders-worker:seek", "{\"snapshot\":\"projects/p/snapshots/before\"}");
+    try testing.expectEqual(2, h.clock.sleep_count);
+
+    try testing.expectError(error.FailedPrecondition, worker.seek(.{ .snapshot = "before" }));
+    try testing.expect(std.mem.startsWith(u8, h.diag.message(), "The subscription's topic (projects/p/topics/other) is different from that of the snapshot"));
+    try testing.expectError(error.NotFound, worker.seek(.{ .snapshot = "before" }));
+    try testing.expectError(error.FailedPrecondition, worker.seek(.{ .time = .{ .nanoseconds = 0 } }));
+    try testing.expectEqualStrings("This method is not supported on detached subscriptions.", h.diag.message());
+    // None of the three refusals was asked for twice.
+    try h.expectRequestCount(6);
+}
+
+test "golden: detach sends an empty POST, and what it is refused is returned as it is" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        .{ .respond = .{} },
+        detached_refusal,
+        .{ .respond = .{ .status = 404, .body = "{\"error\":{\"code\":404,\"message\":\"Resource not found (resource=orders-worker).\",\"status\":\"NOT_FOUND\"}}" } },
+        .{ .respond = .{ .status = 403, .body = "{\"error\":{\"code\":403,\"message\":\"User not authorized to perform this action.\",\"status\":\"PERMISSION_DENIED\"}}" } },
+        // The emulator's words.
+        .{ .respond = .{ .status = 501, .body = "{\"error\":{\"code\":501,\"message\":\"Method google.pubsub.v1.Publisher/DetachSubscription is unimplemented\",\"status\":\"UNIMPLEMENTED\"}}" } },
+    }, .{ .retry = quick });
+    defer h.deinit();
+    const worker = h.client.subscription("orders-worker");
+
+    try worker.detach();
+    try h.expectRequest(0, .POST, "http://localhost:8085/v1/projects/p/subscriptions/orders-worker:detach", null);
+
+    // Already detached before this call: the first attempt's refusal says
+    // so, and nothing is read to second-guess it.
+    try testing.expectError(error.FailedPrecondition, worker.detach());
+    try testing.expectEqualStrings("This method is not supported on detached subscriptions.", h.diag.message());
+    try h.expectRequestCount(2);
+
+    try testing.expectError(error.NotFound, worker.detach());
+    try testing.expectError(error.PermissionDenied, worker.detach());
+    try testing.expectError(error.Unimplemented, worker.detach());
+    try h.expectRequestCount(5);
+    try testing.expectEqual(0, h.clock.sleep_count);
+    try testing.expectError(error.InvalidResourceId, h.client.subscription("go").detach());
+}
+
+test "detach: a retry refused as a detached subscription refuses one is read back, and succeeds if the first attempt landed" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        // The first attempt landed and its answer was lost; the second is
+        // refused, and the read says why.
+        .{ .fail = error.ConnectionResetByPeer },
+        detached_refusal,
+        .{ .respond = .{ .body = detached_body } },
+        // The same after a 503, and a third attempt's refusal.
+        unavailable,
+        unavailable,
+        detached_refusal,
+        .{ .respond = .{ .body = detached_body } },
+    }, .{ .retry = quick });
+    defer h.deinit();
+    const worker = h.client.subscription("orders-worker");
+    const base = "http://localhost:8085/v1/projects/p/subscriptions/orders-worker";
+
+    try worker.detach();
+    try h.expectRequest(0, .POST, base ++ ":detach", null);
+    try h.expectRequest(1, .POST, base ++ ":detach", null);
+    try h.expectRequest(2, .GET, base, null);
+    // It ended well: nothing of the refusal is left to mislead.
+    try testing.expectEqualStrings("", h.diag.message());
+    try testing.expectEqual(1, h.clock.sleep_count);
+
+    try worker.detach();
+    try h.expectRequest(5, .POST, base ++ ":detach", null);
+    try h.expectRequest(6, .GET, base, null);
+    try h.expectRequestCount(7);
+    try testing.expectEqual(3, h.clock.sleep_count);
+}
+
+test "detach: a refused retry stands when the subscription reads back attached, or cannot be read" {
+    var h: Harness = undefined;
+    try h.init(&.{
+        unavailable,
+        detached_refusal,
+        .{ .respond = .{ .body = attached_body } },
+        unavailable,
+        detached_refusal,
+        .{ .respond = .{ .status = 403, .body = "{\"error\":{\"code\":403,\"message\":\"User not authorized to perform this action.\",\"status\":\"PERMISSION_DENIED\"}}" } },
+    }, .{ .retry = quick });
+    defer h.deinit();
+    const worker = h.client.subscription("orders-worker");
+
+    // Refused for another reason than a detach that landed: the refusal is
+    // returned with its own words, not the read's.
+    try testing.expectError(error.FailedPrecondition, worker.detach());
+    try testing.expectEqual(400, h.diag.http_status);
+    try testing.expectEqualStrings("This method is not supported on detached subscriptions.", h.diag.message());
+    try h.expectRequestCount(3);
+
+    // Detach needs no permission to read the subscription. Without it,
+    // the refusal stands, and says the detach may have landed.
+    try testing.expectError(error.FailedPrecondition, worker.detach());
+    try testing.expectEqualStrings(
+        "a retried detach was refused, and reading the subscription to see whether the first attempt landed failed with PermissionDenied: it may be detached",
+        h.diag.message(),
+    );
+    try h.expectRequestCount(6);
+}
+
+test "detach: an outage is retried up to the policy's attempts, and no further" {
+    var h: Harness = undefined;
+    try h.init(&.{ unavailable, unavailable, unavailable, unavailable, .{ .respond = .{} } }, .{ .retry = quick });
+    defer h.deinit();
+    const worker = h.client.subscription("orders-worker");
+    try testing.expectError(error.Unavailable, worker.detach());
+    try h.expectRequestCount(3);
+    try testing.expectEqual(2, h.clock.sleep_count);
+    // The next call starts its own count.
+    try worker.detach();
+    try h.expectRequestCount(5);
+
+    // With one attempt allowed there is no retry, and so no read.
+    var once: Harness = undefined;
+    try once.init(&.{unavailable}, .{ .retry = .{ .max_attempts = 1 } });
+    defer once.deinit();
+    try testing.expectError(error.Unavailable, once.client.subscription("orders-worker").detach());
+    try once.expectRequestCount(1);
+    try testing.expectEqual(0, once.clock.sleep_count);
+}
+
+test "seek and detach: every allocation failure is OutOfMemory without leaks" {
+    const Run = struct {
+        fn all(gpa: std.mem.Allocator) !void {
+            var fake: test_util.FakeTransport = .init(testing.allocator, &.{
+                unavailable,
+                .{ .respond = .{} },
+                .{ .respond = .{} },
+                // A detach whose first answer was lost, read back.
+                unavailable,
+                detached_refusal,
+                .{ .respond = .{ .body = detached_body } },
+            });
+            defer fake.deinit();
+            var clock: test_util.FakeClock = .{};
+            var diag: Diagnostics = .{};
+            var client = try Client.init(gpa, clock.io(), .{
+                .project_id = "p",
+                .endpoint = .{ .url = "localhost:8085", .emulator = true },
+                .transport = fake.transport(),
+                .diagnostics = &diag,
+                .retry = quick,
+            });
+            defer client.deinit();
+            const worker = client.subscription("orders-worker");
+            try worker.seek(.{ .snapshot = "before-deploy" });
+            try worker.seek(.{ .time = try core.timestamp.parse("2026-10-10T13:46:36.839Z") });
+            try worker.detach();
+            try testing.expectEqual(6, fake.requests.items.len);
+        }
+    };
+    try testing.checkAllAllocationFailures(test_util.no_grow_allocator, Run.all, .{});
 }

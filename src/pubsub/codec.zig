@@ -366,6 +366,34 @@ const TopicUpdateBody = struct {
     }
 };
 
+/// The `subscriptions.seek` body: exactly one target, a time as the server
+/// writes one or a snapshot by its full name, which `snapshot_name` is when
+/// the target is one. The time must be one `timestamp.format` can write.
+pub fn encodeSeek(arena: Allocator, target: types.SeekTarget, snapshot_name: ?[]const u8) Allocator.Error![]u8 {
+    return render(arena, SeekBody{ .target = target, .snapshot_name = snapshot_name });
+}
+
+const SeekBody = struct {
+    target: types.SeekTarget,
+    snapshot_name: ?[]const u8,
+
+    fn write(self: SeekBody, jw: *Stringify) Stringify.Error!void {
+        try jw.beginObject();
+        switch (self.target) {
+            .time => |t| {
+                var buf: [timestamp.max_len]u8 = undefined;
+                try jw.objectField("time");
+                try jw.write(timestamp.format(&buf, t));
+            },
+            .snapshot => {
+                try jw.objectField("snapshot");
+                try jw.write(self.snapshot_name.?);
+            },
+        }
+        try jw.endObject();
+    }
+};
+
 /// The `snapshots.create` body: the subscription by its full name, and the
 /// labels when there are any.
 pub fn encodeSnapshot(arena: Allocator, subscription_name: []const u8, config: types.SnapshotConfig) Allocator.Error![]u8 {
@@ -1984,4 +2012,58 @@ fn snapshotRoundTrip(_: void, input: []const u8) !void {
 
 test "fuzz snapshot settings: a create body reads back as the snapshot asked for, and an update names its labels" {
     try test_util.fuzzBytes({}, snapshotRoundTrip, .{ .corpus = &.{ "", "\x04\x01\x02\x03\x00\x01\x02\x03\x02", "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff" } });
+}
+
+test "golden: seek bodies hold one target, a time as the server writes one or a snapshot's name" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectEqualStrings(
+        "{\"time\":\"2026-10-10T13:46:36.839Z\"}",
+        try encodeSeek(a, .{ .time = try timestamp.parse("2026-10-10T13:46:36.839Z") }, null),
+    );
+    // Whole seconds carry no fraction, and an offset becomes UTC.
+    try testing.expectEqualStrings(
+        "{\"time\":\"2026-10-10T13:46:36Z\"}",
+        try encodeSeek(a, .{ .time = try timestamp.parse("2026-10-10T15:46:36+02:00") }, null),
+    );
+    try testing.expectEqualStrings(
+        "{\"time\":\"1970-01-01T00:00:00.000000001Z\"}",
+        try encodeSeek(a, .{ .time = .{ .nanoseconds = 1 } }, null),
+    );
+    try testing.expectEqualStrings(
+        "{\"snapshot\":\"projects/p/snapshots/before\"}",
+        try encodeSeek(a, .{ .snapshot = "before" }, "projects/p/snapshots/before"),
+    );
+}
+
+fn seekBodyProperty(_: void, input: []const u8) !void {
+    var g: ByteGen = .init(input);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Sent = struct { time: ?[]const u8 = null, snapshot: ?[]const u8 = null };
+    if (g.boolean()) {
+        // Any time a timestamp can hold, drawn across the whole range or
+        // close to now, goes out as text that reads back as itself.
+        const span = timestamp.max.nanoseconds - timestamp.min.nanoseconds;
+        const drawn = @as(i128, g.int(u64)) * 4_294_967_311 + g.int(u32);
+        const wide = timestamp.min.nanoseconds + @as(i96, @intCast(@mod(drawn, @as(i128, span) + 1)));
+        const near = 1_791_000_000 * std.time.ns_per_s + @as(i96, g.int(u32)) * g.pick(i96, &.{ 1, std.time.ns_per_us, std.time.ns_per_ms, std.time.ns_per_s });
+        const t: std.Io.Timestamp = .{ .nanoseconds = if (g.boolean()) wide else near };
+        try @import("validate.zig").seekTarget(.{ .time = t }, null);
+        const sent = try std.json.parseFromSliceLeaky(Sent, a, try encodeSeek(a, .{ .time = t }, null), .{});
+        try testing.expectEqual(null, sent.snapshot);
+        try testing.expectEqual(t, try timestamp.parse(sent.time.?));
+        try testing.expect(std.mem.endsWith(u8, sent.time.?, "Z"));
+    } else {
+        const name = g.pick([]const u8, &.{ "projects/p/snapshots/before", "projects/other/snapshots/a%41+b" });
+        const sent = try std.json.parseFromSliceLeaky(Sent, a, try encodeSeek(a, .{ .snapshot = "before" }, name), .{});
+        try testing.expectEqual(null, sent.time);
+        try testing.expectEqualStrings(name, sent.snapshot.?);
+    }
+}
+
+test "fuzz seek bodies: one target, and a time that reads back as itself" {
+    try test_util.fuzzBytes({}, seekBodyProperty, .{ .corpus = &.{ "", "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", "\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\x02", "\x00\x01" } });
 }
