@@ -1498,6 +1498,62 @@ test "detach: the emulator has none; production cuts the subscription off its to
     try testing.expectEqualStrings("detached", again.value.label("state").?);
 }
 
+/// The fixture client's transport, with the answer to the first detach
+/// lost: the request reaches the server, and the caller sees a dropped
+/// connection.
+const LoseDetachAnswer = struct {
+    inner: pubsub.transport.Transport,
+    detaches: usize = 0,
+    lost: usize = 0,
+
+    fn transport(l: *LoseDetachAnswer) pubsub.transport.Transport {
+        return .{ .ptr = l, .vtable = &.{ .send = send } };
+    }
+
+    fn send(ptr: *anyopaque, req: pubsub.transport.Request, arena: Allocator) pubsub.transport.Error!pubsub.transport.Response {
+        const l: *LoseDetachAnswer = @ptrCast(@alignCast(ptr));
+        const response = try l.inner.send(req, arena);
+        if (!std.mem.endsWith(u8, req.url, ":detach")) return response;
+        l.detaches += 1;
+        if (l.detaches > 1) return response;
+        l.lost += 1;
+        return error.ConnectionResetByPeer;
+    }
+};
+
+test "detach: in production, one whose answer was lost is read back and succeeds" {
+    var f: Fixture = undefined;
+    if (!try f.init()) return error.SkipZigTest;
+    defer f.deinit();
+    // The emulator has no detach to lose the answer of.
+    if (!f.production) return error.SkipZigTest;
+    const topic = try f.createTopic("lost");
+    const sub = try f.createSubscription("lost-sub", .{ .topic_id = topic.id });
+
+    var lossy: LoseDetachAnswer = .{ .inner = f.client.transport };
+    var diag: pubsub.Diagnostics = .{};
+    var client: pubsub.Client = try .init(testing.allocator, testing.io, .{
+        .project_id = f.client.project_id,
+        .token_provider = f.token.provider(),
+        .diagnostics = &diag,
+        .transport = lossy.transport(),
+    });
+    defer client.deinit();
+
+    // The first attempt lands and its answer is lost. The second finds
+    // the subscription detached already, which the read after it confirms.
+    client.subscription(sub.id).detach() catch |err| {
+        std.debug.print("{t}: HTTP {d} {s}: {s}\n", .{ err, diag.http_status, diag.status(), diag.message() });
+        return err;
+    };
+    try testing.expectEqual(1, lossy.lost);
+    try testing.expectEqual(2, lossy.detaches);
+    try testing.expectEqualStrings("", diag.message());
+    var got = sub.get() catch |err| return f.fail(err);
+    defer got.deinit();
+    try testing.expect(got.value.detached);
+}
+
 // Publisher.
 
 const Publisher = pubsub.Publisher;

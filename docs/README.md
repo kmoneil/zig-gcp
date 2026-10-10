@@ -23,6 +23,7 @@ Google, not only what Google documents, and where the emulators differ.
 | [Subscribing](pubsub/subscribing.md) | `Subscriber`, a worker loop that extends leases and shuts down cleanly; exactly-once delivery |
 | [Publishing](pubsub/publishing.md) | `Publisher`, which batches from many tasks; caps, ordering keys and compression |
 | [Topics and subscriptions](pubsub/topics-and-subscriptions.md) | Dead letters, retry policies, filters, retention, expiration, labels, updates, and IAM |
+| [Replaying and purging](pubsub/replay.md) | Snapshots, seeking back to replay or ahead to purge, and detaching a subscription |
 
 ## 🪣 Cloud Storage
 
