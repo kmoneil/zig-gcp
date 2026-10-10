@@ -232,3 +232,46 @@ fn refusal(arena: Allocator, status: u16, reason: []const u8, message: []const u
     jw.write(.{ .@"error" = .{ .code = status, .message = message, .errors = &[_]struct { message: []const u8, domain: []const u8, reason: []const u8 }{.{ .message = message, .domain = "global", .reason = reason }} } }) catch return error.OutOfMemory;
     return .{ .status = status, .body = out.written() };
 }
+
+const testing = std.testing;
+
+test "the fake's HMAC keys: another project, an account that is not there, and the state no update sets" {
+    var fake: FakeHmacKeys = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const account = fake.accounts[0];
+
+    // Keys are a project's: another project has none to make.
+    const elsewhere = try fake.serve(.POST, .{ .project = "another-project", .service_account_email = account }, "", a);
+    try testing.expectEqual(404, elsewhere.status);
+    try testing.expect(std.mem.indexOf(u8, elsewhere.body, "Project 'another-project' not found.") != null);
+    try testing.expectEqual(0, fake.counts.creates);
+
+    // A listing for an account the project does not have is 404, where
+    // an account that holds no keys lists none.
+    const stranger = try fake.serve(.GET, .{ .project = fake.project, .service_account_email = "nobody@extractctl.iam.gserviceaccount.com" }, "", a);
+    try testing.expectEqual(404, stranger.status);
+    try testing.expect(std.mem.indexOf(u8, stranger.body, "Service Account 'nobody@extractctl.iam.gserviceaccount.com' not found.") != null);
+    const none = try fake.serve(.GET, .{ .project = fake.project, .service_account_email = account }, "", a);
+    try testing.expectEqualStrings("{\"kind\":\"storage#hmacKeysMetadata\"}", none.body);
+
+    // DELETED is a state only a delete reaches: an update that names it
+    // is refused in its own words, and the key stays as it was.
+    try testing.expectEqual(200, (try fake.serve(.POST, .{ .project = fake.project, .service_account_email = account }, "", a)).status);
+    const id = fake.keys.items[0].access_id;
+    const refused = try fake.serve(.PUT, .{ .project = fake.project, .access_id = id }, "{\"state\":\"DELETED\"}", a);
+    try testing.expectEqual(400, refused.status);
+    try testing.expect(std.mem.indexOf(u8, refused.body, "Cannot set state to 'DELETED'.") != null);
+    // A state in lower case is no state at all.
+    const lower = try fake.serve(.PUT, .{ .project = fake.project, .access_id = id }, "{\"state\":\"inactive\"}", a);
+    try testing.expectEqual(400, lower.status);
+    try testing.expect(std.mem.indexOf(u8, lower.body, "Must specify resource.state.") != null);
+    const kept = fake.key(id).?;
+    try testing.expectEqual(.ACTIVE, kept.state);
+    try testing.expectEqual(1, kept.version);
+
+    // `key` answers for what is kept, and null for an ID that is no key's.
+    try testing.expectEqual(null, fake.key("GOOG1E-TEST-ONLY-NOT-A-REAL-ACCESS-ID"));
+}
