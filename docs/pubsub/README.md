@@ -44,6 +44,7 @@ Against production, pass a `.token_provider` as well:
 | [Subscribing](subscribing.md) | `Subscriber`, a worker loop that extends leases, bounds work and shuts down cleanly; exactly-once delivery |
 | [Publishing](publishing.md) | `Publisher`, which batches messages from many tasks; ordering keys; compression |
 | [Topics and subscriptions](topics-and-subscriptions.md) | Dead letters, retry policies, filters, retention, expiration and labels; updates; IAM |
+| [Replaying and purging](replay.md) | Snapshots, seeking back to replay or ahead to purge, what a running subscriber sees, and detaching a subscription |
 
 **On this page:** [Handles and calls](#handles-and-calls) ·
 [Pulling](#pulling) · [Retries](#retries) · [Limits](#limits) ·
@@ -51,12 +52,13 @@ Against production, pass a `.token_provider` as well:
 
 ## Handles and calls
 
-`Topic` and `Subscription` are cheap handles: a client pointer and a
-short id such as `orders`. Creating one sends nothing. The operations:
+`Topic`, `Subscription` and `Snapshot` are cheap handles: a client
+pointer and a short id such as `orders`. Creating one sends nothing. The
+operations:
 
-| `Client` | `Topic` | `Subscription` |
-| --- | --- | --- |
-| `listTopics`, `listSubscriptions` | `create`, `get`, `update`, `delete`, `publish`, and the [IAM calls](topics-and-subscriptions.md#iam) | `create`, `get`, `update`, `delete`, `pull`, `ack`, `modifyAckDeadline`, `nack`, and `ackWithResults`, `modifyAckDeadlineWithResults`, `nackWithResults`, and the [IAM calls](topics-and-subscriptions.md#iam) |
+| `Client` | `Topic` | `Subscription` | `Snapshot` |
+| --- | --- | --- | --- |
+| `listTopics`, `listSubscriptions`, `listSnapshots` | `create`, `get`, `update`, `delete`, `publish`, `listSubscriptions`, `listSnapshots`, and the [IAM calls](topics-and-subscriptions.md#iam) | `create`, `get`, `update`, `delete`, `pull`, `ack`, `modifyAckDeadline`, `nack`, and `ackWithResults`, `modifyAckDeadlineWithResults`, `nackWithResults`, [`seek` and `detach`](replay.md), and the [IAM calls](topics-and-subscriptions.md#iam) | [`create`, `get`, `update`, `delete`](replay.md#snapshots), and the [IAM calls](topics-and-subscriptions.md#iam) |
 
 See [`examples/publish.zig`](../../examples/publish.zig),
 [`examples/publisher.zig`](../../examples/publisher.zig) and
@@ -127,4 +129,6 @@ emulator does not fail later in production.
 | IAM calls (0.8.36) | 501 `UNIMPLEMENTED`, `error.Unimplemented` | the policy |
 
 [Topics and subscriptions](topics-and-subscriptions.md#what-the-emulator-and-production-do)
-lists how the two treat settings and updates.
+lists how the two treat settings and updates, and
+[Replaying and purging](replay.md#what-the-emulator-and-production-do)
+how they treat snapshots, seeks and detach.

@@ -301,3 +301,83 @@ test "the Cloud Storage guides' code, against a scripted transport" {
     try retireKey(&gcs, "GOOG1E-TEST-ONLY-NOT-A-REAL-ACCESS-ID");
     try std.testing.expectEqual(7, fake.requests.items.len);
 }
+
+// snippet: pubsub-snapshot
+/// Before a risky deploy: keeps the backlog of `orders-worker` as it
+/// stands.
+fn keepBacklog(client: *pubsub.Client) !void {
+    var kept = try client.snapshot("before-deploy").create(.{ .subscription = "orders-worker" });
+    defer kept.deinit();
+}
+
+/// The deploy acknowledged what it should not have: back to the snapshot,
+/// which stays until it is deleted or expires.
+fn undoDeploy(client: *pubsub.Client) !void {
+    try client.subscription("orders-worker").seek(.{ .snapshot = "before-deploy" });
+}
+// end snippet
+
+// snippet: pubsub-seek-time
+/// Replays what was published since `since`, as far back as the
+/// subscription or its topic retains messages.
+fn replaySince(client: *pubsub.Client, since: std.Io.Timestamp) !void {
+    try client.subscription("orders-worker").seek(.{ .time = since });
+}
+
+/// Drops a backlog nobody wants. A minute ahead of this machine's clock,
+/// to be past the server's: what is published afterwards is delivered.
+fn purge(client: *pubsub.Client, io: std.Io) !void {
+    const now = std.Io.Clock.real.now(io);
+    try client.subscription("orders-worker").seek(.{ .time = .{ .nanoseconds = now.nanoseconds + std.time.ns_per_min } });
+}
+// end snippet
+
+// snippet: pubsub-detach
+/// A topic's owner cuts off a subscription for good. `consumers` is a
+/// client for the project the subscription lives in.
+fn cutOff(consumers: *pubsub.Client) !void {
+    try consumers.subscription("stale-consumer").detach();
+}
+// end snippet
+
+test "the replay guide's code, against a scripted transport" {
+    var fake: core.testing.FakeTransport = .init(std.testing.allocator, &.{
+        .{ .respond = .{ .body = "{\"name\":\"projects/my-project/snapshots/before-deploy\",\"topic\":\"projects/my-project/topics/orders\",\"expireTime\":\"2026-10-17T13:46:36.836Z\"}" } },
+        .{ .respond = .{} },
+        .{ .respond = .{} },
+        .{ .respond = .{} },
+        .{ .respond = .{} },
+    });
+    defer fake.deinit();
+    var tokens: core.testing.FakeTokenProvider = .{};
+    var client = try pubsub.Client.init(std.testing.allocator, std.testing.io, .{
+        .project_id = "my-project",
+        .token_provider = tokens.provider(),
+        .transport = fake.transport(),
+    });
+    defer client.deinit();
+    const base = "https://pubsub.googleapis.com/v1/projects/my-project/";
+
+    try keepBacklog(&client);
+    try std.testing.expectEqualStrings(base ++ "snapshots/before-deploy", (try fake.request(0)).url);
+    try std.testing.expectEqualStrings("{\"subscription\":\"projects/my-project/subscriptions/orders-worker\"}", (try fake.request(0)).body.?);
+
+    try undoDeploy(&client);
+    try std.testing.expectEqualStrings(base ++ "subscriptions/orders-worker:seek", (try fake.request(1)).url);
+    try std.testing.expectEqualStrings("{\"snapshot\":\"projects/my-project/snapshots/before-deploy\"}", (try fake.request(1)).body.?);
+
+    try replaySince(&client, try core.timestamp.parse("2026-10-10T12:00:00Z"));
+    try std.testing.expectEqualStrings("{\"time\":\"2026-10-10T12:00:00Z\"}", (try fake.request(2)).body.?);
+
+    // The purge names a time ahead of now.
+    const before = std.Io.Clock.real.now(std.testing.io);
+    try purge(&client, std.testing.io);
+    const sent = try std.json.parseFromSlice(struct { time: []const u8 }, std.testing.allocator, (try fake.request(3)).body.?, .{});
+    defer sent.deinit();
+    try std.testing.expect((try core.timestamp.parse(sent.value.time)).nanoseconds >= before.nanoseconds + 59 * std.time.ns_per_s);
+
+    try cutOff(&client);
+    try std.testing.expectEqualStrings(base ++ "subscriptions/stale-consumer:detach", (try fake.request(4)).url);
+    try std.testing.expectEqual(null, (try fake.request(4)).body);
+    try std.testing.expectEqual(5, fake.requests.items.len);
+}
