@@ -1829,3 +1829,200 @@ test "the fake keeps a retention policy as Cloud Storage did on 2026-09-30" {
     try testing.expectEqual(200, (try fake.serve(.PATCH, target, "{\"defaultEventBasedHold\":true}", a)).status);
     try testing.expect(fake.defaultEventBasedHold("b"));
 }
+
+test "a policy etag is the metageneration as a varint, and anything else is no etag" {
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("CAE=", etagOf(&buf, 1));
+    // Round trips across the varint widths, the multi-byte ones included.
+    const decoder = std.base64.standard.Decoder;
+    for ([_]u64{ 1, 2, 127, 128, 300, 16383, 16384, 1 << 40, (1 << 63) - 1 }) |m| {
+        const encoded = etagOf(&buf, m);
+        var raw: [11]u8 = undefined;
+        const size = decoder.calcSizeForSlice(encoded) catch unreachable;
+        decoder.decode(raw[0..size], encoded) catch unreachable;
+        try testing.expectEqual(m, metagenerationOfEtag(raw[0..size]));
+    }
+    // What is no etag: empty, the tag alone, another field's tag, a
+    // continuation that never ends, and bytes after the value.
+    try testing.expectEqual(null, metagenerationOfEtag(""));
+    try testing.expectEqual(null, metagenerationOfEtag(&.{0x08}));
+    try testing.expectEqual(null, metagenerationOfEtag(&.{ 0x10, 0x01 }));
+    try testing.expectEqual(null, metagenerationOfEtag(&.{ 0x08, 0x80 }));
+    try testing.expectEqual(null, metagenerationOfEtag(&.{ 0x08, 0x01, 0x00 }));
+    // The decoder stops at nine varint bytes, so a tenth is refused: no
+    // real metageneration reaches 2^63.
+    var raw: [11]u8 = undefined;
+    const size = decoder.calcSizeForSlice(etagOf(&buf, 1 << 63)) catch unreachable;
+    decoder.decode(raw[0..size], etagOf(&buf, 1 << 63)) catch unreachable;
+    try testing.expectEqual(null, metagenerationOfEtag(raw[0..size]));
+}
+
+test "the fake bounds a notification's custom attributes as Cloud Storage does" {
+    var fake: FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqual(200, (try fake.serve(.POST, .{ .name = null, .project = "p" }, "{\"name\":\"b\"}", a)).status);
+
+    const create: FakeBuckets.Target = .{ .name = "b", .notification = .collection };
+    const head = "{\"topic\":\"//pubsub.googleapis.com/projects/p/topics/t\",\"payload_format\":\"JSON_API_V1\",\"custom_attributes\":";
+    // Six attributes, an empty key, a key past 256 characters and a value
+    // past 1024 are each 400, in the words production used, and nothing
+    // is kept.
+    const refused = [_]struct { []const u8, []const u8 }{
+        .{ "{\"a1\":\"v\",\"a2\":\"v\",\"a3\":\"v\",\"a4\":\"v\",\"a5\":\"v\",\"a6\":\"v\"}", "Maximum of 5 custom attributes, notification config had 6" },
+        .{ "{\"\":\"v\"}", "Custom attribute keys may not be empty" },
+        .{ "{\"" ++ core.testing.repeat("k", 257) ++ "\":\"v\"}", "may not be longer than 256 characters" },
+        .{ "{\"k\":\"" ++ core.testing.repeat("v", 1025) ++ "\"}", "may not be longer than 1024 characters" },
+    };
+    for (refused) |case| {
+        errdefer std.debug.print("attributes: {s}\n", .{case[0][0..@min(case[0].len, 80)]});
+        const reply = try fake.serve(.POST, create, try a.print("{s}{s}}}", .{ head, case[0] }), a);
+        try testing.expectEqual(400, reply.status);
+        try testing.expect(std.mem.indexOf(u8, reply.body, case[1]) != null);
+        try testing.expectEqual(0, fake.notifications("b").len);
+    }
+
+    // Five attributes, a 256-character key and a 1024-character value are
+    // the measured edges, kept as sent.
+    const edge = "{\"a1\":\"v\",\"a2\":\"v\",\"a3\":\"v\",\"a4\":\"v\",\"" ++
+        core.testing.repeat("k", 256) ++ "\":\"" ++ core.testing.repeat("v", 1024) ++ "\"}";
+    const reply = try fake.serve(.POST, create, try a.print("{s}{s},\"object_name_prefix\":\"pre/\"}}", .{ head, edge }), a);
+    try testing.expectEqual(200, reply.status);
+    const kept = fake.notifications("b");
+    try testing.expectEqual(1, kept.len);
+    try testing.expectEqualStrings("pre/", stringOf(kept[0].get("object_name_prefix").?).?);
+    const attributes = objectOf(kept[0].get("custom_attributes").?).?;
+    try testing.expectEqual(5, attributes.count());
+    try testing.expectEqualStrings(
+        core.testing.repeat("v", 1024),
+        stringOf(attributes.get(core.testing.repeat("k", 256)).?).?,
+    );
+}
+
+test "the fake's ACL reads: each list, one entry, a missing entity, and uniform access" {
+    var fake: FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqual(200, (try fake.serve(.POST, .{ .name = null, .project = "p" }, "{\"name\":\"b\"}", a)).status);
+
+    // The bucket's own list and its default object list, whole.
+    const bucket_list = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .bucket } }, "", a);
+    try testing.expectEqual(200, bucket_list.status);
+    try testing.expect(std.mem.indexOf(u8, bucket_list.body, "storage#bucketAccessControls") != null);
+    const default_list = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .default_object } }, "", a);
+    try testing.expectEqual(200, default_list.status);
+    try testing.expect(std.mem.indexOf(u8, default_list.body, "storage#objectAccessControls") != null);
+
+    // One entry by its entity, and production's 404 for one the list
+    // does not hold.
+    const entry = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .bucket, .entity = fake_acl.viewers } }, "", a);
+    try testing.expectEqual(200, entry.status);
+    try testing.expect(std.mem.indexOf(u8, entry.body, "READER") != null);
+    const missing = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .bucket, .entity = "allUsers" } }, "", a);
+    try testing.expectEqual(404, missing.status);
+
+    // Uniform bucket-level access hides every list.
+    try testing.expectEqual(200, (try fake.serve(.PATCH, .{ .name = "b" }, "{\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true}}}", a)).status);
+    const hidden = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .bucket } }, "", a);
+    try testing.expectEqual(400, hidden.status);
+    try testing.expect(std.mem.indexOf(u8, hidden.body, "Cannot get legacy ACL for a bucket that has uniform bucket-level access.") != null);
+}
+
+test "the fake's canned lists on a create and a patch: kept, invalid, and refused under uniform access or prevention" {
+    var fake: FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // A create naming canned lists keeps them: publicRead puts allUsers
+    // on the bucket's own list.
+    try testing.expectEqual(200, (try fake.serve(.POST, .{
+        .name = null,
+        .project = "p",
+        .predefined_acl = "publicRead",
+        .predefined_default_object_acl = "bucketOwnerRead",
+    }, "{\"name\":\"b\"}", a)).status);
+    const entry = try fake.serve(.GET, .{ .name = "b", .acl = .{ .list = .bucket, .entity = "allUsers" } }, "", a);
+    try testing.expectEqual(200, entry.status);
+
+    // A name production does not take.
+    const unknown = try fake.serve(.POST, .{ .name = null, .project = "p", .predefined_acl = "bogus" }, "{\"name\":\"x\"}", a);
+    try testing.expectEqual(400, unknown.status);
+    try testing.expect(std.mem.indexOf(u8, unknown.body, "Invalid predefined ACL") != null);
+
+    // Uniform access keeps no lists: a canned one on a uniform create is
+    // refused, and so is one patched onto a uniform bucket.
+    const on_uniform = try fake.serve(.POST, .{ .name = null, .project = "p", .predefined_acl = "projectPrivate" }, "{\"name\":\"x\",\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true}}}", a);
+    try testing.expectEqual(400, on_uniform.status);
+    try testing.expect(std.mem.indexOf(u8, on_uniform.body, "Cannot use ACL API to update bucket policy when uniform bucket-level access is enabled.") != null);
+    try testing.expectEqual(200, (try fake.serve(.POST, .{ .name = null, .project = "p" }, "{\"name\":\"u\",\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true}}}", a)).status);
+    const patched = try fake.serve(.PATCH, .{ .name = "u", .predefined_acl = "projectPrivate" }, "{}", a);
+    try testing.expectEqual(400, patched.status);
+    try testing.expect(std.mem.indexOf(u8, patched.body, "Cannot use ACL API to update bucket policy when uniform bucket-level access is enabled.") != null);
+
+    // Public access prevention refuses a public canned list, as measured.
+    const prevented = try fake.serve(.POST, .{ .name = null, .project = "p", .predefined_acl = "publicRead" }, "{\"name\":\"x\",\"iamConfiguration\":{\"publicAccessPrevention\":\"enforced\"}}", a);
+    try testing.expectEqual(412, prevented.status);
+}
+
+test "the fake's IAM policy: an unknown member type, what conditions need, and a conditioned role under version 1" {
+    var fake: FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqual(200, (try fake.serve(.POST, .{ .name = null, .project = "p" }, "{\"name\":\"b\"}", a)).status);
+    const policy: FakeBuckets.Target = .{ .name = "b", .iam = .{ .policy = null } };
+
+    // A member whose prefix Cloud Storage does not know.
+    const unknown = try fake.serve(.PUT, policy, "{\"bindings\":[{\"role\":\"roles/storage.objectViewer\",\"members\":[\"bogus:x\"]}]}", a);
+    try testing.expectEqual(400, unknown.status);
+    try testing.expect(std.mem.indexOf(u8, unknown.body, "The member bogus:x is of an unknown type.") != null);
+
+    // A condition needs uniform access first, then version 3.
+    const conditioned = "{\"version\":%V,\"bindings\":[{\"role\":\"roles/storage.objectViewer\",\"members\":[\"user:a@example.com\"],\"condition\":{\"title\":\"t\",\"expression\":\"request.time < timestamp(\\\"2027-01-01T00:00:00Z\\\")\"}}]}";
+    const v3 = try std.mem.replaceOwned(u8, a, conditioned, "%V", "3");
+    const not_uniform = try fake.serve(.PUT, policy, v3, a);
+    try testing.expectEqual(412, not_uniform.status);
+    try testing.expect(std.mem.indexOf(u8, not_uniform.body, "enable uniform bucket-level access") != null);
+    try testing.expectEqual(200, (try fake.serve(.PATCH, .{ .name = "b" }, "{\"iamConfiguration\":{\"uniformBucketLevelAccess\":{\"enabled\":true}}}", a)).status);
+    const v1 = try std.mem.replaceOwned(u8, a, conditioned, "%V", "1");
+    const low = try fake.serve(.PUT, policy, v1, a);
+    try testing.expectEqual(400, low.status);
+    try testing.expect(std.mem.indexOf(u8, low.body, "must be at least 3") != null);
+    try testing.expectEqual(200, (try fake.serve(.PUT, policy, v3, a)).status);
+
+    // A version 1 read spells a conditioned role as production does; a
+    // version 3 read carries the condition itself.
+    const read_v1 = try fake.serve(.GET, policy, "", a);
+    try testing.expectEqual(200, read_v1.status);
+    try testing.expect(std.mem.indexOf(u8, read_v1.body, "roles/storage.objectViewer_withcond_4e0bd94b67e008e72efb") != null);
+    const read_v3 = try fake.serve(.GET, .{ .name = "b", .iam = .{ .policy = 3 } }, "", a);
+    try testing.expect(std.mem.indexOf(u8, read_v3.body, "\"condition\"") != null);
+
+    // A role outside the documented forms never reaches the bindings.
+    const bad_role = try fake.serve(.PUT, policy, "{\"bindings\":[{\"role\":\"bogus\",\"members\":[\"user:a@example.com\"]}]}", a);
+    try testing.expectEqual(400, bad_role.status);
+    try testing.expect(std.mem.indexOf(u8, bad_role.body, "The role name must be in the form") != null);
+
+    // A permission outside Cloud Storage's names.
+    const bad = try fake.serve(.GET, .{ .name = "b", .iam = .{ .test_permissions = &.{"notstorage.x"} } }, "", a);
+    try testing.expectEqual(400, bad.status);
+    try testing.expect(std.mem.indexOf(u8, bad.body, "notstorage.x is not a valid Google Cloud Storage permission.") != null);
+}
+
+test "a create's body is judged by the patch's rules, and a refused bucket is not kept" {
+    var fake: FakeBuckets = .init(testing.allocator);
+    defer fake.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const refused = try fake.serve(.POST, .{ .name = null, .project = "p" }, "{\"name\":\"x\",\"labels\":{\"Env\":\"v\"}}", a);
+    try testing.expectEqual(400, refused.status);
+    try testing.expectEqual(null, fake.resource("x"));
+}
